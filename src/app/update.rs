@@ -791,11 +791,8 @@ impl AppModel {
                 };
                 let mut config = PostProcessingConfig::default();
                 config.filter_type = filter_type;
-                let pipeline = PhotoPipeline::with_config(
-                    config,
-                    EncodingFormat::Jpeg,
-                    EncodingQuality::High,
-                );
+                let pipeline =
+                    PhotoPipeline::with_config(config, EncodingFormat::Jpeg, EncodingQuality::High);
                 pipeline
                     .capture_and_save(frame_arc, save_dir)
                     .await
@@ -1198,8 +1195,7 @@ impl AppModel {
             Some(std::sync::Arc::new(tokio::sync::Mutex::new(preview_rx)));
 
         // Create progress channel for video files
-        let (progress_tx, progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(f64, f64, f64)>();
+        let (progress_tx, progress_rx) = tokio::sync::mpsc::unbounded_channel::<(f64, f64, f64)>();
 
         // Create playback control channel for video files
         let (control_tx, control_rx) =
@@ -1953,10 +1949,15 @@ impl AppModel {
         Task::run(
             futures::stream::unfold(frame_rx, |mut rx| async move {
                 rx.recv().await.map(|(frame, pos, dur, progress)| {
-                    (Message::VideoPreviewPlaybackUpdate(frame, pos, dur, progress), rx)
+                    (
+                        Message::VideoPreviewPlaybackUpdate(frame, pos, dur, progress),
+                        rx,
+                    )
                 })
             })
-            .chain(futures::stream::once(async { Message::VideoPreviewPlaybackStopped })),
+            .chain(futures::stream::once(async {
+                Message::VideoPreviewPlaybackStopped
+            })),
             cosmic::Action::App,
         )
     }

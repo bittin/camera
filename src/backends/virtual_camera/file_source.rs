@@ -40,7 +40,9 @@ pub fn load_preview_frame(path: &Path) -> BackendResult<CameraFrame> {
 fn wait_for_pipeline_ready(pipeline: &gstreamer::Pipeline, timeout_secs: u64) -> BackendResult<()> {
     use gstreamer::prelude::*;
 
-    let bus = pipeline.bus().ok_or_else(|| BackendError::Other("No bus on pipeline".into()))?;
+    let bus = pipeline
+        .bus()
+        .ok_or_else(|| BackendError::Other("No bus on pipeline".into()))?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     while std::time::Instant::now() < deadline {
@@ -48,7 +50,10 @@ fn wait_for_pipeline_ready(pipeline: &gstreamer::Pipeline, timeout_secs: u64) ->
             use gstreamer::MessageView;
             match msg.view() {
                 MessageView::Error(err) => {
-                    return Err(BackendError::Other(format!("Pipeline error: {}", err.error())));
+                    return Err(BackendError::Other(format!(
+                        "Pipeline error: {}",
+                        err.error()
+                    )));
                 }
                 MessageView::AsyncDone(_) => return Ok(()),
                 _ => {}
@@ -102,7 +107,12 @@ pub fn load_video_frame_at_position(path: &Path, position_secs: f64) -> BackendR
     let frame = extract_frame_from_sample(&sample)?;
     let _ = pipeline.set_state(gstreamer::State::Null);
 
-    debug!(width = frame.width, height = frame.height, position_secs, "Video frame at position loaded successfully");
+    debug!(
+        width = frame.width,
+        height = frame.height,
+        position_secs,
+        "Video frame at position loaded successfully"
+    );
     Ok(frame)
 }
 
@@ -133,8 +143,8 @@ pub fn get_video_duration(path: &Path) -> BackendResult<f64> {
 
     // Wait for state change and query duration
     let bus = pipeline.bus().unwrap();
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(vc_timing::DURATION_QUERY_TIMEOUT_SECS);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_secs(vc_timing::DURATION_QUERY_TIMEOUT_SECS);
 
     while std::time::Instant::now() < deadline {
         if let Some(msg) = bus.timed_pop(gstreamer::ClockTime::from_mseconds(100)) {
@@ -201,7 +211,9 @@ fn extract_frame_from_sample(sample: &gstreamer::Sample) -> BackendResult<Camera
 }
 
 /// Create a video frame extraction pipeline with appsink
-fn create_frame_extraction_pipeline(path: &Path) -> BackendResult<(gstreamer::Pipeline, gstreamer_app::AppSink)> {
+fn create_frame_extraction_pipeline(
+    path: &Path,
+) -> BackendResult<(gstreamer::Pipeline, gstreamer_app::AppSink)> {
     use gstreamer::prelude::*;
 
     gstreamer::init().map_err(|e| BackendError::Other(format!("GStreamer init failed: {}", e)))?;
@@ -243,13 +255,19 @@ fn load_video_first_frame(path: &Path) -> BackendResult<CameraFrame> {
         .map_err(|e| BackendError::Other(format!("Failed to start pipeline: {:?}", e)))?;
 
     let sample = appsink
-        .try_pull_sample(gstreamer::ClockTime::from_seconds(vc_timing::VIDEO_FRAME_TIMEOUT_SECS))
+        .try_pull_sample(gstreamer::ClockTime::from_seconds(
+            vc_timing::VIDEO_FRAME_TIMEOUT_SECS,
+        ))
         .ok_or_else(|| BackendError::Other("Timeout waiting for first video frame".into()))?;
 
     let frame = extract_frame_from_sample(&sample)?;
     let _ = pipeline.set_state(gstreamer::State::Null);
 
-    info!(width = frame.width, height = frame.height, "Video first frame loaded successfully");
+    info!(
+        width = frame.width,
+        height = frame.height,
+        "Video first frame loaded successfully"
+    );
     Ok(frame)
 }
 
@@ -404,12 +422,7 @@ impl VideoDecoder {
         let audio_pipeline = Self::create_audio_pipeline(path);
         let has_audio = audio_pipeline.is_some();
 
-        info!(
-            width,
-            height,
-            has_audio,
-            "Video decoder created"
-        );
+        info!(width, height, has_audio, "Video decoder created");
 
         Ok(Self {
             video_pipeline,
@@ -510,7 +523,10 @@ impl VideoDecoder {
     /// the first frame without waiting for sync timing. Returns None if
     /// preroll is not yet available.
     pub fn preroll_frame(&self) -> Option<CameraFrame> {
-        self.video_appsink.pull_preroll().ok().and_then(|s| self.sample_to_frame(s))
+        self.video_appsink
+            .pull_preroll()
+            .ok()
+            .and_then(|s| self.sample_to_frame(s))
     }
 
     /// Get the next frame from the video
@@ -518,7 +534,10 @@ impl VideoDecoder {
     /// Blocks until a frame is available. Returns None if the video has ended
     /// (caller should restart for looping).
     pub fn next_frame(&self) -> Option<CameraFrame> {
-        self.video_appsink.pull_sample().ok().and_then(|s| self.sample_to_frame(s))
+        self.video_appsink
+            .pull_sample()
+            .ok()
+            .and_then(|s| self.sample_to_frame(s))
     }
 
     /// Check if the video has reached the end
