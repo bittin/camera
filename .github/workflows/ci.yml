@@ -165,7 +165,7 @@ jobs:
         run: just flatpak-bundle x86_64
 
       - name: Upload Flatpak bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: cosmic-camera-x86_64.flatpak
           path: cosmic-camera-x86_64.flatpak
@@ -210,7 +210,7 @@ jobs:
         run: just flatpak-bundle aarch64
 
       - name: Upload Flatpak bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: cosmic-camera-aarch64.flatpak
           path: cosmic-camera-aarch64.flatpak
