@@ -112,8 +112,17 @@ impl cosmic::Application for AppModel {
             .name(fl!("app-title"))
             .icon(widget::icon::from_svg_bytes(APP_ICON))
             .version(env!("GIT_VERSION"))
-            .links([(fl!("repository"), REPOSITORY)])
-            .license(env!("CARGO_PKG_LICENSE"));
+            .author("Frederic Laing")
+            .license("GPL-3.0-only")
+            .license_url("https://www.gnu.org/licenses/gpl-3.0.html")
+            .developers([("Frederic Laing", "frederic.laing.development@gmail.com")])
+            .links([
+                (fl!("repository"), REPOSITORY),
+                (
+                    fl!("about-support"),
+                    "https://github.com/FreddyFunk/cosmic-camera/issues",
+                ),
+            ]);
 
         // Load configuration
         let (config_handler, config) =
@@ -328,10 +337,18 @@ impl cosmic::Application for AppModel {
         let is_disabled = self.transition_state.ui_disabled;
 
         if is_disabled {
-            // Disabled settings button during transitions
+            // Disabled buttons during transitions
+            let about_button =
+                widget::button::icon(widget::icon::from_name("help-about-symbolic"));
             let settings_button =
                 widget::button::icon(widget::icon::from_name("preferences-system-symbolic"));
             vec![
+                widget::container(about_button)
+                    .style(|_theme| widget::container::Style {
+                        text_color: Some(cosmic::iced::Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
+                        ..Default::default()
+                    })
+                    .into(),
                 widget::container(settings_button)
                     .style(|_theme| widget::container::Style {
                         text_color: Some(cosmic::iced::Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
@@ -341,6 +358,9 @@ impl cosmic::Application for AppModel {
             ]
         } else {
             vec![
+                widget::button::icon(widget::icon::from_name("help-about-symbolic"))
+                    .on_press(Message::ToggleContextPage(ContextPage::About))
+                    .into(),
                 widget::button::icon(widget::icon::from_name("preferences-system-symbolic"))
                     .on_press(Message::ToggleContextPage(ContextPage::Settings))
                     .into(),

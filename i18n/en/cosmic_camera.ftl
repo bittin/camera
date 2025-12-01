@@ -64,3 +64,6 @@ qr-send-sms = Send SMS
 qr-open-map = Open Map
 qr-add-contact = Add Contact
 qr-add-event = Add Event
+
+# About page
+about-support = Support & Feedback
