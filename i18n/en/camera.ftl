@@ -1,4 +1,4 @@
-app-title = Cosmic Camera
+app-title = Camera
 about = About
 repository = Repository
 view = View

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
-name := 'cosmic-camera'
+name := 'camera'
 export APPID := 'io.github.cosmicutils.camera'
 
 rootdir := ''
@@ -83,11 +83,11 @@ dev *args:
 
 # Run with debug logs
 run *args:
-    env RUST_LOG=cosmic_camera=info RUST_BACKTRACE=full cargo run --release {{args}}
+    env RUST_LOG=camera=info RUST_BACKTRACE=full cargo run --release {{args}}
 
 # Run with verbose debug logs
 run-debug *args:
-    env RUST_LOG=cosmic_camera=debug,info RUST_BACKTRACE=full cargo run --release {{args}}
+    env RUST_LOG=camera=debug,info RUST_BACKTRACE=full cargo run --release {{args}}
 
 # ============================================================================
 # Cleaning

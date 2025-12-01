@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use camera::app::AppModel;
+use camera::i18n;
 use clap::Parser;
-use cosmic_camera::app::AppModel;
-use cosmic_camera::i18n;
 
 #[derive(Parser)]
-#[command(name = "cosmic-camera")]
+#[command(name = "camera")]
 #[command(about = "Camera application for the COSMIC desktop")]
 #[command(version)]
 struct Cli {
@@ -17,7 +17,7 @@ struct Cli {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     // Set RUST_LOG environment variable to control log level
-    // Examples: RUST_LOG=debug, RUST_LOG=cosmic_camera=debug, RUST_LOG=info
+    // Examples: RUST_LOG=debug, RUST_LOG=camera=debug, RUST_LOG=info
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if cli.terminal {
         // Run terminal mode
-        cosmic_camera::terminal::run()
+        camera::terminal::run()
     } else {
         // Run GUI mode
         run_gui()

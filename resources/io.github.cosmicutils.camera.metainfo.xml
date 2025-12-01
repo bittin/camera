@@ -3,12 +3,12 @@
   <id>io.github.cosmicutils.camera</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-only</project_license>
-  <name>COSMIC Camera</name>
+  <name>Camera</name>
   <summary>Capture photos and videos</summary>
   <description>
     <p>
-      COSMIC Camera is a third-party camera application for the COSMIC™ desktop environment.
-      Whether you need to snap a quick photo, record a video, or scan a QR code, COSMIC Camera
+      Camera is a third-party camera application for the COSMIC™ desktop environment.
+      Whether you need to snap a quick photo, record a video, or scan a QR code, Camera
       provides a clean and intuitive interface that stays out of your way.
     </p>
     <p>
@@ -28,11 +28,11 @@
   </description>
   <launchable type="desktop-id">io.github.cosmicutils.camera.desktop</launchable>
   <provides>
-    <binary>cosmic-camera</binary>
+    <binary>camera</binary>
   </provides>
-  <url type="homepage">https://github.com/FreddyFunk/cosmic-camera</url>
-  <url type="bugtracker">https://github.com/FreddyFunk/cosmic-camera/issues</url>
-  <url type="vcs-browser">https://github.com/FreddyFunk/cosmic-camera</url>
+  <url type="homepage">https://github.com/cosmic-utils/camera</url>
+  <url type="bugtracker">https://github.com/cosmic-utils/camera/issues</url>
+  <url type="vcs-browser">https://github.com/cosmic-utils/camera</url>
   <developer id="io.github.cosmicutils">
     <name>Frederic Laing</name>
   </developer>
@@ -44,23 +44,23 @@
   <screenshots>
     <screenshot type="default">
       <caption>Photo mode with live camera preview</caption>
-      <image>https://raw.githubusercontent.com/FreddyFunk/cosmic-camera/main/preview/preview-002.png</image>
+      <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-002.png</image>
     </screenshot>
     <screenshot>
       <caption>Apply real-time filters to your preview</caption>
-      <image>https://raw.githubusercontent.com/FreddyFunk/cosmic-camera/main/preview/preview-001.png</image>
+      <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-001.png</image>
     </screenshot>
     <screenshot>
       <caption>Record videos with a simple interface</caption>
-      <image>https://raw.githubusercontent.com/FreddyFunk/cosmic-camera/main/preview/preview-003.png</image>
+      <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-003.png</image>
     </screenshot>
     <screenshot>
       <caption>Configure camera, audio, and encoding settings</caption>
-      <image>https://raw.githubusercontent.com/FreddyFunk/cosmic-camera/main/preview/preview-004.png</image>
+      <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-004.png</image>
     </screenshot>
     <screenshot>
       <caption>Theatre mode for fullscreen preview</caption>
-      <image>https://raw.githubusercontent.com/FreddyFunk/cosmic-camera/main/preview/preview-006.png</image>
+      <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-006.png</image>
     </screenshot>
   </screenshots>
   <releases>
@@ -69,7 +69,7 @@
         <p>Release 0.1.13 includes the following changes:</p>
         <ul>
           <li>clearly clarify this as a third party app for COSMIC DE according to the trademark</li>
-          <li>migrate app from io.github.freddyfunk.cosmic-camera to io.github.cosmicutils.camera</li>
+          <li>migrate app from io.github.freddyfunk.camera to io.github.cosmicutils.camera</li>
           <li>deps(cargo): bump rfd from 0.15.4 to 0.16.0</li>
           <li>deps(cargo): bump crossterm from 0.28.1 to 0.29.0</li>
         </ul>
@@ -131,7 +131,7 @@
     </release>
     <release version="0.1.0" date="2025-01-21">
       <description>
-        <p>Initial release of COSMIC Camera.</p>
+        <p>Initial release of Camera.</p>
       </description>
     </release>
   </releases>

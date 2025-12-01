@@ -1,10 +1,10 @@
 [package]
-name = "cosmic-camera"
+name = "camera"
 version = "0.1.13"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Camera application for the COSMIC™ desktop"
-repository = "https://github.com/FreddyFunk/cosmic-camera"
+repository = "https://github.com/cosmic-utils/camera"
 authors = ["Frederic Laing <frederic.laing.development@gmail.com>"]
 
 [dependencies]

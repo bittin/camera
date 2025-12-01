@@ -376,14 +376,14 @@ impl VideoPipeline {
             include_str!("video_shader.wgsl")
         );
         let shader_rgba = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cosmic-camera video shader"),
+            label: Some("camera video shader"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
         // Bind group layout for video texture, sampler, and viewport
         let bind_group_layout_rgba =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cosmic-camera video bind group layout"),
+                label: Some("camera video bind group layout"),
                 entries: &[
                     // RGBA texture
                     wgpu::BindGroupLayoutEntry {
@@ -418,13 +418,13 @@ impl VideoPipeline {
             });
 
         let pipeline_layout_rgba = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cosmic-camera video pipeline layout"),
+            label: Some("camera video pipeline layout"),
             bind_group_layouts: &[&bind_group_layout_rgba],
             push_constant_ranges: &[],
         });
 
         let pipeline_rgba = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cosmic-camera video pipeline"),
+            label: Some("camera video pipeline"),
             layout: Some(&pipeline_layout_rgba),
             vertex: wgpu::VertexState {
                 module: &shader_rgba,
@@ -456,14 +456,14 @@ impl VideoPipeline {
         // ===== Blur Pipeline (for multi-pass blur) =====
         let shader_blur_source = include_str!("video_shader_blur.wgsl");
         let shader_rgb_blur = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("cosmic-camera blur shader"),
+            label: Some("camera blur shader"),
             source: wgpu::ShaderSource::Wgsl(shader_blur_source.into()),
         });
 
         // Bind group layout for blur texture, sampler, and viewport
         let bind_group_layout_rgb =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cosmic-camera blur bind group layout"),
+                label: Some("camera blur bind group layout"),
                 entries: &[
                     // RGB texture
                     wgpu::BindGroupLayoutEntry {
@@ -498,13 +498,13 @@ impl VideoPipeline {
             });
 
         let pipeline_layout_rgb = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("cosmic-camera blur pipeline layout"),
+            label: Some("camera blur pipeline layout"),
             bind_group_layouts: &[&bind_group_layout_rgb],
             push_constant_ranges: &[],
         });
 
         let pipeline_rgb_blur = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("cosmic-camera blur pipeline"),
+            label: Some("camera blur pipeline"),
             layout: Some(&pipeline_layout_rgb),
             vertex: wgpu::VertexState {
                 module: &shader_rgb_blur,
@@ -535,7 +535,7 @@ impl VideoPipeline {
 
         // Shared sampler for all pipelines
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("cosmic-camera video sampler"),
+            label: Some("camera video sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -673,7 +673,7 @@ impl VideoPipeline {
     /// Create a texture for a video source (shared across filter variations)
     fn create_texture(&self, device: &wgpu::Device, width: u32, height: u32) -> VideoTexture {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("cosmic-camera RGBA texture"),
+            label: Some("camera RGBA texture"),
             size: wgpu::Extent3d {
                 width,
                 height,
@@ -719,14 +719,14 @@ impl VideoPipeline {
 
         // Create viewport buffer for this filter
         let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cosmic-camera filter viewport buffer"),
+            label: Some("camera filter viewport buffer"),
             size: std::mem::size_of::<ViewportUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cosmic-camera filter bind group"),
+            label: Some("camera filter bind group"),
             layout: &self.bind_group_layout_rgba,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -775,7 +775,7 @@ impl VideoPipeline {
         if needs_recreation {
             // Create intermediate texture 1
             let texture_1 = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("cosmic-camera blur intermediate 1"),
+                label: Some("camera blur intermediate 1"),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -794,14 +794,14 @@ impl VideoPipeline {
 
             // Create viewport buffer for intermediate texture 1
             let viewport_buffer_1 = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cosmic-camera blur intermediate 1 viewport buffer"),
+                label: Some("camera blur intermediate 1 viewport buffer"),
                 size: std::mem::size_of::<ViewportUniform>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
 
             let bind_group_1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cosmic-camera blur intermediate 1 bind group"),
+                label: Some("camera blur intermediate 1 bind group"),
                 layout: &self.bind_group_layout_rgb,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -830,7 +830,7 @@ impl VideoPipeline {
 
             // Create intermediate texture 2
             let texture_2 = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("cosmic-camera blur intermediate 2"),
+                label: Some("camera blur intermediate 2"),
                 size: wgpu::Extent3d {
                     width,
                     height,
@@ -849,14 +849,14 @@ impl VideoPipeline {
 
             // Create viewport buffer for intermediate texture 2
             let viewport_buffer_2 = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cosmic-camera blur intermediate 2 viewport buffer"),
+                label: Some("camera blur intermediate 2 viewport buffer"),
                 size: std::mem::size_of::<ViewportUniform>() as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
 
             let bind_group_2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("cosmic-camera blur intermediate 2 bind group"),
+                label: Some("camera blur intermediate 2 bind group"),
                 layout: &self.bind_group_layout_rgb,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -910,7 +910,7 @@ impl VideoPipeline {
                 if intermediate_1_opt.is_none() || intermediate_2_opt.is_none() {
                     // Fallback to single-pass if intermediates aren't ready
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("cosmic-camera video render pass fallback"),
+                        label: Some("camera video render pass fallback"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: target,
                             resolve_target: None,
@@ -952,7 +952,7 @@ impl VideoPipeline {
                 // Pass 1: RGBA blur to intermediate texture 1
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("cosmic-camera blur pass 1"),
+                        label: Some("camera blur pass 1"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &intermediate_1.view,
                             resolve_target: None,
@@ -974,7 +974,7 @@ impl VideoPipeline {
                 // Pass 2: RGB blur from intermediate 1 to intermediate 2
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("cosmic-camera blur pass 2"),
+                        label: Some("camera blur pass 2"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: &intermediate_2.view,
                             resolve_target: None,
@@ -996,7 +996,7 @@ impl VideoPipeline {
                 // Pass 3: RGB blur from intermediate 2 to final target
                 {
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("cosmic-camera blur pass 3"),
+                        label: Some("camera blur pass 3"),
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view: target,
                             resolve_target: None,
@@ -1033,7 +1033,7 @@ impl VideoPipeline {
             } else {
                 // Single-pass RGBA rendering for live preview
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("cosmic-camera video render pass"),
+                    label: Some("camera video render pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: target,
                         resolve_target: None,

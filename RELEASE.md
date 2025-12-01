@@ -1,6 +1,6 @@
 # Release Guide
 
-This document describes how to create a new release of COSMIC Camera.
+This document describes how to create a new release of Camera.
 
 ## Overview
 
@@ -110,9 +110,9 @@ Each release includes:
 
 | Artifact | Description |
 |----------|-------------|
-| `cosmic-camera-x86_64-linux.tar.gz` | Linux binary for x86_64 |
-| `cosmic-camera-aarch64-linux.tar.gz` | Linux binary for ARM64 |
-| `cosmic-camera-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
-| `cosmic-camera-x86_64.flatpak` | Flatpak bundle for x86_64 |
-| `cosmic-camera-aarch64.flatpak` | Flatpak bundle for ARM64 |
-| `cosmic-camera-vX.Y.Z-source.zip` | Source code archive |
+| `camera-x86_64-linux.tar.gz` | Linux binary for x86_64 |
+| `camera-aarch64-linux.tar.gz` | Linux binary for ARM64 |
+| `camera-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
+| `camera-x86_64.flatpak` | Flatpak bundle for x86_64 |
+| `camera-aarch64.flatpak` | Flatpak bundle for ARM64 |
+| `camera-vX.Y.Z-source.zip` | Source code archive |

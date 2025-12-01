@@ -1,4 +1,4 @@
-# COSMIC Camera Screenshots
+# Camera Screenshots
 
 ![Preview 1](preview-001.png)
 

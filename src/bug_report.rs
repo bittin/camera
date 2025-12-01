@@ -32,7 +32,7 @@ impl BugReportGenerator {
         let mut report = String::new();
 
         // Header
-        report.push_str("# COSMIC Camera Bug Report\n\n");
+        report.push_str("# Camera Bug Report\n\n");
         report.push_str(&format!(
             "Generated: {}\n\n",
             chrono::Local::now().to_rfc3339()
@@ -79,10 +79,10 @@ impl BugReportGenerator {
     }
 
     /// Get the path where the bug report will be saved
-    /// Reports are saved in the same directory as photos/videos: ~/Pictures/cosmic-camera/
+    /// Reports are saved in the same directory as photos/videos: ~/Pictures/camera/
     fn get_report_path() -> PathBuf {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let filename = format!("cosmic-camera-bug-report-{}.md", timestamp);
+        let filename = format!("camera-bug-report-{}.md", timestamp);
 
         // Use the same directory as photos/videos
         let report_dir = crate::app::get_photo_directory();

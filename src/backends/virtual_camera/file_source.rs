@@ -446,7 +446,7 @@ impl VideoDecoder {
             "filesrc location=\"{}\" ! decodebin name=decode ! \
              queue ! audioconvert ! audioresample ! \
              audio/x-raw,format=F32LE,channels=2,rate=48000 ! \
-             pipewiresink name=audiosink stream-properties=\"p,media.class=Audio/Source,node.name=COSMIC Camera Virtual Mic,media.role=Communication\" sync=true",
+             pipewiresink name=audiosink stream-properties=\"p,media.class=Audio/Source,node.name=Camera Virtual Mic,media.role=Communication\" sync=true",
             path_str
         );
 
