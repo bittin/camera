@@ -64,6 +64,17 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.13" date="2025-12-01">
+      <description>
+        <p>Release 0.1.13 includes the following changes:</p>
+        <ul>
+          <li>clearly clarify this as a third party app for COSMIC DE according to the trademark</li>
+          <li>migrate app from io.github.freddyfunk.cosmic-camera to io.github.cosmicutils.camera</li>
+          <li>deps(cargo): bump rfd from 0.15.4 to 0.16.0</li>
+          <li>deps(cargo): bump crossterm from 0.28.1 to 0.29.0</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.12" date="2025-12-01">
       <description>
         <p>Release 0.1.12 includes the following changes:</p>
