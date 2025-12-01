@@ -1,10 +1,10 @@
 [Desktop Entry]
 Type=Application
-Name=COSMIC Camera
+Name=Camera
 GenericName=Camera
 Comment=Third-party camera app for the COSMIC™ desktop
 Icon=io.github.cosmicutils.camera
-Exec=cosmic-camera
+Exec=camera
 Terminal=false
 Categories=AudioVideo;Video;Recorder;Photography;
 Keywords=camera;webcam;photo;video;

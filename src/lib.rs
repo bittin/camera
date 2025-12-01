@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! COSMIC Camera - A camera application for the COSMIC desktop environment
+//! Camera - A camera application for the COSMIC desktop environment
 //!
-//! This library provides the core functionality for the COSMIC Camera application,
+//! This library provides the core functionality for the Camera application,
 //! including camera capture, video recording, and photo processing.
 //!
 //! # Architecture
@@ -20,7 +20,7 @@
 //!
 //! ```ignore
 //! // This is a GUI application, typically run via:
-//! // cosmic-camera
+//! // camera
 //! ```
 
 pub mod app;

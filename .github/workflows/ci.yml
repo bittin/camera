@@ -167,8 +167,8 @@ jobs:
       - name: Upload Flatpak bundle
         uses: actions/upload-artifact@v5
         with:
-          name: cosmic-camera-x86_64.flatpak
-          path: cosmic-camera-x86_64.flatpak
+          name: camera-x86_64.flatpak
+          path: camera-x86_64.flatpak
           if-no-files-found: error
           retention-days: 7
 
@@ -212,7 +212,7 @@ jobs:
       - name: Upload Flatpak bundle
         uses: actions/upload-artifact@v5
         with:
-          name: cosmic-camera-aarch64.flatpak
-          path: cosmic-camera-aarch64.flatpak
+          name: camera-aarch64.flatpak
+          path: camera-aarch64.flatpak
           if-no-files-found: error
           retention-days: 7

@@ -1,12 +1,12 @@
-# COSMIC Camera
+# Camera
 
 [![Flathub](https://img.shields.io/flathub/v/io.github.cosmicutils.camera?logo=flathub&logoColor=white)](https://flathub.org/apps/io.github.cosmicutils.camera)
-[![CI](https://github.com/FreddyFunk/cosmic-camera/actions/workflows/ci.yml/badge.svg)](https://github.com/FreddyFunk/cosmic-camera/actions/workflows/ci.yml)
-[![Release](https://github.com/FreddyFunk/cosmic-camera/actions/workflows/release.yml/badge.svg)](https://github.com/FreddyFunk/cosmic-camera/actions/workflows/release.yml)
+[![CI](https://github.com/cosmic-utils/camera/actions/workflows/ci.yml/badge.svg)](https://github.com/cosmic-utils/camera/actions/workflows/ci.yml)
+[![Release](https://github.com/cosmic-utils/camera/actions/workflows/release.yml/badge.svg)](https://github.com/cosmic-utils/camera/actions/workflows/release.yml)
 
 A camera application for the [COSMIC](https://github.com/pop-os/cosmic-epoch) desktop environment.
 
-![COSMIC Camera Preview](preview/preview-001.png)
+![Camera Preview](preview/preview-001.png)
 
 [View more screenshots](preview/README.md)
 
@@ -25,7 +25,7 @@ This is a personal project by [Frederic Laing](https://github.com/FreddyFunk). I
 flatpak install flathub io.github.cosmicutils.camera
 
 # Or install from a downloaded .flatpak bundle
-flatpak install cosmic-camera-x86_64.flatpak
+flatpak install camera-x86_64.flatpak
 ```
 
 ### From Source
@@ -58,7 +58,7 @@ sudo just install
 Ever wanted to see your face rendered in glorious Unicode? Wonder what you'd look like as a half-block character? Well, wonder no more!
 
 ```bash
-cosmic-camera --terminal
+camera --terminal
 ```
 
 ![Terminal Mode Demo](preview/preview-terminal-demo.gif)
@@ -131,13 +131,13 @@ Any contribution intentionally submitted for inclusion in the work by you shall 
 
 The easiest way to report a bug is to use the **"Report a Bug"** button in the app settings. This generates a detailed system report that helps with debugging.
 
-1. Open COSMIC Camera → Settings → "Report a Bug"
-2. A bug report file will be saved to `~/Pictures/cosmic-camera/`
-3. Your browser will open the [bug report form](https://github.com/FreddyFunk/cosmic-camera/issues/new?template=bug_report_from_app.yml)
+1. Open Camera → Settings → "Report a Bug"
+2. A bug report file will be saved to `~/Pictures/camera/`
+3. Your browser will open the [bug report form](https://github.com/cosmic-utils/camera/issues/new?template=bug_report_from_app.yml)
 4. Attach the generated report file and describe the issue
 
-You can also [report bugs manually](https://github.com/FreddyFunk/cosmic-camera/issues/new?template=bug_report.yml) if you prefer.
+You can also [report bugs manually](https://github.com/cosmic-utils/camera/issues/new?template=bug_report.yml) if you prefer.
 
 ### Feature Requests
 
-Have an idea for a new feature? [Submit a feature request](https://github.com/FreddyFunk/cosmic-camera/issues/new?template=feature_request.yml)!
+Have an idea for a new feature? [Submit a feature request](https://github.com/cosmic-utils/camera/issues/new?template=feature_request.yml)!

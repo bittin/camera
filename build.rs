@@ -8,7 +8,7 @@ fn main() {
     println!("cargo::rerun-if-changed=.git/refs/tags");
 
     // Check if version is already set (e.g., in flatpak builds)
-    let version = if let Ok(v) = std::env::var("COSMIC_CAMERA_VERSION") {
+    let version = if let Ok(v) = std::env::var("CAMERA_VERSION") {
         v
     } else {
         get_git_version()

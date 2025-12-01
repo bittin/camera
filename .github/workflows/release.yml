@@ -78,16 +78,16 @@ jobs:
       - name: Package binary
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/cosmic-camera dist/
+          cp target/${{ matrix.target }}/release/camera dist/
           cd dist
-          tar -czvf cosmic-camera-${{ matrix.arch }}-linux.tar.gz cosmic-camera
-          rm cosmic-camera
+          tar -czvf camera-${{ matrix.arch }}-linux.tar.gz camera
+          rm camera
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v5
         with:
           name: binary-${{ matrix.arch }}
-          path: dist/cosmic-camera-${{ matrix.arch }}-linux.tar.gz
+          path: dist/camera-${{ matrix.arch }}-linux.tar.gz
           retention-days: 1
 
   # Build Flatpak for x86_64 (native, fast)
@@ -125,7 +125,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: flatpak-x86_64
-          path: cosmic-camera-x86_64.flatpak
+          path: camera-x86_64.flatpak
           if-no-files-found: error
           retention-days: 1
 
@@ -171,7 +171,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: flatpak-aarch64
-          path: cosmic-camera-aarch64.flatpak
+          path: camera-aarch64.flatpak
           if-no-files-found: error
           retention-days: 1
 
@@ -198,15 +198,15 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release-assets
-          mv artifacts/binary-x86_64/cosmic-camera-x86_64-linux.tar.gz release-assets/
-          mv artifacts/binary-aarch64/cosmic-camera-aarch64-linux.tar.gz release-assets/
-          mv artifacts/binary-riscv64/cosmic-camera-riscv64-linux.tar.gz release-assets/
-          mv artifacts/flatpak-x86_64/cosmic-camera-x86_64.flatpak release-assets/
+          mv artifacts/binary-x86_64/camera-x86_64-linux.tar.gz release-assets/
+          mv artifacts/binary-aarch64/camera-aarch64-linux.tar.gz release-assets/
+          mv artifacts/binary-riscv64/camera-riscv64-linux.tar.gz release-assets/
+          mv artifacts/flatpak-x86_64/camera-x86_64.flatpak release-assets/
           # aarch64 flatpak is optional (only built when manually triggered)
           if [ -d "artifacts/flatpak-aarch64" ]; then
-            mv artifacts/flatpak-aarch64/cosmic-camera-aarch64.flatpak release-assets/
+            mv artifacts/flatpak-aarch64/camera-aarch64.flatpak release-assets/
           fi
-          git archive --format=zip --prefix=cosmic-camera-${{ github.ref_name }}/ -o release-assets/cosmic-camera-${{ github.ref_name }}-source.zip HEAD
+          git archive --format=zip --prefix=camera-${{ github.ref_name }}/ -o release-assets/camera-${{ github.ref_name }}-source.zip HEAD
 
       - name: Generate release notes
         run: |
@@ -216,28 +216,28 @@ jobs:
 
           ### Flatpak (Recommended)
           ```bash
-          flatpak install cosmic-camera-x86_64.flatpak
+          flatpak install camera-x86_64.flatpak
           ```
 
           ### Binary
           ```bash
-          tar -xzf cosmic-camera-x86_64-linux.tar.gz
-          ./cosmic-camera
+          tar -xzf camera-x86_64-linux.tar.gz
+          ./camera
           ```
 
           ## Assets
 
           | File | Description |
           |------|-------------|
-          | `cosmic-camera-x86_64.flatpak` | Flatpak bundle for x86_64 |
-          | `cosmic-camera-x86_64-linux.tar.gz` | Linux binary for x86_64 |
-          | `cosmic-camera-aarch64-linux.tar.gz` | Linux binary for ARM64 |
-          | `cosmic-camera-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
-          | `cosmic-camera-${{ github.ref_name }}-source.zip` | Source code |
+          | `camera-x86_64.flatpak` | Flatpak bundle for x86_64 |
+          | `camera-x86_64-linux.tar.gz` | Linux binary for x86_64 |
+          | `camera-aarch64-linux.tar.gz` | Linux binary for ARM64 |
+          | `camera-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
+          | `camera-${{ github.ref_name }}-source.zip` | Source code |
           EOF
           # Add aarch64 flatpak to release notes if it was built
-          if [ -f "release-assets/cosmic-camera-aarch64.flatpak" ]; then
-            sed -i '/cosmic-camera-x86_64.flatpak/a | `cosmic-camera-aarch64.flatpak` | Flatpak bundle for ARM64 |' release_notes_footer.md
+          if [ -f "release-assets/camera-aarch64.flatpak" ]; then
+            sed -i '/camera-x86_64.flatpak/a | `camera-aarch64.flatpak` | Flatpak bundle for ARM64 |' release_notes_footer.md
           fi
 
       - name: Create GitHub Release
@@ -247,7 +247,7 @@ jobs:
             --jq '.body' > release_notes.md
           cat release_notes_footer.md >> release_notes.md
           gh release create ${{ github.ref_name }} \
-            --title "COSMIC Camera ${{ github.ref_name }}" \
+            --title "Camera ${{ github.ref_name }}" \
             --notes-file release_notes.md \
             release-assets/*
         env:

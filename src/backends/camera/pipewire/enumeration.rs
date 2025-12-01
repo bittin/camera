@@ -81,7 +81,7 @@ fn try_enumerate_with_pw_cli() -> Option<Vec<CameraDevice>> {
             if is_video_source {
                 if let (Some(id), Some(name)) = (current_id.as_ref(), current_name.as_ref()) {
                     // Skip our own virtual camera output to avoid self-detection
-                    if name.contains("COSMIC Camera (Virtual)") {
+                    if name.contains("Camera (Virtual)") {
                         debug!(name = %name, "Skipping self (virtual camera output)");
                     } else {
                         // Priority: use object.serial for target-object, fallback to node ID
@@ -147,7 +147,7 @@ fn try_enumerate_with_pw_cli() -> Option<Vec<CameraDevice>> {
     if is_video_source {
         if let (Some(id), Some(name)) = (current_id.as_ref(), current_name.as_ref()) {
             // Skip our own virtual camera output to avoid self-detection
-            if name.contains("COSMIC Camera (Virtual)") {
+            if name.contains("Camera (Virtual)") {
                 debug!(name = %name, "Skipping self (virtual camera output)");
             } else {
                 let path = if let Some(serial) = current_serial.as_ref() {

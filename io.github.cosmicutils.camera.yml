@@ -6,7 +6,7 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
 base: com.system76.Cosmic.BaseApp
 base-version: stable
-command: cosmic-camera
+command: camera
 
 finish-args:
   # Wayland access
@@ -31,23 +31,23 @@ finish-args:
   - --system-talk-name=org.freedesktop.NetworkManager
 
 modules:
-  - name: cosmic-camera
+  - name: camera
     buildsystem: simple
     build-options:
       append-path: /usr/lib/sdk/rust-stable/bin
       env:
-        CARGO_HOME: /run/build/cosmic-camera/cargo
-        CARGO_TARGET_DIR: /run/build/cosmic-camera/target
+        CARGO_HOME: /run/build/camera/cargo
+        CARGO_TARGET_DIR: /run/build/camera/target
     build-commands:
       # Build the application with cargo (version is passed via .flatpak-version file)
       - |
         if [ -f .flatpak-version ]; then
-          export COSMIC_CAMERA_VERSION=$(cat .flatpak-version)
+          export CAMERA_VERSION=$(cat .flatpak-version)
         fi
         cargo --offline fetch --manifest-path Cargo.toml --verbose
         cargo --offline build --release --verbose
       # Install the binary
-      - install -Dm755 target/release/cosmic-camera -t /app/bin/
+      - install -Dm755 target/release/camera -t /app/bin/
       # Install desktop file
       - install -Dm644 resources/io.github.cosmicutils.camera.desktop -t /app/share/applications/
       # Install icon

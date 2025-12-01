@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Main application module for COSMIC Camera
+//! Main application module for Camera
 //!
 //! This module contains the application state, message handling, UI rendering,
 //! and business logic for the camera application.
@@ -60,12 +60,10 @@ pub use state::{
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-/// Get the photo save directory (~/Pictures/cosmic-camera)
+/// Get the photo save directory (~/Pictures/camera)
 pub fn get_photo_directory() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::Path::new(&home)
-        .join("Pictures")
-        .join("cosmic-camera")
+    std::path::Path::new(&home).join("Pictures").join("camera")
 }
 
 /// Ensure the photo directory exists, creating it if necessary
@@ -76,7 +74,7 @@ fn ensure_photo_directory() -> Result<std::path::PathBuf, std::io::Error> {
     Ok(photo_dir)
 }
 
-const REPOSITORY: &str = "https://github.com/FreddyFunk/cosmic-camera";
+const REPOSITORY: &str = "https://github.com/cosmic-utils/camera";
 
 impl cosmic::Application for AppModel {
     /// The async executor that will be used to run your application's commands.
@@ -117,7 +115,7 @@ impl cosmic::Application for AppModel {
                 (fl!("repository"), REPOSITORY),
                 (
                     fl!("about-support"),
-                    "https://github.com/FreddyFunk/cosmic-camera/issues",
+                    "https://github.com/cosmic-utils/camera/issues",
                 ),
             ]);
 

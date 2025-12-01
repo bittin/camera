@@ -31,7 +31,7 @@ impl VirtualCameraPipeline {
     /// Create a new virtual camera pipeline
     ///
     /// The pipeline accepts RGBA frames and outputs them to a PipeWire
-    /// virtual camera node named "COSMIC Camera (Virtual)".
+    /// virtual camera node named "Camera (Virtual)".
     /// Uses videoconvert for proper format negotiation with PipeWire.
     pub fn new(width: u32, height: u32) -> BackendResult<Self> {
         info!(width, height, "Creating virtual camera pipeline");
@@ -99,8 +99,8 @@ impl VirtualCameraPipeline {
         let stream_props = gstreamer::Structure::builder("props")
             .field("media.class", "Video/Source")
             .field("media.role", "Camera")
-            .field("node.name", "cosmic-camera-virtual")
-            .field("node.description", "COSMIC Camera (Virtual)")
+            .field("node.name", "camera-virtual")
+            .field("node.description", "Camera (Virtual)")
             .build();
         pipewiresink.set_property("stream-properties", &stream_props);
 
