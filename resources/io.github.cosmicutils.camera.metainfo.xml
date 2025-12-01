@@ -64,6 +64,14 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.14" date="2025-12-01">
+      <description>
+        <p>Release 0.1.14 includes the following changes:</p>
+        <ul>
+          <li>rename app from "COSMIC camera" to "camera"</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.13" date="2025-12-01">
       <description>
         <p>Release 0.1.13 includes the following changes:</p>
