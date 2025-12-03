@@ -42,23 +42,23 @@
     <color type="primary" scheme_preference="dark">#1a5fb4</color>
   </branding>
   <screenshots>
-    <screenshot type="default">
+    <screenshot type="default" xml:lang="en">
       <caption>Photo mode with live camera preview</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-002.png</image>
     </screenshot>
-    <screenshot>
+    <screenshot xml:lang="en">
       <caption>Apply real-time filters to your preview</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-001.png</image>
     </screenshot>
-    <screenshot>
+    <screenshot xml:lang="en">
       <caption>Record videos with a simple interface</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-003.png</image>
     </screenshot>
-    <screenshot>
+    <screenshot xml:lang="en">
       <caption>Configure camera, audio, and encoding settings</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-004.png</image>
     </screenshot>
-    <screenshot>
+    <screenshot xml:lang="en">
       <caption>Theatre mode for fullscreen preview</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-006.png</image>
     </screenshot>
