@@ -90,6 +90,36 @@ run-debug *args:
     env RUST_LOG=camera=debug,info RUST_BACKTRACE=full cargo run --release {{args}}
 
 # ============================================================================
+# Resource generation
+# ============================================================================
+
+# Generate PNG icons from the scalable SVG and update desktop file
+generate-icons:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    SVG="{{icons-src}}/scalable/apps/{{APPID}}.svg"
+    DESKTOP="{{desktop-src}}"
+    if [ ! -f "$SVG" ]; then
+        echo "Error: Scalable SVG not found at $SVG"
+        exit 1
+    fi
+    # Generate PNG icons for each size
+    for size in 16 24 32 48 64 128 256; do
+        DIR="{{icons-src}}/${size}x${size}/apps"
+        mkdir -p "$DIR"
+        magick -background none -density 384 "$SVG" -resize ${size}x${size} "$DIR/{{APPID}}.png"
+        echo "Generated ${size}x${size} icon"
+    done
+    # Update Icon= line in desktop file
+    if [ -f "$DESKTOP" ]; then
+        sed -i 's/^Icon=.*/Icon={{APPID}}/' "$DESKTOP"
+        echo "Updated desktop file icon to {{APPID}}"
+    else
+        echo "Warning: Desktop file not found at $DESKTOP"
+    fi
+    echo "All icons generated successfully!"
+
+# ============================================================================
 # Cleaning
 # ============================================================================
 
@@ -109,15 +139,17 @@ install:
     install -Dm0755 {{bin-src}} {{bin-dst}}
     install -Dm0644 {{desktop-src}} {{desktop-dst}}
     install -Dm0644 {{metainfo-src}} {{metainfo-dst}}
-    for size in `ls {{icons-src}}`; do \
-        install -Dm0644 "{{icons-src}}/$size/apps/{{APPID}}.svg" "{{icons-dst}}/$size/apps/{{APPID}}.svg"; \
+    install -Dm0644 "{{icons-src}}/scalable/apps/{{APPID}}.svg" "{{icons-dst}}/scalable/apps/{{APPID}}.svg"
+    for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256; do \
+        install -Dm0644 "{{icons-src}}/$size/apps/{{APPID}}.png" "{{icons-dst}}/$size/apps/{{APPID}}.png"; \
     done
 
 # Uninstalls installed files
 uninstall:
     rm -f {{bin-dst}} {{desktop-dst}} {{metainfo-dst}}
-    for size in `ls {{icons-src}}`; do \
-        rm -f "{{icons-dst}}/$size/apps/{{APPID}}.svg"; \
+    rm -f "{{icons-dst}}/scalable/apps/{{APPID}}.svg"
+    for size in 16x16 24x24 32x32 48x48 64x64 128x128 256x256; do \
+        rm -f "{{icons-dst}}/$size/apps/{{APPID}}.png"; \
     done
 
 # Vendor dependencies locally
