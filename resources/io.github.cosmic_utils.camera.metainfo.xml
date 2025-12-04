@@ -64,6 +64,14 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.17" date="2025-12-04">
+      <description>
+        <p>Release 0.1.17 includes the following changes:</p>
+        <ul>
+          <li>rename app id from io.github.cosmicutils.camera to io.github.cosmic_utils.camera</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.16" date="2025-12-03">
       <description>
         <p>Release 0.1.16 includes the following changes:</p>
