@@ -84,6 +84,27 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.18" date="2025-12-07">
+      <description>
+        <p>Release 0.1.18 includes the following changes:</p>
+        <ul>
+          <li>i18n(bg): added Bulgarian translation</li>
+          <li>implement preview mode for screenshots</li>
+          <li>remove gap between camera preview and window borders</li>
+          <li>improve theming for UI elements that can overlap the camera view</li>
+          <li>fix resizing of the filter previews</li>
+          <li>apply theming to camera switch button</li>
+          <li>deps(cargo): bump libcosmic from `62f661e` to `c2b7d78`</li>
+          <li>update cargo lock during release</li>
+          <li>correctly apply (COSMIC) theming when running in a Flatpak sandbox</li>
+          <li>i18n(es): Add Spanish translation</li>
+          <li>deps(cargo): bump libcosmic from `c2b7d78` to `05c6608`</li>
+          <li>fix qr code detection overlay beeing placed incorrectly with mirrored…</li>
+          <li>update preview images</li>
+          <li>add German translation</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.17" date="2025-12-04">
       <description>
         <p>Release 0.1.17 includes the following changes:</p>
