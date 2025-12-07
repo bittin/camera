@@ -635,12 +635,15 @@ impl AppModel {
             VideoContentFit::Contain
         };
 
+        // File sources should never be mirrored - match the video widget behavior
+        let should_mirror = self.config.mirror_preview && !self.current_frame_is_file_source;
+
         build_qr_overlay(
             &self.qr_detections,
             frame.width,
             frame.height,
             content_fit,
-            self.config.mirror_preview,
+            should_mirror,
         )
     }
 }
