@@ -83,6 +83,10 @@ pub fn get_action_color(action: &QrAction) -> Color {
 ///
 /// Returns (offset_x, offset_y, video_width, video_height) for the actual
 /// video content area within the container, accounting for letterboxing.
+///
+/// Note: The VideoWidget is wrapped in a centering container that aligns it
+/// horizontally and vertically within the available space. This function
+/// calculates the offset to match that centering.
 pub fn calculate_video_bounds(
     container_width: f32,
     container_height: f32,
@@ -95,7 +99,8 @@ pub fn calculate_video_bounds(
 
     match content_fit {
         VideoContentFit::Contain => {
-            // Scale to fit within bounds (letterbox)
+            // VideoWidget sizes its layout to match aspect ratio, and the
+            // centering container positions it in the center of available space.
             let (video_width, video_height) = if frame_aspect > container_aspect {
                 // Frame is wider - fit to width
                 let video_width = container_width;
@@ -108,6 +113,7 @@ pub fn calculate_video_bounds(
                 (video_width, video_height)
             };
 
+            // Calculate centering offset (the container centers the video widget)
             let offset_x = (container_width - video_width) / 2.0;
             let offset_y = (container_height - video_height) / 2.0;
 
