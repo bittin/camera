@@ -54,8 +54,8 @@ use cosmic::iced::Subscription;
 use cosmic::widget::{self, about::About};
 use cosmic::{Element, Task};
 pub use state::{
-    AppFlags, AppModel, CameraMode, ContextPage, FileSource, FilterType, Message,
-    PhotoAspectRatio, PhotoTimerSetting, RecordingState, TheatreState, VirtualCameraState,
+    AppFlags, AppModel, CameraMode, ContextPage, FileSource, FilterType, Message, PhotoAspectRatio,
+    PhotoTimerSetting, RecordingState, TheatreState, VirtualCameraState,
 };
 use std::sync::Arc;
 use tracing::{error, info, warn};
