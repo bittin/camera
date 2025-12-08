@@ -319,6 +319,8 @@ impl AppModel {
                     camera_preview,
                     // QR overlay (custom widget calculates positions at render time)
                     self.build_qr_overlay(),
+                    // Privacy cover warning overlay (centered)
+                    self.build_privacy_warning(),
                     // Top bar aligned to top (no extra padding - row has its own padding)
                     widget::container(top_bar)
                         .width(Length::Fill)
@@ -335,19 +337,25 @@ impl AppModel {
                     .height(Length::Fill)
                     .into()
             } else {
-                // Theatre mode with UI hidden - show only full-screen preview with QR overlay
-                cosmic::iced::widget::stack![camera_preview, self.build_qr_overlay()]
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
+                // Theatre mode with UI hidden - show only full-screen preview with QR overlay and privacy warning
+                cosmic::iced::widget::stack![
+                    camera_preview,
+                    self.build_qr_overlay(),
+                    self.build_privacy_warning()
+                ]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
             }
         } else {
             // Normal mode - traditional layout
-            // Preview with top bar, QR overlay, and optional filter name label overlaid
+            // Preview with top bar, QR overlay, privacy warning, and optional filter name label overlaid
             let mut preview_stack = cosmic::iced::widget::stack![
                 camera_preview,
                 // QR overlay (custom widget calculates positions at render time)
                 self.build_qr_overlay(),
+                // Privacy cover warning overlay (centered)
+                self.build_privacy_warning(),
                 widget::container(top_bar)
                     .width(Length::Fill)
                     .align_y(cosmic::iced::alignment::Vertical::Top)
@@ -1011,5 +1019,64 @@ impl AppModel {
                 image_changed || wb_auto_off
             })
             .unwrap_or(false)
+    }
+
+    /// Build the privacy cover warning overlay
+    ///
+    /// Shows a centered warning when the camera's privacy cover is closed.
+    fn build_privacy_warning(&self) -> Element<'_, Message> {
+        if !self.privacy_cover_closed {
+            return widget::Space::new(Length::Fill, Length::Fill).into();
+        }
+
+        let spacing = cosmic::theme::spacing();
+
+        // Warning icon and text
+        let warning_content = widget::column()
+            .push(
+                widget::icon(
+                    icon::from_name("dialog-warning-symbolic")
+                        .symbolic(true)
+                        .into(),
+                )
+                .size(48),
+            )
+            .push(
+                widget::text(fl!("privacy-cover-closed"))
+                    .size(20)
+                    .font(cosmic::font::bold()),
+            )
+            .push(widget::text(fl!("privacy-cover-hint")).size(14))
+            .spacing(spacing.space_s)
+            .align_x(Alignment::Center);
+
+        // Container with semi-transparent background
+        let warning_box = widget::container(warning_content)
+            .padding(spacing.space_m)
+            .style(|theme: &cosmic::Theme| {
+                let cosmic = theme.cosmic();
+                let bg = cosmic.bg_color();
+                widget::container::Style {
+                    background: Some(Background::Color(Color::from_rgba(
+                        bg.red,
+                        bg.green,
+                        bg.blue,
+                        OVERLAY_BACKGROUND_ALPHA,
+                    ))),
+                    border: cosmic::iced::Border {
+                        radius: cosmic.corner_radii.radius_m.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            });
+
+        // Center the warning in the preview area
+        widget::container(warning_box)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(cosmic::iced::alignment::Horizontal::Center)
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .into()
     }
 }

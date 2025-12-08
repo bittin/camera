@@ -119,6 +119,9 @@ pub fn query_exposure_controls(device_path: &str) -> AvailableExposureControls {
     );
     controls.focus = query_range_control(device_path, v4l2_controls::V4L2_CID_FOCUS_ABSOLUTE);
 
+    // Query privacy control (hardware privacy switch)
+    controls.has_privacy = query_bool_control(device_path, v4l2_controls::V4L2_CID_PRIVACY);
+
     info!(
         device_path,
         has_mode = controls.has_exposure_auto,
@@ -138,6 +141,7 @@ pub fn query_exposure_controls(device_path: &str) -> AvailableExposureControls {
         has_wb_temp = controls.white_balance_temperature.available,
         has_focus_auto = controls.has_focus_auto,
         has_focus_manual = controls.focus.available,
+        has_privacy = controls.has_privacy,
         "Exposure controls query complete"
     );
 

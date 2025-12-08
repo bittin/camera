@@ -415,6 +415,10 @@ pub struct AppModel {
     pub qr_detections: Vec<QrDetection>,
     /// Last time QR detection was processed
     pub last_qr_detection_time: Option<Instant>,
+
+    // ===== Privacy Cover Detection =====
+    /// Whether the camera privacy cover is closed (blocking the camera)
+    pub privacy_cover_closed: bool,
 }
 
 /// State for smooth blur transitions when changing camera settings
@@ -941,6 +945,11 @@ pub enum Message {
     },
     /// Copy text from QR code to clipboard
     QrCopyText(String),
+
+    // ===== Privacy Cover Detection =====
+    /// Privacy cover status changed (true = cover closed/camera blocked)
+    PrivacyCoverStatusChanged(bool),
+
     /// No-op message for async tasks that don't need a response
     Noop,
 }

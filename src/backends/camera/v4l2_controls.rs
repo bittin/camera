@@ -63,6 +63,8 @@ pub const V4L2_CID_ISO_SENSITIVITY: u32 = V4L2_CID_CAMERA_CLASS_BASE + 23;
 pub const V4L2_CID_ISO_SENSITIVITY_AUTO: u32 = V4L2_CID_CAMERA_CLASS_BASE + 24;
 /// Exposure metering mode
 pub const V4L2_CID_EXPOSURE_METERING: u32 = V4L2_CID_CAMERA_CLASS_BASE + 25;
+/// Privacy control - when 1 (TRUE), camera cannot capture (privacy cover closed)
+pub const V4L2_CID_PRIVACY: u32 = V4L2_CID_CAMERA_CLASS_BASE + 16;
 
 // ===== V4L2 Control IDs (Image Source Class) =====
 
