@@ -33,6 +33,8 @@ pub struct PostProcessingConfig {
     pub saturation: f32,
     /// Filter type to apply
     pub filter_type: FilterType,
+    /// Crop rectangle (x, y, width, height) - None means no cropping
+    pub crop_rect: Option<(u32, u32, u32, u32)>,
 }
 
 impl Default for PostProcessingConfig {
@@ -44,6 +46,7 @@ impl Default for PostProcessingConfig {
             contrast: 1.0,
             saturation: 1.0,
             filter_type: FilterType::Standard,
+            crop_rect: None,
         }
     }
 }
@@ -106,8 +109,19 @@ impl PostProcessor {
             frame.data.to_vec()
         };
 
-        // Step 2: Convert filtered RGBA to RGB (drop alpha channel)
-        let rgb_image = Self::convert_rgba_to_rgb(&filtered_rgba, frame_width, frame_height)?;
+        // Step 2: Apply cropping if configured
+        let (cropped_rgba, output_width, output_height) = if let Some((x, y, w, h)) =
+            config.crop_rect
+        {
+            debug!(x, y, width = w, height = h, "Applying crop");
+            let cropped = Self::crop_rgba(&filtered_rgba, frame_width, frame_height, x, y, w, h)?;
+            (cropped, w, h)
+        } else {
+            (filtered_rgba, frame_width, frame_height)
+        };
+
+        // Step 3: Convert filtered RGBA to RGB (drop alpha channel)
+        let rgb_image = Self::convert_rgba_to_rgb(&cropped_rgba, output_width, output_height)?;
 
         // Step 3 & 4: Apply adjustments and sharpening (CPU-bound)
         let needs_adjustments =
@@ -137,10 +151,42 @@ impl PostProcessor {
         debug!("Post-processing complete");
 
         Ok(ProcessedImage {
-            width: frame_width,
-            height: frame_height,
+            width: output_width,
+            height: output_height,
             image: rgb_image,
         })
+    }
+
+    /// Crop RGBA data to a rectangular region
+    fn crop_rgba(
+        rgba_data: &[u8],
+        src_width: u32,
+        src_height: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<Vec<u8>, String> {
+        // Validate bounds
+        if x + width > src_width || y + height > src_height {
+            return Err(format!(
+                "Crop region ({},{} {}x{}) exceeds source dimensions ({}x{})",
+                x, y, width, height, src_width, src_height
+            ));
+        }
+
+        let src_stride = src_width as usize * 4;
+        let dst_stride = width as usize * 4;
+        let mut cropped = vec![0u8; (width * height * 4) as usize];
+
+        for row in 0..height as usize {
+            let src_row_start = ((y as usize + row) * src_stride) + (x as usize * 4);
+            let dst_row_start = row * dst_stride;
+            cropped[dst_row_start..dst_row_start + dst_stride]
+                .copy_from_slice(&rgba_data[src_row_start..src_row_start + dst_stride]);
+        }
+
+        Ok(cropped)
     }
 
     /// Convert RGBA data to RGB image (drop alpha channel)

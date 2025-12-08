@@ -32,6 +32,14 @@ const TIMER_3_ICON: &[u8] = include_bytes!("../../resources/button_icons/timer-3
 const TIMER_5_ICON: &[u8] = include_bytes!("../../resources/button_icons/timer-5.svg");
 /// Timer 10s icon SVG (stopwatch with "10")
 const TIMER_10_ICON: &[u8] = include_bytes!("../../resources/button_icons/timer-10.svg");
+/// Aspect ratio native icon SVG
+const ASPECT_NATIVE_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-native.svg");
+/// Aspect ratio 4:3 icon SVG
+const ASPECT_4_3_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-4-3.svg");
+/// Aspect ratio 16:9 icon SVG
+const ASPECT_16_9_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-16-9.svg");
+/// Aspect ratio 1:1 icon SVG
+const ASPECT_1_1_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-1-1.svg");
 
 /// Create a container style with semi-transparent themed background for overlay elements
 ///
@@ -499,6 +507,64 @@ impl AppModel {
                         timer_icon,
                         Some(Message::CyclePhotoTimer),
                         timer_active,
+                    ));
+                }
+
+                // 5px spacing
+                row = row.push(widget::Space::new(Length::Fixed(5.0), Length::Shrink));
+
+                // Aspect ratio toggle button (Photo mode only)
+                // Get frame dimensions to determine native ratio
+                let (frame_width, frame_height) = self
+                    .current_frame
+                    .as_ref()
+                    .map(|f| (f.width, f.height))
+                    .unwrap_or((0, 0));
+                let has_frame = frame_width > 0 && frame_height > 0;
+                let native_ratio = crate::app::state::PhotoAspectRatio::from_frame_dimensions(
+                    frame_width,
+                    frame_height,
+                );
+
+                // Button is active only when cropping is actually happening
+                // (selected ratio differs from native camera ratio)
+                // Not active if no frame is loaded yet
+                let aspect_active = has_frame
+                    && match (self.photo_aspect_ratio, native_ratio) {
+                        (crate::app::state::PhotoAspectRatio::Native, _) => false,
+                        (selected, Some(native)) => selected != native,
+                        (_, None) => true, // Non-standard native ratio, any selection crops
+                    };
+
+                // Show the effective aspect ratio icon (native ratio when matching)
+                let effective_ratio =
+                    if self.photo_aspect_ratio == crate::app::state::PhotoAspectRatio::Native {
+                        native_ratio.unwrap_or(crate::app::state::PhotoAspectRatio::Native)
+                    } else {
+                        self.photo_aspect_ratio
+                    };
+                let aspect_icon_bytes = match effective_ratio {
+                    crate::app::state::PhotoAspectRatio::Native => ASPECT_NATIVE_ICON,
+                    crate::app::state::PhotoAspectRatio::Ratio4x3 => ASPECT_4_3_ICON,
+                    crate::app::state::PhotoAspectRatio::Ratio16x9 => ASPECT_16_9_ICON,
+                    crate::app::state::PhotoAspectRatio::Ratio1x1 => ASPECT_1_1_ICON,
+                };
+                let aspect_icon = widget::icon::from_svg_bytes(aspect_icon_bytes).symbolic(true);
+
+                if is_disabled {
+                    row = row.push(
+                        widget::container(widget::icon(aspect_icon).size(20))
+                            .style(|_theme| widget::container::Style {
+                                text_color: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
+                                ..Default::default()
+                            })
+                            .padding([4, 8]),
+                    );
+                } else {
+                    row = row.push(overlay_icon_button(
+                        aspect_icon,
+                        Some(Message::CyclePhotoAspectRatio),
+                        aspect_active,
                     ));
                 }
 

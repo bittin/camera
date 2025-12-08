@@ -18,8 +18,8 @@
 //! - **System**: Bug reports, recovery
 
 use crate::app::state::{
-    AppModel, CameraMode, FileSource, FilterType, Message, RecordingState, VideoPlaybackCommand,
-    VirtualCameraState,
+    AppModel, CameraMode, FileSource, FilterType, Message, PhotoAspectRatio, RecordingState,
+    VideoPlaybackCommand, VirtualCameraState,
 };
 use crate::app::utils::{parse_codec, parse_resolution};
 use cosmic::Task;
@@ -71,6 +71,7 @@ impl AppModel {
             // ===== Capture Operations =====
             Message::Capture => self.handle_capture(),
             Message::ToggleFlash => self.handle_toggle_flash(),
+            Message::CyclePhotoAspectRatio => self.handle_cycle_photo_aspect_ratio(),
             Message::FlashComplete => self.handle_flash_complete(),
             Message::CyclePhotoTimer => self.handle_cycle_photo_timer(),
             Message::PhotoTimerTick => self.handle_photo_timer_tick(),
@@ -365,6 +366,11 @@ impl AppModel {
             info!("Photo mode: selecting maximum resolution");
             crate::app::format_picker::preferences::select_max_resolution_format(&formats)
         };
+
+        // Set default aspect ratio based on selected format dimensions
+        if let Some(fmt) = &self.active_format {
+            self.photo_aspect_ratio = PhotoAspectRatio::default_for_frame(fmt.width, fmt.height);
+        }
 
         self.update_mode_options();
         self.update_resolution_options();
@@ -705,6 +711,9 @@ impl AppModel {
 
                 if let Some(fmt) = &self.active_format {
                     info!(width, format = %fmt, "Applied resolution with framerate preservation");
+                    // Update aspect ratio default for new dimensions
+                    self.photo_aspect_ratio =
+                        PhotoAspectRatio::default_for_frame(fmt.width, fmt.height);
                 }
                 self.save_settings();
                 let _ = self.transition_state.start();
@@ -720,6 +729,9 @@ impl AppModel {
 
             if let Some(fmt) = &self.active_format {
                 info!(format = %fmt, "Selected format from picker");
+                // Update aspect ratio default for new dimensions
+                self.photo_aspect_ratio =
+                    PhotoAspectRatio::default_for_frame(fmt.width, fmt.height);
             }
             self.save_settings();
             let _ = self.transition_state.start();
@@ -760,6 +772,14 @@ impl AppModel {
         let save_dir = crate::app::get_photo_directory();
         let filter_type = self.selected_filter;
 
+        // Calculate crop rectangle based on aspect ratio setting
+        let crop_rect = self.photo_aspect_ratio.crop_rect(frame.width, frame.height);
+        let crop_rect = if self.photo_aspect_ratio == crate::app::state::PhotoAspectRatio::Native {
+            None
+        } else {
+            Some(crop_rect)
+        };
+
         let save_task = Task::perform(
             async move {
                 use crate::pipelines::photo::{
@@ -767,6 +787,7 @@ impl AppModel {
                 };
                 let mut config = PostProcessingConfig::default();
                 config.filter_type = filter_type;
+                config.crop_rect = crop_rect;
                 let pipeline =
                     PhotoPipeline::with_config(config, EncodingFormat::Jpeg, EncodingQuality::High);
                 pipeline
@@ -821,6 +842,19 @@ impl AppModel {
     fn handle_toggle_flash(&mut self) -> Task<cosmic::Action<Message>> {
         self.flash_enabled = !self.flash_enabled;
         info!(flash_enabled = self.flash_enabled, "Flash toggled");
+        Task::none()
+    }
+
+    fn handle_cycle_photo_aspect_ratio(&mut self) -> Task<cosmic::Action<Message>> {
+        // Get frame dimensions to determine if native matches a defined ratio
+        let (width, height) = self
+            .current_frame
+            .as_ref()
+            .map(|f| (f.width, f.height))
+            .unwrap_or((0, 0));
+
+        self.photo_aspect_ratio = self.photo_aspect_ratio.next_for_frame(width, height);
+        info!(aspect_ratio = ?self.photo_aspect_ratio, "Photo aspect ratio changed");
         Task::none()
     }
 

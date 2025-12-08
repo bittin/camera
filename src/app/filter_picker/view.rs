@@ -73,6 +73,7 @@ impl AppModel {
                     filter_type,
                     corner_radius,
                     self.config.mirror_preview,
+                    None, // No aspect ratio cropping in filter previews
                 );
 
                 video_elem

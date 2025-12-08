@@ -16,7 +16,8 @@ struct ViewportUniform {
     mirror_horizontal: u32,     // 0 = normal, 1 = mirrored horizontally
     uv_offset: vec2<f32>,       // UV offset for scroll clipping (0-1)
     uv_scale: vec2<f32>,        // UV scale for scroll clipping (0-1)
-    _padding: vec2<f32>,        // Padding for 16-byte alignment
+    crop_uv_min: vec2<f32>,     // Crop UV min (u_min, v_min) - normalized 0-1
+    crop_uv_max: vec2<f32>,     // Crop UV max (u_max, v_max) - normalized 0-1
 }
 
 @group(0) @binding(2)
@@ -82,6 +83,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (viewport.mirror_horizontal == 1u) {
         tex_coords.x = 1.0 - tex_coords.x;
     }
+
+    // Apply crop UV mapping (aspect ratio cropping)
+    // Remap tex_coords from 0-1 range to crop_uv_min to crop_uv_max range
+    tex_coords = mix(viewport.crop_uv_min, viewport.crop_uv_max, tex_coords);
 
     // Apply Cover mode adjustment if enabled
     if (viewport.content_fit_mode == 1u) {

@@ -52,8 +52,10 @@ struct ViewportUniform {
     uv_offset: [f32; 2],
     /// UV scale for scroll clipping (normalized, size of visible area relative to full widget)
     uv_scale: [f32; 2],
-    /// Padding to maintain 16-byte alignment (total: 48 bytes)
-    _padding: [f32; 2],
+    /// Crop UV min (u_min, v_min) - normalized 0-1
+    crop_uv_min: [f32; 2],
+    /// Crop UV max (u_max, v_max) - normalized 0-1
+    crop_uv_max: [f32; 2],
 }
 
 /// Combined frame and viewport data to reduce mutex contention
@@ -83,6 +85,8 @@ pub struct VideoPrimitive {
     pub corner_radius: f32,
     /// Mirror horizontally (selfie mode)
     pub mirror_horizontal: bool,
+    /// Crop UV coordinates (u_min, v_min, u_max, v_max) - None means no cropping
+    pub crop_uv: Option<(f32, f32, f32, f32)>,
 }
 
 /// Video texture (shared across filter variations)
@@ -148,6 +152,7 @@ impl VideoPrimitive {
             filter_type: FilterType::Standard,
             corner_radius: 0.0,
             mirror_horizontal: false,
+            crop_uv: None,
         }
     }
 
@@ -315,6 +320,12 @@ impl PrimitiveTrait for VideoPrimitive {
             if let Some(binding) = pipeline.bindings.get(&binding_key) {
                 // For blur video (video_id == 1), use Contain mode for Pass 1
                 // For regular video, use the requested Cover/Contain mode
+                // Get crop UV values (default to full image if not set)
+                let (crop_min, crop_max) = self.crop_uv.map_or(
+                    ([0.0f32, 0.0], [1.0f32, 1.0]),
+                    |(u_min, v_min, u_max, v_max)| ([u_min, v_min], [u_max, v_max]),
+                );
+
                 if self.video_id == 1 {
                     if let Some((tex_width, tex_height)) = tex_dims {
                         // Blur video: use Contain mode with texture dimensions for Pass 1
@@ -328,7 +339,8 @@ impl PrimitiveTrait for VideoPrimitive {
                             mirror_horizontal: if self.mirror_horizontal { 1 } else { 0 },
                             uv_offset: [0.0, 0.0],
                             uv_scale: [1.0, 1.0],
-                            _padding: [0.0, 0.0],
+                            crop_uv_min: crop_min,
+                            crop_uv_max: crop_max,
                         };
                         queue.write_buffer(
                             &binding.viewport_buffer,
@@ -346,7 +358,8 @@ impl PrimitiveTrait for VideoPrimitive {
                         mirror_horizontal: if self.mirror_horizontal { 1 } else { 0 },
                         uv_offset: [stored_uv_offset.0, stored_uv_offset.1],
                         uv_scale: [stored_uv_scale.0, stored_uv_scale.1],
-                        _padding: [0.0, 0.0],
+                        crop_uv_min: crop_min,
+                        crop_uv_max: crop_max,
                     };
                     queue.write_buffer(
                         &binding.viewport_buffer,
@@ -367,7 +380,8 @@ impl PrimitiveTrait for VideoPrimitive {
                         mirror_horizontal: 0, // No mirror for intermediate passes
                         uv_offset: [0.0, 0.0],
                         uv_scale: [1.0, 1.0],
-                        _padding: [0.0, 0.0],
+                        crop_uv_min: [0.0, 0.0], // No crop for intermediate
+                        crop_uv_max: [1.0, 1.0],
                     };
                     queue.write_buffer(
                         &intermediate_1.viewport_buffer,
@@ -386,7 +400,8 @@ impl PrimitiveTrait for VideoPrimitive {
                         mirror_horizontal: 0, // Already mirrored in pass 1
                         uv_offset: [0.0, 0.0],
                         uv_scale: [1.0, 1.0],
-                        _padding: [0.0, 0.0],
+                        crop_uv_min: [0.0, 0.0], // No crop for final blur pass
+                        crop_uv_max: [1.0, 1.0],
                     };
                     queue.write_buffer(
                         &intermediate_2.viewport_buffer,

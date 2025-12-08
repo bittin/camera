@@ -38,6 +38,9 @@ pub struct VideoWidget {
 
 impl VideoWidget {
     /// Create a new video widget from a camera frame
+    ///
+    /// # Arguments
+    /// * `crop_uv` - Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
     pub fn new(
         frame: Arc<CameraFrame>,
         video_id: u64,
@@ -45,14 +48,25 @@ impl VideoWidget {
         filter_type: FilterType,
         corner_radius: f32,
         mirror_horizontal: bool,
+        crop_uv: Option<(f32, f32, f32, f32)>,
     ) -> Self {
         let mut primitive = VideoPrimitive::new(video_id);
         primitive.filter_type = filter_type;
         primitive.corner_radius = corner_radius;
         primitive.mirror_horizontal = mirror_horizontal;
+        primitive.crop_uv = crop_uv;
 
-        // Calculate aspect ratio from frame dimensions
-        let aspect_ratio = if frame.height > 0 {
+        // Calculate aspect ratio from frame dimensions, adjusted for crop
+        let aspect_ratio = if let Some((u_min, v_min, u_max, v_max)) = crop_uv {
+            // Use cropped region's aspect ratio
+            let crop_width = (u_max - u_min) * frame.width as f32;
+            let crop_height = (v_max - v_min) * frame.height as f32;
+            if crop_height > 0.0 {
+                crop_width / crop_height
+            } else {
+                16.0 / 9.0
+            }
+        } else if frame.height > 0 {
             frame.width as f32 / frame.height as f32
         } else {
             16.0 / 9.0 // Default aspect ratio
@@ -157,6 +171,9 @@ impl<'a> From<VideoWidget> for Element<'a, crate::app::Message, Theme, Renderer>
 }
 
 /// Create a video widget from a camera frame
+///
+/// # Arguments
+/// * `crop_uv` - Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
 pub fn video_widget<'a>(
     frame: Arc<CameraFrame>,
     video_id: u64,
@@ -164,6 +181,7 @@ pub fn video_widget<'a>(
     filter_type: FilterType,
     corner_radius: f32,
     mirror_horizontal: bool,
+    crop_uv: Option<(f32, f32, f32, f32)>,
 ) -> Element<'a, crate::app::Message, Theme, Renderer> {
     Element::new(VideoWidget::new(
         frame,
@@ -172,5 +190,6 @@ pub fn video_widget<'a>(
         filter_type,
         corner_radius,
         mirror_horizontal,
+        crop_uv,
     ))
 }

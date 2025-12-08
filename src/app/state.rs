@@ -333,6 +333,8 @@ pub struct AppModel {
     pub photo_timer_countdown: Option<u8>,
     /// When the current countdown second started (for fade animation)
     pub photo_timer_tick_start: Option<Instant>,
+    /// Photo aspect ratio (native, 4:3, 16:9, 1:1)
+    pub photo_aspect_ratio: PhotoAspectRatio,
     /// Path to last generated bug report
     pub last_bug_report_path: Option<String>,
     /// Latest gallery thumbnail (cached)
@@ -483,6 +485,127 @@ impl PhotoTimerSetting {
     }
 }
 
+/// Photo aspect ratio settings
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PhotoAspectRatio {
+    /// Native camera aspect ratio (no cropping)
+    #[default]
+    Native,
+    /// 4:3 aspect ratio
+    Ratio4x3,
+    /// 16:9 aspect ratio
+    Ratio16x9,
+    /// 1:1 square aspect ratio
+    Ratio1x1,
+}
+
+impl PhotoAspectRatio {
+    /// Tolerance for aspect ratio matching (allows for minor pixel rounding differences)
+    const RATIO_TOLERANCE: f32 = 0.02;
+
+    /// Detect which defined aspect ratio matches the given frame dimensions
+    /// Returns None if the native ratio doesn't match any defined ratio
+    pub fn from_frame_dimensions(width: u32, height: u32) -> Option<Self> {
+        if height == 0 {
+            return None;
+        }
+        let frame_ratio = width as f32 / height as f32;
+
+        // Check each defined ratio
+        if (frame_ratio - 4.0 / 3.0).abs() < Self::RATIO_TOLERANCE {
+            Some(PhotoAspectRatio::Ratio4x3)
+        } else if (frame_ratio - 16.0 / 9.0).abs() < Self::RATIO_TOLERANCE {
+            Some(PhotoAspectRatio::Ratio16x9)
+        } else if (frame_ratio - 1.0).abs() < Self::RATIO_TOLERANCE {
+            Some(PhotoAspectRatio::Ratio1x1)
+        } else {
+            None
+        }
+    }
+
+    /// Get the default aspect ratio for given frame dimensions
+    /// If native matches a defined ratio, use that; otherwise use Native
+    pub fn default_for_frame(width: u32, height: u32) -> Self {
+        Self::from_frame_dimensions(width, height).unwrap_or(PhotoAspectRatio::Native)
+    }
+
+    /// Cycle to next aspect ratio, skipping Native if it matches a defined ratio
+    pub fn next_for_frame(&self, frame_width: u32, frame_height: u32) -> Self {
+        let native_matches_defined =
+            Self::from_frame_dimensions(frame_width, frame_height).is_some();
+
+        let next = match self {
+            PhotoAspectRatio::Native => PhotoAspectRatio::Ratio4x3,
+            PhotoAspectRatio::Ratio4x3 => PhotoAspectRatio::Ratio16x9,
+            PhotoAspectRatio::Ratio16x9 => PhotoAspectRatio::Ratio1x1,
+            PhotoAspectRatio::Ratio1x1 => {
+                if native_matches_defined {
+                    // Skip Native, go directly to 4:3
+                    PhotoAspectRatio::Ratio4x3
+                } else {
+                    PhotoAspectRatio::Native
+                }
+            }
+        };
+
+        next
+    }
+
+    /// Get the aspect ratio as a float (width / height), or None for native
+    pub fn ratio(&self) -> Option<f32> {
+        match self {
+            PhotoAspectRatio::Native => None,
+            PhotoAspectRatio::Ratio4x3 => Some(4.0 / 3.0),
+            PhotoAspectRatio::Ratio16x9 => Some(16.0 / 9.0),
+            PhotoAspectRatio::Ratio1x1 => Some(1.0),
+        }
+    }
+
+    /// Calculate crop rectangle for a given frame size
+    /// Returns (x, y, width, height) for the crop region
+    pub fn crop_rect(&self, frame_width: u32, frame_height: u32) -> (u32, u32, u32, u32) {
+        let Some(target_ratio) = self.ratio() else {
+            return (0, 0, frame_width, frame_height);
+        };
+
+        let frame_ratio = frame_width as f32 / frame_height as f32;
+
+        if frame_ratio > target_ratio {
+            // Frame is wider than target - crop sides
+            let new_width = (frame_height as f32 * target_ratio) as u32;
+            let x = (frame_width - new_width) / 2;
+            (x, 0, new_width, frame_height)
+        } else {
+            // Frame is taller than target - crop top/bottom
+            let new_height = (frame_width as f32 / target_ratio) as u32;
+            let y = (frame_height - new_height) / 2;
+            (0, y, frame_width, new_height)
+        }
+    }
+
+    /// Calculate crop UV coordinates for shader use
+    /// Returns (u_min, v_min, u_max, v_max) in 0-1 range
+    pub fn crop_uv(&self, frame_width: u32, frame_height: u32) -> Option<(f32, f32, f32, f32)> {
+        let Some(target_ratio) = self.ratio() else {
+            return None; // Native - no cropping
+        };
+
+        let frame_ratio = frame_width as f32 / frame_height as f32;
+
+        if frame_ratio > target_ratio {
+            // Frame is wider than target - crop sides
+            let scale = target_ratio / frame_ratio;
+            let offset = (1.0 - scale) / 2.0;
+            Some((offset, 0.0, 1.0 - offset, 1.0))
+        } else {
+            // Frame is taller than target - crop top/bottom
+            let scale = frame_ratio / target_ratio;
+            let offset = (1.0 - scale) / 2.0;
+            Some((0.0, offset, 1.0, 1.0 - offset))
+        }
+    }
+}
+
 /// Filter types for camera preview
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterType {
@@ -606,6 +729,8 @@ pub enum Message {
     Capture,
     /// Toggle flash for photo capture
     ToggleFlash,
+    /// Cycle photo aspect ratio (native -> 4:3 -> 16:9 -> 1:1 -> native)
+    CyclePhotoAspectRatio,
     /// Flash duration complete, now capture the photo
     FlashComplete,
     /// Cycle photo timer setting (off -> 3s -> 5s -> 10s -> off)

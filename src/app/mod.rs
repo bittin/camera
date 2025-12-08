@@ -54,7 +54,7 @@ use cosmic::iced::Subscription;
 use cosmic::widget::{self, about::About};
 use cosmic::{Element, Task};
 pub use state::{
-    AppFlags, AppModel, CameraMode, ContextPage, FileSource, FilterType, Message,
+    AppFlags, AppModel, CameraMode, ContextPage, FileSource, FilterType, Message, PhotoAspectRatio,
     PhotoTimerSetting, RecordingState, TheatreState, VirtualCameraState,
 };
 use std::sync::Arc;
@@ -246,6 +246,7 @@ impl cosmic::Application for AppModel {
             photo_timer_setting: PhotoTimerSetting::default(),
             photo_timer_countdown: None,
             photo_timer_tick_start: None,
+            photo_aspect_ratio: PhotoAspectRatio::default(),
             last_bug_report_path: None,
             gallery_thumbnail: None,
             gallery_thumbnail_rgba: None,
