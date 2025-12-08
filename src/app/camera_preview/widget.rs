@@ -79,6 +79,14 @@ impl AppModel {
             // Use the flag that tracks if the current frame is actually from a file source
             let should_mirror = self.config.mirror_preview && !self.current_frame_is_file_source;
 
+            // Calculate crop UV for aspect ratio (only in Photo mode)
+            let crop_uv = match self.mode {
+                crate::app::state::CameraMode::Photo => {
+                    self.photo_aspect_ratio.crop_uv(frame.width, frame.height)
+                }
+                _ => None,
+            };
+
             let video_elem = video_widget::video_widget(
                 frame.clone(),
                 video_id,
@@ -86,6 +94,7 @@ impl AppModel {
                 filter_mode,
                 0.0,
                 should_mirror,
+                crop_uv,
             );
 
             widget::container(video_elem)
