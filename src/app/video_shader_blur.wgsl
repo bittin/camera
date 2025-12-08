@@ -8,13 +8,14 @@ var texture_blur: texture_2d<f32>;
 var sampler_blur: sampler;
 
 struct ViewportUniform {
-    viewport_size: vec2<f32>,
-    content_fit_mode: u32,  // 0 = Contain, 1 = Cover
-    filter_mode: u32,       // Unused in blur, but kept for struct compatibility
-    corner_radius: f32,     // Unused in blur
-    mirror_horizontal: u32, // 0 = normal, 1 = mirrored horizontally
-    _padding1: f32,
-    _padding2: f32,
+    viewport_size: vec2<f32>,   // Full widget size
+    content_fit_mode: u32,      // 0 = Contain, 1 = Cover
+    filter_mode: u32,           // Unused in blur, but kept for struct compatibility
+    corner_radius: f32,         // Unused in blur
+    mirror_horizontal: u32,     // 0 = normal, 1 = mirrored horizontally
+    uv_offset: vec2<f32>,       // UV offset for scroll clipping (0-1)
+    uv_scale: vec2<f32>,        // UV scale for scroll clipping (0-1)
+    _padding: vec2<f32>,        // Padding for 16-byte alignment
 }
 
 @group(0) @binding(2)
@@ -43,7 +44,8 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 // Fragment shader - Gaussian blur on RGB texture
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    var tex_coords = in.tex_coords;
+    // Apply scroll clipping UV transformation
+    var tex_coords = viewport.uv_offset + in.tex_coords * viewport.uv_scale;
 
     // Apply horizontal mirror if enabled (selfie mode)
     if (viewport.mirror_horizontal == 1u) {
