@@ -240,6 +240,10 @@ pub struct AvailableExposureControls {
     // === Focus ===
     pub has_focus_auto: bool,
     pub focus: ControlRange,
+
+    // === Privacy ===
+    /// Whether privacy control is available (hardware privacy switch)
+    pub has_privacy: bool,
 }
 
 impl AvailableExposureControls {

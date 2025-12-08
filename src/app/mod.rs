@@ -301,6 +301,8 @@ impl cosmic::Application for AppModel {
             qr_detection_enabled: true,
             qr_detections: Vec::new(),
             last_qr_detection_time: None,
+            // Privacy cover detection
+            privacy_cover_closed: false,
         };
 
         // Make context drawer overlay the content instead of reserving space
@@ -911,6 +913,43 @@ impl cosmic::Application for AppModel {
             Subscription::none()
         };
 
+        // Privacy cover status polling subscription (every 3 seconds)
+        // Only runs if the camera has privacy control support
+        let privacy_polling_sub = if self.available_exposure_controls.has_privacy {
+            let device_path = self.get_v4l2_device_path();
+            if let Some(path) = device_path {
+                let path = path.clone();
+                Subscription::run_with_id(
+                    ("privacy_polling", path.clone()),
+                    cosmic::iced::stream::channel(1, move |mut output| async move {
+                        use crate::backends::camera::v4l2_controls;
+                        loop {
+                            // Poll privacy control status
+                            let is_closed =
+                                v4l2_controls::get_control(&path, v4l2_controls::V4L2_CID_PRIVACY)
+                                    .map(|v| v != 0)
+                                    .unwrap_or(false);
+
+                            if output
+                                .send(Message::PrivacyCoverStatusChanged(is_closed))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+
+                            // Wait 3 seconds before next poll
+                            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                        }
+                    }),
+                )
+            } else {
+                Subscription::none()
+            }
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             config_sub,
             camera_sub,
@@ -918,6 +957,7 @@ impl cosmic::Application for AppModel {
             qr_detection_sub,
             file_source_preview_sub,
             timer_animation_sub,
+            privacy_polling_sub,
         ])
     }
 

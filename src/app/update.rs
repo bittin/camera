@@ -210,6 +210,12 @@ impl AppModel {
                 hidden,
             } => self.handle_qr_connect_wifi(ssid, password, security, hidden),
             Message::QrCopyText(text) => self.handle_qr_copy_text(text),
+
+            // ===== Privacy Cover Detection =====
+            Message::PrivacyCoverStatusChanged(is_closed) => {
+                self.handle_privacy_cover_status_changed(is_closed)
+            }
+
             Message::Noop => Task::none(),
         }
     }
