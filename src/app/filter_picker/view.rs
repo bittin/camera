@@ -140,10 +140,11 @@ impl AppModel {
             grid_column = grid_column.push(current_row);
         }
 
-        // Wrap in scrollable for proper overflow handling
-        let scrollable_content = widget::scrollable(grid_column).width(Length::Fill);
-
-        let content: Element<'_, Message> = scrollable_content.into();
+        // Context drawer already provides scrollable behavior, so just wrap in a clipping container
+        let content: Element<'_, Message> = widget::container(grid_column)
+            .width(Length::Fill)
+            .clip(true)
+            .into();
 
         context_drawer::context_drawer(content, Message::ToggleContextPage(ContextPage::Filters))
             .title(fl!("filters-title"))

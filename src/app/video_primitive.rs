@@ -38,7 +38,7 @@ impl VideoFrame {
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct ViewportUniform {
-    /// Viewport width and height
+    /// Viewport width and height (full widget size)
     viewport_size: [f32; 2],
     /// Content fit mode: 0 = Contain, 1 = Cover
     content_fit_mode: u32,
@@ -48,9 +48,12 @@ struct ViewportUniform {
     corner_radius: f32,
     /// Mirror horizontally: 0 = normal, 1 = mirrored
     mirror_horizontal: u32,
-    /// Padding for 16-byte alignment (avoiding vec3 which has 16-byte alignment in WGSL)
-    _padding1: f32,
-    _padding2: f32,
+    /// UV offset for scroll clipping (normalized 0-1, where visible area starts)
+    uv_offset: [f32; 2],
+    /// UV scale for scroll clipping (normalized, size of visible area relative to full widget)
+    uv_scale: [f32; 2],
+    /// Padding to maintain 16-byte alignment (total: 48 bytes)
+    _padding: [f32; 2],
 }
 
 /// Combined frame and viewport data to reduce mutex contention
@@ -59,6 +62,13 @@ struct ViewportUniform {
 pub struct FrameViewportData {
     pub frame: Option<VideoFrame>,
     pub viewport: (f32, f32, crate::app::video_widget::VideoContentFit),
+    /// Physical widget bounds (x, y, width, height) clamped to render target
+    /// Stored during prepare() and used in render() for valid viewport rect
+    pub physical_bounds: Option<(f32, f32, f32, f32)>,
+    /// UV offset for scroll/render-target clipping (normalized 0-1)
+    pub uv_offset: (f32, f32),
+    /// UV scale for scroll/render-target clipping (normalized 0-1)
+    pub uv_scale: (f32, f32),
 }
 
 /// Custom primitive for video rendering
@@ -131,6 +141,9 @@ impl VideoPrimitive {
             data: Arc::new(Mutex::new(FrameViewportData {
                 frame: None,
                 viewport: (0.0, 0.0, VideoContentFit::Contain),
+                physical_bounds: None,
+                uv_offset: (0.0, 0.0),
+                uv_scale: (1.0, 1.0),
             })),
             filter_type: FilterType::Standard,
             corner_radius: 0.0,
@@ -163,8 +176,8 @@ impl PrimitiveTrait for VideoPrimitive {
         queue: &wgpu::Queue,
         _format: wgpu::TextureFormat,
         storage: &mut primitive::Storage,
-        _bounds: &Rectangle,
-        _viewport: &Viewport,
+        bounds: &Rectangle,
+        viewport: &Viewport,
     ) {
         use std::time::Instant;
         let prepare_start = Instant::now();
@@ -174,10 +187,57 @@ impl PrimitiveTrait for VideoPrimitive {
             storage.store(VideoPipeline::new(device, _format));
         }
 
+        // Calculate physical bounds from logical bounds using scale factor
+        // Then clamp to render target to ensure valid viewport rect
+        let scale = viewport.scale_factor() as f32;
+        let render_target = viewport.physical_size();
+
+        let raw_physical_bounds = (
+            bounds.x * scale,
+            bounds.y * scale,
+            bounds.width * scale,
+            bounds.height * scale,
+        );
+
+        // Clamp physical bounds to render target to avoid wgpu validation errors
+        let clamped_x = raw_physical_bounds.0.max(0.0);
+        let clamped_y = raw_physical_bounds.1.max(0.0);
+        let clamped_w = ((raw_physical_bounds.0 + raw_physical_bounds.2)
+            .min(render_target.width as f32)
+            - clamped_x)
+            .max(0.0);
+        let clamped_h = ((raw_physical_bounds.1 + raw_physical_bounds.3)
+            .min(render_target.height as f32)
+            - clamped_y)
+            .max(0.0);
+
+        let clamped_physical_bounds = (clamped_x, clamped_y, clamped_w, clamped_h);
+
+        // Calculate UV offset/scale to compensate for clamping
+        // This ensures the visible portion maps to correct texture coordinates
+        let (uv_offset, uv_scale) = if raw_physical_bounds.2 > 0.0 && raw_physical_bounds.3 > 0.0 {
+            let uv_offset_x = (clamped_x - raw_physical_bounds.0) / raw_physical_bounds.2;
+            let uv_offset_y = (clamped_y - raw_physical_bounds.1) / raw_physical_bounds.3;
+            let uv_scale_x = clamped_w / raw_physical_bounds.2;
+            let uv_scale_y = clamped_h / raw_physical_bounds.3;
+            ((uv_offset_x, uv_offset_y), (uv_scale_x, uv_scale_y))
+        } else {
+            ((0.0, 0.0), (1.0, 1.0))
+        };
+
         // Take frame and viewport data with brief lock, then release before GPU ops
-        let (frame_opt, viewport_data) = {
+        // Also store clamped physical bounds and UV adjustment for use in render()
+        let (frame_opt, viewport_data, stored_uv_offset, stored_uv_scale) = {
             if let Ok(mut data_guard) = self.data.lock() {
-                (data_guard.frame.take(), data_guard.viewport)
+                data_guard.physical_bounds = Some(clamped_physical_bounds);
+                data_guard.uv_offset = uv_offset;
+                data_guard.uv_scale = uv_scale;
+                (
+                    data_guard.frame.take(),
+                    data_guard.viewport,
+                    data_guard.uv_offset,
+                    data_guard.uv_scale,
+                )
             } else {
                 return;
             }
@@ -266,8 +326,9 @@ impl PrimitiveTrait for VideoPrimitive {
                             filter_mode,         // Apply filter during blur (visible in transition)
                             corner_radius: 0.0,  // No rounded corners for blur passes
                             mirror_horizontal: if self.mirror_horizontal { 1 } else { 0 },
-                            _padding1: 0.0,
-                            _padding2: 0.0,
+                            uv_offset: [0.0, 0.0],
+                            uv_scale: [1.0, 1.0],
+                            _padding: [0.0, 0.0],
                         };
                         queue.write_buffer(
                             &binding.viewport_buffer,
@@ -276,15 +337,16 @@ impl PrimitiveTrait for VideoPrimitive {
                         );
                     }
                 } else {
-                    // Regular video: use requested mode
+                    // Regular video: use requested mode with UV adjustment for clipping
                     let uniform_data = ViewportUniform {
                         viewport_size: [width, height],
                         content_fit_mode,
                         filter_mode,
                         corner_radius: self.corner_radius,
                         mirror_horizontal: if self.mirror_horizontal { 1 } else { 0 },
-                        _padding1: 0.0,
-                        _padding2: 0.0,
+                        uv_offset: [stored_uv_offset.0, stored_uv_offset.1],
+                        uv_scale: [stored_uv_scale.0, stored_uv_scale.1],
+                        _padding: [0.0, 0.0],
                     };
                     queue.write_buffer(
                         &binding.viewport_buffer,
@@ -303,8 +365,9 @@ impl PrimitiveTrait for VideoPrimitive {
                         filter_mode: 0,      // No filter during intermediate pass
                         corner_radius: 0.0,  // No rounded corners for intermediate passes
                         mirror_horizontal: 0, // No mirror for intermediate passes
-                        _padding1: 0.0,
-                        _padding2: 0.0,
+                        uv_offset: [0.0, 0.0],
+                        uv_scale: [1.0, 1.0],
+                        _padding: [0.0, 0.0],
                     };
                     queue.write_buffer(
                         &intermediate_1.viewport_buffer,
@@ -321,8 +384,9 @@ impl PrimitiveTrait for VideoPrimitive {
                         filter_mode: 0,       // No filter during blur
                         corner_radius: 0.0,   // No rounded corners for blur
                         mirror_horizontal: 0, // Already mirrored in pass 1
-                        _padding1: 0.0,
-                        _padding2: 0.0,
+                        uv_offset: [0.0, 0.0],
+                        uv_scale: [1.0, 1.0],
+                        _padding: [0.0, 0.0],
                     };
                     queue.write_buffer(
                         &intermediate_2.viewport_buffer,
@@ -360,8 +424,29 @@ impl PrimitiveTrait for VideoPrimitive {
             FilterType::Pencil => 14,
         };
 
+        // Use stored physical bounds for viewport (prevents distortion in scrollable contexts)
+        // Fall back to clip_bounds if physical_bounds not available
+        let widget_bounds = self
+            .data
+            .lock()
+            .ok()
+            .and_then(|guard| guard.physical_bounds)
+            .unwrap_or((
+                clip_bounds.x as f32,
+                clip_bounds.y as f32,
+                clip_bounds.width as f32,
+                clip_bounds.height as f32,
+            ));
+
         if let Some(pipeline) = storage.get::<VideoPipeline>() {
-            pipeline.render(self.video_id, filter_mode, encoder, target, clip_bounds);
+            pipeline.render(
+                self.video_id,
+                filter_mode,
+                encoder,
+                target,
+                clip_bounds,
+                widget_bounds,
+            );
         }
     }
 }
@@ -885,6 +970,15 @@ impl VideoPipeline {
         }
     }
 
+    /// Render the video primitive.
+    ///
+    /// # Arguments
+    /// * `video_id` - Unique identifier for the video source
+    /// * `filter_mode` - Filter to apply (0 = none, 1+ = various filters)
+    /// * `encoder` - GPU command encoder
+    /// * `target` - Render target texture view
+    /// * `clip_bounds` - Clipped bounds for scissor rect (visible portion after scroll clipping)
+    /// * `widget_bounds` - Full widget bounds for viewport (x, y, width, height)
     pub fn render(
         &self,
         video_id: u64,
@@ -892,6 +986,7 @@ impl VideoPipeline {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
+        widget_bounds: (f32, f32, f32, f32),
     ) {
         // Look up binding for this (video_id, filter_mode) combination
         let binding_key = (video_id, filter_mode);
@@ -924,15 +1019,17 @@ impl VideoPipeline {
                         occlusion_query_set: None,
                     });
 
+                    // Use full widget bounds for viewport (prevents distortion in scrollables)
                     render_pass.set_viewport(
-                        clip_bounds.x as f32,
-                        clip_bounds.y as f32,
-                        clip_bounds.width as f32,
-                        clip_bounds.height as f32,
+                        widget_bounds.0,
+                        widget_bounds.1,
+                        widget_bounds.2,
+                        widget_bounds.3,
                         0.0,
                         1.0,
                     );
 
+                    // Use clip bounds for scissor (clips to visible portion)
                     render_pass.set_scissor_rect(
                         clip_bounds.x,
                         clip_bounds.y,
@@ -1010,15 +1107,17 @@ impl VideoPipeline {
                         occlusion_query_set: None,
                     });
 
+                    // Use full widget bounds for viewport (prevents distortion in scrollables)
                     render_pass.set_viewport(
-                        clip_bounds.x as f32,
-                        clip_bounds.y as f32,
-                        clip_bounds.width as f32,
-                        clip_bounds.height as f32,
+                        widget_bounds.0,
+                        widget_bounds.1,
+                        widget_bounds.2,
+                        widget_bounds.3,
                         0.0,
                         1.0,
                     );
 
+                    // Use clip bounds for scissor (clips to visible portion)
                     render_pass.set_scissor_rect(
                         clip_bounds.x,
                         clip_bounds.y,
@@ -1047,15 +1146,17 @@ impl VideoPipeline {
                     occlusion_query_set: None,
                 });
 
+                // Use full widget bounds for viewport (prevents distortion in scrollables)
                 render_pass.set_viewport(
-                    clip_bounds.x as f32,
-                    clip_bounds.y as f32,
-                    clip_bounds.width as f32,
-                    clip_bounds.height as f32,
+                    widget_bounds.0,
+                    widget_bounds.1,
+                    widget_bounds.2,
+                    widget_bounds.3,
                     0.0,
                     1.0,
                 );
 
+                // Use clip bounds for scissor (clips to visible portion)
                 render_pass.set_scissor_rect(
                     clip_bounds.x,
                     clip_bounds.y,
