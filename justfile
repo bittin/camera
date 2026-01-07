@@ -211,13 +211,11 @@ flatpak-cargo-sources:
         echo "Error: python3 not found!"
         exit 1
     fi
-    [ -f flatpak-cargo-generator.py ] || curl -sLo flatpak-cargo-generator.py \
-        https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py
-    if python3 -c "import aiohttp, toml" 2>/dev/null; then
+    if python3 -c "import aiohttp, tomlkit" 2>/dev/null; then
         python3 flatpak-cargo-generator.py ./Cargo.lock -o cargo-sources.json
     else
         [ -d .flatpak-venv ] || python3 -m venv .flatpak-venv
-        .flatpak-venv/bin/pip install --quiet aiohttp toml tomlkit
+        .flatpak-venv/bin/pip install --quiet aiohttp tomlkit
         .flatpak-venv/bin/python flatpak-cargo-generator.py ./Cargo.lock -o cargo-sources.json
     fi
     echo "Generated cargo-sources.json"
@@ -285,7 +283,7 @@ flatpak-install:
 
 # Clean Flatpak build artifacts
 flatpak-clean:
-    rm -rf build-dir .flatpak-builder repo cargo-sources.json {{name}}-*.flatpak flatpak-cargo-generator.py .flatpak-venv .flatpak-version
+    rm -rf build-dir .flatpak-builder repo cargo-sources.json {{name}}-*.flatpak .flatpak-venv .flatpak-version
 
 # Install Flatpak dependencies (runtime and SDK)
 flatpak-deps arch="":
