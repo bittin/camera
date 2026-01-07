@@ -85,6 +85,53 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.19" date="2026-01-07">
+      <description>
+        <p>Release 0.1.19 includes the following changes:</p>
+        <ul>
+          <li>fix distored filter previews on the borders of the scrollable filter …</li>
+          <li>fix theatre mode log spam</li>
+          <li>add background for live and stream indicators for better visibility</li>
+          <li>add timer for photo mode</li>
+          <li>allow setting an aspect ratio in photo mode</li>
+          <li>implement digital zoom feature</li>
+          <li>add camera driver details in settings menu</li>
+          <li>implement exposure and color camera controls</li>
+          <li>ignore aspect ratio cropping in theatre mode</li>
+          <li>better defaults for framerate in photo mode</li>
+          <li>reorder filters in filter preview</li>
+          <li>detect if camera privacy cover is closed and let user know</li>
+          <li>ci: free disk space before builds to prevent out-of-space errors</li>
+          <li>implement hdr+</li>
+          <li>deps(actions): bump peter-evans/create-pull-request from 7 to 8</li>
+          <li>deps(cargo): bump libcosmic from `05c6608` to `2f0b333`</li>
+          <li>deps(actions): bump actions/cache from 4 to 5</li>
+          <li>deps(actions): bump actions/upload-artifact from 5 to 6</li>
+          <li>deps(actions): bump actions/download-artifact from 6 to 7</li>
+          <li>reset camera zoom when switching cameras</li>
+          <li>fix: Make ioctl calls compatible with musl</li>
+          <li>deps(cargo): bump naga from 27.0.3 to 28.0.0</li>
+          <li>deps(cargo): bump tracing from 0.1.43 to 0.1.44 in the rust-dependencies group</li>
+          <li>deps(cargo): bump libcosmic from `aabc8dc` to `fa26e0e`</li>
+          <li>deps(cargo): bump serde_json from 1.0.145 to 1.0.146 in the rust-dependencies group</li>
+          <li>deps(cargo): bump libcosmic from `fa26e0e` to `dd3610b`</li>
+          <li>deps(cargo): bump serde_json from 1.0.146 to 1.0.147 in the rust-dependencies group</li>
+          <li>deps(cargo): bump ratatui from 0.29.0 to 0.30.0</li>
+          <li>deps(cargo): bump serde_json from 1.0.147 to 1.0.148 in the rust-dependencies group</li>
+          <li>deps(cargo): bump libcosmic from `dd3610b` to `a9f64c3`</li>
+          <li>deps(cargo): bump the rust-dependencies group with 4 updates</li>
+          <li>deps(cargo): bump rfd from 0.16.0 to 0.17.1</li>
+          <li>deps(cargo): bump libcosmic from `a9f64c3` to `f603959`</li>
+          <li>feat(codec): extend format support with Bayer, depth, and helper methods</li>
+          <li>metainfo: add CosmicApplication provides tag</li>
+          <li>feat(v4l2): add PTZ (pan/tilt/zoom) control detection and UI</li>
+          <li>fix: install libglib2.0-dev-bin before adding arm64 arch</li>
+          <li>chore: flatpak manifest and justfile cleanup</li>
+          <li>fix: recreate venv if Python interpreter is stale</li>
+          <li>fix: only update package version in Cargo.toml, not dependency versions</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.18" date="2025-12-07">
       <description>
         <p>Release 0.1.18 includes the following changes:</p>
