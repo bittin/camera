@@ -23,7 +23,7 @@ finish-args:
   - --filesystem=xdg-videos:rw
   # COSMIC config access (theme settings + app config)
   # Needs rw for app's own config; reads system theme configs
-  - --filesystem=xdg-config/cosmic
+  - --filesystem=xdg-config/cosmic:rw
   # COSMIC system-wide defaults (corner radii, toolkit settings)
   - --filesystem=/usr/share/cosmic:ro
   # PipeWire access for camera and audio
