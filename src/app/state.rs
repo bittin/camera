@@ -568,8 +568,6 @@ pub struct AppModel {
     /// Auto-detected frame count based on current scene brightness (1-8)
     /// Updated every 1 second when in Auto mode via BrightnessEvaluationTick
     pub auto_detected_frame_count: usize,
-    /// Last time brightness was evaluated for auto frame count
-    pub last_brightness_eval_time: Option<Instant>,
     /// User override to disable HDR+ even when auto-detection suggests using it
     /// Reset when switching burst mode settings or on app restart
     pub hdr_override_disabled: bool,
@@ -601,6 +599,8 @@ pub struct AppModel {
     pub backend_manager: Option<CameraBackendManager>,
     /// Flag to cancel camera subscription (used when switching backends/cameras)
     pub camera_cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Counter to force camera stream restart (incremented to change subscription ID)
+    pub camera_stream_restart_counter: u32,
     /// Current camera frame
     pub current_frame: Option<Arc<CameraFrame>>,
     /// Available camera devices

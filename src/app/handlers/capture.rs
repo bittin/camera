@@ -8,7 +8,7 @@ use crate::app::state::{AppModel, CameraMode, Message, RecordingState};
 use crate::backends::camera::v4l2_controls::read_exposure_metadata;
 use crate::pipelines::photo::burst_mode::BurstModeConfig;
 use crate::pipelines::photo::burst_mode::burst::{
-    analyze_brightness_multi, calculate_adaptive_params,
+    calculate_adaptive_params, estimate_scene_brightness,
 };
 use cosmic::Task;
 use std::path::PathBuf;
@@ -200,6 +200,13 @@ impl AppModel {
             self.flash_active = false;
         }
 
+        // Stop the PipeWire camera stream during HDR+ processing
+        // This frees GPU/CPU resources for burst processing
+        // The stream will be restarted in handle_burst_mode_complete
+        info!("Stopping camera stream for HDR+ processing");
+        self.camera_cancel_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+
         // Update state to processing
         self.burst_mode.start_processing();
 
@@ -265,25 +272,19 @@ impl AppModel {
         config.camera_metadata = camera_metadata;
         config.save_burst_raw_dng = self.config.save_burst_raw;
 
-        // Calculate adaptive processing parameters using multi-metric brightness analysis
-        // This combines: GPU histogram, V4L2 exposure settings, and simple luminance
-        // to make an intelligent decision about scene brightness
+        // Calculate adaptive processing parameters based on scene brightness
         if let Some(first_frame) = frames.first() {
-            let multi_metrics = analyze_brightness_multi(first_frame, exposure_metadata);
-            let adaptive_params = calculate_adaptive_params(multi_metrics.classification);
+            let (_luminance, brightness) = estimate_scene_brightness(first_frame);
+            let adaptive_params = calculate_adaptive_params(brightness);
             config.shadow_boost = adaptive_params.shadow_boost;
             config.local_contrast = adaptive_params.local_contrast;
             config.robustness = adaptive_params.robustness;
-            info!(
-                luminance_avg = multi_metrics.luminance_avg,
-                histogram_available = multi_metrics.histogram.is_some(),
-                exposure_available = multi_metrics.exposure.is_some(),
-                ?multi_metrics.classification,
-                confidence = multi_metrics.confidence,
+            debug!(
+                ?brightness,
                 shadow_boost = adaptive_params.shadow_boost,
                 local_contrast = adaptive_params.local_contrast,
                 robustness = adaptive_params.robustness,
-                "Multi-metric adaptive burst mode parameters applied"
+                "Adaptive burst mode parameters applied"
             );
         }
 
@@ -372,7 +373,6 @@ impl AppModel {
                     "Auto frame count updated based on scene brightness"
                 );
                 self.auto_detected_frame_count = params.frame_count;
-                self.last_brightness_eval_time = Some(std::time::Instant::now());
             }
         }
 
@@ -807,6 +807,18 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         self.is_capturing = false;
 
+        // Clear current_frame to force the video widget to refresh
+        // when the next frame arrives (unsticks the preview after processing pause)
+        self.current_frame = None;
+
+        // Restart the camera stream after HDR+ processing
+        // The stream was stopped when processing began to free GPU resources.
+        // Increment the restart counter to change the subscription ID and trigger restart.
+        // Create a new cancel flag so the new subscription isn't immediately cancelled.
+        info!("Restarting camera stream after HDR+ processing");
+        self.camera_stream_restart_counter = self.camera_stream_restart_counter.wrapping_add(1);
+        self.camera_cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         match result {
             Ok(path) => {
                 info!(path, "Burst mode capture complete");
@@ -918,6 +930,7 @@ async fn process_burst_mode_frames_with_atomic(
         encoding_format,
         camera_metadata,
         Some(filter),
+        Some("_HDR+"),
     )
     .await?;
 
@@ -934,83 +947,27 @@ async fn save_first_burst_frame(
     camera_metadata: &crate::pipelines::photo::CameraMetadata,
     filter: crate::app::FilterType,
 ) -> Result<PathBuf, String> {
-    use crate::pipelines::photo::{EncodingQuality, PhotoEncoder};
-    use crate::shaders::apply_filter_gpu_rgba;
-    use image::{ImageBuffer, Rgba};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::pipelines::photo::burst_mode::{MergedFrame, save_output};
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let filename = format!("IMG_SINGLE_{}.{}", timestamp, encoding_format.extension());
-    let output_path = save_dir.join(&filename);
-
-    tokio::fs::create_dir_all(save_dir)
-        .await
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
-
-    // Apply filter if specified and not Standard
-    let image_data = if filter != crate::app::FilterType::Standard {
-        apply_filter_gpu_rgba(&frame.data, frame.width, frame.height, filter)
-            .await
-            .map_err(|e| format!("Failed to apply filter: {}", e))?
-    } else {
-        frame.data.to_vec()
+    // Convert CameraFrame to MergedFrame for save_output
+    let merged = MergedFrame {
+        data: frame.data.to_vec(),
+        width: frame.width,
+        height: frame.height,
     };
 
-    // Create RGBA image buffer
-    let img: ImageBuffer<Rgba<u8>, _> =
-        ImageBuffer::from_raw(frame.width, frame.height, image_data)
-            .ok_or("Failed to create image buffer")?;
+    // Reuse save_output with no filename suffix (plain IMG_{timestamp})
+    let path = save_output(
+        &merged,
+        save_dir.to_path_buf(),
+        crop_rect,
+        encoding_format,
+        camera_metadata.clone(),
+        Some(filter),
+        None, // No suffix for first frame
+    )
+    .await?;
 
-    let dynamic_img = image::DynamicImage::ImageRgba8(img);
-
-    // Apply crop if specified (for aspect ratio)
-    let cropped_img = if let Some((x, y, w, h)) = crop_rect {
-        let x = x.min(frame.width.saturating_sub(1));
-        let y = y.min(frame.height.saturating_sub(1));
-        let w = w.min(frame.width - x);
-        let h = h.min(frame.height - y);
-
-        if w > 0 && h > 0 {
-            dynamic_img.crop_imm(x, y, w, h)
-        } else {
-            dynamic_img
-        }
-    } else {
-        dynamic_img
-    };
-
-    let rgb_img = cropped_img.to_rgb8();
-    let (width, height) = rgb_img.dimensions();
-
-    // Create encoder with settings
-    let mut encoder = PhotoEncoder::new();
-    encoder.set_format(encoding_format);
-    encoder.set_quality(EncodingQuality::High);
-    encoder.set_camera_metadata(camera_metadata.clone());
-
-    // Create processed image from RGB data
-    let processed = crate::pipelines::photo::processing::ProcessedImage {
-        image: rgb_img,
-        width,
-        height,
-    };
-
-    // Encode
-    let encoded = encoder.encode(processed).await?;
-
-    // Save the encoded data
-    let output_path_clone = output_path.clone();
-    let data = encoded.data;
-    tokio::task::spawn_blocking(move || {
-        std::fs::write(&output_path_clone, data).map_err(|e| format!("Failed to save image: {}", e))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
-
-    info!(path = %output_path.display(), "First burst frame saved for comparison");
-    Ok(output_path)
+    info!(path = %path.display(), "First burst frame saved for comparison");
+    Ok(path)
 }
