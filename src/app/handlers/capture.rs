@@ -884,6 +884,23 @@ async fn process_burst_mode_frames_with_atomic(
         }
     }
 
+    // Save first frame as reference (before HDR+ processing)
+    if let Some(first_frame) = frames.first() {
+        if let Err(e) = save_first_burst_frame(
+            first_frame,
+            &save_dir,
+            crop_rect,
+            encoding_format,
+            &camera_metadata,
+            filter,
+        )
+        .await
+        {
+            warn!(error = %e, "Failed to save first burst frame");
+            // Continue with HDR+ processing even if first frame save fails
+        }
+    }
+
     // Create progress callback that updates the atomic counter
     let progress_callback: ProgressCallback = Arc::new(move |progress: f32| {
         let progress_int = (progress * 1000.0) as u32;
@@ -906,4 +923,98 @@ async fn process_burst_mode_frames_with_atomic(
 
     info!(path = %output_path.display(), "Burst mode photo saved");
     Ok(output_path.display().to_string())
+}
+
+/// Save the first frame of a burst as a separate file for comparison
+async fn save_first_burst_frame(
+    frame: &crate::backends::camera::types::CameraFrame,
+    save_dir: &std::path::Path,
+    crop_rect: Option<(u32, u32, u32, u32)>,
+    encoding_format: crate::pipelines::photo::EncodingFormat,
+    camera_metadata: &crate::pipelines::photo::CameraMetadata,
+    filter: crate::app::FilterType,
+) -> Result<PathBuf, String> {
+    use crate::pipelines::photo::{EncodingQuality, PhotoEncoder};
+    use crate::shaders::apply_filter_gpu_rgba;
+    use image::{ImageBuffer, Rgba};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let filename = format!(
+        "IMG_SINGLE_{}.{}",
+        timestamp,
+        encoding_format.extension()
+    );
+    let output_path = save_dir.join(&filename);
+
+    tokio::fs::create_dir_all(save_dir)
+        .await
+        .map_err(|e| format!("Failed to create output directory: {}", e))?;
+
+    // Apply filter if specified and not Standard
+    let image_data = if filter != crate::app::FilterType::Standard {
+        apply_filter_gpu_rgba(&frame.data, frame.width, frame.height, filter)
+            .await
+            .map_err(|e| format!("Failed to apply filter: {}", e))?
+    } else {
+        frame.data.to_vec()
+    };
+
+    // Create RGBA image buffer
+    let img: ImageBuffer<Rgba<u8>, _> =
+        ImageBuffer::from_raw(frame.width, frame.height, image_data)
+            .ok_or("Failed to create image buffer")?;
+
+    let dynamic_img = image::DynamicImage::ImageRgba8(img);
+
+    // Apply crop if specified (for aspect ratio)
+    let cropped_img = if let Some((x, y, w, h)) = crop_rect {
+        let x = x.min(frame.width.saturating_sub(1));
+        let y = y.min(frame.height.saturating_sub(1));
+        let w = w.min(frame.width - x);
+        let h = h.min(frame.height - y);
+
+        if w > 0 && h > 0 {
+            dynamic_img.crop_imm(x, y, w, h)
+        } else {
+            dynamic_img
+        }
+    } else {
+        dynamic_img
+    };
+
+    let rgb_img = cropped_img.to_rgb8();
+    let (width, height) = rgb_img.dimensions();
+
+    // Create encoder with settings
+    let mut encoder = PhotoEncoder::new();
+    encoder.set_format(encoding_format);
+    encoder.set_quality(EncodingQuality::High);
+    encoder.set_camera_metadata(camera_metadata.clone());
+
+    // Create processed image from RGB data
+    let processed = crate::pipelines::photo::processing::ProcessedImage {
+        image: rgb_img,
+        width,
+        height,
+    };
+
+    // Encode
+    let encoded = encoder.encode(processed).await?;
+
+    // Save the encoded data
+    let output_path_clone = output_path.clone();
+    let data = encoded.data;
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&output_path_clone, data).map_err(|e| format!("Failed to save image: {}", e))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {}", e))??;
+
+    info!(path = %output_path.display(), "First burst frame saved for comparison");
+    Ok(output_path)
 }
