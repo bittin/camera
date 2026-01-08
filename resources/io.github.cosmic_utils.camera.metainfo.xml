@@ -85,6 +85,16 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.20" date="2026-01-08">
+      <description>
+        <p>Release 0.1.20 includes the following changes:</p>
+        <ul>
+          <li>deps(cargo): bump libc from 0.2.179 to 0.2.180 in the rust-dependencies group</li>
+          <li>Improve HDR+ brightness detection and preview experience</li>
+          <li>fix: align flatpak config with flathub linter</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.19" date="2026-01-07">
       <description>
         <p>Release 0.1.19 includes the following changes:</p>
