@@ -5,7 +5,10 @@
 //! Handles photo capture, video recording, flash, zoom, and timer functionality.
 
 use crate::app::state::{AppModel, CameraMode, Message, RecordingState};
-use crate::pipelines::photo::burst_mode::burst::{calculate_adaptive_params, estimate_scene_brightness};
+use crate::backends::camera::v4l2_controls::read_exposure_metadata;
+use crate::pipelines::photo::burst_mode::burst::{
+    analyze_brightness_multi, calculate_adaptive_params,
+};
 use crate::pipelines::photo::burst_mode::BurstModeConfig;
 use cosmic::Task;
 use std::path::PathBuf;
@@ -228,6 +231,14 @@ impl AppModel {
         // Get encoding format and camera metadata (including exposure info)
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
+
+        // Read V4L2 exposure metadata for both camera metadata and brightness analysis
+        let exposure_metadata = self
+            .available_cameras
+            .get(self.current_camera_index)
+            .and_then(|cam| cam.device_info.as_ref())
+            .map(|info| read_exposure_metadata(&info.path));
+
         let camera_metadata = self
             .available_cameras
             .get(self.current_camera_index)
@@ -237,11 +248,8 @@ impl AppModel {
                     camera_driver: cam.device_info.as_ref().map(|info| info.driver.clone()),
                     ..Default::default()
                 };
-                // Read exposure metadata from V4L2 device if available
-                if let Some(device_info) = &cam.device_info {
-                    let exposure = crate::backends::camera::v4l2_controls::read_exposure_metadata(
-                        &device_info.path,
-                    );
+                // Copy exposure metadata if available
+                if let Some(ref exposure) = exposure_metadata {
                     metadata.exposure_time = exposure.exposure_time;
                     metadata.iso = exposure.iso;
                     metadata.gain = exposure.gain;
@@ -257,22 +265,25 @@ impl AppModel {
         config.camera_metadata = camera_metadata;
         config.save_burst_raw_dng = self.config.save_burst_raw;
 
-        // Calculate adaptive processing parameters based on scene brightness
-        // This ensures bright scenes aren't over-processed while dark scenes
-        // get appropriate shadow boost and denoising
+        // Calculate adaptive processing parameters using multi-metric brightness analysis
+        // This combines: GPU histogram, V4L2 exposure settings, and simple luminance
+        // to make an intelligent decision about scene brightness
         if let Some(first_frame) = frames.first() {
-            let (luminance, brightness) = estimate_scene_brightness(first_frame);
-            let adaptive_params = calculate_adaptive_params(brightness);
+            let multi_metrics = analyze_brightness_multi(first_frame, exposure_metadata);
+            let adaptive_params = calculate_adaptive_params(multi_metrics.classification);
             config.shadow_boost = adaptive_params.shadow_boost;
             config.local_contrast = adaptive_params.local_contrast;
             config.robustness = adaptive_params.robustness;
             info!(
-                luminance = luminance,
-                ?brightness,
+                luminance_avg = multi_metrics.luminance_avg,
+                histogram_available = multi_metrics.histogram.is_some(),
+                exposure_available = multi_metrics.exposure.is_some(),
+                ?multi_metrics.classification,
+                confidence = multi_metrics.confidence,
                 shadow_boost = adaptive_params.shadow_boost,
                 local_contrast = adaptive_params.local_contrast,
                 robustness = adaptive_params.robustness,
-                "Adaptive burst mode parameters applied"
+                "Multi-metric adaptive burst mode parameters applied"
             );
         }
 

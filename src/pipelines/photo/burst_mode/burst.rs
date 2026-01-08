@@ -14,8 +14,10 @@
 //! - Medium scenes: standard frames (6-8), good balance
 //! - Dark scenes: more frames (8-15), need aggressive noise reduction
 
+use crate::backends::camera::v4l2_controls::ExposureMetadata;
 use crate::backends::camera::CameraBackendManager;
 use crate::backends::camera::types::CameraFrame;
+use crate::shaders::{analyze_brightness_gpu, BrightnessMetrics as GpuBrightnessMetrics};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -283,6 +285,206 @@ pub fn estimate_scene_brightness(frame: &CameraFrame) -> (f32, SceneBrightness) 
     );
 
     (avg_luminance, brightness)
+}
+
+/// Multi-source brightness analysis combining GPU histogram, V4L2 exposure, and luminance
+#[derive(Debug, Clone)]
+pub struct MultiMetricBrightness {
+    /// Simple luminance average (fast, always available)
+    pub luminance_avg: f32,
+    /// GPU histogram metrics (more accurate, may fail on some systems)
+    pub histogram: Option<GpuBrightnessMetrics>,
+    /// V4L2 exposure metadata (camera settings, if available)
+    pub exposure: Option<ExposureMetadata>,
+    /// Final fused brightness classification
+    pub classification: SceneBrightness,
+    /// Confidence in the classification (0.0-1.0)
+    pub confidence: f32,
+}
+
+/// Estimate brightness from V4L2 exposure settings
+///
+/// Uses exposure time and ISO/gain to infer scene brightness.
+/// Cameras use longer exposure or higher ISO in darker scenes.
+fn classify_from_exposure(exposure: &ExposureMetadata) -> Option<(SceneBrightness, f32)> {
+    // Exposure time in seconds
+    let exp_time = exposure.exposure_time?;
+
+    // Get ISO or gain (normalize gain to ISO-like scale)
+    let iso = exposure.iso.map(|i| i as f32).or_else(|| {
+        // Map gain to approximate ISO: gain of 0 ~ ISO 100, gain of 255 ~ ISO 3200
+        exposure.gain.map(|g| 100.0 * (1.0 + g.max(0) as f32 / 32.0))
+    })?;
+
+    // Calculate exposure value (EV) approximation
+    // EV = log2(100 * f^2 / (ISO * t)) for f/2.0 (typical webcam)
+    // Simplified: higher EV = brighter scene
+    let ev = (100.0 * 4.0 / (iso * exp_time as f32)).log2();
+
+    debug!(
+        exposure_time = exp_time,
+        iso,
+        ev,
+        "V4L2 exposure-based brightness estimation"
+    );
+
+    // Map EV to brightness classification
+    // EV ~14+ is very bright (sunny outdoors)
+    // EV ~10-14 is bright (overcast, shade)
+    // EV ~6-10 is medium (indoor lighting)
+    // EV ~2-6 is low (dim indoor)
+    // EV <2 is very dark (night)
+    let (brightness, confidence) = if ev > 12.0 {
+        (SceneBrightness::VeryBright, 0.8)
+    } else if ev > 9.0 {
+        (SceneBrightness::Bright, 0.7)
+    } else if ev > 5.0 {
+        (SceneBrightness::Medium, 0.6)
+    } else if ev > 1.0 {
+        (SceneBrightness::Low, 0.7)
+    } else {
+        (SceneBrightness::VeryDark, 0.8)
+    };
+
+    Some((brightness, confidence))
+}
+
+/// Classify brightness from GPU histogram metrics
+///
+/// Uses histogram-derived metrics for more nuanced classification.
+fn classify_from_histogram(metrics: &GpuBrightnessMetrics) -> (SceneBrightness, f32) {
+    let mean = metrics.mean_luminance;
+    let median = metrics.median_luminance;
+    let p5 = metrics.percentile_5;
+    let p95 = metrics.percentile_95;
+    let dynamic_range = metrics.dynamic_range_stops;
+
+    // Use median as primary indicator (more robust to outliers than mean)
+    // But also consider dynamic range and shadow/highlight distribution
+
+    // High dynamic range scenes need more careful handling
+    let is_high_contrast = dynamic_range > 6.0;
+
+    // Determine base classification from median
+    let base_brightness = if median > 0.5 {
+        SceneBrightness::VeryBright
+    } else if median > 0.3 {
+        SceneBrightness::Bright
+    } else if median > 0.1 {
+        SceneBrightness::Medium
+    } else if median > 0.03 {
+        SceneBrightness::Low
+    } else {
+        SceneBrightness::VeryDark
+    };
+
+    // Calculate confidence based on histogram characteristics
+    let mut confidence: f32 = 0.9;
+
+    // Reduce confidence if mean and median diverge significantly (skewed histogram)
+    let skew = (mean - median).abs();
+    if skew > 0.1 {
+        confidence -= 0.1;
+    }
+
+    // High contrast scenes are harder to classify accurately
+    if is_high_contrast {
+        confidence -= 0.1;
+    }
+
+    // Boost confidence if shadows/highlights match expectation
+    match base_brightness {
+        SceneBrightness::VeryBright => {
+            if metrics.highlight_fraction > 0.2 {
+                confidence += 0.05;
+            }
+        }
+        SceneBrightness::VeryDark => {
+            if metrics.shadow_fraction > 0.3 {
+                confidence += 0.05;
+            }
+        }
+        _ => {}
+    }
+
+    debug!(
+        mean,
+        median,
+        p5,
+        p95,
+        dynamic_range,
+        ?base_brightness,
+        confidence,
+        "Histogram-based brightness classification"
+    );
+
+    (base_brightness, confidence.clamp(0.0, 1.0))
+}
+
+/// Perform comprehensive multi-metric brightness analysis
+///
+/// Combines three sources of brightness information:
+/// 1. GPU histogram (most accurate, uses percentiles and dynamic range)
+/// 2. V4L2 exposure settings (what the camera thinks brightness is)
+/// 3. Simple luminance average (fast fallback)
+///
+/// Returns fused classification with confidence score.
+pub fn analyze_brightness_multi(
+    frame: &CameraFrame,
+    exposure: Option<ExposureMetadata>,
+) -> MultiMetricBrightness {
+    // 1. Always compute simple luminance (fast, always works)
+    let (luminance_avg, simple_brightness) = estimate_scene_brightness(frame);
+    let simple_confidence = 0.5; // Lowest confidence - just averaging
+
+    // 2. Try GPU histogram analysis (most accurate)
+    let histogram = analyze_brightness_gpu(&frame.data, frame.width, frame.height);
+    let histogram_result = histogram.as_ref().map(classify_from_histogram);
+
+    // 3. Try V4L2 exposure analysis
+    let exposure_result = exposure.as_ref().and_then(classify_from_exposure);
+
+    // Fuse results using confidence-weighted voting
+    let mut votes: [(SceneBrightness, f32); 3] = [
+        (simple_brightness, simple_confidence),
+        histogram_result.unwrap_or((simple_brightness, 0.0)),
+        exposure_result.unwrap_or((simple_brightness, 0.0)),
+    ];
+
+    // Sort by confidence (highest first)
+    votes.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Use highest confidence result, but boost confidence if sources agree
+    let (classification, mut final_confidence) = votes[0];
+
+    // Check for agreement between sources
+    let sources_agree = votes
+        .iter()
+        .filter(|(b, c)| *c > 0.1 && *b == classification)
+        .count();
+
+    if sources_agree >= 2 {
+        final_confidence = (final_confidence + 0.1).min(1.0);
+    }
+
+    info!(
+        luminance_avg,
+        ?simple_brightness,
+        histogram_available = histogram.is_some(),
+        exposure_available = exposure.is_some(),
+        ?classification,
+        confidence = final_confidence,
+        sources_agreeing = sources_agree,
+        "Multi-metric brightness analysis complete"
+    );
+
+    MultiMetricBrightness {
+        luminance_avg,
+        histogram,
+        exposure,
+        classification,
+        confidence: final_confidence,
+    }
 }
 
 /// Capture a burst with adaptive sizing based on scene brightness
