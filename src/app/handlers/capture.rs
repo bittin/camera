@@ -610,7 +610,16 @@ impl AppModel {
                 return Task::done(cosmic::Action::App(Message::RefreshGalleryThumbnail));
             }
             Err(err) => {
-                error!(error = %err, "Failed to save photo");
+                let expected_dir = crate::app::get_photo_directory();
+                error!(
+                    error = %err,
+                    expected_directory = %expected_dir.display(),
+                    "Failed to save photo. This may be caused by: \
+                     1) Insufficient disk space, \
+                     2) Missing write permissions to the Pictures directory, \
+                     3) Flatpak sandbox restrictions (ensure xdg-pictures access is granted), \
+                     4) XDG_PICTURES_DIR pointing to an inaccessible location"
+                );
             }
         }
         Task::none()
@@ -666,7 +675,16 @@ impl AppModel {
                 return Task::done(cosmic::Action::App(Message::RefreshGalleryThumbnail));
             }
             Err(err) => {
-                error!(error = %err, "Failed to save recording");
+                let expected_dir = crate::app::get_photo_directory();
+                error!(
+                    error = %err,
+                    expected_directory = %expected_dir.display(),
+                    "Failed to save recording. This may be caused by: \
+                     1) Insufficient disk space, \
+                     2) Missing write permissions to the Pictures directory, \
+                     3) Flatpak sandbox restrictions (ensure xdg-pictures access is granted), \
+                     4) XDG_PICTURES_DIR pointing to an inaccessible location"
+                );
             }
         }
         Task::none()

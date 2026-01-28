@@ -11,7 +11,7 @@
 use super::processing::ProcessedImage;
 use image::{ImageFormat, RgbImage};
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 /// Supported encoding formats
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +198,27 @@ impl PhotoEncoder {
         encoded: EncodedImage,
         output_dir: PathBuf,
     ) -> Result<PathBuf, String> {
+        debug!(
+            output_dir = %output_dir.display(),
+            format = ?encoded.format,
+            size_bytes = encoded.data.len(),
+            "Preparing to save photo"
+        );
+
+        // Ensure output directory exists
+        if let Err(e) = tokio::fs::create_dir_all(&output_dir).await {
+            error!(
+                output_dir = %output_dir.display(),
+                error = %e,
+                "Failed to create output directory - check filesystem permissions and path validity"
+            );
+            return Err(format!(
+                "Failed to create output directory '{}': {}",
+                output_dir.display(),
+                e
+            ));
+        }
+
         // Generate filename with timestamp
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let filename = format!("IMG_{}.{}", timestamp, encoded.format.extension());
@@ -207,16 +228,37 @@ impl PhotoEncoder {
 
         // Write to disk in background task (I/O-bound)
         let filepath_clone = filepath.clone();
-        tokio::task::spawn_blocking(move || {
-            std::fs::write(&filepath_clone, &encoded.data)
-                .map_err(|e| format!("Failed to save photo: {}", e))?;
-            Ok::<_, String>(())
-        })
-        .await
-        .map_err(|e| format!("Save task error: {}", e))??;
+        let filepath_for_error = filepath.clone();
+        let write_result =
+            tokio::task::spawn_blocking(move || std::fs::write(&filepath_clone, &encoded.data))
+                .await;
 
-        info!(path = %filepath.display(), "Photo saved successfully");
-        Ok(filepath)
+        match write_result {
+            Ok(Ok(())) => {
+                info!(path = %filepath.display(), "Photo saved successfully");
+                Ok(filepath)
+            }
+            Ok(Err(io_err)) => {
+                error!(
+                    path = %filepath_for_error.display(),
+                    error = %io_err,
+                    "Failed to write photo to disk - check disk space and permissions"
+                );
+                Err(format!(
+                    "Failed to save photo to '{}': {}",
+                    filepath_for_error.display(),
+                    io_err
+                ))
+            }
+            Err(join_err) => {
+                error!(
+                    path = %filepath_for_error.display(),
+                    error = %join_err,
+                    "Save task panicked or was cancelled"
+                );
+                Err(format!("Save task error: {}", join_err))
+            }
+        }
     }
 
     /// Encode image as JPEG

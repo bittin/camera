@@ -62,12 +62,29 @@ pub use state::{
     VirtualCameraState,
 };
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-/// Get the photo save directory (~/Pictures/camera)
+/// Get the photo/video save directory
+///
+/// Uses XDG Pictures directory for proper flatpak compatibility.
+/// Falls back to $HOME/Pictures if XDG directory is unavailable.
 pub fn get_photo_directory() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    std::path::Path::new(&home).join("Pictures").join("camera")
+    let (base_dir, source) = if let Some(xdg_dir) = dirs::picture_dir() {
+        (xdg_dir, "XDG Pictures")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        (
+            std::path::Path::new(&home).join("Pictures").to_path_buf(),
+            "$HOME/Pictures fallback",
+        )
+    };
+    let photo_dir = base_dir.join("camera");
+    debug!(
+        path = %photo_dir.display(),
+        source = source,
+        "Resolved photo directory"
+    );
+    photo_dir
 }
 
 /// Ensure the photo directory exists, creating it if necessary
