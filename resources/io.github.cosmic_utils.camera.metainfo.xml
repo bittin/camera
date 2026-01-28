@@ -119,6 +119,18 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.21" date="2026-01-28">
+      <description>
+        <p>Release 0.1.21 includes the following changes:</p>
+        <ul>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 7 updates</li>
+          <li>deps(cargo): bump libcosmic from `f603959` to `cf19ac6`</li>
+          <li>Add distrobox setup for atomic desktop development</li>
+          <li>Fix flatpak photo save using XDG directories</li>
+          <li>i18n(cs): Add Czech translation</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.20" date="2026-01-08">
       <description>
         <p>Release 0.1.20 includes the following changes:</p>
