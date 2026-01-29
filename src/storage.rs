@@ -2,19 +2,21 @@
 
 //! Storage utilities for managing photo and video files
 
+use crate::constants::file_formats;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Load latest thumbnail for gallery button
 ///
-/// Scans the photos directory for JPEG and PNG files, finds the most recent one,
+/// Scans the directory for photo and video files, finds the most recent one,
 /// and loads it as both an image handle and RGBA data for custom rendering.
+/// For videos, extracts the first frame as a thumbnail.
 /// Returns (Handle, RGBA bytes wrapped in Arc, width, height)
 pub async fn load_latest_thumbnail(
     photos_dir: PathBuf,
 ) -> Option<(cosmic::widget::image::Handle, Arc<Vec<u8>>, u32, u32)> {
-    // Get list of photo files (using blocking std::fs)
+    // Get list of photo and video files (using blocking std::fs)
     let photos_dir_clone = photos_dir.clone();
     let mut entries = tokio::task::spawn_blocking(move || {
         let mut files = Vec::new();
@@ -22,8 +24,11 @@ pub async fn load_latest_thumbnail(
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
-                    let ext_str = ext.to_string_lossy();
-                    if ext_str.eq_ignore_ascii_case("jpg") || ext_str.eq_ignore_ascii_case("png") {
+                    let ext_str = ext.to_string_lossy().to_lowercase();
+                    // Include both image and video files
+                    if file_formats::is_image_extension(&ext_str)
+                        || file_formats::is_video_extension(&ext_str)
+                    {
                         files.push(entry);
                     }
                 }
@@ -47,8 +52,18 @@ pub async fn load_latest_thumbnail(
     });
 
     let latest_path = entries.first()?.path();
+    let extension = latest_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
 
     debug!(path = ?latest_path, "Loading latest thumbnail");
+
+    // Check if it's a video file
+    if file_formats::is_video_extension(&extension) {
+        return load_video_thumbnail(latest_path).await;
+    }
 
     // Load image bytes
     let bytes = tokio::fs::read(&latest_path).await.ok()?;
@@ -70,4 +85,54 @@ pub async fn load_latest_thumbnail(
     let handle = cosmic::widget::image::Handle::from_bytes(bytes);
 
     Some((handle, Arc::new(rgba_data), width, height))
+}
+
+/// Load a thumbnail from a video file by extracting the first frame
+async fn load_video_thumbnail(
+    video_path: PathBuf,
+) -> Option<(cosmic::widget::image::Handle, Arc<Vec<u8>>, u32, u32)> {
+    debug!(path = ?video_path, "Extracting thumbnail from video");
+
+    // Extract first frame from video in blocking task (uses GStreamer)
+    let result = tokio::task::spawn_blocking(move || {
+        use crate::backends::virtual_camera::load_preview_frame;
+
+        match load_preview_frame(&video_path) {
+            Ok(frame) => {
+                let width = frame.width;
+                let height = frame.height;
+                let rgba_data: Vec<u8> = frame.data.to_vec();
+
+                // Encode as PNG for the Handle
+                let png_bytes = encode_rgba_to_png(&rgba_data, width, height)?;
+
+                Some((png_bytes, rgba_data, width, height))
+            }
+            Err(e) => {
+                warn!(error = ?e, "Failed to extract video thumbnail");
+                None
+            }
+        }
+    })
+    .await
+    .ok()??;
+
+    let (png_bytes, rgba_data, width, height) = result;
+    let handle = cosmic::widget::image::Handle::from_bytes(png_bytes);
+
+    Some((handle, Arc::new(rgba_data), width, height))
+}
+
+/// Encode RGBA data to PNG bytes
+fn encode_rgba_to_png(rgba_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    use image::{ImageBuffer, Rgba};
+
+    let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(width, height, rgba_data.to_vec())?;
+
+    let mut png_bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut png_bytes);
+
+    img.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+
+    Some(png_bytes)
 }
