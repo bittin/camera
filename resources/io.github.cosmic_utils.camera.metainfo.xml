@@ -115,6 +115,16 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.23" date="2026-01-29">
+      <description>
+        <p>Release 0.1.23 includes the following changes:</p>
+        <ul>
+          <li>Blacklist SVT-AV1 and AOM AV1 software encoders</li>
+          <li>Add configurable save folder name with Camera as default</li>
+          <li>Show video thumbnails in gallery button</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.1.22" date="2026-01-29">
       <description>
         <p>Release 0.1.22 includes the following changes:</p>
