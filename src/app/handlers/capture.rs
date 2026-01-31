@@ -712,7 +712,7 @@ impl AppModel {
 
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
         let filename = format!("VID_{}.mp4", timestamp);
-        let save_dir = crate::app::get_photo_directory(&self.config.save_folder_name);
+        let save_dir = crate::app::get_video_directory(&self.config.save_folder_name);
         let output_path = save_dir.join(&filename);
 
         info!(
