@@ -64,7 +64,7 @@ pub use state::{
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
-/// Get the photo/video save directory
+/// Get the photo save directory
 ///
 /// Uses XDG Pictures directory for proper flatpak compatibility.
 /// Falls back to $HOME/Pictures if XDG directory is unavailable.
@@ -87,12 +87,43 @@ pub fn get_photo_directory(folder_name: &str) -> std::path::PathBuf {
     photo_dir
 }
 
+/// Get the video save directory
+///
+/// Uses XDG Videos directory for proper flatpak compatibility.
+/// Falls back to $HOME/Videos if XDG directory is unavailable.
+pub fn get_video_directory(folder_name: &str) -> std::path::PathBuf {
+    let (base_dir, source) = if let Some(xdg_dir) = dirs::video_dir() {
+        (xdg_dir, "XDG Videos")
+    } else {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        (
+            std::path::Path::new(&home).join("Videos").to_path_buf(),
+            "$HOME/Videos fallback",
+        )
+    };
+    let video_dir = base_dir.join(folder_name);
+    debug!(
+        path = %video_dir.display(),
+        source = source,
+        "Resolved video directory"
+    );
+    video_dir
+}
+
 /// Ensure the photo directory exists, creating it if necessary
 fn ensure_photo_directory(folder_name: &str) -> Result<std::path::PathBuf, std::io::Error> {
     let photo_dir = get_photo_directory(folder_name);
     std::fs::create_dir_all(&photo_dir)?;
     info!(path = %photo_dir.display(), "Photo directory ready");
     Ok(photo_dir)
+}
+
+/// Ensure the video directory exists, creating it if necessary
+fn ensure_video_directory(folder_name: &str) -> Result<std::path::PathBuf, std::io::Error> {
+    let video_dir = get_video_directory(folder_name);
+    std::fs::create_dir_all(&video_dir)?;
+    info!(path = %video_dir.display(), "Video directory ready");
+    Ok(video_dir)
 }
 
 const REPOSITORY: &str = "https://github.com/cosmic-utils/camera";
@@ -164,9 +195,12 @@ impl cosmic::Application for AppModel {
                 }
             };
 
-        // Ensure photo directory exists
+        // Ensure photo and video directories exist
         if let Err(e) = ensure_photo_directory(&config.save_folder_name) {
             error!(error = %e, "Failed to create photo directory");
+        }
+        if let Err(e) = ensure_video_directory(&config.save_folder_name) {
+            error!(error = %e, "Failed to create video directory");
         }
 
         // Initialize GStreamer early (required before any GStreamer calls)

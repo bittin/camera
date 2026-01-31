@@ -144,7 +144,7 @@ pub type VideoSettings = FormatSettings;
 pub struct Config {
     /// Application theme preference (System, Dark, Light)
     pub app_theme: AppTheme,
-    /// Folder name for saving photos and videos (inside Pictures/Videos directories)
+    /// Folder name for saving captures (photos go to XDG Pictures, videos go to XDG Videos)
     pub save_folder_name: String,
     /// Last used camera device path
     pub last_camera_path: Option<String>,
