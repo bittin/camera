@@ -5,7 +5,7 @@
 //! This module provides camera discovery and format enumeration using PipeWire.
 //! PipeWire handles all camera access, format negotiation, and decoding internally.
 
-use super::super::types::{CameraDevice, CameraFormat, DeviceInfo};
+use super::super::types::{CameraDevice, CameraFormat, DeviceInfo, SensorRotation};
 use crate::constants::formats;
 use tracing::{debug, info, warn};
 
@@ -49,6 +49,7 @@ pub fn enumerate_pipewire_cameras() -> Option<Vec<CameraDevice>> {
         path: String::new(), // Empty path = PipeWire auto-selects
         metadata_path: None,
         device_info: None,
+        rotation: SensorRotation::None,
     }])
 }
 
@@ -100,12 +101,16 @@ fn try_enumerate_with_pw_cli() -> Option<Vec<CameraDevice>> {
                             current_object_path.as_deref(),
                         );
 
-                        debug!(id = %id, serial = ?current_serial, name = %name, path = %path, "Found video camera");
+                        // Query rotation from pw-cli info (not available in pw-cli ls output)
+                        let rotation = query_node_rotation(id);
+
+                        debug!(id = %id, serial = ?current_serial, name = %name, path = %path, rotation = %rotation, "Found video camera");
                         cameras.push(CameraDevice {
                             name: name.clone(),
                             path,
                             metadata_path: Some(id.clone()), // Store node ID in metadata_path for format enumeration
                             device_info,
+                            rotation,
                         });
                     }
                 }
@@ -185,12 +190,16 @@ fn try_enumerate_with_pw_cli() -> Option<Vec<CameraDevice>> {
                 let device_info =
                     build_device_info(current_nick.as_deref(), current_object_path.as_deref());
 
-                debug!(id = %id, serial = ?current_serial, name = %name, path = %path, "Found video camera (last)");
+                // Query rotation from pw-cli info (not available in pw-cli ls output)
+                let rotation = query_node_rotation(id);
+
+                debug!(id = %id, serial = ?current_serial, name = %name, path = %path, rotation = %rotation, "Found video camera (last)");
                 cameras.push(CameraDevice {
                     name: name.clone(),
                     path,
                     metadata_path: Some(id.clone()), // Store node ID in metadata_path for format enumeration
                     device_info,
+                    rotation,
                 });
             }
         }
@@ -210,6 +219,36 @@ fn extract_quoted_value(line: &str) -> Option<String> {
     let start = line.find('"')?;
     let end = line[start + 1..].find('"')?;
     Some(line[start + 1..start + 1 + end].to_string())
+}
+
+/// Query rotation for a PipeWire node using pw-cli info
+/// This is needed because pw-cli ls Node doesn't include api.libcamera.rotation
+fn query_node_rotation(node_id: &str) -> SensorRotation {
+    let output = match std::process::Command::new("pw-cli")
+        .args(["info", node_id])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => {
+            debug!(node_id, "Failed to query node info for rotation");
+            return SensorRotation::default();
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        // Look for: api.libcamera.rotation = "90"
+        if trimmed.contains("api.libcamera.rotation") {
+            if let Some(value) = extract_quoted_value(trimmed) {
+                debug!(node_id, rotation = %value, "Found rotation from pw-cli info");
+                return SensorRotation::from_degrees(&value);
+            }
+        }
+    }
+
+    SensorRotation::default()
 }
 
 /// Build DeviceInfo from PipeWire properties and V4L2 device info
@@ -314,6 +353,7 @@ fn try_enumerate_with_pactl() -> Option<Vec<CameraDevice>> {
 
     // Simple parsing - look for video sources
     // This is a basic implementation, may need refinement
+    // Note: pactl doesn't provide rotation info, so we default to None
     for line in stdout.lines() {
         if line.contains("Name:") && line.contains("video") {
             if let Some(name) = line.split(':').nth(1) {
@@ -322,6 +362,7 @@ fn try_enumerate_with_pactl() -> Option<Vec<CameraDevice>> {
                     path: name.trim().to_string(),
                     metadata_path: None,
                     device_info: None,
+                    rotation: SensorRotation::None,
                 });
             }
         }

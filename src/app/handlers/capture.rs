@@ -726,6 +726,7 @@ impl AppModel {
 
         let device_path = camera.path.clone();
         let metadata_path = camera.metadata_path.clone();
+        let sensor_rotation = camera.rotation;
         let width = format.width;
         let height = format.height;
         let framerate = format.framerate.unwrap_or(30);
@@ -775,6 +776,7 @@ impl AppModel {
                     audio_device.as_deref(),
                     None,
                     selected_encoder.as_ref(),
+                    sensor_rotation,
                 ) {
                     Ok(r) => r,
                     Err(e) => return Err(e),

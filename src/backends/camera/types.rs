@@ -40,6 +40,74 @@ pub struct DeviceInfo {
     pub real_path: String,
 }
 
+/// Sensor rotation in degrees (clockwise)
+///
+/// Camera sensors may be physically mounted at various angles relative to the device.
+/// This is common on mobile devices where sensors are rotated 90° or 270° relative
+/// to the display orientation.
+///
+/// The rotation value comes from:
+/// - libcamera's `api.libcamera.rotation` property in PipeWire
+/// - Device tree sensor rotation values
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SensorRotation {
+    /// No rotation (sensor is oriented correctly)
+    #[default]
+    None,
+    /// 90 degrees clockwise
+    Rotate90,
+    /// 180 degrees (upside down)
+    Rotate180,
+    /// 270 degrees clockwise (90 degrees counter-clockwise)
+    Rotate270,
+}
+
+impl SensorRotation {
+    /// Parse rotation from a string value (degrees)
+    pub fn from_degrees(degrees: &str) -> Self {
+        match degrees.trim() {
+            "90" => SensorRotation::Rotate90,
+            "180" => SensorRotation::Rotate180,
+            "270" => SensorRotation::Rotate270,
+            "0" | "" => SensorRotation::None,
+            other => {
+                // Try to parse as integer and normalize
+                if let Ok(deg) = other.parse::<i32>() {
+                    match deg.rem_euclid(360) {
+                        90 => SensorRotation::Rotate90,
+                        180 => SensorRotation::Rotate180,
+                        270 => SensorRotation::Rotate270,
+                        _ => SensorRotation::None,
+                    }
+                } else {
+                    SensorRotation::None
+                }
+            }
+        }
+    }
+
+    /// Get the rotation in degrees
+    pub fn degrees(&self) -> u32 {
+        match self {
+            SensorRotation::None => 0,
+            SensorRotation::Rotate90 => 90,
+            SensorRotation::Rotate180 => 180,
+            SensorRotation::Rotate270 => 270,
+        }
+    }
+
+    /// Check if rotation swaps width and height
+    pub fn swaps_dimensions(&self) -> bool {
+        matches!(self, SensorRotation::Rotate90 | SensorRotation::Rotate270)
+    }
+}
+
+impl std::fmt::Display for SensorRotation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}°", self.degrees())
+    }
+}
+
 /// Represents a camera device
 #[derive(Debug, Clone)]
 pub struct CameraDevice {
@@ -47,6 +115,7 @@ pub struct CameraDevice {
     pub path: String,                    // Path to capture device (pipewire node ID)
     pub metadata_path: Option<String>,   // Path to metadata/control device or node ID
     pub device_info: Option<DeviceInfo>, // V4L2 device information (card, driver, path, real_path)
+    pub rotation: SensorRotation,        // Sensor rotation from libcamera/device tree
 }
 
 /// Camera format specification

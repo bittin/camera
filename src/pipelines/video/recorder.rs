@@ -10,7 +10,7 @@
 
 use super::encoder_selection::{EncoderConfig, select_encoders};
 use super::muxer::{create_muxer, link_audio_to_muxer, link_muxer_to_sink, link_video_to_muxer};
-use crate::backends::camera::types::CameraFrame;
+use crate::backends::camera::types::{CameraFrame, SensorRotation};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -41,10 +41,12 @@ impl VideoRecorder {
     /// * `enable_audio` - Whether to record audio
     /// * `audio_device` - Optional audio device path
     /// * `preview_sender` - Optional preview frame sender
+    /// * `rotation` - Sensor rotation to correct video orientation
     ///
     /// # Returns
     /// * `Ok(VideoRecorder)` - Video recorder instance
     /// * `Err(String)` - Error message
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_path: &str,
         metadata_path: Option<&str>,
@@ -58,6 +60,7 @@ impl VideoRecorder {
         audio_device: Option<&str>,
         preview_sender: Option<tokio::sync::mpsc::Sender<CameraFrame>>,
         encoder_info: Option<&crate::media::encoders::video::EncoderInfo>,
+        rotation: SensorRotation,
     ) -> Result<Self, String> {
         info!(
             device = %device_path,
@@ -114,14 +117,46 @@ impl VideoRecorder {
             .build()
             .map_err(|e| format!("Failed to create videoconvert: {}", e))?;
 
+        // Create videoflip element if rotation is needed
+        // GStreamer videoflip method values:
+        // 0 = none, 1 = clockwise 90°, 2 = rotate 180°, 3 = counter-clockwise 90° (270° clockwise)
+        let videoflip = if rotation != SensorRotation::None {
+            let flip_method = match rotation {
+                SensorRotation::Rotate90 => 1,  // clockwise 90°
+                SensorRotation::Rotate180 => 2, // 180°
+                SensorRotation::Rotate270 => 3, // counter-clockwise 90° (270° clockwise)
+                SensorRotation::None => 0,      // identity (won't happen due to outer if)
+            };
+            info!(
+                rotation = %rotation,
+                flip_method,
+                "Adding videoflip element to correct sensor rotation"
+            );
+            Some(
+                gst::ElementFactory::make("videoflip")
+                    .property("video-direction", flip_method as i32)
+                    .build()
+                    .map_err(|e| format!("Failed to create videoflip: {}", e))?,
+            )
+        } else {
+            None
+        };
+
         let videoscale = gst::ElementFactory::make("videoscale")
             .build()
             .map_err(|e| format!("Failed to create videoscale: {}", e))?;
 
+        // Account for dimension swap when rotation is 90° or 270°
+        let (base_width, base_height) = if rotation.swaps_dimensions() {
+            (height, width) // Swap dimensions for rotated video
+        } else {
+            (width, height)
+        };
+
         // OpenH264 has a maximum resolution limit of 9,437,184 pixels (roughly 3072x3072)
         // If resolution exceeds this and we're using openh264, downscale to 1920x1080
         let (final_width, final_height) = {
-            let pixels = width * height;
+            let pixels = base_width * base_height;
             const OPENH264_MAX_PIXELS: u32 = 9_437_184;
 
             let is_openh264 = encoders
@@ -133,7 +168,7 @@ impl VideoRecorder {
 
             if pixels > OPENH264_MAX_PIXELS && is_openh264 {
                 // Downscale to 1920x1080 maintaining aspect ratio
-                let aspect_ratio = width as f64 / height as f64;
+                let aspect_ratio = base_width as f64 / base_height as f64;
                 let target_width = 1920u32;
                 let target_height = (target_width as f64 / aspect_ratio) as u32;
                 // Make sure height is even (required for most encoders)
@@ -141,11 +176,16 @@ impl VideoRecorder {
 
                 warn!(
                     "OpenH264 resolution limit exceeded ({}x{} = {} pixels > {} max), downscaling to {}x{}",
-                    width, height, pixels, OPENH264_MAX_PIXELS, target_width, target_height
+                    base_width,
+                    base_height,
+                    pixels,
+                    OPENH264_MAX_PIXELS,
+                    target_width,
+                    target_height
                 );
                 (target_width, target_height)
             } else {
-                (width, height)
+                (base_width, base_height)
             }
         };
 
@@ -195,8 +235,13 @@ impl VideoRecorder {
             elements.push(decoder);
         }
 
+        elements.push(&videoconvert);
+
+        if let Some(ref flip) = videoflip {
+            elements.push(flip);
+        }
+
         elements.extend_from_slice(&[
-            &videoconvert,
             &videoscale,
             &capsfilter,
             &tee,
@@ -235,6 +280,7 @@ impl VideoRecorder {
             &source,
             jpeg_decoder.as_ref(),
             &videoconvert,
+            videoflip.as_ref(),
             &videoscale,
             &capsfilter,
             &tee,
@@ -420,6 +466,7 @@ impl VideoRecorder {
         source: &gst::Element,
         jpeg_decoder: Option<&gst::Element>,
         videoconvert: &gst::Element,
+        videoflip: Option<&gst::Element>,
         videoscale: &gst::Element,
         capsfilter: &gst::Element,
         tee: &gst::Element,
@@ -437,9 +484,19 @@ impl VideoRecorder {
                 .map_err(|_| "Failed to link source to videoconvert")?;
         }
 
-        videoconvert
-            .link(videoscale)
-            .map_err(|_| "Failed to link videoconvert to videoscale")?;
+        // Link videoconvert -> (optional videoflip) -> videoscale
+        if let Some(flip) = videoflip {
+            videoconvert
+                .link(flip)
+                .map_err(|_| "Failed to link videoconvert to videoflip")?;
+            flip.link(videoscale)
+                .map_err(|_| "Failed to link videoflip to videoscale")?;
+        } else {
+            videoconvert
+                .link(videoscale)
+                .map_err(|_| "Failed to link videoconvert to videoscale")?;
+        }
+
         videoscale
             .link(capsfilter)
             .map_err(|_| "Failed to link videoscale to capsfilter")?;
