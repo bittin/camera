@@ -717,6 +717,10 @@ impl cosmic::Application for AppModel {
                                 device_info: current_camera
                                     .as_ref()
                                     .and_then(|c| c.device_info.clone()),
+                                rotation: current_camera
+                                    .as_ref()
+                                    .map(|c| c.rotation)
+                                    .unwrap_or_default(),
                             };
 
                             let format = CameraFormat {

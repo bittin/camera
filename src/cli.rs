@@ -257,6 +257,7 @@ pub fn record_video(
         None, // Use default audio device
         None, // No preview sender needed for CLI
         None, // Auto-select encoder
+        camera.rotation,
     )?;
 
     // Start recording
