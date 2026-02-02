@@ -257,11 +257,15 @@ impl PipeWirePipeline {
                         );
                     }
 
-                    // Use Arc::from to avoid intermediate Vec allocation
+                    // Measure frame data copy time (Arc::from copies the slice data)
+                    let copy_start = Instant::now();
+                    let frame_data = Arc::from(map.as_slice());
+                    let copy_time = copy_start.elapsed();
+
                     let frame = CameraFrame {
                         width: video_info.width(),
                         height: video_info.height(),
-                        data: Arc::from(map.as_slice()),
+                        data: frame_data,
                         format: PixelFormat::RGBA,  // Pipeline outputs RGBA
                         stride,
                         captured_at: frame_start, // Use frame_start as capture timestamp
@@ -278,15 +282,23 @@ impl PipeWirePipeline {
                             // Performance stats every N frames
                             if frame_num % timing::FRAME_LOG_INTERVAL == 0 {
                                 let total_time = frame_start.elapsed();
+                                let size_bytes = map.as_slice().len();
+                                let copy_throughput_mbps = if copy_time.as_micros() > 0 {
+                                    (size_bytes as f64 / 1_000_000.0) / (copy_time.as_micros() as f64 / 1_000_000.0)
+                                } else {
+                                    0.0
+                                };
                                 debug!(
                                     frame = frame_num,
-                                    decode_us = decode_time.as_micros(),
-                                    send_us = send_time.as_micros(),
-                                    total_us = total_time.as_micros(),
+                                    decode_ms = format!("{:.2}", decode_time.as_micros() as f64 / 1000.0),
+                                    copy_ms = format!("{:.2}", copy_time.as_micros() as f64 / 1000.0),
+                                    send_ms = format!("{:.2}", send_time.as_micros() as f64 / 1000.0),
+                                    total_ms = format!("{:.2}", total_time.as_micros() as f64 / 1000.0),
                                     width = video_info.width(),
                                     height = video_info.height(),
-                                    size_kb = map.as_slice().len() / 1024,
-                                    "Frame performance"
+                                    size_mb = format!("{:.1}", size_bytes as f64 / 1_000_000.0),
+                                    copy_throughput_mbps = format!("{:.0}", copy_throughput_mbps),
+                                    "Frame capture"
                                 );
                             }
                         }
