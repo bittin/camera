@@ -1266,6 +1266,10 @@ pub enum Message {
 
     /// No-op message for async tasks that don't need a response
     Noop,
+
+    // ===== Menu Surface =====
+    /// Surface action from menu bar
+    Surface(cosmic::surface::Action),
 }
 
 impl TransitionState {
