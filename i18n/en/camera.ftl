@@ -155,3 +155,30 @@ settings-save-burst-raw-description = Save individual burst frames as DNG files 
 
 # About page
 about-support = Support & Feedback
+
+# Insights
+insights-title = Insights
+insights-pipeline = Pipeline
+insights-pipeline-full = GStreamer Pipeline
+insights-decoder-chain = Decoder Fallback Chain
+
+insights-performance = Live Performance
+insights-frame-latency = Frame Latency
+insights-dropped-frames = Dropped Frames
+insights-frame-size-decoded = Frame Size
+insights-decode-time-gst = Buffer Processing
+insights-copy-time = Frame Wrap Time
+insights-gpu-upload-time = GPU Upload Time
+insights-gpu-upload-bandwidth = GPU Upload Bandwidth
+
+insights-format = Format
+insights-format-source = Source
+insights-format-resolution = Resolution
+insights-format-framerate = Framerate
+insights-format-native = Native Format
+insights-format-gstreamer = GStreamer Output
+insights-format-wgpu = GPU Processing
+
+insights-selected = Selected
+insights-available = Available
+insights-unavailable = Unavailable

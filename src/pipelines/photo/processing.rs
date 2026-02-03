@@ -13,7 +13,7 @@
 
 use crate::app::FilterType;
 use crate::backends::camera::types::{CameraFrame, PixelFormat};
-use crate::shaders::{YuvFrameInput, apply_filter_gpu_rgba, get_yuv_convert_pipeline};
+use crate::shaders::{GpuFrameInput, apply_filter_gpu_rgba, get_gpu_convert_pipeline};
 use image::RgbImage;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -194,14 +194,14 @@ impl PostProcessor {
         let buffer_data = frame.data.as_ref();
         let yuv_planes = frame.yuv_planes.as_ref();
 
-        // Build YuvFrameInput from the frame
+        // Build GpuFrameInput from the frame
         let input = match frame.format {
-            PixelFormat::NV12 => {
-                let planes = yuv_planes.ok_or("NV12 frame missing yuv_planes")?;
+            PixelFormat::NV12 | PixelFormat::NV21 => {
+                let planes = yuv_planes.ok_or("NV12/NV21 frame missing yuv_planes")?;
                 let y_end = planes.y_offset + planes.y_size;
                 let uv_end = planes.uv_offset + planes.uv_size;
 
-                YuvFrameInput {
+                GpuFrameInput {
                     format: frame.format,
                     width: frame.width,
                     height: frame.height,
@@ -219,7 +219,7 @@ impl PostProcessor {
                 let u_end = planes.uv_offset + planes.uv_size;
                 let v_end = planes.v_offset + planes.v_size;
 
-                YuvFrameInput {
+                GpuFrameInput {
                     format: frame.format,
                     width: frame.width,
                     height: frame.height,
@@ -235,7 +235,22 @@ impl PostProcessor {
                     v_stride: planes.v_stride,
                 }
             }
-            PixelFormat::YUYV => YuvFrameInput {
+            // Packed 4:2:2 formats - all have same structure, just different byte order
+            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                GpuFrameInput {
+                    format: frame.format,
+                    width: frame.width,
+                    height: frame.height,
+                    y_data: buffer_data,
+                    y_stride: frame.stride,
+                    uv_data: None,
+                    uv_stride: 0,
+                    v_data: None,
+                    v_stride: 0,
+                }
+            }
+            // Single-plane formats: Gray8, RGB24
+            PixelFormat::Gray8 | PixelFormat::RGB24 => GpuFrameInput {
                 format: frame.format,
                 width: frame.width,
                 height: frame.height,
@@ -253,7 +268,7 @@ impl PostProcessor {
         };
 
         // Use GPU compute shader pipeline for conversion
-        let mut pipeline_guard = get_yuv_convert_pipeline()
+        let mut pipeline_guard = get_gpu_convert_pipeline()
             .await
             .map_err(|e| format!("Failed to get YUV convert pipeline: {}", e))?;
 

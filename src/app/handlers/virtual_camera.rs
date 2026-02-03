@@ -23,10 +23,10 @@ impl AppModel {
 
             // For video file sources, save the current playback position BEFORE stopping
             // so we can resume from this position later
-            if matches!(self.virtual_camera_file_source, Some(FileSource::Video(_))) {
-                if let Some((current_position, _, _)) = self.video_file_progress {
-                    self.video_preview_seek_position = current_position;
-                }
+            if matches!(self.virtual_camera_file_source, Some(FileSource::Video(_)))
+                && let Some((current_position, _, _)) = self.video_file_progress
+            {
+                self.video_preview_seek_position = current_position;
             }
 
             if let Some(sender) = self.virtual_camera.take_stop_sender() {
@@ -36,6 +36,12 @@ impl AppModel {
             // but don't send VirtualCameraStopped - the streaming thread will send it
             // when it actually stops. This avoids duplicate messages.
             self.virtual_camera = VirtualCameraState::Idle;
+
+            // Clear current frame to avoid accessing invalid mapped buffers
+            // The frame might contain a GStreamer mapped buffer that becomes invalid
+            // when the pipeline stops
+            self.current_frame = None;
+
             return Task::none();
         }
 
@@ -117,7 +123,7 @@ impl AppModel {
                     }
 
                     frame_count += 1;
-                    if frame_count % 30 == 0 {
+                    if frame_count.is_multiple_of(30) {
                         debug!(
                             frame = frame_count,
                             dropped = dropped_count,
@@ -339,7 +345,7 @@ impl AppModel {
             let _ = preview_tx.send(Arc::clone(&frame_arc));
 
             frame_count += 1;
-            if frame_count % 30 == 0 {
+            if frame_count.is_multiple_of(30) {
                 debug!(frame = frame_count, "Image streaming");
             }
 
@@ -516,7 +522,7 @@ impl AppModel {
                     }
 
                     frame_count += 1;
-                    if frame_count % 30 == 0 {
+                    if frame_count.is_multiple_of(30) {
                         debug!(frame = frame_count, "Video streaming");
                     }
                 }
@@ -811,10 +817,10 @@ impl AppModel {
 
         if self.virtual_camera.is_streaming() {
             // If streaming, send seek command to the streaming decoder
-            if let Some(ref tx) = self.video_playback_control_tx {
-                if tx.send(VideoPlaybackCommand::Seek(position)).is_ok() {
-                    info!(position, "Seeking streaming video to position");
-                }
+            if let Some(ref tx) = self.video_playback_control_tx
+                && tx.send(VideoPlaybackCommand::Seek(position)).is_ok()
+            {
+                info!(position, "Seeking streaming video to position");
             }
             Task::none()
         } else if let Some(ref tx) = self.video_preview_control_tx {

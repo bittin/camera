@@ -27,5 +27,7 @@ pub mod encoders;
 pub mod formats;
 
 // Re-export commonly used types
-pub use decoders::{PipelineBackend, detect_hw_decoders, try_create_pipeline};
+pub use decoders::{
+    PipelineBackend, detect_hw_decoders, get_full_pipeline_string, try_create_pipeline,
+};
 pub use formats::Codec;

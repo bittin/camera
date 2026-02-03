@@ -621,7 +621,7 @@ impl AppModel {
 
             if is_disabled {
                 row = row.push(
-                    widget::container(widget::icon(tools_icon.into()).size(20))
+                    widget::container(widget::icon(tools_icon).size(20))
                         .style(|_theme| widget::container::Style {
                             text_color: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
                             ..Default::default()
@@ -909,7 +909,7 @@ impl AppModel {
         ));
 
         // Distribute buttons into 2 rows
-        let items_per_row = (buttons.len() + 1) / 2; // Ceiling division
+        let items_per_row = buttons.len().div_ceil(2); // Ceiling division
         let mut rows: Vec<Element<'_, Message>> = Vec::new();
         let mut current_row: Vec<Element<'_, Message>> = Vec::new();
 

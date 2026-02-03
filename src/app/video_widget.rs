@@ -47,6 +47,7 @@ impl VideoWidget {
     /// * `crop_uv` - Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
     /// * `zoom_level` - Zoom level (1.0 = no zoom, 2.0 = 2x zoom)
     /// * `scroll_zoom_enabled` - Whether scroll wheel zoom is enabled
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         frame: Arc<CameraFrame>,
         video_id: u64,
@@ -90,8 +91,15 @@ impl VideoWidget {
                 // Fallback based on format
                 match frame.format {
                     PixelFormat::RGBA => frame.width * 4,
-                    PixelFormat::YUYV => frame.width * 2, // 2 bytes per pixel
-                    PixelFormat::NV12 | PixelFormat::I420 => frame.width, // Y plane stride
+                    PixelFormat::RGB24 => frame.width * 3, // 3 bytes per pixel
+                    PixelFormat::YUYV
+                    | PixelFormat::UYVY
+                    | PixelFormat::YVYU
+                    | PixelFormat::VYUY => {
+                        frame.width * 2 // 2 bytes per pixel
+                    }
+                    PixelFormat::NV12 | PixelFormat::NV21 | PixelFormat::I420 => frame.width, // Y plane stride
+                    PixelFormat::Gray8 => frame.width, // 1 byte per pixel
                 }
             };
 
@@ -102,7 +110,7 @@ impl VideoWidget {
                 data: frame.data.clone(), // Clone FrameData - just refcount increment, no data copy
                 format: frame.format,
                 stride,
-                yuv_planes: frame.yuv_planes.clone(),
+                yuv_planes: frame.yuv_planes,
             };
 
             primitive.update_frame(video_frame);
@@ -236,6 +244,7 @@ impl<'a> From<VideoWidget> for Element<'a, crate::app::Message, Theme, Renderer>
 /// * `crop_uv` - Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
 /// * `zoom_level` - Zoom level (1.0 = no zoom, 2.0 = 2x zoom)
 /// * `scroll_zoom_enabled` - Whether scroll wheel zoom is enabled
+#[allow(clippy::too_many_arguments)]
 pub fn video_widget<'a>(
     frame: Arc<CameraFrame>,
     video_id: u64,

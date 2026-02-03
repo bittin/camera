@@ -102,20 +102,25 @@ impl AppModel {
             );
 
         if let Some(formats) = resolution_groups.get(&selected_res) {
+            use crate::backends::camera::types::Framerate;
             use std::collections::HashSet;
-            let mut seen_fps: HashSet<u32> = HashSet::new();
-            let mut fps_buttons: Vec<(u32, usize)> = Vec::new();
+            let mut seen_fps: HashSet<Framerate> = HashSet::new();
+            let mut fps_buttons: Vec<(Framerate, usize)> = Vec::new();
 
             // Collect unique framerates
             for &(idx, fmt) in formats {
-                if let Some(fps) = fmt.framerate {
-                    if seen_fps.insert(fps) {
-                        fps_buttons.push((fps, idx));
-                    }
+                if let Some(fps) = fmt.framerate
+                    && seen_fps.insert(fps)
+                {
+                    fps_buttons.push((fps, idx));
                 }
             }
 
-            fps_buttons.sort_by_key(|(fps, _)| *fps);
+            fps_buttons.sort_by(|(a, _), (b, _)| {
+                a.as_f64()
+                    .partial_cmp(&b.as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             // Create framerate buttons
             for (fps, idx) in fps_buttons {

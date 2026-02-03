@@ -66,7 +66,7 @@ impl AppModel {
             let thumbnail: Element<'_, Message> = if let Some(frame) = &self.current_frame {
                 // Use video widget with the specific filter type
                 // The video widget fills its container and handles aspect ratio via Cover mode
-                let video_elem = video_widget::video_widget(
+                video_widget::video_widget(
                     Arc::clone(frame),
                     99, // Shared source texture ID for all filter previews
                     VideoContentFit::Cover,
@@ -76,9 +76,7 @@ impl AppModel {
                     None,  // No aspect ratio cropping in filter previews
                     1.0,   // No zoom for filter previews
                     false, // No scroll zoom for filter previews
-                );
-
-                video_elem
+                )
             } else {
                 // Fallback: colored placeholder when no camera frame
                 let color = Self::filter_placeholder_color(filter_type);

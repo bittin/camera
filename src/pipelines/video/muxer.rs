@@ -42,7 +42,7 @@ pub fn create_muxer(
     // Configure muxer for proper file output (non-streamable)
     // This ensures duration and indexes are written for seekable playback
     if muxer.has_property("streamable") {
-        let _ = muxer.set_property("streamable", false);
+        muxer.set_property("streamable", false);
         info!(muxer = %muxer_name, "Configured muxer with streamable=false for seekable output");
     }
 

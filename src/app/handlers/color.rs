@@ -96,18 +96,18 @@ impl AppModel {
 
                 // When switching to manual, read current temp and set it
                 // This preserves the temperature that auto mode was using
-                if switching_to_manual {
-                    if let Some(current_temp) = v4l2_controls::get_control(
+                if switching_to_manual
+                    && let Some(current_temp) = v4l2_controls::get_control(
                         &device_path,
                         v4l2_controls::V4L2_CID_WHITE_BALANCE_TEMPERATURE,
-                    ) {
-                        v4l2_controls::set_control(
-                            &device_path,
-                            v4l2_controls::V4L2_CID_WHITE_BALANCE_TEMPERATURE,
-                            current_temp,
-                        )?;
-                        return Ok(Some(current_temp));
-                    }
+                    )
+                {
+                    v4l2_controls::set_control(
+                        &device_path,
+                        v4l2_controls::V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+                        current_temp,
+                    )?;
+                    return Ok(Some(current_temp));
                 }
                 Ok(None)
             },

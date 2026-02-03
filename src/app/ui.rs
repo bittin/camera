@@ -18,6 +18,7 @@ impl AppModel {
     /// Returns:
     /// - A sorted list of (label, width) pairs representing unique resolution categories
     /// - A map from width to list of (index, format) pairs for that resolution
+    #[allow(clippy::type_complexity)]
     pub(crate) fn group_formats_by_label(
         &self,
     ) -> (
@@ -25,6 +26,7 @@ impl AppModel {
         HashMap<u32, Vec<(usize, &CameraFormat)>>,
     ) {
         // Group formats by their label (SD, HD, 4K, etc.) and pick the highest resolution for each
+        #[allow(clippy::type_complexity)]
         let mut label_to_best_format: HashMap<
             &'static str,
             (u32, u32, Vec<(usize, &CameraFormat)>),

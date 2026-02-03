@@ -315,8 +315,8 @@ impl GpuFilterPipeline {
             compute_pass.set_bind_group(0, Some(&bind_group), &[]);
 
             // Dispatch workgroups (16x16 threads per workgroup)
-            let workgroups_x = (width + 15) / 16;
-            let workgroups_y = (height + 15) / 16;
+            let workgroups_x = width.div_ceil(16);
+            let workgroups_y = height.div_ceil(16);
             compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 

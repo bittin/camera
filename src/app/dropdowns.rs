@@ -36,9 +36,11 @@ impl AppModel {
 
     /// Update framerate dropdown options based on current resolution (sorted highest to lowest)
     pub fn update_framerate_options(&mut self) {
+        use crate::backends::camera::types::Framerate;
+
         if let Some(active) = &self.active_format {
             // Get all unique framerates for current resolution
-            let mut available_framerates: Vec<u32> = self
+            let mut available_framerates: Vec<Framerate> = self
                 .available_formats
                 .iter()
                 .filter(|f| f.width == active.width && f.height == active.height)
@@ -47,8 +49,12 @@ impl AppModel {
                 .into_iter()
                 .collect();
 
-            // Sort from highest to lowest
-            available_framerates.sort_by(|a, b| b.cmp(a));
+            // Sort from highest to lowest by actual fps value
+            available_framerates.sort_by(|a, b| {
+                b.as_f64()
+                    .partial_cmp(&a.as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             self.framerate_dropdown_options = available_framerates
                 .into_iter()
@@ -137,14 +143,18 @@ impl AppModel {
 
         // Sort by: resolution descending, framerate descending, format alphabetical
         modes.sort_by(|a, b| {
-            let framerate_a = a.framerate.unwrap_or(0);
-            let framerate_b = b.framerate.unwrap_or(0);
+            let framerate_a = a.framerate.map(|f| f.as_f64()).unwrap_or(0.0);
+            let framerate_b = b.framerate.map(|f| f.as_f64()).unwrap_or(0.0);
             let pixels_a = a.width * a.height;
             let pixels_b = b.width * b.height;
 
             pixels_b
                 .cmp(&pixels_a) // resolution (pixels) descending
-                .then(framerate_b.cmp(&framerate_a)) // framerate descending
+                .then(
+                    framerate_b
+                        .partial_cmp(&framerate_a)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                ) // framerate descending
                 .then(a.pixel_format.cmp(&b.pixel_format)) // format alphabetical
         });
 
@@ -152,12 +162,15 @@ impl AppModel {
         self.mode_dropdown_options = modes
             .iter()
             .map(|f| {
-                let framerate = f.framerate.unwrap_or(0);
+                let framerate_str = f
+                    .framerate
+                    .map(|fr| fr.to_string())
+                    .unwrap_or_else(|| "0".to_string());
                 let codec_desc = get_codec_short_description(&f.pixel_format);
                 let codec_detail = get_codec_display_detail(&f.pixel_format);
                 format!(
                     "{}x{} @ {}fps - {} ({})",
-                    f.width, f.height, framerate, codec_desc, codec_detail
+                    f.width, f.height, framerate_str, codec_desc, codec_detail
                 )
             })
             .collect();

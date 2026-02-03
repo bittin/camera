@@ -449,9 +449,9 @@ fn configure_video_encoder(
     match encoder_name {
         // x264 software encoder
         "x264enc" => {
-            let _ = encoder.set_property_from_str("speed-preset", quality.x264_preset());
-            let _ = encoder.set_property_from_str("tune", "zerolatency");
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property_from_str("speed-preset", quality.x264_preset());
+            encoder.set_property_from_str("tune", "zerolatency");
+            encoder.set_property("bitrate", bitrate);
             debug!(
                 "Configured x264enc: preset={}, bitrate={} kbps",
                 quality.x264_preset(),
@@ -461,8 +461,8 @@ fn configure_video_encoder(
 
         // x265 software encoder
         "x265enc" => {
-            let _ = encoder.set_property_from_str("speed-preset", quality.x264_preset());
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property_from_str("speed-preset", quality.x264_preset());
+            encoder.set_property("bitrate", bitrate);
             debug!(
                 "Configured x265enc: preset={}, bitrate={} kbps",
                 quality.x264_preset(),
@@ -472,20 +472,20 @@ fn configure_video_encoder(
 
         // VA-API encoders (old plugin style - uses integer)
         "vaapih264enc" | "vaapih265enc" => {
-            let _ = encoder.set_property("rate-control", 2); // CBR
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property("rate-control", 2); // CBR
+            encoder.set_property("bitrate", bitrate);
             debug!("Configured VA-API encoder: bitrate={} kbps", bitrate);
         }
 
         // NVIDIA encoders
         "nvh264enc" | "nvh265enc" | "nvav1enc" => {
-            let _ = encoder.set_property("bitrate", bitrate);
-            let _ = encoder.set_property_from_str("rc-mode", "vbr"); // Variable bitrate
+            encoder.set_property("bitrate", bitrate);
+            encoder.set_property_from_str("rc-mode", "vbr"); // Variable bitrate
             let preset = match quality {
                 VideoQuality::Low | VideoQuality::Medium => "fast",
                 VideoQuality::High | VideoQuality::Maximum => "hq",
             };
-            let _ = encoder.set_property_from_str("preset", preset);
+            encoder.set_property_from_str("preset", preset);
             debug!(
                 "Configured NVIDIA encoder: preset={}, bitrate={} kbps",
                 preset, bitrate
@@ -501,10 +501,10 @@ fn configure_video_encoder(
         // OpenH264 (software H.264 encoder)
         "openh264enc" => {
             // Set rate control mode to bitrate mode using string enum
-            let _ = encoder.set_property_from_str("rate-control", "bitrate");
-            let _ = encoder.set_property("bitrate", bitrate * 1000); // Bits per second
+            encoder.set_property_from_str("rate-control", "bitrate");
+            encoder.set_property("bitrate", bitrate * 1000); // Bits per second
             // Set usage type to camera for real-time encoding
-            let _ = encoder.set_property_from_str("usage-type", "camera");
+            encoder.set_property_from_str("usage-type", "camera");
             debug!(
                 "Configured openh264enc: rate-control=bitrate, bitrate={} bps",
                 bitrate * 1000
@@ -513,14 +513,14 @@ fn configure_video_encoder(
 
         // SVT-AV1 encoder
         "svtav1enc" => {
-            let _ = encoder.set_property("target-bitrate", bitrate);
+            encoder.set_property("target-bitrate", bitrate);
             let preset = match quality {
                 VideoQuality::Low => 8,
                 VideoQuality::Medium => 6,
                 VideoQuality::High => 4,
                 VideoQuality::Maximum => 2,
             };
-            let _ = encoder.set_property("speed", preset);
+            encoder.set_property("speed", preset);
             debug!(
                 "Configured svtav1enc: preset={}, bitrate={} kbps",
                 preset, bitrate
@@ -529,14 +529,14 @@ fn configure_video_encoder(
 
         // AOM AV1 encoder
         "av1enc" => {
-            let _ = encoder.set_property("target-bitrate", bitrate * 1000); // bits per second
+            encoder.set_property("target-bitrate", bitrate * 1000); // bits per second
             let cpu_used = match quality {
                 VideoQuality::Low => 8,
                 VideoQuality::Medium => 5,
                 VideoQuality::High => 3,
                 VideoQuality::Maximum => 1,
             };
-            let _ = encoder.set_property("cpu-used", cpu_used);
+            encoder.set_property("cpu-used", cpu_used);
             debug!(
                 "Configured av1enc: cpu-used={}, bitrate={} bps",
                 cpu_used,
@@ -546,28 +546,28 @@ fn configure_video_encoder(
 
         // VA-API AV1 encoder
         "vaav1enc" | "vaapiavcenc" => {
-            let _ = encoder.set_property_from_str("rate-control", "cbr");
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property_from_str("rate-control", "cbr");
+            encoder.set_property("bitrate", bitrate);
             debug!("Configured VA-API AV1 encoder: bitrate={} kbps", bitrate);
         }
 
         // VA-API H.264/H.265 encoders (new plugin style - uses string)
         "vah264enc" | "vah265enc" => {
-            let _ = encoder.set_property_from_str("rate-control", "cbr");
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property_from_str("rate-control", "cbr");
+            encoder.set_property("bitrate", bitrate);
             debug!("Configured VA-API encoder: bitrate={} kbps", bitrate);
         }
 
         // AMD AMF encoders
         "amfh264enc" | "amfh265enc" | "amfav1enc" => {
-            let _ = encoder.set_property("bitrate", bitrate);
-            let _ = encoder.set_property_from_str("rate-control", "cbr");
+            encoder.set_property("bitrate", bitrate);
+            encoder.set_property_from_str("rate-control", "cbr");
             debug!("Configured AMD AMF encoder: bitrate={} kbps", bitrate);
         }
 
         // Intel QSV encoders
         "qsvh264enc" | "qsvh265enc" | "qsvav1enc" => {
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property("bitrate", bitrate);
             debug!("Configured Intel QSV encoder: bitrate={} kbps", bitrate);
         }
 

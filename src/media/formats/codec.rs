@@ -95,11 +95,14 @@ impl Codec {
             "YV12" => Self::YV12,
             "I420" | "IYUV" => Self::I420,
 
-            // RGB
-            "RGB3" | "RGB24" => Self::RGB24,
-            "RGB4" | "RGBA" | "RGB32" => Self::RGB32,
-            "BGR3" | "BGR24" => Self::BGR24,
-            "BGR4" | "BGRA" | "BGR32" => Self::BGR32,
+            // RGB - various naming conventions (V4L2, GStreamer, etc.)
+            "RGB" | "RGB3" | "RGB24" => Self::RGB24,
+            "RGBA" | "RGBX" | "RGB4" | "RGB32" => Self::RGB32,
+            "BGR" | "BGR3" | "BGR24" => Self::BGR24,
+            "BGRA" | "BGRX" | "BGR4" | "BGR32" => Self::BGR32,
+            // GStreamer ARGB/XRGB variants (alpha/padding in different positions)
+            "ARGB" | "XRGB" | "ARGB32" => Self::RGB32,
+            "ABGR" | "XBGR" | "ABGR32" => Self::BGR32,
 
             // Bayer patterns (V4L2 FourCC codes)
             "GRBG" | "BA81" | "SGRBG8" => Self::BayerGRBG,
@@ -109,11 +112,11 @@ impl Codec {
             // Generic "BAYER" defaults to GRBG (most common, Kinect uses this)
             "BAYER" => Self::BayerGRBG,
 
-            // Depth/IR
+            // Depth/IR/Grayscale
             "Y10B" => Self::Y10B,
             "IR10" => Self::IR10,
             "Y16" | "Y16 " => Self::Y16,
-            "GREY" | "Y8" | "Y800" => Self::GREY,
+            "GREY" | "GRAY8" | "Y8" | "Y800" => Self::GREY,
 
             _ => Self::Unknown,
         }
@@ -396,6 +399,23 @@ mod tests {
         assert_eq!(Codec::from_fourcc("GRBG"), Codec::BayerGRBG);
         assert_eq!(Codec::from_fourcc("BAYER"), Codec::BayerGRBG);
         assert_eq!(Codec::from_fourcc("UNKN"), Codec::Unknown);
+    }
+
+    #[test]
+    fn test_gstreamer_format_names() {
+        // GStreamer-style RGB variants
+        assert_eq!(Codec::from_fourcc("RGB"), Codec::RGB24);
+        assert_eq!(Codec::from_fourcc("RGBA"), Codec::RGB32);
+        assert_eq!(Codec::from_fourcc("RGBX"), Codec::RGB32);
+        assert_eq!(Codec::from_fourcc("BGR"), Codec::BGR24);
+        assert_eq!(Codec::from_fourcc("BGRA"), Codec::BGR32);
+        assert_eq!(Codec::from_fourcc("BGRX"), Codec::BGR32);
+        assert_eq!(Codec::from_fourcc("ARGB"), Codec::RGB32);
+        assert_eq!(Codec::from_fourcc("XRGB"), Codec::RGB32);
+        assert_eq!(Codec::from_fourcc("ABGR"), Codec::BGR32);
+        assert_eq!(Codec::from_fourcc("XBGR"), Codec::BGR32);
+        // GStreamer grayscale
+        assert_eq!(Codec::from_fourcc("GRAY8"), Codec::GREY);
     }
 
     #[test]

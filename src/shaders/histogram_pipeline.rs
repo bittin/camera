@@ -330,8 +330,8 @@ impl HistogramPipeline {
             pass.set_pipeline(&self.histogram_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             // Dispatch 16x16 workgroups
-            let workgroups_x = (width + 15) / 16;
-            let workgroups_y = (height + 15) / 16;
+            let workgroups_x = width.div_ceil(16);
+            let workgroups_y = height.div_ceil(16);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 

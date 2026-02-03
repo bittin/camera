@@ -384,17 +384,14 @@ impl VideoDecoder {
                     MessageView::StateChanged(state) => {
                         if state.src() == Some(video_pipeline.upcast_ref())
                             && state.current() == gstreamer::State::Playing
+                            && let Some(pad) = video_appsink.static_pad("sink")
+                            && let Some(caps) = pad.current_caps()
+                            && let Some(s) = caps.structure(0)
                         {
-                            if let Some(pad) = video_appsink.static_pad("sink") {
-                                if let Some(caps) = pad.current_caps() {
-                                    if let Some(s) = caps.structure(0) {
-                                        width = s.get::<i32>("width").unwrap_or(0) as u32;
-                                        height = s.get::<i32>("height").unwrap_or(0) as u32;
-                                        if width > 0 && height > 0 {
-                                            break;
-                                        }
-                                    }
-                                }
+                            width = s.get::<i32>("width").unwrap_or(0) as u32;
+                            height = s.get::<i32>("height").unwrap_or(0) as u32;
+                            if width > 0 && height > 0 {
+                                break;
                             }
                         }
                     }
@@ -402,15 +399,14 @@ impl VideoDecoder {
                 }
             }
 
-            if let Some(pad) = video_appsink.static_pad("sink") {
-                if let Some(caps) = pad.current_caps() {
-                    if let Some(s) = caps.structure(0) {
-                        width = s.get::<i32>("width").unwrap_or(0) as u32;
-                        height = s.get::<i32>("height").unwrap_or(0) as u32;
-                        if width > 0 && height > 0 {
-                            break;
-                        }
-                    }
+            if let Some(pad) = video_appsink.static_pad("sink")
+                && let Some(caps) = pad.current_caps()
+                && let Some(s) = caps.structure(0)
+            {
+                width = s.get::<i32>("width").unwrap_or(0) as u32;
+                height = s.get::<i32>("height").unwrap_or(0) as u32;
+                if width > 0 && height > 0 {
+                    break;
                 }
             }
         }
@@ -575,13 +571,13 @@ impl VideoDecoder {
         }
 
         // Also restart audio pipeline if present
-        if let Some(ref audio_pipeline) = self.audio_pipeline {
-            if let Err(e) = audio_pipeline.seek_simple(
+        if let Some(ref audio_pipeline) = self.audio_pipeline
+            && let Err(e) = audio_pipeline.seek_simple(
                 gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
                 gstreamer::ClockTime::ZERO,
-            ) {
-                warn!(?e, "Audio seek failed");
-            }
+            )
+        {
+            warn!(?e, "Audio seek failed");
         }
 
         Ok(())
@@ -640,13 +636,13 @@ impl VideoDecoder {
         }
 
         // Also seek audio pipeline if present
-        if let Some(ref audio_pipeline) = self.audio_pipeline {
-            if let Err(e) = audio_pipeline.seek_simple(
+        if let Some(ref audio_pipeline) = self.audio_pipeline
+            && let Err(e) = audio_pipeline.seek_simple(
                 gstreamer::SeekFlags::FLUSH | gstreamer::SeekFlags::KEY_UNIT,
                 position,
-            ) {
-                warn!(?e, "Audio seek failed");
-            }
+            )
+        {
+            warn!(?e, "Audio seek failed");
         }
     }
 
@@ -667,10 +663,10 @@ impl VideoDecoder {
         }
 
         // Also pause/resume audio pipeline if present
-        if let Some(ref audio_pipeline) = self.audio_pipeline {
-            if let Err(e) = audio_pipeline.set_state(state) {
-                warn!(?e, "Failed to set audio pipeline state");
-            }
+        if let Some(ref audio_pipeline) = self.audio_pipeline
+            && let Err(e) = audio_pipeline.set_state(state)
+        {
+            warn!(?e, "Failed to set audio pipeline state");
         }
     }
 

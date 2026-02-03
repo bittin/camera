@@ -58,7 +58,7 @@ impl GpuFilterRenderer {
         let (device, queue, gpu_info) =
             gpu::create_low_priority_compute_device("virtual_camera_gpu")
                 .await
-                .map_err(|e| BackendError::InitializationFailed(e))?;
+                .map_err(BackendError::InitializationFailed)?;
 
         info!(
             name = %gpu_info.adapter_name,
@@ -315,8 +315,8 @@ impl GpuFilterRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, Some(&bind_group), &[]);
-            let workgroups_x = (frame.width + 15) / 16;
-            let workgroups_y = (frame.height + 15) / 16;
+            let workgroups_x = frame.width.div_ceil(16);
+            let workgroups_y = frame.height.div_ceil(16);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 

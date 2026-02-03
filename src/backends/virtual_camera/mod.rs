@@ -316,10 +316,10 @@ impl Default for VirtualCameraManager {
 
 impl Drop for VirtualCameraManager {
     fn drop(&mut self) {
-        if self.streaming {
-            if let Err(e) = self.stop() {
-                error!(?e, "Failed to stop virtual camera on drop");
-            }
+        if self.streaming
+            && let Err(e) = self.stop()
+        {
+            error!(?e, "Failed to stop virtual camera on drop");
         }
     }
 }

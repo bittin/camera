@@ -337,26 +337,26 @@ pub fn get_color_settings(
     device_path: &str,
     available: &AvailableExposureControls,
 ) -> ColorSettings {
-    let mut settings = ColorSettings::default();
-
     // Reset color controls to defaults
-    settings.contrast = reset_control_to_default(
-        device_path,
-        v4l2_controls::V4L2_CID_CONTRAST,
-        &available.contrast,
-    );
-    settings.saturation = reset_control_to_default(
-        device_path,
-        v4l2_controls::V4L2_CID_SATURATION,
-        &available.saturation,
-    );
-    settings.sharpness = reset_control_to_default(
-        device_path,
-        v4l2_controls::V4L2_CID_SHARPNESS,
-        &available.sharpness,
-    );
-    settings.hue =
-        reset_control_to_default(device_path, v4l2_controls::V4L2_CID_HUE, &available.hue);
+    let mut settings = ColorSettings {
+        contrast: reset_control_to_default(
+            device_path,
+            v4l2_controls::V4L2_CID_CONTRAST,
+            &available.contrast,
+        ),
+        saturation: reset_control_to_default(
+            device_path,
+            v4l2_controls::V4L2_CID_SATURATION,
+            &available.saturation,
+        ),
+        sharpness: reset_control_to_default(
+            device_path,
+            v4l2_controls::V4L2_CID_SHARPNESS,
+            &available.sharpness,
+        ),
+        hue: reset_control_to_default(device_path, v4l2_controls::V4L2_CID_HUE, &available.hue),
+        ..Default::default()
+    };
 
     // Reset white balance to auto mode
     if available.has_white_balance_auto {

@@ -12,13 +12,13 @@
 //!
 //! All pipelines operate on RGBA textures for uniform downstream processing.
 
+mod gpu_convert;
 mod gpu_filter;
 mod histogram_pipeline;
-mod yuv_convert;
 
+pub use gpu_convert::{GpuConvertPipeline, GpuFrameInput, get_gpu_convert_pipeline};
 pub use gpu_filter::{GpuFilterPipeline, apply_filter_gpu_rgba, get_gpu_filter_pipeline};
 pub use histogram_pipeline::{BrightnessMetrics, analyze_brightness_gpu};
-pub use yuv_convert::{YuvConvertPipeline, YuvFrameInput, get_yuv_convert_pipeline};
 
 /// Shared filter functions (WGSL)
 /// Contains: luminance(), hash(), apply_filter()

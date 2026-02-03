@@ -51,79 +51,73 @@ pub fn enumerate_audio_devices() -> Vec<AudioDevice> {
 
     // First pass: find the default audio source from metadata
     for node in &nodes {
-        if node.get("type").and_then(|v| v.as_str()) == Some("PipeWire:Interface:Metadata") {
-            if let Some(props) = node.get("props") {
-                if props.get("metadata.name").and_then(|v| v.as_str()) == Some("default") {
-                    if let Some(metadata) = node.get("metadata").and_then(|v| v.as_array()) {
-                        for entry in metadata {
-                            if entry.get("key").and_then(|v| v.as_str())
-                                == Some("default.audio.source")
-                                || entry.get("key").and_then(|v| v.as_str())
-                                    == Some("default.configured.audio.source")
-                            {
-                                if let Some(value) = entry.get("value") {
-                                    if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
-                                        default_node_name = Some(name.to_string());
-                                        debug!(default_source = %name, "Found default audio source from metadata");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
+        if node.get("type").and_then(|v| v.as_str()) == Some("PipeWire:Interface:Metadata")
+            && let Some(props) = node.get("props")
+            && props.get("metadata.name").and_then(|v| v.as_str()) == Some("default")
+        {
+            if let Some(metadata) = node.get("metadata").and_then(|v| v.as_array()) {
+                for entry in metadata {
+                    if (entry.get("key").and_then(|v| v.as_str()) == Some("default.audio.source")
+                        || entry.get("key").and_then(|v| v.as_str())
+                            == Some("default.configured.audio.source"))
+                        && let Some(value) = entry.get("value")
+                        && let Some(name) = value.get("name").and_then(|v| v.as_str())
+                    {
+                        default_node_name = Some(name.to_string());
+                        debug!(default_source = %name, "Found default audio source from metadata");
+                        break;
                     }
-                    break;
                 }
             }
+            break;
         }
     }
 
     // Second pass: collect all audio sources
     for node in &nodes {
-        if let Some(info) = node.get("info") {
-            if let Some(props) = info.get("props") {
-                if let Some(media_class) = props.get("media.class").and_then(|v| v.as_str()) {
-                    if media_class == "Audio/Source" {
-                        let name = props
-                            .get("node.nick")
-                            .or_else(|| props.get("node.description"))
-                            .or_else(|| props.get("node.name"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("Unknown Audio Device")
-                            .to_string();
+        if let Some(info) = node.get("info")
+            && let Some(props) = info.get("props")
+            && let Some(media_class) = props.get("media.class").and_then(|v| v.as_str())
+            && media_class == "Audio/Source"
+        {
+            let name = props
+                .get("node.nick")
+                .or_else(|| props.get("node.description"))
+                .or_else(|| props.get("node.name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown Audio Device")
+                .to_string();
 
-                        let serial = props
-                            .get("object.serial")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0")
-                            .to_string();
+            let serial = props
+                .get("object.serial")
+                .and_then(|v| v.as_str())
+                .unwrap_or("0")
+                .to_string();
 
-                        let node_name = props
-                            .get("node.name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
+            let node_name = props
+                .get("node.name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
-                        let is_default = default_node_name
-                            .as_ref()
-                            .map(|default| default == &node_name)
-                            .unwrap_or(false);
+            let is_default = default_node_name
+                .as_ref()
+                .map(|default| default == &node_name)
+                .unwrap_or(false);
 
-                        devices.push(AudioDevice {
-                            name,
-                            serial,
-                            node_name,
-                            is_default,
-                        });
+            devices.push(AudioDevice {
+                name,
+                serial,
+                node_name,
+                is_default,
+            });
 
-                        debug!(
-                            name = %devices.last().unwrap().name,
-                            serial = %devices.last().unwrap().serial,
-                            is_default = is_default,
-                            "Found audio input device"
-                        );
-                    }
-                }
-            }
+            debug!(
+                name = %devices.last().unwrap().name,
+                serial = %devices.last().unwrap().serial,
+                is_default = is_default,
+                "Found audio input device"
+            );
         }
     }
 
