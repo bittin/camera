@@ -27,12 +27,11 @@ pub async fn load_latest_thumbnail(
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
                     let ext_str = ext.to_string_lossy().to_lowercase();
-                    if file_formats::is_image_extension(&ext_str) {
-                        if let Ok(metadata) = entry.metadata() {
-                            if let Ok(modified) = metadata.modified() {
-                                files.push((path, modified));
-                            }
-                        }
+                    if file_formats::is_image_extension(&ext_str)
+                        && let Ok(metadata) = entry.metadata()
+                        && let Ok(modified) = metadata.modified()
+                    {
+                        files.push((path, modified));
                     }
                 }
             }
@@ -44,12 +43,11 @@ pub async fn load_latest_thumbnail(
                 let path = entry.path();
                 if let Some(ext) = path.extension() {
                     let ext_str = ext.to_string_lossy().to_lowercase();
-                    if file_formats::is_video_extension(&ext_str) {
-                        if let Ok(metadata) = entry.metadata() {
-                            if let Ok(modified) = metadata.modified() {
-                                files.push((path, modified));
-                            }
-                        }
+                    if file_formats::is_video_extension(&ext_str)
+                        && let Ok(metadata) = entry.metadata()
+                        && let Ok(modified) = metadata.modified()
+                    {
+                        files.push((path, modified));
                     }
                 }
             }

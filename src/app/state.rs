@@ -972,7 +972,6 @@ pub enum ContextPage {
 /// - **Settings**: Configuration, audio/video encoder selection
 /// - **System**: Bug reports, recovery, external URLs
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)]
 pub enum Message {
     // ===== UI Navigation =====
     /// Open external URL (repository, etc.)
@@ -1019,8 +1018,12 @@ pub enum Message {
     SetMeteringMode(MeteringMode),
     /// Toggle auto exposure priority (allow frame rate variation)
     ToggleAutoExposurePriority,
-    /// Exposure controls queried from camera
-    ExposureControlsQueried(AvailableExposureControls, ExposureSettings, ColorSettings),
+    /// Exposure controls queried from camera (boxed to reduce enum size)
+    ExposureControlsQueried(
+        Box<AvailableExposureControls>,
+        ExposureSettings,
+        ColorSettings,
+    ),
     /// Exposure control change applied successfully
     ExposureControlApplied,
     /// White balance toggled, with optional temperature value when switching to manual

@@ -493,7 +493,7 @@ impl AppModel {
 
     pub(crate) fn handle_exposure_controls_queried(
         &mut self,
-        controls: AvailableExposureControls,
+        controls: Box<AvailableExposureControls>,
         settings: ExposureSettings,
         color_settings: ColorSettings,
     ) -> Task<cosmic::Action<Message>> {
@@ -505,7 +505,7 @@ impl AppModel {
             has_iso = controls.iso.available,
             "Exposure controls queried"
         );
-        self.available_exposure_controls = controls;
+        self.available_exposure_controls = *controls;
         self.exposure_settings = Some(settings);
         self.color_settings = Some(color_settings);
         Task::none()
@@ -562,7 +562,7 @@ impl AppModel {
                 },
                 |(controls, settings, color_settings)| {
                     cosmic::Action::App(Message::ExposureControlsQueried(
-                        controls,
+                        Box::new(controls),
                         settings,
                         color_settings,
                     ))

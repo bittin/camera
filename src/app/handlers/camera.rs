@@ -207,7 +207,7 @@ impl AppModel {
                 },
                 |(controls, settings, color_settings)| {
                     cosmic::Action::App(Message::ExposureControlsQueried(
-                        controls,
+                        Box::new(controls),
                         settings,
                         color_settings,
                     ))

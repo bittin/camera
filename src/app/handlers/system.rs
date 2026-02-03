@@ -165,10 +165,10 @@ impl AppModel {
             "Toggled record audio"
         );
 
-        if let Some(handler) = self.config_handler.as_ref() {
-            if let Err(err) = self.config.write_entry(handler) {
-                error!(?err, "Failed to save record audio setting");
-            }
+        if let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save record audio setting");
         }
         Task::none()
     }
@@ -185,10 +185,10 @@ impl AppModel {
             info!(?encoder, "Selected audio encoder");
             self.config.audio_encoder = encoder;
 
-            if let Some(handler) = self.config_handler.as_ref() {
-                if let Err(err) = self.config.write_entry(handler) {
-                    error!(?err, "Failed to save audio encoder selection");
-                }
+            if let Some(handler) = self.config_handler.as_ref()
+                && let Err(err) = self.config.write_entry(handler)
+            {
+                error!(?err, "Failed to save audio encoder selection");
             }
         }
         Task::none()

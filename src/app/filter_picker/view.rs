@@ -68,14 +68,16 @@ impl AppModel {
                 // The video widget fills its container and handles aspect ratio via Cover mode
                 video_widget::video_widget(
                     Arc::clone(frame),
-                    99, // Shared source texture ID for all filter previews
-                    VideoContentFit::Cover,
-                    filter_type,
-                    corner_radius,
-                    self.config.mirror_preview,
-                    None,  // No aspect ratio cropping in filter previews
-                    1.0,   // No zoom for filter previews
-                    false, // No scroll zoom for filter previews
+                    video_widget::VideoWidgetConfig {
+                        video_id: 99, // Shared source texture ID for all filter previews
+                        content_fit: VideoContentFit::Cover,
+                        filter_type,
+                        corner_radius,
+                        mirror_horizontal: self.config.mirror_preview,
+                        crop_uv: None,   // No aspect ratio cropping in filter previews
+                        zoom_level: 1.0, // No zoom for filter previews
+                        scroll_zoom_enabled: false, // No scroll zoom for filter previews
+                    },
                 )
             } else {
                 // Fallback: colored placeholder when no camera frame

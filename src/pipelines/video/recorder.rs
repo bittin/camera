@@ -18,6 +18,36 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
+/// Configuration for creating a video recorder
+pub struct VideoRecorderConfig<'a> {
+    /// Camera device path
+    pub device_path: &'a str,
+    /// Optional metadata path for PipeWire
+    pub metadata_path: Option<&'a str>,
+    /// Video width
+    pub width: u32,
+    /// Video height
+    pub height: u32,
+    /// Video framerate
+    pub framerate: u32,
+    /// Pixel format (e.g., "NV12", "MJPEG")
+    pub pixel_format: &'a str,
+    /// Output file path
+    pub output_path: PathBuf,
+    /// Encoder configuration
+    pub encoder_config: EncoderConfig,
+    /// Whether to record audio
+    pub enable_audio: bool,
+    /// Optional audio device path
+    pub audio_device: Option<&'a str>,
+    /// Optional preview frame sender
+    pub preview_sender: Option<tokio::sync::mpsc::Sender<CameraFrame>>,
+    /// Specific encoder info (if None, auto-select)
+    pub encoder_info: Option<&'a crate::media::encoders::video::EncoderInfo>,
+    /// Sensor rotation to correct video orientation
+    pub rotation: SensorRotation,
+}
+
 /// Video recorder using the new pipeline architecture
 #[derive(Debug)]
 pub struct VideoRecorder {
@@ -31,38 +61,28 @@ impl VideoRecorder {
     /// Create a new video recorder with intelligent encoder selection
     ///
     /// # Arguments
-    /// * `device_path` - Camera device path
-    /// * `metadata_path` - Optional metadata path for PipeWire
-    /// * `width` - Video width
-    /// * `height` - Video height
-    /// * `framerate` - Video framerate
-    /// * `pixel_format` - Pixel format (e.g., "NV12", "MJPEG")
-    /// * `output_path` - Output file path
-    /// * `config` - Encoder configuration
-    /// * `enable_audio` - Whether to record audio
-    /// * `audio_device` - Optional audio device path
-    /// * `preview_sender` - Optional preview frame sender
-    /// * `rotation` - Sensor rotation to correct video orientation
+    /// * `config` - Video recorder configuration
     ///
     /// # Returns
     /// * `Ok(VideoRecorder)` - Video recorder instance
     /// * `Err(String)` - Error message
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        device_path: &str,
-        metadata_path: Option<&str>,
-        width: u32,
-        height: u32,
-        framerate: u32,
-        pixel_format: &str,
-        output_path: PathBuf,
-        config: EncoderConfig,
-        enable_audio: bool,
-        audio_device: Option<&str>,
-        preview_sender: Option<tokio::sync::mpsc::Sender<CameraFrame>>,
-        encoder_info: Option<&crate::media::encoders::video::EncoderInfo>,
-        rotation: SensorRotation,
-    ) -> Result<Self, String> {
+    pub fn new(config: VideoRecorderConfig<'_>) -> Result<Self, String> {
+        let VideoRecorderConfig {
+            device_path,
+            metadata_path,
+            width,
+            height,
+            framerate,
+            pixel_format,
+            output_path,
+            encoder_config,
+            enable_audio,
+            audio_device,
+            preview_sender,
+            encoder_info,
+            rotation,
+        } = config;
+
         info!(
             device = %device_path,
             metadata = ?metadata_path,
@@ -80,9 +100,13 @@ impl VideoRecorder {
 
         // Select encoders (use specific encoder if provided, otherwise auto-select)
         let encoders = if let Some(enc_info) = encoder_info {
-            super::encoder_selection::select_encoders_with_video(&config, enc_info, enable_audio)?
+            super::encoder_selection::select_encoders_with_video(
+                &encoder_config,
+                enc_info,
+                enable_audio,
+            )?
         } else {
-            select_encoders(&config, enable_audio)?
+            select_encoders(&encoder_config, enable_audio)?
         };
 
         info!(
