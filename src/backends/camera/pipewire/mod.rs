@@ -61,8 +61,10 @@ impl PipeWireBackend {
             .as_ref()
             .ok_or_else(|| BackendError::Other("No format set".to_string()))?;
 
-        // Create frame channel
-        let (sender, receiver) = cosmic::iced::futures::channel::mpsc::channel(100);
+        // Create frame channel (small capacity for low latency)
+        let (sender, receiver) = cosmic::iced::futures::channel::mpsc::channel(
+            crate::constants::latency::FRAME_CHANNEL_CAPACITY,
+        );
 
         // Create pipeline
         let pipeline = pipeline::PipeWirePipeline::new(device, format, sender.clone())?;
