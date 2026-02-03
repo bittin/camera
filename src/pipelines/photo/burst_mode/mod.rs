@@ -1732,7 +1732,6 @@ impl BurstModeGpuPipeline {
             // Align using pre-allocated buffers
             let gpu_frame = self
                 .align_single_frame_pooled(
-                    &ref_rgba_buffer,
                     &ref_pyramids,
                     frame,
                     width,
@@ -1906,7 +1905,6 @@ impl BurstModeGpuPipeline {
     #[allow(clippy::too_many_arguments)]
     async fn align_single_frame_pooled(
         &self,
-        _ref_rgba_buffer: &wgpu::Buffer,
         ref_pyramids: &ReferencePyramids,
         comparison: &CameraFrame,
         width: u32,

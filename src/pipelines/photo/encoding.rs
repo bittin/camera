@@ -9,7 +9,7 @@
 //! All encoding operations run asynchronously to avoid blocking.
 
 use super::processing::ProcessedImage;
-use image::{ImageFormat, RgbImage};
+use image::RgbImage;
 use std::path::PathBuf;
 use tracing::{debug, error, info};
 
@@ -31,16 +31,6 @@ impl EncodingFormat {
             EncodingFormat::Jpeg => "jpg",
             EncodingFormat::Png => "png",
             EncodingFormat::Dng => "dng",
-        }
-    }
-
-    /// Convert to image crate's ImageFormat (returns None for DNG)
-    #[allow(clippy::wrong_self_convention)]
-    fn to_image_format(&self) -> Option<ImageFormat> {
-        match self {
-            EncodingFormat::Jpeg => Some(ImageFormat::Jpeg),
-            EncodingFormat::Png => Some(ImageFormat::Png),
-            EncodingFormat::Dng => None, // DNG uses separate encoding
         }
     }
 }

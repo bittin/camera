@@ -29,6 +29,27 @@ pub enum VideoContentFit {
     Cover,
 }
 
+/// Configuration for creating a video widget
+#[derive(Debug, Clone)]
+pub struct VideoWidgetConfig {
+    /// Unique identifier for this video stream
+    pub video_id: u64,
+    /// How to scale content within bounds
+    pub content_fit: VideoContentFit,
+    /// Filter to apply to the video
+    pub filter_type: FilterType,
+    /// Corner radius for rounded corners (0.0 for sharp corners)
+    pub corner_radius: f32,
+    /// Whether to mirror the video horizontally
+    pub mirror_horizontal: bool,
+    /// Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
+    pub crop_uv: Option<(f32, f32, f32, f32)>,
+    /// Zoom level (1.0 = no zoom, 2.0 = 2x zoom)
+    pub zoom_level: f32,
+    /// Whether scroll wheel zoom is enabled
+    pub scroll_zoom_enabled: bool,
+}
+
 /// Video widget that renders camera frames using a custom GPU primitive
 pub struct VideoWidget {
     primitive: VideoPrimitive,
@@ -44,30 +65,18 @@ impl VideoWidget {
     /// Create a new video widget from a camera frame
     ///
     /// # Arguments
-    /// * `crop_uv` - Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
-    /// * `zoom_level` - Zoom level (1.0 = no zoom, 2.0 = 2x zoom)
-    /// * `scroll_zoom_enabled` - Whether scroll wheel zoom is enabled
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        frame: Arc<CameraFrame>,
-        video_id: u64,
-        content_fit: VideoContentFit,
-        filter_type: FilterType,
-        corner_radius: f32,
-        mirror_horizontal: bool,
-        crop_uv: Option<(f32, f32, f32, f32)>,
-        zoom_level: f32,
-        scroll_zoom_enabled: bool,
-    ) -> Self {
-        let mut primitive = VideoPrimitive::new(video_id);
-        primitive.filter_type = filter_type;
-        primitive.corner_radius = corner_radius;
-        primitive.mirror_horizontal = mirror_horizontal;
-        primitive.crop_uv = crop_uv;
-        primitive.zoom_level = zoom_level;
+    /// * `frame` - The camera frame to display
+    /// * `config` - Widget configuration options
+    pub fn new(frame: Arc<CameraFrame>, config: VideoWidgetConfig) -> Self {
+        let mut primitive = VideoPrimitive::new(config.video_id);
+        primitive.filter_type = config.filter_type;
+        primitive.corner_radius = config.corner_radius;
+        primitive.mirror_horizontal = config.mirror_horizontal;
+        primitive.crop_uv = config.crop_uv;
+        primitive.zoom_level = config.zoom_level;
 
         // Calculate aspect ratio from frame dimensions, adjusted for crop
-        let aspect_ratio = if let Some((u_min, v_min, u_max, v_max)) = crop_uv {
+        let aspect_ratio = if let Some((u_min, v_min, u_max, v_max)) = config.crop_uv {
             // Use cropped region's aspect ratio
             let crop_width = (u_max - u_min) * frame.width as f32;
             let crop_height = (v_max - v_min) * frame.height as f32;
@@ -104,7 +113,7 @@ impl VideoWidget {
             };
 
             let video_frame = VideoFrame {
-                id: video_id,
+                id: config.video_id,
                 width: frame.width,
                 height: frame.height,
                 data: frame.data.clone(), // Clone FrameData - just refcount increment, no data copy
@@ -121,8 +130,8 @@ impl VideoWidget {
             width: Length::Fill,
             height: Length::Fill,
             aspect_ratio,
-            content_fit,
-            scroll_zoom_enabled,
+            content_fit: config.content_fit,
+            scroll_zoom_enabled: config.scroll_zoom_enabled,
         }
     }
 }
@@ -241,30 +250,11 @@ impl<'a> From<VideoWidget> for Element<'a, crate::app::Message, Theme, Renderer>
 /// Create a video widget from a camera frame
 ///
 /// # Arguments
-/// * `crop_uv` - Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
-/// * `zoom_level` - Zoom level (1.0 = no zoom, 2.0 = 2x zoom)
-/// * `scroll_zoom_enabled` - Whether scroll wheel zoom is enabled
-#[allow(clippy::too_many_arguments)]
+/// * `frame` - The camera frame to display
+/// * `config` - Widget configuration options
 pub fn video_widget<'a>(
     frame: Arc<CameraFrame>,
-    video_id: u64,
-    content_fit: VideoContentFit,
-    filter_type: FilterType,
-    corner_radius: f32,
-    mirror_horizontal: bool,
-    crop_uv: Option<(f32, f32, f32, f32)>,
-    zoom_level: f32,
-    scroll_zoom_enabled: bool,
+    config: VideoWidgetConfig,
 ) -> Element<'a, crate::app::Message, Theme, Renderer> {
-    Element::new(VideoWidget::new(
-        frame,
-        video_id,
-        content_fit,
-        filter_type,
-        corner_radius,
-        mirror_horizontal,
-        crop_uv,
-        zoom_level,
-        scroll_zoom_enabled,
-    ))
+    Element::new(VideoWidget::new(frame, config))
 }

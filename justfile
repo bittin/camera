@@ -50,8 +50,12 @@ build-vendored *args: vendor-extract (build-release '--frozen --offline' args)
 cargo-check *args:
     cargo check --all-features {{args}}
 
-# Runs clippy
+# Runs clippy (used in CI - default warnings only)
 clippy *args:
+    cargo clippy --all-features {{args}} -- -D warnings
+
+# Runs clippy with pedantic warnings (for development)
+clippy-pedantic *args:
     cargo clippy --all-features {{args}} -- -W clippy::pedantic
 
 # Runs clippy with JSON message format
@@ -69,8 +73,8 @@ fmt-check:
 test *args:
     cargo test {{args}}
 
-# Run all checks (format, cargo check, test)
-check: fmt-check cargo-check test
+# Run all checks (format, clippy, cargo check, test)
+check: fmt-check clippy cargo-check test
 
 # ============================================================================
 # Development

@@ -12,7 +12,7 @@ use camera::backends::camera::pipewire::{
 };
 use camera::backends::camera::types::{CameraFormat, CameraFrame};
 use camera::pipelines::photo::PhotoPipeline;
-use camera::pipelines::video::{EncoderConfig, VideoRecorder};
+use camera::pipelines::video::{EncoderConfig, VideoRecorder, VideoRecorderConfig};
 use chrono::Local;
 use futures::channel::mpsc;
 use std::path::{Path, PathBuf};
@@ -244,21 +244,21 @@ pub fn record_video(
     let encoder_config = EncoderConfig::default();
 
     // Create video recorder
-    let recorder = VideoRecorder::new(
-        &camera.path,
-        camera.metadata_path.as_deref(),
-        format.width,
-        format.height,
+    let recorder = VideoRecorder::new(VideoRecorderConfig {
+        device_path: &camera.path,
+        metadata_path: camera.metadata_path.as_deref(),
+        width: format.width,
+        height: format.height,
         framerate,
-        &format.pixel_format,
-        output_path.clone(),
+        pixel_format: &format.pixel_format,
+        output_path: output_path.clone(),
         encoder_config,
         enable_audio,
-        None, // Use default audio device
-        None, // No preview sender needed for CLI
-        None, // Auto-select encoder
-        camera.rotation,
-    )?;
+        audio_device: None,   // Use default audio device
+        preview_sender: None, // No preview sender needed for CLI
+        encoder_info: None,   // Auto-select encoder
+        rotation: camera.rotation,
+    })?;
 
     // Start recording
     println!();

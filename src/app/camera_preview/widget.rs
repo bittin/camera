@@ -103,14 +103,16 @@ impl AppModel {
 
             let video_elem = video_widget::video_widget(
                 frame.clone(),
-                video_id,
-                content_fit,
-                filter_mode,
-                0.0,
-                should_mirror,
-                crop_uv,
-                zoom_level,
-                scroll_zoom_enabled,
+                video_widget::VideoWidgetConfig {
+                    video_id,
+                    content_fit,
+                    filter_type: filter_mode,
+                    corner_radius: 0.0,
+                    mirror_horizontal: should_mirror,
+                    crop_uv,
+                    zoom_level,
+                    scroll_zoom_enabled,
+                },
             );
 
             widget::container(video_elem)

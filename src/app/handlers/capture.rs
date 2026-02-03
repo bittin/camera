@@ -757,6 +757,7 @@ impl AppModel {
             async move {
                 use crate::pipelines::video::{
                     AudioChannels, AudioQuality, EncoderConfig, VideoQuality, VideoRecorder,
+                    VideoRecorderConfig,
                 };
 
                 let config = EncoderConfig {
@@ -768,21 +769,21 @@ impl AppModel {
                     bitrate_override_kbps: Some(bitrate_kbps),
                 };
 
-                let recorder = match VideoRecorder::new(
-                    &device_path,
-                    metadata_path.as_deref(),
+                let recorder = match VideoRecorder::new(VideoRecorderConfig {
+                    device_path: &device_path,
+                    metadata_path: metadata_path.as_deref(),
                     width,
                     height,
                     framerate,
-                    &pixel_format,
-                    output_path.clone(),
-                    config,
-                    audio_device.is_some(),
-                    audio_device.as_deref(),
-                    None,
-                    selected_encoder.as_ref(),
-                    sensor_rotation,
-                ) {
+                    pixel_format: &pixel_format,
+                    output_path: output_path.clone(),
+                    encoder_config: config,
+                    enable_audio: audio_device.is_some(),
+                    audio_device: audio_device.as_deref(),
+                    preview_sender: None,
+                    encoder_info: selected_encoder.as_ref(),
+                    rotation: sensor_rotation,
+                }) {
                     Ok(r) => r,
                     Err(e) => return Err(e),
                 };
