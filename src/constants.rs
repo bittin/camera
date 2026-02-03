@@ -269,6 +269,23 @@ pub mod timing {
     pub const START_TIMEOUT_SECS: u64 = 5;
 }
 
+/// Frame latency optimization constants
+pub mod latency {
+    /// Frame channel capacity (smaller = lower latency, more drops)
+    /// At 30fps, 4 frames = ~130ms max queue latency
+    pub const FRAME_CHANNEL_CAPACITY: usize = 4;
+
+    /// Cancel flag check interval in milliseconds
+    /// Higher values reduce overhead but slow camera switching response
+    pub const CANCEL_CHECK_INTERVAL_MS: u64 = 100;
+
+    /// High latency warning threshold in microseconds (33ms = 2 frames at 60fps)
+    pub const HIGH_LATENCY_WARNING_US: u128 = 33_000;
+
+    /// Pipeline cleanup delay in milliseconds before creating new pipeline
+    pub const PIPELINE_CLEANUP_DELAY_MS: u64 = 20;
+}
+
 /// Resolution labels for format picker
 pub fn get_resolution_label(width: u32) -> Option<&'static str> {
     match width {

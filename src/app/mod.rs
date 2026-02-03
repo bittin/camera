@@ -672,8 +672,11 @@ impl cosmic::Application for AppModel {
                             // Note: Preview continues during recording since VideoRecorder has its own pipeline
                             // Both can access the same PipeWire node simultaneously
 
-                            // Give previous pipeline time to clean up (50ms should be enough)
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                            // Give previous pipeline time to clean up
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                crate::constants::latency::PIPELINE_CLEANUP_DELAY_MS,
+                            ))
+                            .await;
 
                             // Check cancel flag again after brief wait
                             if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
@@ -686,7 +689,9 @@ impl cosmic::Application for AppModel {
                             use crate::backends::camera::types::{CameraDevice, CameraFormat};
 
                             let (sender, mut receiver) =
-                                cosmic::iced::futures::channel::mpsc::channel(100);
+                                cosmic::iced::futures::channel::mpsc::channel(
+                                    crate::constants::latency::FRAME_CHANNEL_CAPACITY,
+                                );
 
                             // Build device and format objects for backend
                             let device = CameraDevice {
@@ -748,43 +753,57 @@ impl cosmic::Application for AppModel {
                                     }
 
                                     // Wait for next frame with a timeout to periodically check cancellation
-                                    // Use 16ms timeout (~60fps) to reduce frame delivery jitter
+                                    // Timeout only affects cancel flag checking - frames arrive immediately when ready
                                     match tokio::time::timeout(
-                                        tokio::time::Duration::from_millis(16),
+                                        tokio::time::Duration::from_millis(
+                                            crate::constants::latency::CANCEL_CHECK_INTERVAL_MS,
+                                        ),
                                         receiver.next(),
                                     )
                                     .await
                                     {
                                         Ok(Some(frame)) => {
+                                            // Drain any queued frames to get the most recent one (reduces latency)
+                                            let mut latest_frame = frame;
+                                            let mut drained_count = 0u32;
+                                            while let Ok(Some(newer_frame)) = receiver.try_next() {
+                                                latest_frame = newer_frame;
+                                                drained_count += 1;
+                                            }
+
                                             frame_count += 1;
                                             // Calculate frame latency (time from capture to subscription delivery)
                                             let latency_us =
-                                                frame.captured_at.elapsed().as_micros();
+                                                latest_frame.captured_at.elapsed().as_micros();
 
                                             if frame_count.is_multiple_of(30) {
                                                 debug!(
                                                     frame = frame_count,
-                                                    width = frame.width,
-                                                    height = frame.height,
+                                                    width = latest_frame.width,
+                                                    height = latest_frame.height,
                                                     latency_ms = latency_us as f64 / 1000.0,
+                                                    drained = drained_count,
                                                     "Received frame from pipeline"
                                                 );
                                             }
 
-                                            // Warn if latency exceeds 2 frame periods (>33ms at 60fps)
-                                            if latency_us > 33_000 {
+                                            // Warn if latency exceeds threshold
+                                            if latency_us
+                                                > crate::constants::latency::HIGH_LATENCY_WARNING_US
+                                            {
                                                 tracing::warn!(
                                                     frame = frame_count,
                                                     latency_ms = latency_us as f64 / 1000.0,
+                                                    drained = drained_count,
                                                     "High frame latency detected - possible stuttering"
                                                 );
                                             }
 
                                             // Use try_send to avoid blocking the subscription when UI is busy
                                             // Dropping frames is fine for live preview - we want the latest frame
-                                            match output
-                                                .try_send(Message::CameraFrame(Arc::new(frame)))
-                                            {
+                                            match output.try_send(Message::CameraFrame(Arc::new(
+                                                latest_frame,
+                                            ))) {
                                                 Ok(_) => {
                                                     if frame_count.is_multiple_of(30) {
                                                         debug!(
