@@ -135,7 +135,7 @@ impl VideoRecorder {
             );
             Some(
                 gst::ElementFactory::make("videoflip")
-                    .property("video-direction", flip_method as i32)
+                    .property("video-direction", flip_method)
                     .build()
                     .map_err(|e| format!("Failed to create videoflip: {}", e))?,
             )
@@ -329,11 +329,11 @@ impl VideoRecorder {
                 info!("Using PipeWire target-object serial: {}", serial);
                 builder = builder.property("target-object", serial);
             }
-        } else if device_path.starts_with("pipewire-") {
-            if let Some(node) = device_path.strip_prefix("pipewire-") {
-                info!("Using PipeWire target-object node name: {}", node);
-                builder = builder.property("target-object", node);
-            }
+        } else if device_path.starts_with("pipewire-")
+            && let Some(node) = device_path.strip_prefix("pipewire-")
+        {
+            info!("Using PipeWire target-object node name: {}", node);
+            builder = builder.property("target-object", node);
         }
         // If device_path is empty, PipeWire will use the default camera
 
@@ -429,7 +429,7 @@ impl VideoRecorder {
         // Apply 1.0x (unity gain) by default to match COSMIC settings behavior
         // Users should adjust input volume in COSMIC Sound Settings if needed
         // (Enable over-amplification there for up to 150% if mic is too quiet)
-        let _ = volume.set_property("volume", 1.0f64);
+        volume.set_property("volume", 1.0f64);
         debug!("Configured audio volume: 1.0x (unity gain, adjust in Sound Settings if needed)");
 
         // Add audio limiter to prevent clipping and overly loud audio
@@ -566,30 +566,28 @@ impl VideoRecorder {
             loop {
                 match appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
                     Some(sample) => {
-                        if let Some(buffer) = sample.buffer() {
-                            if let Some(caps) = sample.caps() {
-                                if let Ok(map) = buffer.map_readable() {
-                                    use gstreamer_video::VideoInfo;
+                        if let Some(buffer) = sample.buffer()
+                            && let Some(caps) = sample.caps()
+                            && let Ok(map) = buffer.map_readable()
+                        {
+                            use gstreamer_video::VideoInfo;
 
-                                    if let Ok(video_info) = VideoInfo::from_caps(caps) {
-                                        let stride = video_info.stride()[0] as u32;
+                            if let Ok(video_info) = VideoInfo::from_caps(caps) {
+                                let stride = video_info.stride()[0] as u32;
 
-                                        let frame = CameraFrame {
-                                            data: FrameData::Copied(Arc::from(
-                                                map.as_slice().to_vec().into_boxed_slice(),
-                                            )),
-                                            width: video_info.width(),
-                                            height: video_info.height(),
-                                            format:
-                                                crate::backends::camera::types::PixelFormat::RGBA,
-                                            stride,
-                                            yuv_planes: None,
-                                            captured_at: std::time::Instant::now(),
-                                        };
+                                let frame = CameraFrame {
+                                    data: FrameData::Copied(Arc::from(
+                                        map.as_slice().to_vec().into_boxed_slice(),
+                                    )),
+                                    width: video_info.width(),
+                                    height: video_info.height(),
+                                    format: crate::backends::camera::types::PixelFormat::RGBA,
+                                    stride,
+                                    yuv_planes: None,
+                                    captured_at: std::time::Instant::now(),
+                                };
 
-                                        let _ = preview_sender.send(frame).await;
-                                    }
-                                }
+                                let _ = preview_sender.send(frame).await;
                             }
                         }
                     }

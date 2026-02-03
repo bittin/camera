@@ -159,21 +159,21 @@ fn configure_opus_encoder(encoder: &gst::Element, quality: AudioQuality, channel
     let bitrate = quality.bitrate_bps();
 
     // Opus bitrate is in bits per second
-    let _ = encoder.set_property("bitrate", bitrate);
+    encoder.set_property("bitrate", bitrate);
 
     // Audio type: voice for mono, music for stereo/multi-channel
     let audio_type = match channels {
         AudioChannels::Mono => "voice",
         AudioChannels::Stereo | AudioChannels::MultiChannel(_) => "generic",
     };
-    let _ = encoder.set_property_from_str("audio-type", audio_type);
+    encoder.set_property_from_str("audio-type", audio_type);
 
     // Bandwidth: wide for voice, fullband for music
     let bandwidth = match channels {
         AudioChannels::Mono => "wideband",
         AudioChannels::Stereo | AudioChannels::MultiChannel(_) => "fullband",
     };
-    let _ = encoder.set_property_from_str("bandwidth", bandwidth);
+    encoder.set_property_from_str("bandwidth", bandwidth);
 
     debug!(
         "Configured opusenc: bitrate={} bps, audio-type={}, bandwidth={}",
@@ -193,19 +193,19 @@ fn configure_aac_encoder(
     match encoder_name {
         "avenc_aac" => {
             // avenc_aac uses bitrate in bits per second
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property("bitrate", bitrate);
             debug!("Configured avenc_aac: bitrate={} bps", bitrate);
         }
 
         "faac" => {
             // faac uses bitrate in kbps
-            let _ = encoder.set_property("bitrate", bitrate / 1000);
+            encoder.set_property("bitrate", bitrate / 1000);
             debug!("Configured faac: bitrate={} kbps", bitrate / 1000);
         }
 
         "voaacenc" => {
             // voaacenc uses bitrate in bits per second
-            let _ = encoder.set_property("bitrate", bitrate);
+            encoder.set_property("bitrate", bitrate);
             debug!("Configured voaacenc: bitrate={} bps", bitrate);
         }
 

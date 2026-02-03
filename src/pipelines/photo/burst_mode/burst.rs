@@ -273,7 +273,7 @@ pub fn estimate_scene_brightness(frame: &CameraFrame) -> (f32, SceneBrightness) 
         }
     }
 
-    let samples_taken = (pixels + sample_stride - 1) / sample_stride;
+    let samples_taken = pixels.div_ceil(sample_stride);
     let avg_luminance = (total_luminance / samples_taken as f64) as f32;
     let brightness = SceneBrightness::from_luminance(avg_luminance);
 

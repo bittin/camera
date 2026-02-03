@@ -4,9 +4,19 @@
 
 use crate::app::format_picker::preferences as format_selection;
 use crate::app::state::{AppModel, CameraMode};
-use crate::backends::camera::types::CameraFormat;
+use crate::backends::camera::types::{CameraFormat, Framerate};
 use cosmic::cosmic_config::CosmicConfigEntry;
 use tracing::{error, info};
+
+/// Helper to compare Framerate with config's u32 framerate
+/// Config stores integer fps, so we compare using the integer value
+fn framerate_matches_config(framerate: Option<&Framerate>, config_fps: Option<u32>) -> bool {
+    match (framerate, config_fps) {
+        (Some(fr), Some(fps)) => fr.matches_int(fps),
+        (None, None) => true,
+        _ => false,
+    }
+}
 
 impl AppModel {
     /// Check if switching to a different mode would change the camera format
@@ -32,20 +42,22 @@ impl AppModel {
         let formats_for_new_mode = backend.get_formats(&device, new_mode == CameraMode::Video);
 
         // Helper to check saved settings for a mode
-        let check_saved_settings =
-            |settings_map: &std::collections::HashMap<String, crate::config::FormatSettings>| {
-                settings_map
-                    .get(camera_path)
-                    .and_then(|settings| {
-                        formats_for_new_mode.iter().find(|f| {
-                            f.width == settings.width
-                                && f.height == settings.height
-                                && f.framerate == settings.framerate
-                                && f.pixel_format == settings.pixel_format
-                        })
+        let check_saved_settings = |settings_map: &std::collections::HashMap<
+            String,
+            crate::config::FormatSettings,
+        >| {
+            settings_map
+                .get(camera_path)
+                .and_then(|settings| {
+                    formats_for_new_mode.iter().find(|f| {
+                        f.width == settings.width
+                            && f.height == settings.height
+                            && framerate_matches_config(f.framerate.as_ref(), settings.framerate)
+                            && f.pixel_format == settings.pixel_format
                     })
-                    .cloned()
-            };
+                })
+                .cloned()
+        };
 
         // Determine what format would be selected in the new mode
         // Note: We don't use current format as fallback to avoid cross-contamination
@@ -102,10 +114,11 @@ impl AppModel {
         };
 
         // Create FormatSettings for this camera
+        // Convert Framerate to integer for config storage
         let format_settings = crate::config::FormatSettings {
             width: format.width,
             height: format.height,
-            framerate: format.framerate,
+            framerate: format.framerate.map(|fr| fr.as_int()),
             pixel_format: format.pixel_format.clone(),
         };
 
@@ -158,7 +171,7 @@ impl AppModel {
                 .find(|f| {
                     f.width == settings.width
                         && f.height == settings.height
-                        && f.framerate == settings.framerate
+                        && framerate_matches_config(f.framerate.as_ref(), settings.framerate)
                         && f.pixel_format == settings.pixel_format
                 })
                 .cloned()
@@ -179,7 +192,7 @@ impl AppModel {
                 .find(|f| {
                     f.width == settings.width
                         && f.height == settings.height
-                        && f.framerate == settings.framerate
+                        && framerate_matches_config(f.framerate.as_ref(), settings.framerate)
                         && f.pixel_format == settings.pixel_format
                 })
                 .cloned()
@@ -346,7 +359,7 @@ impl AppModel {
                     f.width == width
                         && f.height == height
                         && f.pixel_format == pixel_format
-                        && f.framerate == Some(fps)
+                        && f.framerate.map(|fr| fr.matches_int(fps)).unwrap_or(false)
                 })
                 .or_else(|| {
                     // Fall back to best format for this resolution and framerate
@@ -354,7 +367,9 @@ impl AppModel {
                         .available_formats
                         .iter()
                         .filter(|f| {
-                            f.width == width && f.height == height && f.framerate == Some(fps)
+                            f.width == width
+                                && f.height == height
+                                && f.framerate.map(|fr| fr.matches_int(fps)).unwrap_or(false)
                         })
                         .cloned()
                         .collect();

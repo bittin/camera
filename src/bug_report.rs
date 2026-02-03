@@ -46,7 +46,7 @@ impl BugReportGenerator {
             "**Runtime:** {}\n",
             app_info::runtime_environment()
         ));
-        report.push_str("\n");
+        report.push('\n');
 
         // System information
         report.push_str(&Self::get_system_info().await);
@@ -105,24 +105,24 @@ impl BugReportGenerator {
         let mut info = String::from("## System Information\n\n");
 
         // Linux kernel version
-        if let Ok(output) = Command::new("uname").arg("-r").output() {
-            if let Ok(kernel) = String::from_utf8(output.stdout) {
-                info.push_str(&format!("**Kernel:** {}\n", kernel.trim()));
-            }
+        if let Ok(output) = Command::new("uname").arg("-r").output()
+            && let Ok(kernel) = String::from_utf8(output.stdout)
+        {
+            info.push_str(&format!("**Kernel:** {}\n", kernel.trim()));
         }
 
         // Distribution info
-        if let Ok(output) = Command::new("cat").arg("/etc/os-release").output() {
-            if let Ok(os_release) = String::from_utf8(output.stdout) {
-                for line in os_release.lines() {
-                    if line.starts_with("PRETTY_NAME=") {
-                        let distro = line
-                            .strip_prefix("PRETTY_NAME=")
-                            .unwrap_or("")
-                            .trim_matches('"');
-                        info.push_str(&format!("**Distribution:** {}\n", distro));
-                        break;
-                    }
+        if let Ok(output) = Command::new("cat").arg("/etc/os-release").output()
+            && let Ok(os_release) = String::from_utf8(output.stdout)
+        {
+            for line in os_release.lines() {
+                if line.starts_with("PRETTY_NAME=") {
+                    let distro = line
+                        .strip_prefix("PRETTY_NAME=")
+                        .unwrap_or("")
+                        .trim_matches('"');
+                    info.push_str(&format!("**Distribution:** {}\n", distro));
+                    break;
                 }
             }
         }
@@ -143,13 +143,13 @@ impl BugReportGenerator {
         }
 
         // PipeWire version
-        if let Ok(output) = Command::new("pw-cli").arg("--version").output() {
-            if let Ok(pw_version) = String::from_utf8(output.stdout) {
-                info.push_str(&format!("**PipeWire Version:** {}\n", pw_version.trim()));
-            }
+        if let Ok(output) = Command::new("pw-cli").arg("--version").output()
+            && let Ok(pw_version) = String::from_utf8(output.stdout)
+        {
+            info.push_str(&format!("**PipeWire Version:** {}\n", pw_version.trim()));
         }
 
-        info.push_str("\n");
+        info.push('\n');
         info
     }
 
@@ -158,46 +158,44 @@ impl BugReportGenerator {
         let mut info = String::from("## GPU Information\n\n");
 
         // Try lspci for GPU info
-        if let Ok(output) = Command::new("lspci").output() {
-            if let Ok(lspci_output) = String::from_utf8(output.stdout) {
-                let gpu_lines: Vec<&str> = lspci_output
-                    .lines()
-                    .filter(|line| {
-                        line.contains("VGA") || line.contains("3D") || line.contains("Display")
-                    })
-                    .collect();
+        if let Ok(output) = Command::new("lspci").output()
+            && let Ok(lspci_output) = String::from_utf8(output.stdout)
+        {
+            let gpu_lines: Vec<&str> = lspci_output
+                .lines()
+                .filter(|line| {
+                    line.contains("VGA") || line.contains("3D") || line.contains("Display")
+                })
+                .collect();
 
-                if !gpu_lines.is_empty() {
-                    for line in gpu_lines {
-                        info.push_str(&format!("- {}\n", line));
-                    }
-                    info.push_str("\n");
+            if !gpu_lines.is_empty() {
+                for line in gpu_lines {
+                    info.push_str(&format!("- {}\n", line));
                 }
+                info.push('\n');
             }
         }
 
         // Try glxinfo for more details (if available)
-        if let Ok(output) = Command::new("glxinfo").arg("-B").output() {
-            if output.status.success() {
-                if let Ok(glx_output) = String::from_utf8(output.stdout) {
-                    info.push_str("### GLX Information\n\n");
-                    info.push_str("```\n");
-                    info.push_str(&glx_output);
-                    info.push_str("```\n\n");
-                }
-            }
+        if let Ok(output) = Command::new("glxinfo").arg("-B").output()
+            && output.status.success()
+            && let Ok(glx_output) = String::from_utf8(output.stdout)
+        {
+            info.push_str("### GLX Information\n\n");
+            info.push_str("```\n");
+            info.push_str(&glx_output);
+            info.push_str("```\n\n");
         }
 
         // Try vulkaninfo (if available)
-        if let Ok(output) = Command::new("vulkaninfo").arg("--summary").output() {
-            if output.status.success() {
-                if let Ok(vk_output) = String::from_utf8(output.stdout) {
-                    info.push_str("### Vulkan Information\n\n");
-                    info.push_str("```\n");
-                    info.push_str(&vk_output);
-                    info.push_str("```\n\n");
-                }
-            }
+        if let Ok(output) = Command::new("vulkaninfo").arg("--summary").output()
+            && output.status.success()
+            && let Ok(vk_output) = String::from_utf8(output.stdout)
+        {
+            info.push_str("### Vulkan Information\n\n");
+            info.push_str("```\n");
+            info.push_str(&vk_output);
+            info.push_str("```\n\n");
         }
 
         if info == "## GPU Information\n\n" {
@@ -222,7 +220,7 @@ impl BugReportGenerator {
             if let Some(metadata_path) = &device.metadata_path {
                 info.push_str(&format!("- **Metadata Path:** {}\n", metadata_path));
             }
-            info.push_str("\n");
+            info.push('\n');
         }
 
         info
@@ -242,7 +240,7 @@ impl BugReportGenerator {
             info.push_str(&format!("- **Serial:** {}\n", device.serial));
             info.push_str(&format!("- **Node Name:** {}\n", device.node_name));
             info.push_str(&format!("- **Default:** {}\n", device.is_default));
-            info.push_str("\n");
+            info.push('\n');
         }
 
         info
@@ -282,7 +280,7 @@ impl BugReportGenerator {
                 encoder.is_hardware
             ));
             info.push_str(&format!("- **Priority:** {}\n", encoder.priority));
-            info.push_str("\n");
+            info.push('\n');
         }
 
         info
@@ -293,15 +291,14 @@ impl BugReportGenerator {
         let mut info = String::from("## PipeWire Detailed Information\n\n");
 
         // Get pw-dump output if available
-        if let Ok(output) = Command::new("pw-dump").output() {
-            if output.status.success() {
-                if let Ok(dump) = String::from_utf8(output.stdout) {
-                    info.push_str("```json\n");
-                    info.push_str(&dump);
-                    info.push_str("\n```\n\n");
-                    return info;
-                }
-            }
+        if let Ok(output) = Command::new("pw-dump").output()
+            && output.status.success()
+            && let Ok(dump) = String::from_utf8(output.stdout)
+        {
+            info.push_str("```json\n");
+            info.push_str(&dump);
+            info.push_str("\n```\n\n");
+            return info;
         }
 
         info.push_str("**pw-dump not available or failed**\n\n");

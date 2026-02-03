@@ -82,16 +82,11 @@ impl std::ops::Deref for FrameData {
 }
 
 /// Camera backend type (PipeWire only)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum CameraBackendType {
     /// PipeWire backend (modern Linux standard)
+    #[default]
     PipeWire,
-}
-
-impl Default for CameraBackendType {
-    fn default() -> Self {
-        Self::PipeWire
-    }
 }
 
 impl std::fmt::Display for CameraBackendType {
@@ -191,19 +186,86 @@ pub struct CameraDevice {
     pub rotation: SensorRotation,        // Sensor rotation from libcamera/device tree
 }
 
+/// Framerate as a fraction (numerator/denominator)
+/// Stores exact framerate to handle NTSC rates like 59.94fps (60000/1001)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Framerate {
+    pub num: u32,
+    pub denom: u32,
+}
+
+impl Framerate {
+    /// Create a new framerate from numerator and denominator
+    pub fn new(num: u32, denom: u32) -> Self {
+        Self {
+            num,
+            denom: if denom == 0 { 1 } else { denom },
+        }
+    }
+
+    /// Create a framerate from an integer (e.g., 30 becomes 30/1)
+    pub fn from_int(fps: u32) -> Self {
+        Self { num: fps, denom: 1 }
+    }
+
+    /// Get the framerate as a floating point value
+    pub fn as_f64(&self) -> f64 {
+        self.num as f64 / self.denom as f64
+    }
+
+    /// Get the rounded integer framerate (for backwards compatibility)
+    pub fn as_int(&self) -> u32 {
+        self.num / self.denom
+    }
+
+    /// Check if this is an NTSC framerate (has non-1 denominator)
+    pub fn is_ntsc(&self) -> bool {
+        self.denom != 1
+    }
+
+    /// Format as GStreamer fraction string (e.g., "60000/1001")
+    pub fn as_gst_fraction(&self) -> String {
+        format!("{}/{}", self.num, self.denom)
+    }
+
+    /// Check if this framerate matches an integer fps (for config compatibility)
+    /// Returns true if the integer part matches (e.g., 59.94fps matches 59)
+    pub fn matches_int(&self, fps: u32) -> bool {
+        self.as_int() == fps
+    }
+}
+
+impl std::fmt::Display for Framerate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let fps = self.as_f64();
+        // Show decimal for non-integer framerates (NTSC)
+        if self.denom != 1 {
+            write!(f, "{:.2}", fps)
+        } else {
+            write!(f, "{}", self.num)
+        }
+    }
+}
+
+impl Default for Framerate {
+    fn default() -> Self {
+        Self { num: 30, denom: 1 }
+    }
+}
+
 /// Camera format specification
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraFormat {
     pub width: u32,
     pub height: u32,
-    pub framerate: Option<u32>,     // None for photo mode
-    pub hardware_accelerated: bool, // True for MJPEG and raw formats with HW support
-    pub pixel_format: String,       // FourCC code (e.g., "MJPG", "H264", "YUYV")
+    pub framerate: Option<Framerate>, // None for photo mode
+    pub hardware_accelerated: bool,   // True for MJPEG and raw formats with HW support
+    pub pixel_format: String,         // FourCC code (e.g., "MJPG", "H264", "YUYV")
 }
 
 impl std::fmt::Display for CameraFormat {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(fps) = self.framerate {
+        if let Some(fps) = &self.framerate {
             write!(f, "{}x{} @ {}fps", self.width, self.height, fps)
         } else {
             write!(f, "{}x{}", self.width, self.height)
@@ -216,7 +278,7 @@ impl std::fmt::Display for CameraFormat {
 /// Supports both direct RGBA and various YUV formats for GPU conversion.
 /// YUV formats are converted to RGBA by a GPU compute shader before use
 /// by downstream consumers (filters, histogram, photo capture, etc.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PixelFormat {
     /// RGBA - 32-bit with alpha (4 bytes per pixel)
     /// This is the canonical format used throughout the pipeline after conversion
@@ -227,15 +289,42 @@ pub enum PixelFormat {
     /// I420 - Planar 4:2:0 (separate Y, U, V planes)
     /// Common output from software JPEG decoders
     I420,
-    /// YUYV - Packed 4:2:2 (Y0 U0 Y1 V0 interleaved)
+    /// YUYV - Packed 4:2:2 (Y0 U Y1 V interleaved)
     /// Common raw format from webcam sensors
     YUYV,
+    /// UYVY - Packed 4:2:2 (U Y0 V Y1 interleaved)
+    /// Common alternative to YUYV
+    UYVY,
+    /// Gray8 - 8-bit grayscale (single channel)
+    /// Used for monochrome cameras, depth sensors, IR cameras
+    Gray8,
+    /// RGB24 - 24-bit RGB (3 bytes per pixel, no alpha)
+    /// Direct RGB without alpha channel
+    RGB24,
+    /// NV21 - Semi-planar 4:2:0 (Y plane + interleaved VU plane)
+    /// Like NV12 but with V and U swapped
+    NV21,
+    /// YVYU - Packed 4:2:2 (Y0 V Y1 U interleaved)
+    /// Variant of YUYV with U/V swapped
+    YVYU,
+    /// VYUY - Packed 4:2:2 (V Y0 U Y1 interleaved)
+    /// Variant with V first
+    VYUY,
 }
 
 impl PixelFormat {
     /// Check if this format is a YUV format requiring GPU conversion
     pub fn is_yuv(&self) -> bool {
-        matches!(self, Self::NV12 | Self::I420 | Self::YUYV)
+        matches!(
+            self,
+            Self::NV12
+                | Self::I420
+                | Self::YUYV
+                | Self::UYVY
+                | Self::NV21
+                | Self::YVYU
+                | Self::VYUY
+        )
     }
 
     /// Get the format code for the GPU compute shader
@@ -245,6 +334,12 @@ impl PixelFormat {
             Self::NV12 => 1,
             Self::I420 => 2,
             Self::YUYV => 3,
+            Self::UYVY => 4,
+            Self::Gray8 => 5,
+            Self::RGB24 => 6,
+            Self::NV21 => 7,
+            Self::YVYU => 8,
+            Self::VYUY => 9,
         }
     }
 
@@ -252,18 +347,28 @@ impl PixelFormat {
     pub fn bytes_per_pixel(&self) -> f32 {
         match self {
             Self::RGBA => 4.0,
-            Self::NV12 | Self::I420 => 1.5, // 4:2:0 subsampling
-            Self::YUYV => 2.0,              // 4:2:2 subsampling
+            Self::NV12 | Self::NV21 | Self::I420 => 1.5, // 4:2:0 subsampling
+            Self::YUYV | Self::UYVY | Self::YVYU | Self::VYUY => 2.0, // 4:2:2 subsampling
+            Self::Gray8 => 1.0,                          // Single channel
+            Self::RGB24 => 3.0,                          // 3 bytes per pixel
         }
     }
 
     /// Parse format from GStreamer format string
     pub fn from_gst_format(format: &str) -> Option<Self> {
         match format {
-            "RGBA" | "RGBx" | "BGRx" | "BGRA" => Some(Self::RGBA),
+            "RGBA" | "RGBx" | "BGRx" | "BGRA" | "ARGB" | "ABGR" | "xRGB" | "xBGR" => {
+                Some(Self::RGBA)
+            }
             "NV12" => Some(Self::NV12),
+            "NV21" => Some(Self::NV21),
             "I420" | "YV12" => Some(Self::I420),
-            "YUYV" | "YUY2" | "UYVY" => Some(Self::YUYV),
+            "YUYV" | "YUY2" => Some(Self::YUYV),
+            "UYVY" => Some(Self::UYVY),
+            "YVYU" => Some(Self::YVYU),
+            "VYUY" => Some(Self::VYUY),
+            "GRAY8" | "GREY" | "Y8" => Some(Self::Gray8),
+            "RGB" | "BGR" => Some(Self::RGB24),
             _ => None,
         }
     }
@@ -344,6 +449,33 @@ impl CameraFrame {
     #[inline]
     pub fn data_ptr(&self) -> usize {
         self.data.as_ptr() as usize
+    }
+
+    /// Convert to a frame with copied data (safe for background processing)
+    ///
+    /// Mapped GStreamer buffers become invalid when the pipeline is destroyed.
+    /// Use this method before sending frames to background tasks that may outlive
+    /// the pipeline.
+    pub fn to_copied(&self) -> Self {
+        let copied_data = match &self.data {
+            FrameData::Copied(data) => FrameData::Copied(Arc::clone(data)),
+            FrameData::Mapped(buffer) => {
+                // Copy the mapped buffer data to owned memory
+                let slice: &[u8] = buffer.as_ref();
+                let bytes: Arc<[u8]> = Arc::from(slice);
+                FrameData::Copied(bytes)
+            }
+        };
+
+        Self {
+            width: self.width,
+            height: self.height,
+            data: copied_data,
+            format: self.format,
+            stride: self.stride,
+            yuv_planes: self.yuv_planes,
+            captured_at: self.captured_at,
+        }
     }
 }
 

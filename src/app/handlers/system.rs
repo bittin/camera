@@ -97,10 +97,10 @@ impl AppModel {
         info!(?app_theme, "Setting application theme");
         self.config.app_theme = app_theme;
 
-        if let Some(handler) = self.config_handler.as_ref() {
-            if let Err(err) = self.config.write_entry(handler) {
-                error!(?err, "Failed to save app theme setting");
-            }
+        if let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save app theme setting");
         }
 
         cosmic::command::set_theme(app_theme.theme())
@@ -126,10 +126,10 @@ impl AppModel {
             self.current_video_encoder_index = index;
 
             self.config.last_video_encoder_index = Some(index);
-            if let Some(handler) = self.config_handler.as_ref() {
-                if let Err(err) = self.config.write_entry(handler) {
-                    error!(?err, "Failed to save encoder selection");
-                }
+            if let Some(handler) = self.config_handler.as_ref()
+                && let Err(err) = self.config.write_entry(handler)
+            {
+                error!(?err, "Failed to save encoder selection");
             }
         }
         Task::none()
@@ -146,10 +146,10 @@ impl AppModel {
             info!(?format, "Selected photo output format");
             self.config.photo_output_format = format;
 
-            if let Some(handler) = self.config_handler.as_ref() {
-                if let Err(err) = self.config.write_entry(handler) {
-                    error!(?err, "Failed to save photo output format selection");
-                }
+            if let Some(handler) = self.config_handler.as_ref()
+                && let Err(err) = self.config.write_entry(handler)
+            {
+                error!(?err, "Failed to save photo output format selection");
             }
         }
         Task::none()
@@ -162,10 +162,10 @@ impl AppModel {
             "Toggled save burst raw frames"
         );
 
-        if let Some(handler) = self.config_handler.as_ref() {
-            if let Err(err) = self.config.write_entry(handler) {
-                error!(?err, "Failed to save burst raw setting");
-            }
+        if let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save burst raw setting");
         }
         Task::none()
     }
@@ -301,11 +301,11 @@ impl AppModel {
             ])
             .output();
 
-        if let Ok(output) = dbus_result {
-            if output.status.success() {
-                info!("Opened file manager via D-Bus");
-                return Ok(());
-            }
+        if let Ok(output) = dbus_result
+            && output.status.success()
+        {
+            info!("Opened file manager via D-Bus");
+            return Ok(());
         }
 
         // Method 2: Try file manager-specific commands
@@ -326,12 +326,12 @@ impl AppModel {
         }
 
         // Method 3: Fallback to opening the parent directory
-        if let Some(parent) = path.parent() {
-            if let Ok(child) = Command::new("xdg-open").arg(parent).spawn() {
-                info!("Opened parent directory as fallback");
-                drop(child);
-                return Ok(());
-            }
+        if let Some(parent) = path.parent()
+            && let Ok(child) = Command::new("xdg-open").arg(parent).spawn()
+        {
+            info!("Opened parent directory as fallback");
+            drop(child);
+            return Ok(());
         }
 
         Err("Failed to open file manager".to_string())
@@ -403,5 +403,112 @@ impl AppModel {
 
         // Use iced/cosmic clipboard API - works in both native and flatpak
         cosmic::iced::clipboard::write(text).map(|_: ()| cosmic::Action::App(Message::Noop))
+    }
+
+    // =========================================================================
+    // Insights Handlers
+    // =========================================================================
+
+    pub(crate) fn handle_update_insights_metrics(&mut self) -> Task<cosmic::Action<Message>> {
+        use crate::app::insights::InsightsState;
+        use crate::app::video_primitive;
+        use crate::backends::camera::pipewire::pipeline;
+
+        // Update pipeline info and rebuild decoder chain only if changed
+        let new_pipeline = crate::media::get_full_pipeline_string();
+        let pixel_format = self.active_format.as_ref().map(|f| f.pixel_format.as_str());
+        if new_pipeline != self.insights.full_pipeline_string {
+            self.insights.decoder_chain =
+                InsightsState::build_decoder_chain(pixel_format, new_pipeline.as_deref());
+            self.insights.full_pipeline_string = new_pipeline;
+        }
+
+        // Update format chain from active format and pipeline
+        if let Some(format) = &self.active_format {
+            let codec = crate::media::Codec::from_fourcc(&format.pixel_format);
+            let needs_decoder = codec.needs_decoder();
+
+            // Determine source type from pipeline
+            let source = self
+                .insights
+                .full_pipeline_string
+                .as_ref()
+                .map(|p| {
+                    if !p.contains("pipewiresrc") {
+                        "Unknown"
+                    } else if p.contains("v4l2:") || p.contains("path=v4l2") {
+                        "V4L2 via PipeWire"
+                    } else if p.contains("libcamera") {
+                        "libcamera via PipeWire"
+                    } else {
+                        "PipeWire"
+                    }
+                })
+                .unwrap_or("Unknown")
+                .to_string();
+
+            // Get GStreamer output format (if decoding is involved)
+            let gstreamer_output = if needs_decoder {
+                pipeline::get_output_format()
+            } else {
+                None
+            };
+
+            // Determine WGPU processing based on the format reaching the GPU
+            let gpu_input_format = gstreamer_output.as_deref().unwrap_or(&format.pixel_format);
+            let wgpu_processing = match gpu_input_format {
+                "I420" => "I420 → RGBA (compute shader)".to_string(),
+                "NV12" => "NV12 → RGBA (compute shader)".to_string(),
+                "YUYV" | "YUY2" => "YUYV → RGBA (compute shader)".to_string(),
+                "RGBA" => "Passthrough".to_string(),
+                other => format!("{} → RGBA (compute shader)", other),
+            };
+
+            self.insights.format_chain.source = source;
+            self.insights.format_chain.resolution = format!("{}x{}", format.width, format.height);
+            self.insights.format_chain.framerate = format
+                .framerate
+                .map(|fps| format!("{} fps", fps))
+                .unwrap_or_else(|| "N/A".to_string());
+            self.insights.format_chain.native_format = format.pixel_format.clone();
+            self.insights.format_chain.gstreamer_output = gstreamer_output;
+            self.insights.format_chain.wgpu_processing = wgpu_processing;
+        }
+
+        // Update performance metrics
+        self.insights.gstreamer_decode_time_us = pipeline::get_decode_time_us();
+        self.insights.dropped_frames = pipeline::get_dropped_frame_count();
+        self.insights.frame_size_decoded = pipeline::get_last_frame_size() as usize;
+        self.insights.copy_time_us = pipeline::get_copy_time_us();
+
+        // Get GPU upload metrics from video_primitive
+        self.insights.gpu_conversion_time_us = video_primitive::get_gpu_upload_time_us();
+        let gpu_frame_size = video_primitive::get_gpu_frame_size() as usize;
+
+        // Calculate GPU upload bandwidth if we have meaningful upload time (> 10us)
+        if gpu_frame_size > 0 && self.insights.gpu_conversion_time_us > 10 {
+            let bytes_per_sec = (gpu_frame_size as f64)
+                / (self.insights.gpu_conversion_time_us as f64 / 1_000_000.0);
+            self.insights.copy_bandwidth_mbps = bytes_per_sec / (1024.0 * 1024.0);
+        } else {
+            self.insights.copy_bandwidth_mbps = 0.0;
+        }
+
+        // Update frame latency from last frame capture time
+        if let Some(frame) = &self.current_frame {
+            self.insights.frame_latency_us = frame.captured_at.elapsed().as_micros() as u64;
+        }
+
+        Task::none()
+    }
+
+    pub(crate) fn handle_copy_pipeline_string(&self) -> Task<cosmic::Action<Message>> {
+        if let Some(pipeline) = &self.insights.full_pipeline_string {
+            info!("Copying pipeline string to clipboard");
+            cosmic::iced::clipboard::write(pipeline.clone())
+                .map(|_: ()| cosmic::Action::App(Message::Noop))
+        } else {
+            Task::none()
+        }
     }
 }

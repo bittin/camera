@@ -40,7 +40,7 @@ pub fn select_max_resolution_format(formats: &[CameraFormat]) -> Option<CameraFo
         .iter()
         .filter(|f| {
             f.framerate
-                .map(|fps| fps >= 30 && fps <= 60)
+                .map(|fps| (30..=60).contains(&fps.as_int()))
                 .unwrap_or(false)
         })
         .cloned()
@@ -51,40 +51,48 @@ pub fn select_max_resolution_format(formats: &[CameraFormat]) -> Option<CameraFo
         let best_fps = preferred_fps_formats
             .iter()
             .filter_map(|f| f.framerate)
-            .max()
-            .unwrap_or(30);
+            .max_by(|a, b| {
+                a.as_f64()
+                    .partial_cmp(&b.as_f64())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-        let best_fps_formats: Vec<_> = preferred_fps_formats
-            .iter()
-            .filter(|f| f.framerate == Some(best_fps))
-            .cloned()
-            .collect();
+        if let Some(best) = best_fps {
+            let best_fps_formats: Vec<_> = preferred_fps_formats
+                .iter()
+                .filter(|f| f.framerate == Some(best))
+                .cloned()
+                .collect();
 
-        info!(
-            resolution = format!("{}x{}", max_res_formats[0].width, max_res_formats[0].height),
-            fps = best_fps,
-            "Selected format with preferred framerate"
-        );
-        return select_best_codec(&best_fps_formats);
+            info!(
+                resolution = format!("{}x{}", max_res_formats[0].width, max_res_formats[0].height),
+                fps = %best,
+                "Selected format with preferred framerate"
+            );
+            return select_best_codec(&best_fps_formats);
+        }
     }
 
     // No formats in 30-60 fps range, fall back to highest available framerate
     let max_fps = max_res_formats
         .iter()
         .filter_map(|f| f.framerate)
-        .max()
-        .unwrap_or(0);
+        .max_by(|a, b| {
+            a.as_f64()
+                .partial_cmp(&b.as_f64())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
-    if max_fps > 0 {
+    if let Some(max) = max_fps {
         let max_fps_formats: Vec<_> = max_res_formats
             .iter()
-            .filter(|f| f.framerate == Some(max_fps))
+            .filter(|f| f.framerate == Some(max))
             .cloned()
             .collect();
 
         info!(
             resolution = format!("{}x{}", max_res_formats[0].width, max_res_formats[0].height),
-            fps = max_fps,
+            fps = %max,
             "Selected format with highest available framerate (outside 30-60 range)"
         );
         return select_best_codec(&max_fps_formats);
@@ -131,7 +139,7 @@ pub fn select_first_time_video_format(formats: &[CameraFormat]) -> Option<Camera
     for format in formats {
         if let Some(fps) = format.framerate {
             // Only consider formats with at least 25 fps
-            if fps >= 25 {
+            if fps.as_int() >= 25 {
                 resolution_groups
                     .entry((format.width, format.height))
                     .or_default()
@@ -162,12 +170,13 @@ pub fn select_first_time_video_format(formats: &[CameraFormat]) -> Option<Camera
         .iter()
         .filter_map(|f| f.framerate.map(|fps| (f, fps)))
         .min_by_key(|(_, fps)| {
-            if *fps == 60 {
-                0 // Perfect match - highest priority
-            } else if *fps < 60 {
-                60 - fps // Prefer higher fps below 60
+            let int_fps = fps.as_int();
+            if int_fps == 60 {
+                0i32 // Perfect match - highest priority
+            } else if int_fps < 60 {
+                (60 - int_fps) as i32 // Prefer higher fps below 60
             } else {
-                fps - 60 + 1000 // Deprioritize fps > 60, but still consider them
+                (int_fps - 60 + 1000) as i32 // Deprioritize fps > 60, but still consider them
             }
         })
         .map(|(f, _)| *f)
@@ -187,6 +196,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::camera::types::Framerate;
 
     fn create_test_format(
         width: u32,
@@ -197,7 +207,7 @@ mod tests {
         CameraFormat {
             width,
             height,
-            framerate: Some(30),
+            framerate: Some(Framerate::from_int(30)),
             hardware_accelerated: hw_accel,
             pixel_format: pixel_format.to_string(),
         }
@@ -213,7 +223,7 @@ mod tests {
         CameraFormat {
             width,
             height,
-            framerate: Some(fps),
+            framerate: Some(Framerate::from_int(fps)),
             hardware_accelerated: hw_accel,
             pixel_format: pixel_format.to_string(),
         }
@@ -359,7 +369,7 @@ mod tests {
 
         let selected = select_max_resolution_format(&formats).unwrap();
         assert_eq!(selected.width, 3840);
-        assert_eq!(selected.framerate, Some(30));
+        assert_eq!(selected.framerate, Some(Framerate::from_int(30)));
     }
 
     #[test]
@@ -373,7 +383,7 @@ mod tests {
 
         let selected = select_max_resolution_format(&formats).unwrap();
         assert_eq!(selected.width, 3840);
-        assert_eq!(selected.framerate, Some(60));
+        assert_eq!(selected.framerate, Some(Framerate::from_int(60)));
     }
 
     #[test]
@@ -387,7 +397,7 @@ mod tests {
 
         let selected = select_max_resolution_format(&formats).unwrap();
         assert_eq!(selected.width, 3840);
-        assert_eq!(selected.framerate, Some(15));
+        assert_eq!(selected.framerate, Some(Framerate::from_int(15)));
     }
 
     #[test]
@@ -401,7 +411,7 @@ mod tests {
 
         let selected = select_max_resolution_format(&formats).unwrap();
         assert_eq!(selected.width, 3840);
-        assert_eq!(selected.framerate, Some(30));
+        assert_eq!(selected.framerate, Some(Framerate::from_int(30)));
     }
 
     #[test]
@@ -415,7 +425,7 @@ mod tests {
 
         let selected = select_max_resolution_format(&formats).unwrap();
         assert_eq!(selected.width, 3840);
-        assert_eq!(selected.framerate, Some(30));
+        assert_eq!(selected.framerate, Some(Framerate::from_int(30)));
         // Raw format (YUYV) should be preferred
         assert_eq!(selected.pixel_format, "YUYV");
     }

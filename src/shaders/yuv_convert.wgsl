@@ -113,6 +113,92 @@ fn convert_yuyv(pos: vec2<u32>) -> vec3<f32> {
     return yuv_to_rgb_bt601(y, u, v);
 }
 
+// Convert UYVY pixel at given position
+// UYVY: Packed 4:2:2 - each 4 bytes encode 2 pixels: [U Y0 V Y1]
+// Texture is uploaded as RGBA8 where:
+//   R = U, G = Y0, B = V, A = Y1
+fn convert_uyvy(pos: vec2<u32>) -> vec3<f32> {
+    let packed_x = pos.x / 2u;
+    let packed = textureLoad(tex_y, vec2(packed_x, pos.y), 0);
+
+    // Select Y0 (G channel) for even pixels, Y1 (A channel) for odd pixels
+    let is_odd = (pos.x & 1u) == 1u;
+    let y = select(packed.g, packed.a, is_odd);
+
+    // U in R channel, V in B channel
+    let u = packed.r;
+    let v = packed.b;
+
+    return yuv_to_rgb_bt601(y, u, v);
+}
+
+// Convert YVYU pixel at given position
+// YVYU: Packed 4:2:2 - each 4 bytes encode 2 pixels: [Y0 V Y1 U]
+// Texture is uploaded as RGBA8 where:
+//   R = Y0, G = V, B = Y1, A = U
+fn convert_yvyu(pos: vec2<u32>) -> vec3<f32> {
+    let packed_x = pos.x / 2u;
+    let packed = textureLoad(tex_y, vec2(packed_x, pos.y), 0);
+
+    // Select Y0 (R channel) for even pixels, Y1 (B channel) for odd pixels
+    let is_odd = (pos.x & 1u) == 1u;
+    let y = select(packed.r, packed.b, is_odd);
+
+    // V in G channel, U in A channel (swapped from YUYV)
+    let u = packed.a;
+    let v = packed.g;
+
+    return yuv_to_rgb_bt601(y, u, v);
+}
+
+// Convert VYUY pixel at given position
+// VYUY: Packed 4:2:2 - each 4 bytes encode 2 pixels: [V Y0 U Y1]
+// Texture is uploaded as RGBA8 where:
+//   R = V, G = Y0, B = U, A = Y1
+fn convert_vyuy(pos: vec2<u32>) -> vec3<f32> {
+    let packed_x = pos.x / 2u;
+    let packed = textureLoad(tex_y, vec2(packed_x, pos.y), 0);
+
+    // Select Y0 (G channel) for even pixels, Y1 (A channel) for odd pixels
+    let is_odd = (pos.x & 1u) == 1u;
+    let y = select(packed.g, packed.a, is_odd);
+
+    // V in R channel, U in B channel
+    let u = packed.b;
+    let v = packed.r;
+
+    return yuv_to_rgb_bt601(y, u, v);
+}
+
+// Convert NV21 pixel at given position
+// NV21: Same as NV12 but with V and U channels swapped (VU instead of UV)
+fn convert_nv21(pos: vec2<u32>) -> vec3<f32> {
+    // Sample Y at full resolution
+    let y = textureLoad(tex_y, pos, 0).r;
+
+    // Sample VU at half resolution (V in R channel, U in G channel)
+    let uv_pos = pos / 2u;
+    let vu = textureLoad(tex_uv, uv_pos, 0);
+
+    // VU layout: R=V, G=U (swapped from NV12's UV)
+    return yuv_to_rgb_bt601(y, vu.g, vu.r);
+}
+
+// Convert Gray8 pixel at given position
+// Gray8: Single channel luminance, output as grayscale RGB
+fn convert_gray8(pos: vec2<u32>) -> vec3<f32> {
+    let gray = textureLoad(tex_y, pos, 0).r;
+    return vec3(gray, gray, gray);
+}
+
+// Convert RGB24 pixel at given position
+// RGB24: 3 bytes per pixel (R, G, B), uploaded with padding to RGBA8
+// The alpha channel should be ignored
+fn convert_rgb24(pos: vec2<u32>) -> vec3<f32> {
+    let rgba = textureLoad(tex_y, pos, 0);
+    return rgba.rgb;
+}
+
 // Passthrough for RGBA (or already converted) data
 fn passthrough_rgba(pos: vec2<u32>) -> vec4<f32> {
     return textureLoad(tex_y, pos, 0);
@@ -132,6 +218,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var color: vec4<f32>;
 
     // Select conversion based on format
+    // Format codes: 0=RGBA, 1=NV12, 2=I420, 3=YUYV, 4=UYVY, 5=Gray8, 6=RGB24, 7=NV21, 8=YVYU, 9=VYUY
     switch params.format {
         case 1u: {
             // NV12
@@ -144,6 +231,30 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         case 3u: {
             // YUYV
             color = vec4(convert_yuyv(pos), 1.0);
+        }
+        case 4u: {
+            // UYVY
+            color = vec4(convert_uyvy(pos), 1.0);
+        }
+        case 5u: {
+            // Gray8
+            color = vec4(convert_gray8(pos), 1.0);
+        }
+        case 6u: {
+            // RGB24
+            color = vec4(convert_rgb24(pos), 1.0);
+        }
+        case 7u: {
+            // NV21
+            color = vec4(convert_nv21(pos), 1.0);
+        }
+        case 8u: {
+            // YVYU
+            color = vec4(convert_yvyu(pos), 1.0);
+        }
+        case 9u: {
+            // VYUY
+            color = vec4(convert_vyuy(pos), 1.0);
         }
         default: {
             // RGBA passthrough (format 0 or unknown)

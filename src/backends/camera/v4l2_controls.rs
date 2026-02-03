@@ -23,7 +23,7 @@ const V4L2_CID_IMAGE_SOURCE_CLASS_BASE: u32 = V4L2_CTRL_CLASS_IMAGE_SOURCE | 0x9
 // ===== V4L2 Control IDs (User Class) =====
 
 /// Brightness control
-pub const V4L2_CID_BRIGHTNESS: u32 = V4L2_CID_BASE + 0;
+pub const V4L2_CID_BRIGHTNESS: u32 = V4L2_CID_BASE;
 /// Contrast control
 pub const V4L2_CID_CONTRAST: u32 = V4L2_CID_BASE + 1;
 /// Saturation control

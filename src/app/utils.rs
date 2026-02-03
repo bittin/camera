@@ -5,10 +5,10 @@
 /// Parse resolution string in format "WIDTHxHEIGHT"
 pub fn parse_resolution(resolution_str: &str) -> Option<(u32, u32)> {
     let parts: Vec<&str> = resolution_str.split('x').collect();
-    if parts.len() == 2 {
-        if let (Ok(width), Ok(height)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-            return Some((width, height));
-        }
+    if parts.len() == 2
+        && let (Ok(width), Ok(height)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+    {
+        return Some((width, height));
     }
     None
 }

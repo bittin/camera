@@ -266,6 +266,10 @@ impl AppModel {
                 self.handle_privacy_cover_status_changed(is_closed)
             }
 
+            // ===== Insights Drawer =====
+            Message::UpdateInsightsMetrics => self.handle_update_insights_metrics(),
+            Message::CopyPipelineString => self.handle_copy_pipeline_string(),
+
             Message::Noop => Task::none(),
 
             Message::Surface(action) => {

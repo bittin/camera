@@ -9,6 +9,7 @@ use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
 use gstreamer_video::VideoInfo;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -16,6 +17,35 @@ use tracing::{debug, error, info, warn};
 static FRAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 static DECODE_TIME_US: AtomicU64 = AtomicU64::new(0);
 static SEND_TIME_US: AtomicU64 = AtomicU64::new(0);
+static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAME_SIZE: AtomicU64 = AtomicU64::new(0);
+static COPY_TIME_US: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_FORMAT: RwLock<Option<String>> = RwLock::new(None);
+
+/// Get the decode time in microseconds
+pub fn get_decode_time_us() -> u64 {
+    DECODE_TIME_US.load(Ordering::Relaxed)
+}
+
+/// Get the dropped frame count
+pub fn get_dropped_frame_count() -> u64 {
+    DROPPED_FRAMES.load(Ordering::Relaxed)
+}
+
+/// Get the last frame size in bytes
+pub fn get_last_frame_size() -> u64 {
+    LAST_FRAME_SIZE.load(Ordering::Relaxed)
+}
+
+/// Get the copy time in microseconds
+pub fn get_copy_time_us() -> u64 {
+    COPY_TIME_US.load(Ordering::Relaxed)
+}
+
+/// Get the output format (from decoder/pipeline)
+pub fn get_output_format() -> Option<String> {
+    OUTPUT_FORMAT.read().ok().and_then(|guard| guard.clone())
+}
 
 /// PipeWire camera pipeline
 ///
@@ -59,11 +89,15 @@ impl PipeWirePipeline {
         let pixel_format = Some(format.pixel_format.as_str());
 
         // Build caps string for resolution and framerate
+        // Use the exact framerate fraction from enumeration (e.g., 60000/1001 for 59.94fps)
         let caps_filter = match (width, height, framerate) {
             (Some(w), Some(h), Some(fps)) => {
+                // Use the exact framerate fraction as reported by the camera
                 format!(
-                    "width=(int){},height=(int){},framerate=(fraction){}/1",
-                    w, h, fps
+                    "width=(int){},height=(int){},framerate=(fraction){}",
+                    w,
+                    h,
+                    fps.as_gst_fraction()
                 )
             }
             (Some(w), Some(h), None) => {
@@ -168,7 +202,8 @@ impl PipeWirePipeline {
 
         // Adjust buffering based on framerate to ensure complete frame delivery
         // At high framerates (>30 FPS), use more buffering to prevent incomplete frames
-        let buffer_count = if framerate.unwrap_or(0) > 30 {
+        let fps_int = framerate.map(|f| f.as_int()).unwrap_or(0);
+        let buffer_count = if fps_int > 30 {
             3 // More buffering at high FPS to ensure DMA transfers complete
         } else {
             pipeline::MAX_BUFFERS
@@ -179,7 +214,8 @@ impl PipeWirePipeline {
 
         debug!(
             buffer_count,
-            framerate, "Appsink configured for maximum performance"
+            fps = fps_int,
+            "Appsink configured for maximum performance"
         );
 
         // Set up callback for new samples with performance tracking
@@ -194,7 +230,7 @@ impl PipeWirePipeline {
                     let sample = match appsink.pull_sample() {
                         Ok(s) => s,
                         Err(e) => {
-                            if frame_num % 30 == 0 {
+                            if frame_num.is_multiple_of(30) {
                                 error!(frame = frame_num, error = ?e, "Failed to pull sample");
                             }
                             return Err(gstreamer::FlowError::Eos);
@@ -202,7 +238,7 @@ impl PipeWirePipeline {
                     };
 
                     let buffer = sample.buffer().ok_or_else(|| {
-                        if frame_num % 30 == 0 {
+                        if frame_num.is_multiple_of(30) {
                             error!(frame = frame_num, "No buffer in sample");
                         }
                         gstreamer::FlowError::Error
@@ -212,21 +248,21 @@ impl PipeWirePipeline {
                     // This can happen at high framerates when DMA transfers aren't complete
                     let buffer_flags = buffer.flags();
                     if buffer_flags.contains(gstreamer::BufferFlags::CORRUPTED) {
-                        if frame_num % 30 == 0 {
+                        if frame_num.is_multiple_of(30) {
                             warn!(frame = frame_num, "Buffer marked as corrupted, skipping frame");
                         }
                         return Err(gstreamer::FlowError::Error);
                     }
 
                     let caps = sample.caps().ok_or_else(|| {
-                        if frame_num % 30 == 0 {
+                        if frame_num.is_multiple_of(30) {
                             error!(frame = frame_num, "No caps in sample");
                         }
                         gstreamer::FlowError::Error
                     })?;
 
                     let video_info = VideoInfo::from_caps(caps).map_err(|e| {
-                        if frame_num % 30 == 0 {
+                        if frame_num.is_multiple_of(30) {
                             error!(frame = frame_num, error = ?e, "Failed to get video info");
                         }
                         gstreamer::FlowError::Error
@@ -235,25 +271,45 @@ impl PipeWirePipeline {
                     // Detect pixel format from GStreamer caps
                     let gst_format = video_info.format();
                     let pixel_format = match gst_format {
+                        // Semi-planar 4:2:0 formats
                         gstreamer_video::VideoFormat::Nv12 => PixelFormat::NV12,
+                        gstreamer_video::VideoFormat::Nv21 => PixelFormat::NV21,
+                        // Planar 4:2:0 formats
                         gstreamer_video::VideoFormat::I420 | gstreamer_video::VideoFormat::Yv12 => PixelFormat::I420,
-                        gstreamer_video::VideoFormat::Yuy2 | gstreamer_video::VideoFormat::Uyvy => PixelFormat::YUYV,
+                        // Packed 4:2:2 formats
+                        gstreamer_video::VideoFormat::Yuy2 => PixelFormat::YUYV,
+                        gstreamer_video::VideoFormat::Uyvy => PixelFormat::UYVY,
+                        gstreamer_video::VideoFormat::Yvyu => PixelFormat::YVYU,
+                        gstreamer_video::VideoFormat::Vyuy => PixelFormat::VYUY,
+                        // Grayscale
+                        gstreamer_video::VideoFormat::Gray8 => PixelFormat::Gray8,
+                        // RGBA variants
                         gstreamer_video::VideoFormat::Rgba | gstreamer_video::VideoFormat::Rgbx |
-                        gstreamer_video::VideoFormat::Bgra | gstreamer_video::VideoFormat::Bgrx => PixelFormat::RGBA,
+                        gstreamer_video::VideoFormat::Bgra | gstreamer_video::VideoFormat::Bgrx |
+                        gstreamer_video::VideoFormat::Argb | gstreamer_video::VideoFormat::Abgr |
+                        gstreamer_video::VideoFormat::Xrgb | gstreamer_video::VideoFormat::Xbgr => PixelFormat::RGBA,
+                        // RGB24 variants (should have been converted to RGBA by pipeline)
+                        gstreamer_video::VideoFormat::Rgb | gstreamer_video::VideoFormat::Bgr => PixelFormat::RGB24,
                         _ => {
-                            // Unknown format - log warning and try RGBA
-                            if frame_num % 60 == 0 {
-                                warn!(frame = frame_num, format = ?gst_format, "Unknown video format, assuming RGBA");
+                            // Unknown format - log warning and assume NV12 (fallback should have converted to it)
+                            if frame_num.is_multiple_of(60) {
+                                warn!(frame = frame_num, format = ?gst_format, "Unknown video format, assuming NV12 (fallback conversion)");
                             }
-                            PixelFormat::RGBA
+                            PixelFormat::NV12
                         }
                     };
+
+                    // Store output format for insights (only on first frame to avoid lock contention)
+                    if frame_num == 0
+                        && let Ok(mut guard) = OUTPUT_FORMAT.write() {
+                            *guard = Some(format!("{:?}", pixel_format));
+                        }
 
                     // Get owned buffer (increments refcount, shares underlying memory)
                     // then convert to mapped buffer (zero-copy - keeps buffer mapped until dropped)
                     let owned_buffer = buffer.copy();
                     let mapped = owned_buffer.into_mapped_buffer_readable().map_err(|_| {
-                        if frame_num % 30 == 0 {
+                        if frame_num.is_multiple_of(30) {
                             error!(frame = frame_num, "Failed to map buffer for zero-copy");
                         }
                         gstreamer::FlowError::Error
@@ -269,7 +325,7 @@ impl PipeWirePipeline {
                     let offsets = video_info.offset();
 
                     // Log format info every 60 frames for debugging
-                    if frame_num % 60 == 0 {
+                    if frame_num.is_multiple_of(60) {
                         info!(
                             frame = frame_num,
                             width,
@@ -288,8 +344,8 @@ impl PipeWirePipeline {
 
                     // Extract plane offsets (zero-copy: no data copying, just store offsets)
                     let (frame_data, yuv_planes, stride) = match pixel_format {
-                        PixelFormat::NV12 => {
-                            // NV12: Y plane + UV interleaved plane (zero-copy with offsets)
+                        PixelFormat::NV12 | PixelFormat::NV21 => {
+                            // NV12/NV21: Y plane + UV/VU interleaved plane (zero-copy with offsets)
                             let y_stride = strides[0] as u32;
                             let uv_stride = strides[1] as u32;
                             let y_offset = offsets[0] as usize;
@@ -336,8 +392,18 @@ impl PipeWirePipeline {
 
                             (FrameData::from_mapped_buffer(mapped), Some(yuv), y_stride)
                         }
-                        PixelFormat::YUYV => {
-                            // YUYV: Packed format, single plane
+                        PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                            // Packed 4:2:2 formats: single plane with 2 bytes per pixel
+                            let stride = strides[0] as u32;
+                            (FrameData::from_mapped_buffer(mapped), None, stride)
+                        }
+                        PixelFormat::Gray8 => {
+                            // Grayscale: single channel, single plane
+                            let stride = strides[0] as u32;
+                            (FrameData::from_mapped_buffer(mapped), None, stride)
+                        }
+                        PixelFormat::RGB24 => {
+                            // RGB24: 3 bytes per pixel, single plane
                             let stride = strides[0] as u32;
                             (FrameData::from_mapped_buffer(mapped), None, stride)
                         }
@@ -363,6 +429,10 @@ impl PipeWirePipeline {
                     // Capture size before send (frame is moved)
                     let size_bytes = frame.data.len();
 
+                    // Store metrics for insights
+                    LAST_FRAME_SIZE.store(size_bytes as u64, Ordering::Relaxed);
+                    COPY_TIME_US.store(copy_time.as_micros() as u64, Ordering::Relaxed);
+
                     // Send frame to the app (non-blocking using try_send)
                     let send_start = Instant::now();
                     let mut sender = frame_sender.clone();
@@ -372,7 +442,7 @@ impl PipeWirePipeline {
                             SEND_TIME_US.store(send_time.as_micros() as u64, Ordering::Relaxed);
 
                             // Performance stats every N frames
-                            if frame_num % timing::FRAME_LOG_INTERVAL == 0 {
+                            if frame_num.is_multiple_of(timing::FRAME_LOG_INTERVAL) {
                                 let total_time = frame_start.elapsed();
                                 debug!(
                                     frame = frame_num,
@@ -388,7 +458,8 @@ impl PipeWirePipeline {
                             }
                         }
                         Err(e) => {
-                            if frame_num % 30 == 0 {
+                            DROPPED_FRAMES.fetch_add(1, Ordering::Relaxed);
+                            if frame_num.is_multiple_of(30) {
                                 debug!(frame = frame_num, error = ?e, "Frame dropped (channel full)");
                             }
                         }

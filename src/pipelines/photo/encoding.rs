@@ -35,6 +35,7 @@ impl EncodingFormat {
     }
 
     /// Convert to image crate's ImageFormat (returns None for DNG)
+    #[allow(clippy::wrong_self_convention)]
     fn to_image_format(&self) -> Option<ImageFormat> {
         match self {
             EncodingFormat::Jpeg => Some(ImageFormat::Jpeg),

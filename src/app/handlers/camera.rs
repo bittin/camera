@@ -33,6 +33,9 @@ impl AppModel {
             self.camera_cancel_flag =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+            // Clear current frame to avoid accessing invalid mapped buffers
+            self.current_frame = None;
+
             // Reset zoom and aspect ratio when switching cameras
             self.zoom_level = 1.0;
             self.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Native;
@@ -58,6 +61,9 @@ impl AppModel {
             self.camera_cancel_flag =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+            // Clear current frame to avoid accessing invalid mapped buffers
+            self.current_frame = None;
+
             self.current_camera_index = index;
             self.zoom_level = 1.0; // Reset zoom when switching cameras
             // Reset aspect ratio to native when switching cameras
@@ -76,7 +82,7 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         static FRAME_MSG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let count = FRAME_MSG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if count % 30 == 0 {
+        if count.is_multiple_of(30) {
             info!(
                 message = count,
                 width = frame.width,
@@ -98,10 +104,11 @@ impl AppModel {
         }
 
         // Send frame to virtual camera if streaming from camera (not file source)
-        if self.virtual_camera.is_streaming() && !self.virtual_camera.is_file_source() {
-            if !self.virtual_camera.send_frame(Arc::clone(&frame)) {
-                debug!("Failed to send frame to virtual camera (channel closed)");
-            }
+        if self.virtual_camera.is_streaming()
+            && !self.virtual_camera.is_file_source()
+            && !self.virtual_camera.send_frame(Arc::clone(&frame))
+        {
+            debug!("Failed to send frame to virtual camera (channel closed)");
         }
 
         // Track whether this frame is from a file source (for mirror handling)
@@ -276,13 +283,12 @@ impl AppModel {
                     |index| cosmic::Action::App(Message::SelectCamera(index)),
                 );
             }
-        } else if let Some(current) = self.available_cameras.get(self.current_camera_index) {
-            if let Some(new_index) = new_cameras
+        } else if let Some(current) = self.available_cameras.get(self.current_camera_index)
+            && let Some(new_index) = new_cameras
                 .iter()
                 .position(|c| c.path == current.path && c.name == current.name)
-            {
-                self.current_camera_index = new_index;
-            }
+        {
+            self.current_camera_index = new_index;
         }
         Task::none()
     }
@@ -308,10 +314,10 @@ impl AppModel {
             "Mirror preview toggled"
         );
 
-        if let Some(handler) = self.config_handler.as_ref() {
-            if let Err(err) = self.config.write_entry(handler) {
-                error!(?err, "Failed to save mirror preview setting");
-            }
+        if let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save mirror preview setting");
         }
         Task::none()
     }
@@ -337,10 +343,10 @@ impl AppModel {
             self.mode = CameraMode::Photo;
         }
 
-        if let Some(handler) = self.config_handler.as_ref() {
-            if let Err(err) = self.config.write_entry(handler) {
-                error!(?err, "Failed to save virtual camera setting");
-            }
+        if let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save virtual camera setting");
         }
         Task::none()
     }

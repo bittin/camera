@@ -8,7 +8,7 @@
 //! It's the modern, recommended approach for Linux camera access.
 
 mod enumeration;
-mod pipeline;
+pub mod pipeline;
 
 pub use enumeration::{enumerate_pipewire_cameras, get_pipewire_formats, is_pipewire_available};
 pub use pipeline::PipeWirePipeline;
@@ -30,6 +30,12 @@ pub struct PipeWireBackend {
     frame_sender: Option<FrameSender>,
     /// Frame receiver for preview stream (given to UI)
     frame_receiver: Option<FrameReceiver>,
+}
+
+impl Default for PipeWireBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PipeWireBackend {

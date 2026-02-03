@@ -95,7 +95,7 @@ const WORKGROUP_SIZE: u32 = 16;
 /// Calculate number of workgroups needed to cover a dimension
 #[inline]
 const fn div_ceil(dimension: u32, divisor: u32) -> u32 {
-    (dimension + divisor - 1) / divisor
+    dimension.div_ceil(divisor)
 }
 
 /// Convert u8 pixel data to normalized f32 (0.0-1.0)
@@ -984,8 +984,8 @@ impl BurstModeGpuPipeline {
             (pixel_count * 4 * std::mem::size_of::<f32>()) as u64,
         );
 
-        let n_tiles_x = (width + SHARPNESS_TILE_SIZE - 1) / SHARPNESS_TILE_SIZE;
-        let n_tiles_y = (height + SHARPNESS_TILE_SIZE - 1) / SHARPNESS_TILE_SIZE;
+        let n_tiles_x = width.div_ceil(SHARPNESS_TILE_SIZE);
+        let n_tiles_y = height.div_ceil(SHARPNESS_TILE_SIZE);
         let n_tiles = (n_tiles_x * n_tiles_y) as usize;
 
         let partial_buffer = self.create_storage_buffer_readonly(
@@ -1142,8 +1142,8 @@ impl BurstModeGpuPipeline {
         // bin = laplacian * (256/1020) ≈ laplacian * 0.251
         let bin_scale: f32 = NUM_BINS as f32 / 1020.0;
 
-        let n_tiles_x = (width + SHARPNESS_TILE_SIZE - 1) / SHARPNESS_TILE_SIZE;
-        let n_tiles_y = (height + SHARPNESS_TILE_SIZE - 1) / SHARPNESS_TILE_SIZE;
+        let n_tiles_x = width.div_ceil(SHARPNESS_TILE_SIZE);
+        let n_tiles_y = height.div_ceil(SHARPNESS_TILE_SIZE);
         let n_tiles = (n_tiles_x * n_tiles_y) as usize;
 
         // Create buffers
@@ -1345,7 +1345,7 @@ impl BurstModeGpuPipeline {
             "ca_init_bins",
             &self.ca_init_bins,
             &bind_group,
-            ((NUM_RADIUS_BINS * 3 + 63) / 64, 1, 1),
+            ((NUM_RADIUS_BINS * 3).div_ceil(64), 1, 1),
         );
 
         // Pass 2: Estimate CA offsets at edge pixels
@@ -1353,7 +1353,7 @@ impl BurstModeGpuPipeline {
             "ca_estimate_offsets",
             &self.ca_estimate_offsets,
             &bind_group,
-            ((width + 15) / 16, (height + 15) / 16, 1),
+            (width.div_ceil(16), height.div_ceil(16), 1),
         );
 
         // Pass 3: Fit quadratic model
@@ -1417,7 +1417,7 @@ impl BurstModeGpuPipeline {
         let level_dims: Vec<(u32, u32)> = (0..PYRAMID_LEVELS)
             .map(|level| {
                 let scale = 1 << level;
-                ((width + scale - 1) / scale, (height + scale - 1) / scale)
+                (width.div_ceil(scale), height.div_ceil(scale))
             })
             .collect();
 
@@ -1679,7 +1679,7 @@ impl BurstModeGpuPipeline {
         let level_dims: Vec<(u32, u32)> = (0..PYRAMID_LEVELS)
             .map(|level| {
                 let scale = 1 << level;
-                ((width + scale - 1) / scale, (height + scale - 1) / scale)
+                (width.div_ceil(scale), height.div_ceil(scale))
             })
             .collect();
 
@@ -1704,7 +1704,7 @@ impl BurstModeGpuPipeline {
             &format!("{}_luminance", label_prefix),
             &self.rgb_to_luminance,
             &lum_bg,
-            ((width + 15) / 16, (height + 15) / 16, 1),
+            (width.div_ceil(16), height.div_ceil(16), 1),
         );
 
         // Build pyramid (L1-L3)
@@ -1738,7 +1738,7 @@ impl BurstModeGpuPipeline {
                 &format!("{}_pyramid_L{}", label_prefix, level),
                 &self.pyramid_downsample_gray,
                 &downsample_bg,
-                ((dst_w + 15) / 16, (dst_h + 15) / 16, 1),
+                (dst_w.div_ceil(16), dst_h.div_ceil(16), 1),
             );
         }
     }
@@ -1756,7 +1756,7 @@ impl BurstModeGpuPipeline {
         let level_dims: Vec<(u32, u32)> = (0..PYRAMID_LEVELS)
             .map(|level| {
                 let scale = 1 << level;
-                ((width + scale - 1) / scale, (height + scale - 1) / scale)
+                (width.div_ceil(scale), height.div_ceil(scale))
             })
             .collect();
 
@@ -1792,6 +1792,7 @@ impl BurstModeGpuPipeline {
     /// This is the optimized version that reuses buffers across multiple frame alignments.
     /// Only the output buffer is unique per frame (returned in GpuAlignedFrame).
     /// Uses luminance-based alignment with optional CA correction.
+    #[allow(clippy::too_many_arguments)]
     async fn align_single_frame_pooled(
         &self,
         _ref_rgba_buffer: &wgpu::Buffer,
@@ -1832,7 +1833,7 @@ impl BurstModeGpuPipeline {
         let level_dims: Vec<(u32, u32)> = (0..PYRAMID_LEVELS)
             .map(|level| {
                 let scale = 1 << level;
-                ((width + scale - 1) / scale, (height + scale - 1) / scale)
+                (width.div_ceil(scale), height.div_ceil(scale))
             })
             .collect();
 
@@ -1939,7 +1940,7 @@ impl BurstModeGpuPipeline {
                 chunk_count += 1;
 
                 // Yield every few chunks to allow compositor to render
-                if chunk_count % CHUNKS_PER_YIELD == 0 {
+                if chunk_count.is_multiple_of(CHUNKS_PER_YIELD) {
                     self.yield_to_compositor().await;
                 }
             }
@@ -2004,7 +2005,7 @@ impl BurstModeGpuPipeline {
             "warp_pass",
             &self.warp_frame,
             &warp_bg,
-            ((width + 15) / 16, (height + 15) / 16, 1),
+            (width.div_ceil(16), height.div_ceil(16), 1),
         );
 
         Ok(GpuAlignedFrame {
@@ -2083,8 +2084,8 @@ impl BurstModeGpuPipeline {
         let input_f32 = u8_to_f32_normalized(&merged.data);
 
         let block_size = 8u32;
-        let lum_width = (width + block_size - 1) / block_size;
-        let lum_height = (height + block_size - 1) / block_size;
+        let lum_width = width.div_ceil(block_size);
+        let lum_height = height.div_ceil(block_size);
         let lum_size = (lum_width * lum_height) as usize;
 
         // Create buffers
@@ -2219,7 +2220,7 @@ impl BurstModeGpuPipeline {
             });
             pass.set_pipeline(&self.tonemap_local_lum);
             pass.set_bind_group(0, Some(&local_lum_bind_group), &[]);
-            pass.dispatch_workgroups((lum_width + 15) / 16, (lum_height + 15) / 16, 1);
+            pass.dispatch_workgroups(lum_width.div_ceil(16), lum_height.div_ceil(16), 1);
         }
 
         // Copy brightness accumulator to staging for readback
@@ -2320,7 +2321,7 @@ impl BurstModeGpuPipeline {
             });
             pass.set_pipeline(&self.tonemap_apply);
             pass.set_bind_group(0, Some(&tonemap_bind_group), &[]);
-            pass.dispatch_workgroups((width + 15) / 16, (height + 15) / 16, 1);
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
         }
 
         // Read back result using pooled staging buffer

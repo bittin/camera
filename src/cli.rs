@@ -15,7 +15,7 @@ use camera::pipelines::photo::PhotoPipeline;
 use camera::pipelines::video::{EncoderConfig, VideoRecorder};
 use chrono::Local;
 use futures::channel::mpsc;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,10 +39,10 @@ pub fn list_cameras() -> Result<(), Box<dyn std::error::Error>> {
         // Get formats for this camera
         let formats = get_pipewire_formats(&camera.path, camera.metadata_path.as_deref());
         if !formats.is_empty() {
-            // Group formats by resolution and show best framerate
+            // Group formats by resolution and show best framerate (as integer for display)
             let mut resolutions: Vec<(u32, u32, u32)> = Vec::new();
             for format in &formats {
-                let fps = format.framerate.unwrap_or(30);
+                let fps = format.framerate.map(|f| f.as_int()).unwrap_or(30);
                 if let Some(existing) = resolutions
                     .iter_mut()
                     .find(|(w, h, _)| *w == format.width && *h == format.height)
@@ -167,12 +167,12 @@ pub fn take_photo(
     })?;
 
     // If user specified a specific filename, rename the file
-    if let Some(user_path) = output {
-        if !user_path.is_dir() {
-            std::fs::rename(&output_path, &user_path)?;
-            println!("Photo saved: {}", user_path.display());
-            return Ok(());
-        }
+    if let Some(user_path) = output
+        && !user_path.is_dir()
+    {
+        std::fs::rename(&output_path, &user_path)?;
+        println!("Photo saved: {}", user_path.display());
+        return Ok(());
     }
 
     println!("Photo saved: {}", output_path.display());
@@ -214,7 +214,7 @@ pub fn record_video(
     }
 
     let format = select_video_format(&formats);
-    let framerate = format.framerate.unwrap_or(30);
+    let framerate = format.framerate.map(|f| f.as_int()).unwrap_or(30);
     println!(
         "Recording format: {}x{} @ {}fps",
         format.width, format.height, framerate
@@ -312,11 +312,14 @@ fn select_photo_format(formats: &[CameraFormat]) -> CameraFormat {
 fn select_video_format(formats: &[CameraFormat]) -> CameraFormat {
     // Prefer 1080p at 30fps, otherwise highest resolution with reasonable framerate
     let target_height = 1080;
-    let target_fps = 30;
+    let target_fps: u32 = 30;
 
     // First try to find exact match
     if let Some(format) = formats.iter().find(|f| {
-        f.height == target_height && f.framerate.map(|fps| fps >= target_fps).unwrap_or(false)
+        f.height == target_height
+            && f.framerate
+                .map(|fps| fps.as_int() >= target_fps)
+                .unwrap_or(false)
     }) {
         return format.clone();
     }
@@ -324,10 +327,11 @@ fn select_video_format(formats: &[CameraFormat]) -> CameraFormat {
     // Otherwise find closest to 1080p with at least 24fps
     formats
         .iter()
-        .filter(|f| f.framerate.map(|fps| fps >= 24).unwrap_or(false))
+        .filter(|f| f.framerate.map(|fps| fps.as_int() >= 24).unwrap_or(false))
         .min_by_key(|f| {
             let height_diff = (f.height as i32 - target_height as i32).abs();
-            let fps_diff = (f.framerate.unwrap_or(30) as i32 - target_fps as i32).abs();
+            let fps_int = f.framerate.map(|fps| fps.as_int()).unwrap_or(30);
+            let fps_diff = (fps_int as i32 - target_fps as i32).abs();
             height_diff * 10 + fps_diff // Prioritize resolution over framerate
         })
         .cloned()
@@ -474,7 +478,7 @@ fn collect_image_paths(input: &[PathBuf]) -> Result<Vec<PathBuf>, Box<dyn std::e
 }
 
 /// Check if a path is a supported image file
-fn is_supported_image(path: &PathBuf) -> bool {
+fn is_supported_image(path: &Path) -> bool {
     path.extension()
         .map(|ext| {
             let ext_lower = ext.to_string_lossy().to_lowercase();

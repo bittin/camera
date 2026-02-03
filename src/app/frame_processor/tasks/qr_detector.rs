@@ -98,13 +98,11 @@ fn detect_sync(frame: &CameraFrame, max_dimension: u32) -> Vec<QrDetection> {
     );
 
     // Create grayscale image for rqrr
-    let mut img = match rqrr::PreparedImage::prepare_from_greyscale(
+    let mut img = rqrr::PreparedImage::prepare_from_greyscale(
         proc_width as usize,
         proc_height as usize,
         |x, y| gray_data[y * proc_width as usize + x],
-    ) {
-        img => img,
-    };
+    );
 
     // Detect QR codes
     let grids = img.detect_grids();

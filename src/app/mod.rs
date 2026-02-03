@@ -37,6 +37,7 @@ pub mod frame_processor;
 mod gallery_primitive;
 mod gallery_widget;
 mod handlers;
+mod insights;
 mod menu;
 mod motor_picker;
 pub mod qr_overlay;
@@ -382,6 +383,8 @@ impl cosmic::Application for AppModel {
             last_qr_detection_time: None,
             // Privacy cover detection
             privacy_cover_closed: false,
+            // Insights drawer
+            insights: Default::default(),
         };
 
         // Make context drawer overlay the content instead of reserving space
@@ -498,6 +501,7 @@ impl cosmic::Application for AppModel {
             ),
             ContextPage::Settings => self.settings_view(),
             ContextPage::Filters => self.filters_view(),
+            ContextPage::Insights => self.insights_view(),
         })
     }
 
@@ -748,7 +752,7 @@ impl cosmic::Application for AppModel {
                                             let latency_us =
                                                 frame.captured_at.elapsed().as_micros();
 
-                                            if frame_count % 30 == 0 {
+                                            if frame_count.is_multiple_of(30) {
                                                 info!(
                                                     frame = frame_count,
                                                     width = frame.width,
@@ -773,7 +777,7 @@ impl cosmic::Application for AppModel {
                                                 .try_send(Message::CameraFrame(Arc::new(frame)))
                                             {
                                                 Ok(_) => {
-                                                    if frame_count % 30 == 0 {
+                                                    if frame_count.is_multiple_of(30) {
                                                         info!(
                                                             frame = frame_count,
                                                             "Frame forwarded to UI"
@@ -906,7 +910,8 @@ impl cosmic::Application for AppModel {
 
         let qr_detection_sub = match (should_detect_qr, &self.current_frame) {
             (true, Some(frame)) => {
-                let frame = frame.clone();
+                // Copy frame for background task - mapped buffers become invalid when pipeline stops
+                let frame = Arc::new(frame.to_copied());
                 Subscription::run_with_id(
                     ("qr_detection", frame.captured_at),
                     cosmic::iced::stream::channel(1, move |mut output| async move {
@@ -1028,6 +1033,15 @@ impl cosmic::Application for AppModel {
             Subscription::none()
         };
 
+        // Update insights metrics every 500ms when the Insights drawer is open
+        let insights_update_sub =
+            if self.context_page == ContextPage::Insights && self.core.window.show_context {
+                let interval = std::time::Duration::from_millis(500);
+                cosmic::iced::time::every(interval).map(|_| Message::UpdateInsightsMetrics)
+            } else {
+                Subscription::none()
+            };
+
         Subscription::batch([
             config_sub,
             camera_sub,
@@ -1037,6 +1051,7 @@ impl cosmic::Application for AppModel {
             timer_animation_sub,
             privacy_polling_sub,
             brightness_eval_sub,
+            insights_update_sub,
         ])
     }
 

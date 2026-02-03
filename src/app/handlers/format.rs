@@ -59,69 +59,69 @@ impl AppModel {
         self.switch_camera_or_mode(self.current_camera_index, mode);
 
         // When switching to Virtual mode with a file source, restore the file source preview
-        if mode == CameraMode::Virtual {
-            if let Some(ref source) = self.virtual_camera_file_source {
-                let path = match source {
-                    FileSource::Image(p) | FileSource::Video(p) => p.clone(),
-                };
-                let is_video = matches!(source, FileSource::Video(_));
-                // For video files, use the stored seek position to restore at the correct frame
-                let seek_position = if is_video {
-                    self.video_preview_seek_position
-                } else {
-                    0.0
-                };
-                info!(
-                    is_video,
-                    seek_position, "Restoring file source preview after mode switch"
-                );
+        if mode == CameraMode::Virtual
+            && let Some(ref source) = self.virtual_camera_file_source
+        {
+            let path = match source {
+                FileSource::Image(p) | FileSource::Video(p) => p.clone(),
+            };
+            let is_video = matches!(source, FileSource::Video(_));
+            // For video files, use the stored seek position to restore at the correct frame
+            let seek_position = if is_video {
+                self.video_preview_seek_position
+            } else {
+                0.0
+            };
+            info!(
+                is_video,
+                seek_position, "Restoring file source preview after mode switch"
+            );
 
-                return Task::perform(
-                    async move {
-                        use crate::backends::virtual_camera::{
-                            get_video_duration, load_preview_frame, load_video_frame_at_position,
-                        };
+            return Task::perform(
+                async move {
+                    use crate::backends::virtual_camera::{
+                        get_video_duration, load_preview_frame, load_video_frame_at_position,
+                    };
 
-                        // For video files with a seek position, load frame at that position
-                        // Otherwise load the first frame
-                        let frame = if is_video && seek_position > 0.0 {
-                            match load_video_frame_at_position(&path, seek_position) {
-                                Ok(frame) => Some(Arc::new(frame)),
-                                Err(e) => {
-                                    warn!(?e, "Failed to load video frame at position");
-                                    // Fall back to first frame
-                                    load_preview_frame(&path).ok().map(Arc::new)
-                                }
+                    // For video files with a seek position, load frame at that position
+                    // Otherwise load the first frame
+                    let frame = if is_video && seek_position > 0.0 {
+                        match load_video_frame_at_position(&path, seek_position) {
+                            Ok(frame) => Some(Arc::new(frame)),
+                            Err(e) => {
+                                warn!(?e, "Failed to load video frame at position");
+                                // Fall back to first frame
+                                load_preview_frame(&path).ok().map(Arc::new)
                             }
-                        } else {
-                            match load_preview_frame(&path) {
-                                Ok(frame) => Some(Arc::new(frame)),
-                                Err(e) => {
-                                    warn!(?e, "Failed to load preview frame");
-                                    None
-                                }
+                        }
+                    } else {
+                        match load_preview_frame(&path) {
+                            Ok(frame) => Some(Arc::new(frame)),
+                            Err(e) => {
+                                warn!(?e, "Failed to load preview frame");
+                                None
                             }
-                        };
+                        }
+                    };
 
-                        let duration = if is_video {
-                            match get_video_duration(&path) {
-                                Ok(dur) => Some(dur),
-                                Err(e) => {
-                                    warn!(?e, "Failed to get video duration");
-                                    None
-                                }
+                    let duration = if is_video {
+                        match get_video_duration(&path) {
+                            Ok(dur) => Some(dur),
+                            Err(e) => {
+                                warn!(?e, "Failed to get video duration");
+                                None
                             }
-                        } else {
-                            None
-                        };
+                        }
+                    } else {
+                        None
+                    };
 
-                        (frame, duration)
-                    },
-                    |(frame, duration)| {
-                        cosmic::Action::App(Message::FileSourcePreviewLoaded(frame, duration))
-                    },
-                );
-            }
+                    (frame, duration)
+                },
+                |(frame, duration)| {
+                    cosmic::Action::App(Message::FileSourcePreviewLoaded(frame, duration))
+                },
+            );
         }
 
         // Re-query exposure controls when format changes
@@ -221,6 +221,7 @@ impl AppModel {
 
         if !matching_formats.is_empty() {
             let format_to_apply = if let Some(target_fps) = current_fps {
+                let target_int = target_fps.as_int() as i32;
                 matching_formats
                     .iter()
                     .find(|(_, fmt)| fmt.framerate == Some(target_fps))
@@ -229,8 +230,8 @@ impl AppModel {
                             .iter()
                             .filter(|(_, fmt)| fmt.framerate.is_some())
                             .min_by_key(|(_, fmt)| {
-                                let fps = fmt.framerate.unwrap();
-                                ((fps as i32) - (target_fps as i32)).abs()
+                                let fps = fmt.framerate.unwrap().as_int() as i32;
+                                (fps - target_int).abs()
                             })
                     })
                     .or_else(|| matching_formats.first())
@@ -288,10 +289,10 @@ impl AppModel {
             info!(preset = ?preset, "Selected bitrate preset");
             self.config.bitrate_preset = preset;
 
-            if let Some(handler) = self.config_handler.as_ref() {
-                if let Err(err) = self.config.write_entry(handler) {
-                    error!(?err, "Failed to save bitrate preset setting");
-                }
+            if let Some(handler) = self.config_handler.as_ref()
+                && let Err(err) = self.config.write_entry(handler)
+            {
+                error!(?err, "Failed to save bitrate preset setting");
             }
         }
         Task::none()

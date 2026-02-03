@@ -377,6 +377,7 @@ impl FftMergePipeline {
     /// Offsets: [(-half, -half), (0, -half), (-half, 0), (0, 0)]
     ///
     /// Yields once at the end of all 4 passes to let compositor render.
+    #[allow(clippy::too_many_arguments)]
     async fn run_4pass_wola<P: bytemuck::Pod>(
         &self,
         label: &str,
@@ -419,6 +420,7 @@ impl FftMergePipeline {
     /// allowing the GPU to preempt between chunks for better compositor responsiveness.
     ///
     /// This version is specific to MergeParams which has tile_row_offset support.
+    #[allow(clippy::too_many_arguments)]
     async fn run_4pass_wola_chunked(
         &self,
         label: &str,
@@ -551,8 +553,8 @@ impl FftMergePipeline {
             mapped_at_creation: false,
         });
 
-        let denoise_tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE + 1;
-        let denoise_tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE + 1;
+        let denoise_tiles_x = width.div_ceil(TILE_SIZE) + 1;
+        let denoise_tiles_y = height.div_ceil(TILE_SIZE) + 1;
 
         let spatial_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("spatial_denoise_params_buffer"),
@@ -610,7 +612,7 @@ impl FftMergePipeline {
             "spatial_denoise_init",
             &self.spatial_denoise_init_pipeline,
             &spatial_bind_group,
-            ((width + 15) / 16, (height + 15) / 16, 1),
+            (width.div_ceil(16), height.div_ceil(16), 1),
         );
 
         self.run_4pass_wola(
@@ -633,7 +635,7 @@ impl FftMergePipeline {
             "spatial_denoise_normalize",
             &self.spatial_denoise_normalize_pipeline,
             &spatial_bind_group,
-            ((width + 15) / 16, (height + 15) / 16, 1),
+            (width.div_ceil(16), height.div_ceil(16), 1),
         );
 
         // Copy result back to output buffer
@@ -718,7 +720,7 @@ impl FftMergePipeline {
             "chroma_denoise",
             &self.chroma_denoise_pipeline,
             &chroma_bind_group,
-            ((width + 15) / 16, (height + 15) / 16, 1),
+            (width.div_ceil(16), height.div_ceil(16), 1),
         );
 
         // Copy chroma output back to output buffer
@@ -790,8 +792,8 @@ impl FftMergePipeline {
             ));
         }
 
-        let n_tiles_x = (width + tile_size - 1) / tile_size + 1;
-        let n_tiles_y = (height + tile_size - 1) / tile_size + 1;
+        let n_tiles_x = width.div_ceil(tile_size) + 1;
+        let n_tiles_y = height.div_ceil(tile_size) + 1;
         let tile_count = (n_tiles_x * n_tiles_y) as usize;
 
         // Convert reference to normalized f32 and upload (only CPU->GPU transfer needed)
@@ -950,7 +952,7 @@ impl FftMergePipeline {
                 (
                     &pipelines.init,
                     &bind_group,
-                    ((width + 15) / 16, (height + 15) / 16, 1),
+                    (width.div_ceil(16), height.div_ceil(16), 1),
                 ),
                 (&pipelines.rms, &bind_group, (n_tiles_x, n_tiles_y, 1)),
             ],
@@ -1087,12 +1089,12 @@ impl FftMergePipeline {
                 (
                     &pipelines.normalize,
                     &bind_group,
-                    ((width + 15) / 16, (height + 15) / 16, 1),
+                    (width.div_ceil(16), height.div_ceil(16), 1),
                 ),
                 (
                     &pipelines.reduce_artifacts,
                     &bind_group,
-                    ((width + 15) / 16, (height + 15) / 16, 1),
+                    (width.div_ceil(16), height.div_ceil(16), 1),
                 ),
             ],
         )

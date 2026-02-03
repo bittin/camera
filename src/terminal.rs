@@ -130,51 +130,48 @@ fn run_app(
         })?;
 
         // Handle input with timeout for frame updates
-        if event::poll(Duration::from_millis(16))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    // Ctrl+C to quit
-                    if key.code == KeyCode::Char('c')
-                        && key.modifiers.contains(KeyModifiers::CONTROL)
-                    {
-                        break;
+        if event::poll(Duration::from_millis(16))?
+            && let Event::Key(key) = event::read()?
+            && key.kind == KeyEventKind::Press
+        {
+            // Ctrl+C to quit
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                break;
+            }
+
+            // 's' to switch camera
+            if key.code == KeyCode::Char('s') && cameras.len() > 1 {
+                current_camera_index = (current_camera_index + 1) % cameras.len();
+
+                // Drop old pipeline first
+                drop(pipeline);
+
+                match initialize_camera(&cameras[current_camera_index]) {
+                    Ok(new_pipeline) => {
+                        pipeline = new_pipeline;
+                        status_message = format!(
+                            "Camera: {} | Press 's' to switch, 'q' or Ctrl+C to quit",
+                            cameras[current_camera_index].name
+                        );
+                        frame_widget = FrameWidget::new(); // Clear old frame
                     }
-
-                    // 's' to switch camera
-                    if key.code == KeyCode::Char('s') && cameras.len() > 1 {
-                        current_camera_index = (current_camera_index + 1) % cameras.len();
-
-                        // Drop old pipeline first
-                        drop(pipeline);
-
-                        match initialize_camera(&cameras[current_camera_index]) {
-                            Ok(new_pipeline) => {
-                                pipeline = new_pipeline;
-                                status_message = format!(
-                                    "Camera: {} | Press 's' to switch, 'q' or Ctrl+C to quit",
-                                    cameras[current_camera_index].name
-                                );
-                                frame_widget = FrameWidget::new(); // Clear old frame
-                            }
-                            Err(e) => {
-                                error!("Failed to switch camera: {}", e);
-                                status_message = format!("Error: {}", e);
-                                // Try to go back to previous camera
-                                current_camera_index = if current_camera_index == 0 {
-                                    cameras.len() - 1
-                                } else {
-                                    current_camera_index - 1
-                                };
-                                pipeline = initialize_camera(&cameras[current_camera_index])?;
-                            }
-                        }
-                    }
-
-                    // 'q' also quits
-                    if key.code == KeyCode::Char('q') {
-                        break;
+                    Err(e) => {
+                        error!("Failed to switch camera: {}", e);
+                        status_message = format!("Error: {}", e);
+                        // Try to go back to previous camera
+                        current_camera_index = if current_camera_index == 0 {
+                            cameras.len() - 1
+                        } else {
+                            current_camera_index - 1
+                        };
+                        pipeline = initialize_camera(&cameras[current_camera_index])?;
                     }
                 }
+            }
+
+            // 'q' also quits
+            if key.code == KeyCode::Char('q') {
+                break;
             }
         }
     }

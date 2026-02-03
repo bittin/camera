@@ -124,8 +124,7 @@ pub async fn create_low_priority_compute_device(
 }
 
 /// VK_EXT_global_priority extension name
-const VK_EXT_GLOBAL_PRIORITY: &std::ffi::CStr =
-    unsafe { std::ffi::CStr::from_bytes_with_nul_unchecked(b"VK_EXT_global_priority\0") };
+const VK_EXT_GLOBAL_PRIORITY: &std::ffi::CStr = c"VK_EXT_global_priority";
 
 /// Create a Vulkan device with LOW global priority using VK_EXT_global_priority.
 ///

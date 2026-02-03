@@ -122,10 +122,12 @@ impl AppModel {
                 use crate::pipelines::photo::{
                     EncodingQuality, PhotoPipeline, PostProcessingConfig,
                 };
-                let mut config = PostProcessingConfig::default();
-                config.filter_type = filter_type;
-                config.crop_rect = crop_rect;
-                config.zoom_level = zoom_level;
+                let config = PostProcessingConfig {
+                    filter_type,
+                    crop_rect,
+                    zoom_level,
+                    ..Default::default()
+                };
                 let mut pipeline =
                     PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
                 pipeline.set_camera_metadata(camera_metadata);
@@ -460,12 +462,11 @@ impl AppModel {
         );
 
         // Save config only if setting changed
-        if config_changed {
-            if let Some(handler) = self.config_handler.as_ref() {
-                if let Err(err) = self.config.write_entry(handler) {
-                    error!(?err, "Failed to save HDR+ setting");
-                }
-            }
+        if config_changed
+            && let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save HDR+ setting");
         }
         Task::none()
     }
@@ -502,10 +503,10 @@ impl AppModel {
             "HDR+ setting changed (override cleared)"
         );
 
-        if let Some(handler) = self.config_handler.as_ref() {
-            if let Err(err) = self.config.write_entry(handler) {
-                error!(?err, "Failed to save burst mode frame count setting");
-            }
+        if let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save burst mode frame count setting");
         }
         Task::none()
     }
@@ -729,7 +730,7 @@ impl AppModel {
         let sensor_rotation = camera.rotation;
         let width = format.width;
         let height = format.height;
-        let framerate = format.framerate.unwrap_or(30);
+        let framerate = format.framerate.map(|f| f.as_int()).unwrap_or(30);
         let pixel_format = format.pixel_format.clone();
 
         let audio_device = self
@@ -782,9 +783,7 @@ impl AppModel {
                     Err(e) => return Err(e),
                 };
 
-                if let Err(e) = recorder.start() {
-                    return Err(e);
-                }
+                recorder.start()?;
 
                 let path = output_path.display().to_string();
                 let _ = stop_rx.await;
@@ -918,8 +917,8 @@ async fn process_burst_mode_frames_with_atomic(
     }
 
     // Save first frame as reference (before HDR+ processing)
-    if let Some(first_frame) = frames.first() {
-        if let Err(e) = save_first_burst_frame(
+    if let Some(first_frame) = frames.first()
+        && let Err(e) = save_first_burst_frame(
             first_frame,
             &save_dir,
             crop_rect,
@@ -928,10 +927,9 @@ async fn process_burst_mode_frames_with_atomic(
             filter,
         )
         .await
-        {
-            warn!(error = %e, "Failed to save first burst frame");
-            // Continue with HDR+ processing even if first frame save fails
-        }
+    {
+        warn!(error = %e, "Failed to save first burst frame");
+        // Continue with HDR+ processing even if first frame save fails
     }
 
     // Create progress callback that updates the atomic counter

@@ -141,34 +141,31 @@ impl AppModel {
 
     /// Set V4L2 pan absolute position
     pub fn set_v4l2_pan(&self, value: i32) {
-        if let Some(path) = self.get_v4l2_device_path() {
-            if let Err(e) =
+        if let Some(path) = self.get_v4l2_device_path()
+            && let Err(e) =
                 v4l2_controls::set_control(&path, v4l2_controls::V4L2_CID_PAN_ABSOLUTE, value)
-            {
-                warn!("Failed to set pan: {}", e);
-            }
+        {
+            warn!("Failed to set pan: {}", e);
         }
     }
 
     /// Set V4L2 tilt absolute position
     pub fn set_v4l2_tilt(&self, value: i32) {
-        if let Some(path) = self.get_v4l2_device_path() {
-            if let Err(e) =
+        if let Some(path) = self.get_v4l2_device_path()
+            && let Err(e) =
                 v4l2_controls::set_control(&path, v4l2_controls::V4L2_CID_TILT_ABSOLUTE, value)
-            {
-                warn!("Failed to set tilt: {}", e);
-            }
+        {
+            warn!("Failed to set tilt: {}", e);
         }
     }
 
     /// Set V4L2 zoom absolute position
     pub fn set_v4l2_zoom(&self, value: i32) {
-        if let Some(path) = self.get_v4l2_device_path() {
-            if let Err(e) =
+        if let Some(path) = self.get_v4l2_device_path()
+            && let Err(e) =
                 v4l2_controls::set_control(&path, v4l2_controls::V4L2_CID_ZOOM_ABSOLUTE, value)
-            {
-                warn!("Failed to set zoom: {}", e);
-            }
+        {
+            warn!("Failed to set zoom: {}", e);
         }
     }
 

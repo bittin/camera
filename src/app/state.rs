@@ -248,12 +248,11 @@ impl TheatreState {
 
         // Debounce: if UI is already visible and last interaction was very recent,
         // skip the state update entirely to avoid unnecessary re-renders
-        if self.ui_visible {
-            if let Some(last) = self.last_interaction {
-                if now.duration_since(last) < std::time::Duration::from_millis(100) {
-                    return false;
-                }
-            }
+        if self.ui_visible
+            && let Some(last) = self.last_interaction
+            && now.duration_since(last) < std::time::Duration::from_millis(100)
+        {
+            return false;
         }
 
         // UI was hidden, or enough time has passed - update state
@@ -269,11 +268,11 @@ impl TheatreState {
         if !self.enabled {
             return false;
         }
-        if let Some(last) = self.last_interaction {
-            if last.elapsed() >= std::time::Duration::from_secs(1) {
-                self.ui_visible = false;
-                return true;
-            }
+        if let Some(last) = self.last_interaction
+            && last.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            self.ui_visible = false;
+            return true;
         }
         false
     }
@@ -657,6 +656,10 @@ pub struct AppModel {
     // ===== Privacy Cover Detection =====
     /// Whether the camera privacy cover is closed (blocking the camera)
     pub privacy_cover_closed: bool,
+
+    // ===== Insights Drawer =====
+    /// Insights drawer diagnostic state
+    pub insights: super::insights::InsightsState,
 }
 
 /// State for smooth blur transitions when changing camera settings
@@ -812,7 +815,7 @@ impl PhotoAspectRatio {
         let native_matches_defined =
             Self::from_frame_dimensions(frame_width, frame_height).is_some();
 
-        let next = match self {
+        match self {
             PhotoAspectRatio::Native => PhotoAspectRatio::Ratio4x3,
             PhotoAspectRatio::Ratio4x3 => PhotoAspectRatio::Ratio16x9,
             PhotoAspectRatio::Ratio16x9 => PhotoAspectRatio::Ratio1x1,
@@ -824,9 +827,7 @@ impl PhotoAspectRatio {
                     PhotoAspectRatio::Native
                 }
             }
-        };
-
-        next
+        }
     }
 
     /// Get the aspect ratio as a float (width / height), or None for native
@@ -954,6 +955,7 @@ pub enum ContextPage {
     About,
     Settings,
     Filters,
+    Insights,
 }
 
 /// Messages emitted by the application and its widgets.
@@ -968,6 +970,7 @@ pub enum ContextPage {
 /// - **Settings**: Configuration, audio/video encoder selection
 /// - **System**: Bug reports, recovery, external URLs
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     // ===== UI Navigation =====
     /// Open external URL (repository, etc.)
@@ -1263,6 +1266,12 @@ pub enum Message {
     // ===== Privacy Cover Detection =====
     /// Privacy cover status changed (true = cover closed/camera blocked)
     PrivacyCoverStatusChanged(bool),
+
+    // ===== Insights Drawer =====
+    /// Update insights metrics from pipeline
+    UpdateInsightsMetrics,
+    /// Copy pipeline string to clipboard
+    CopyPipelineString,
 
     /// No-op message for async tasks that don't need a response
     Noop,

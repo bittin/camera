@@ -60,7 +60,7 @@ pub enum WifiSecurity {
 
 impl WifiSecurity {
     /// Parse security type from WiFi QR code string
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_uppercase().as_str() {
             "WEP" => Self::Wep,
             "WPA" | "WPA2" => Self::Wpa,
@@ -174,10 +174,10 @@ impl QrAction {
         }
 
         // Check for geo: URI
-        if let Some(rest) = trimmed.strip_prefix("geo:") {
-            if let Some(loc) = Self::parse_geo(rest) {
-                return loc;
-            }
+        if let Some(rest) = trimmed.strip_prefix("geo:")
+            && let Some(loc) = Self::parse_geo(rest)
+        {
+            return loc;
         }
 
         // Check for vCard
@@ -231,7 +231,7 @@ impl QrAction {
                 match key {
                     "S" => ssid = value,
                     "P" => password = Some(value),
-                    "T" => security = WifiSecurity::from_str(&value),
+                    "T" => security = WifiSecurity::parse(&value),
                     "H" => hidden = value.eq_ignore_ascii_case("true"),
                     _ => {}
                 }
@@ -306,10 +306,10 @@ impl QrAction {
 
         let mut label = None;
         for param in params.split('&') {
-            if let Some((key, value)) = param.split_once('=') {
-                if key == "q" || key == "label" {
-                    label = Some(urlencoding_decode(value));
-                }
+            if let Some((key, value)) = param.split_once('=')
+                && (key == "q" || key == "label")
+            {
+                label = Some(urlencoding_decode(value));
             }
         }
 

@@ -13,7 +13,22 @@ use cosmic::iced::Rectangle;
 use cosmic::iced_wgpu::graphics::Viewport;
 use cosmic::iced_wgpu::primitive::{self, Primitive as PrimitiveTrait};
 use cosmic::iced_wgpu::wgpu;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+// Static for GPU upload time tracking (insights)
+static GPU_UPLOAD_TIME_US: AtomicU64 = AtomicU64::new(0);
+static GPU_FRAME_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// Get the last GPU upload time in microseconds
+pub fn get_gpu_upload_time_us() -> u64 {
+    GPU_UPLOAD_TIME_US.load(Ordering::Relaxed)
+}
+
+/// Get the last GPU frame size in bytes
+pub fn get_gpu_frame_size() -> u64 {
+    GPU_FRAME_SIZE.load(Ordering::Relaxed)
+}
 
 /// Video frame data for GPU upload
 ///
@@ -834,13 +849,12 @@ impl VideoPipeline {
 
         // Check if this exact frame was already uploaded (same Arc pointer)
         // This prevents 15 redundant uploads when filter picker widgets share the same frame
-        if !needs_creation {
-            if let Some(tex) = self.textures.get(&frame.id) {
-                if tex.last_frame_ptr == frame_data_ptr {
-                    // Same frame data already uploaded, skip
-                    return;
-                }
-            }
+        if !needs_creation
+            && let Some(tex) = self.textures.get(&frame.id)
+            && tex.last_frame_ptr == frame_data_ptr
+        {
+            // Same frame data already uploaded, skip
+            return;
         }
 
         // Create or resize texture if needed (invalidates all bindings for this video_id)
@@ -905,12 +919,16 @@ impl VideoPipeline {
         }
         let gpu_copy_time = gpu_copy_start.elapsed();
 
+        // Store GPU upload metrics for insights
+        GPU_UPLOAD_TIME_US.store(gpu_copy_time.as_micros() as u64, Ordering::Relaxed);
+        GPU_FRAME_SIZE.store(frame.data_slice().len() as u64, Ordering::Relaxed);
+
         // Track upload duration for frame skipping decisions
         let upload_duration = upload_start.elapsed();
         self.last_upload_duration.set(upload_duration);
 
         // Log GPU upload performance periodically (every ~30 frames based on frame.id)
-        if frame.id % 30 == 0 {
+        if frame.id.is_multiple_of(30) {
             let size_bytes = frame.data_slice().len();
             tracing::debug!(
                 gpu_upload_ms = format!("{:.2}", gpu_copy_time.as_micros() as f64 / 1000.0),
@@ -1007,9 +1025,9 @@ impl VideoPipeline {
 
         // Upload planes using offsets (zero-copy: we slice from the mapped buffer)
         match frame.format {
-            PixelFormat::YUYV => {
-                // YUYV: packed as RGBA8 where each texel is [Y0, U, Y1, V]
-                // Texture width is frame.width / 2 (2 pixels per texel)
+            // Packed 4:2:2 formats: YUYV, UYVY, YVYU, VYUY
+            // All packed as RGBA8 where each texel encodes 2 pixels
+            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
                 let packed_width = frame.width / 2;
                 queue.write_texture(
                     wgpu::ImageCopyTexture {
@@ -1031,7 +1049,8 @@ impl VideoPipeline {
                     },
                 );
             }
-            PixelFormat::NV12 => {
+            // Semi-planar 4:2:0 formats: NV12, NV21
+            PixelFormat::NV12 | PixelFormat::NV21 => {
                 // NV12: Use offsets to slice Y and UV planes from buffer
                 if let Some(ref yuv_planes) = frame.yuv_planes {
                     let uv_width = frame.width / 2;
@@ -1157,6 +1176,36 @@ impl VideoPipeline {
                     }
                 }
             }
+            // Grayscale: single channel R8 format
+            PixelFormat::Gray8 => {
+                queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &yuv_textures.tex_y,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    buffer_data,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(frame.stride),
+                        rows_per_image: None,
+                    },
+                    wgpu::Extent3d {
+                        width: frame.width,
+                        height: frame.height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            // RGB24: Should have been converted to RGBA by GStreamer pipeline
+            // If it arrives here, treat similarly to RGBA but with 3 bytes per pixel
+            PixelFormat::RGB24 => {
+                tracing::warn!(
+                    "RGB24 format received - should have been converted to RGBA by pipeline"
+                );
+                return;
+            }
             PixelFormat::RGBA => {
                 // Should not reach here - RGBA is handled by direct upload path
                 tracing::warn!("upload_yuv_and_convert called for RGBA frame");
@@ -1165,12 +1214,8 @@ impl VideoPipeline {
         }
 
         // Update uniform buffer with conversion parameters
-        let format_code = match frame.format {
-            PixelFormat::RGBA => 0u32,
-            PixelFormat::NV12 => 1u32,
-            PixelFormat::I420 => 2u32,
-            PixelFormat::YUYV => 3u32,
-        };
+        // Use the PixelFormat method to get format code
+        let format_code = frame.format.gpu_format_code();
 
         let params = YuvConvertParams {
             width: frame.width,
@@ -1252,15 +1297,15 @@ impl VideoPipeline {
             compute_pass.set_bind_group(0, &bind_group, &[]);
 
             // Dispatch: workgroup size is 16x16, so divide and round up
-            let workgroup_x = (frame.width + 15) / 16;
-            let workgroup_y = (frame.height + 15) / 16;
+            let workgroup_x = frame.width.div_ceil(16);
+            let workgroup_y = frame.height.div_ceil(16);
             compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
         }
 
         queue.submit(std::iter::once(encoder.finish()));
 
         let convert_time = convert_start.elapsed();
-        if frame.id % 60 == 0 {
+        if frame.id.is_multiple_of(60) {
             tracing::debug!(
                 format = ?frame.format,
                 width = frame.width,
@@ -1281,41 +1326,60 @@ impl VideoPipeline {
         format: PixelFormat,
     ) {
         // Check if textures exist and match dimensions/format
-        if let Some(yuv) = self.yuv_textures.get(&video_id) {
-            if yuv.width == width && yuv.height == height && yuv.format == format {
-                return;
-            }
+        if let Some(yuv) = self.yuv_textures.get(&video_id)
+            && yuv.width == width
+            && yuv.height == height
+            && yuv.format == format
+        {
+            return;
         }
 
         // Calculate texture dimensions based on format
         let (y_width, y_height) = (width, height);
         let (uv_width, uv_height) = match format {
-            PixelFormat::NV12 | PixelFormat::I420 => (width / 2, height / 2),
-            PixelFormat::YUYV => (width / 2, height), // Packed: 2 pixels per texel
-            PixelFormat::RGBA => (1, 1),              // Dummy
+            // Semi-planar 4:2:0 formats: UV plane at half resolution
+            PixelFormat::NV12 | PixelFormat::NV21 | PixelFormat::I420 => (width / 2, height / 2),
+            // Packed 4:2:2 formats: 2 pixels per texel, no separate UV plane
+            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                (width / 2, height)
+            }
+            // Gray8, RGB24, RGBA: no UV plane (dummy 1x1)
+            PixelFormat::Gray8 | PixelFormat::RGB24 | PixelFormat::RGBA => (1, 1),
         };
 
         // Y plane texture format
         let y_format = match format {
-            PixelFormat::YUYV => wgpu::TextureFormat::Rgba8Unorm, // Packed YUYV as RGBA
-            _ => wgpu::TextureFormat::R8Unorm,                    // Y plane
+            // Packed 4:2:2 formats: store as RGBA8 (4 bytes = 2 pixels)
+            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                wgpu::TextureFormat::Rgba8Unorm
+            }
+            // RGBA, RGB24: full RGBA texture
+            PixelFormat::RGBA | PixelFormat::RGB24 => wgpu::TextureFormat::Rgba8Unorm,
+            // Y plane or grayscale: single channel
+            _ => wgpu::TextureFormat::R8Unorm,
         };
 
         // UV plane texture format
         let uv_format = match format {
-            PixelFormat::NV12 => wgpu::TextureFormat::Rg8Unorm, // Interleaved UV
-            _ => wgpu::TextureFormat::R8Unorm,                  // U/V planes
+            // NV12/NV21: interleaved UV/VU as Rg8
+            PixelFormat::NV12 | PixelFormat::NV21 => wgpu::TextureFormat::Rg8Unorm,
+            // I420 and others: R8 for U/V planes
+            _ => wgpu::TextureFormat::R8Unorm,
+        };
+
+        // Calculate Y texture width (packed formats store 2 pixels per texel)
+        let y_tex_width = match format {
+            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                y_width / 2
+            }
+            _ => y_width,
         };
 
         // Create Y texture
         let tex_y = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("yuv_tex_y"),
             size: wgpu::Extent3d {
-                width: if format == PixelFormat::YUYV {
-                    y_width / 2
-                } else {
-                    y_width
-                },
+                width: y_tex_width,
                 height: y_height,
                 depth_or_array_layers: 1,
             },

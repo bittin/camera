@@ -216,7 +216,7 @@ impl VirtualCameraPipeline {
         match self.appsrc.push_buffer(buffer) {
             Ok(_) => {
                 let count = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-                if count % 100 == 0 {
+                if count.is_multiple_of(100) {
                     debug!(
                         frame = count,
                         "Virtual camera frames pushed (RGBA zero-copy)"

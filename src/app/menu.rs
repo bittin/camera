@@ -24,6 +24,7 @@ pub fn menu_bar<'a>(core: &Core) -> Element<'a, Message> {
                 fl!("view"),
                 vec![
                     MenuItem::Button(fl!("settings-title"), None, MenuAction::Settings),
+                    MenuItem::Button(fl!("insights-title"), None, MenuAction::Insights),
                     MenuItem::Divider,
                     MenuItem::Button(fl!("about"), None, MenuAction::About),
                 ],
@@ -34,6 +35,7 @@ pub fn menu_bar<'a>(core: &Core) -> Element<'a, Message> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MenuAction {
     Settings,
+    Insights,
     About,
 }
 
@@ -43,6 +45,7 @@ impl cosmic::widget::menu::Action for MenuAction {
     fn message(&self) -> Self::Message {
         match self {
             MenuAction::Settings => Message::ToggleContextPage(ContextPage::Settings),
+            MenuAction::Insights => Message::ToggleContextPage(ContextPage::Insights),
             MenuAction::About => Message::ToggleContextPage(ContextPage::About),
         }
     }
