@@ -521,6 +521,9 @@ pub struct AppModel {
     /// Rotation of the camera that produced the current frame
     /// (used during blur transitions to maintain correct rotation)
     pub current_frame_rotation: crate::backends::camera::types::SensorRotation,
+    /// Rotation of the camera that produced the blur frame
+    /// (captured at start of blur transition to maintain correct rotation during transition)
+    pub blur_frame_rotation: crate::backends::camera::types::SensorRotation,
     /// Video file playback progress (position_secs, duration_secs, progress 0.0-1.0)
     pub video_file_progress: Option<(f64, f64, f64)>,
     /// Video preview seek position (used when not streaming to store desired start position)
