@@ -41,7 +41,7 @@ pub mod fft_gpu;
 mod gpu_helpers;
 pub mod params;
 
-use crate::backends::camera::types::{CameraFrame, PixelFormat};
+use crate::backends::camera::types::{CameraFrame, PixelFormat, SensorRotation};
 use crate::gpu::{self, wgpu};
 use crate::shaders::{GpuFrameInput, get_gpu_convert_pipeline};
 use std::sync::{Arc, RwLock};
@@ -250,6 +250,8 @@ pub struct BurstModeConfig {
     pub encoding_format: super::EncodingFormat,
     /// Camera metadata for DNG encoding
     pub camera_metadata: super::CameraMetadata,
+    /// Sensor rotation to correct the image orientation
+    pub rotation: SensorRotation,
 }
 
 impl Default for BurstModeConfig {
@@ -265,6 +267,7 @@ impl Default for BurstModeConfig {
             save_burst_raw_dng: false, // Don't save raw DNG frames by default
             encoding_format: super::EncodingFormat::Jpeg, // Default to JPEG
             camera_metadata: super::CameraMetadata::default(),
+            rotation: SensorRotation::None, // No rotation by default
         }
     }
 }
@@ -2577,7 +2580,7 @@ pub async fn process_burst_mode(
     Ok(tonemapped)
 }
 
-/// Save output image to disk with optional filter and aspect ratio cropping
+/// Save output image to disk with optional filter, rotation, and aspect ratio cropping
 ///
 /// # Arguments
 /// * `frame` - The merged frame to save
@@ -2586,6 +2589,7 @@ pub async fn process_burst_mode(
 /// * `encoding_format` - Output format (JPEG, PNG, or DNG)
 /// * `camera_metadata` - Optional camera metadata for DNG encoding
 /// * `filter` - Optional filter to apply to the image (None or Standard = no filter)
+/// * `rotation` - Sensor rotation to correct the image orientation
 /// * `filename_suffix` - Optional suffix for filename (e.g., "_HDR+"), None for no suffix
 pub async fn save_output(
     frame: &MergedFrame,
@@ -2594,6 +2598,7 @@ pub async fn save_output(
     encoding_format: super::EncodingFormat,
     camera_metadata: super::CameraMetadata,
     filter: Option<crate::app::FilterType>,
+    rotation: SensorRotation,
     filename_suffix: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
     use super::{EncodingQuality, PhotoEncoder};
@@ -2658,7 +2663,26 @@ pub async fn save_output(
     };
 
     let rgb_img = cropped_img.to_rgb8();
-    let (width, height) = rgb_img.dimensions();
+
+    // Apply rotation correction if needed
+    let (rgb_img, width, height) = if rotation != SensorRotation::None {
+        use image::imageops;
+        debug!(rotation = ?rotation, "Applying rotation correction to burst mode output");
+        let rotated = match rotation {
+            SensorRotation::None => rgb_img,
+            // 90 CW sensor -> rotate 90 CCW to correct
+            SensorRotation::Rotate90 => imageops::rotate270(&rgb_img),
+            // 180 sensor -> rotate 180 to correct
+            SensorRotation::Rotate180 => imageops::rotate180(&rgb_img),
+            // 270 CW sensor -> rotate 90 CW to correct
+            SensorRotation::Rotate270 => imageops::rotate90(&rgb_img),
+        };
+        let (w, h) = rotated.dimensions();
+        (rotated, w, h)
+    } else {
+        let (w, h) = rgb_img.dimensions();
+        (rgb_img, w, h)
+    };
 
     // Create a PhotoEncoder for the selected format
     let mut encoder = PhotoEncoder::new();

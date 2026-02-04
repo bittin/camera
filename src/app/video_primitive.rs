@@ -98,8 +98,8 @@ struct ViewportUniform {
     crop_uv_max: [f32; 2],
     /// Zoom level (1.0 = no zoom, 2.0 = 2x zoom, etc.)
     zoom_level: f32,
-    /// Padding to maintain 16-byte alignment
-    _padding: f32,
+    /// Sensor rotation: 0=None, 1=90CW, 2=180, 3=270CW
+    rotation: u32,
 }
 
 /// Combined frame and viewport data to reduce mutex contention
@@ -129,6 +129,8 @@ pub struct VideoPrimitive {
     pub corner_radius: f32,
     /// Mirror horizontally (selfie mode)
     pub mirror_horizontal: bool,
+    /// Sensor rotation: 0=None, 1=90CW, 2=180, 3=270CW
+    pub rotation: u32,
     /// Crop UV coordinates (u_min, v_min, u_max, v_max) - None means no cropping
     pub crop_uv: Option<(f32, f32, f32, f32)>,
     /// Zoom level (1.0 = no zoom, 2.0 = 2x zoom, etc.)
@@ -230,6 +232,7 @@ impl VideoPrimitive {
             filter_type: FilterType::Standard,
             corner_radius: 0.0,
             mirror_horizontal: false,
+            rotation: 0,
             crop_uv: None,
             zoom_level: 1.0,
         }
@@ -394,8 +397,15 @@ impl PrimitiveTrait for VideoPrimitive {
                         // Blur video: use Contain mode with texture dimensions for Pass 1
                         // Apply mirror in first pass since this reads from source texture
                         // Apply filter in first pass so the filter is visible during transition
+                        // For 90/270 rotation, use effective (swapped) dimensions for viewport
+                        let (effective_width, effective_height) =
+                            if self.rotation == 1 || self.rotation == 3 {
+                                (tex_height as f32, tex_width as f32)
+                            } else {
+                                (tex_width as f32, tex_height as f32)
+                            };
                         let blur_uniform = ViewportUniform {
-                            viewport_size: [tex_width as f32, tex_height as f32],
+                            viewport_size: [effective_width, effective_height],
                             content_fit_mode: 0, // Contain mode - no Cover cropping in Pass 1
                             filter_mode,         // Apply filter during blur (visible in transition)
                             corner_radius: 0.0,  // No rounded corners for blur passes
@@ -405,7 +415,7 @@ impl PrimitiveTrait for VideoPrimitive {
                             crop_uv_min: crop_min,
                             crop_uv_max: crop_max,
                             zoom_level: 1.0, // No zoom for blur passes
-                            _padding: 0.0,
+                            rotation: self.rotation,
                         };
                         queue.write_buffer(
                             &binding.viewport_buffer,
@@ -426,7 +436,7 @@ impl PrimitiveTrait for VideoPrimitive {
                         crop_uv_min: crop_min,
                         crop_uv_max: crop_max,
                         zoom_level: self.zoom_level,
-                        _padding: 0.0,
+                        rotation: self.rotation,
                     };
                     queue.write_buffer(
                         &binding.viewport_buffer,
@@ -450,7 +460,7 @@ impl PrimitiveTrait for VideoPrimitive {
                         crop_uv_min: [0.0, 0.0], // No crop for intermediate
                         crop_uv_max: [1.0, 1.0],
                         zoom_level: 1.0, // No zoom for intermediate passes
-                        _padding: 0.0,
+                        rotation: 0,     // Already rotated in pass 1
                     };
                     queue.write_buffer(
                         &intermediate_1.viewport_buffer,
@@ -472,7 +482,7 @@ impl PrimitiveTrait for VideoPrimitive {
                         crop_uv_min: [0.0, 0.0], // No crop for final blur pass
                         crop_uv_max: [1.0, 1.0],
                         zoom_level: 1.0, // No zoom for blur
-                        _padding: 0.0,
+                        rotation: 0,     // Already rotated in pass 1
                     };
                     queue.write_buffer(
                         &intermediate_2.viewport_buffer,

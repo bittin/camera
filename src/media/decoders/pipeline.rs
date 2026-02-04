@@ -82,6 +82,9 @@ pub fn get_full_pipeline_string() -> Option<String> {
 /// This function creates pipelines using pipewiresrc, handling format negotiation
 /// and decoder selection automatically. PipeWire-only application.
 ///
+/// Rotation is NOT applied in the preview pipeline - it's handled by the GPU shader
+/// for better performance.
+///
 /// # Arguments
 /// * `device_path` - Device path (e.g., "pipewire-serial-12345" or "/dev/video0" via PipeWire)
 /// * `caps_filter` - GStreamer caps filter string (e.g., "width=1920,height=1080")
@@ -127,6 +130,7 @@ fn try_create_pipewire_pipeline(
     log_requested_format(caps_filter);
 
     // Build PipeWire pipeline based on pixel format
+    // Note: Rotation is handled by the GPU shader for better performance
     let pipewire_pipeline =
         build_pipewire_pipeline_string(&pw_path_prop, caps_filter, pixel_format);
 
@@ -244,6 +248,9 @@ fn log_requested_format(caps_filter: &str) {
 ///
 /// For unsupported raw formats, the pipeline converts to NV12 via videoconvert
 /// which the GPU shader can then process.
+///
+/// Note: Rotation is NOT applied in the pipeline - it's handled by the GPU shader
+/// for better performance (zero CPU overhead per frame).
 fn build_pipewire_pipeline_string(
     pw_path_prop: &str,
     caps_filter: &str,

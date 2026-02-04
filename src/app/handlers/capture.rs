@@ -82,8 +82,17 @@ impl AppModel {
         let filter_type = self.selected_filter;
         let zoom_level = self.zoom_level;
 
-        // Calculate crop rectangle based on aspect ratio setting
-        let crop_rect = self.photo_aspect_ratio.crop_rect(frame.width, frame.height);
+        // Get camera rotation for photo processing
+        let rotation = self
+            .available_cameras
+            .get(self.current_camera_index)
+            .map(|cam| cam.rotation)
+            .unwrap_or_default();
+
+        // Calculate crop rectangle based on aspect ratio setting (accounting for rotation)
+        let crop_rect =
+            self.photo_aspect_ratio
+                .crop_rect_with_rotation(frame.width, frame.height, rotation);
         let crop_rect = if self.photo_aspect_ratio == crate::app::state::PhotoAspectRatio::Native {
             None
         } else {
@@ -126,6 +135,7 @@ impl AppModel {
                     filter_type,
                     crop_rect,
                     zoom_level,
+                    rotation,
                     ..Default::default()
                 };
                 let mut pipeline =
@@ -225,18 +235,6 @@ impl AppModel {
 
         let save_dir = crate::app::get_photo_directory(&self.config.save_folder_name);
 
-        // Calculate crop rectangle based on aspect ratio setting (same as regular photo capture)
-        let crop_rect = if let Some(frame) = frames.first() {
-            let rect = self.photo_aspect_ratio.crop_rect(frame.width, frame.height);
-            if self.photo_aspect_ratio == crate::app::state::PhotoAspectRatio::Native {
-                None
-            } else {
-                Some(rect)
-            }
-        } else {
-            None
-        };
-
         // Get encoding format and camera metadata (including exposure info)
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
@@ -267,12 +265,36 @@ impl AppModel {
             })
             .unwrap_or_default();
 
+        // Get camera rotation for photo processing
+        let rotation = self
+            .available_cameras
+            .get(self.current_camera_index)
+            .map(|cam| cam.rotation)
+            .unwrap_or_default();
+
+        // Calculate crop rectangle based on aspect ratio setting (accounting for rotation)
+        let crop_rect = if let Some(frame) = frames.first() {
+            let rect = self.photo_aspect_ratio.crop_rect_with_rotation(
+                frame.width,
+                frame.height,
+                rotation,
+            );
+            if self.photo_aspect_ratio == crate::app::state::PhotoAspectRatio::Native {
+                None
+            } else {
+                Some(rect)
+            }
+        } else {
+            None
+        };
+
         // Create burst mode config with user's settings
         let mut config = BurstModeConfig::default();
         config.crop_rect = crop_rect;
         config.encoding_format = encoding_format;
         config.camera_metadata = camera_metadata;
         config.save_burst_raw_dng = self.config.save_burst_raw;
+        config.rotation = rotation;
 
         // Calculate adaptive processing parameters based on scene brightness
         if let Some(first_frame) = frames.first() {
@@ -907,6 +929,7 @@ async fn process_burst_mode_frames_with_atomic(
     let encoding_format = config.encoding_format;
     let camera_metadata = config.camera_metadata.clone();
     let save_burst_raw_dng = config.save_burst_raw_dng;
+    let rotation = config.rotation;
 
     // Export raw burst frames as DNG if enabled (before processing)
     if save_burst_raw_dng {
@@ -930,6 +953,7 @@ async fn process_burst_mode_frames_with_atomic(
             encoding_format,
             &camera_metadata,
             filter,
+            rotation,
         )
         .await
     {
@@ -946,7 +970,7 @@ async fn process_burst_mode_frames_with_atomic(
     // Process using the unified GPU pipeline with progress reporting
     let merged = process_burst_mode(frames, config, Some(progress_callback)).await?;
 
-    // Save output with optional crop, filter, and selected encoding format
+    // Save output with optional crop, filter, rotation, and selected encoding format
     let output_path = save_output(
         &merged,
         save_dir,
@@ -954,6 +978,7 @@ async fn process_burst_mode_frames_with_atomic(
         encoding_format,
         camera_metadata,
         Some(filter),
+        rotation,
         Some("_HDR+"),
     )
     .await?;
@@ -970,6 +995,7 @@ async fn save_first_burst_frame(
     encoding_format: crate::pipelines::photo::EncodingFormat,
     camera_metadata: &crate::pipelines::photo::CameraMetadata,
     filter: crate::app::FilterType,
+    rotation: crate::backends::camera::types::SensorRotation,
 ) -> Result<PathBuf, String> {
     use crate::pipelines::photo::burst_mode::{MergedFrame, save_output};
 
@@ -988,6 +1014,7 @@ async fn save_first_burst_frame(
         encoding_format,
         camera_metadata.clone(),
         Some(filter),
+        rotation,
         None, // No suffix for first frame
     )
     .await?;

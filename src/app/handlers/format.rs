@@ -19,6 +19,14 @@ impl AppModel {
     // Format Selection Handlers
     // =========================================================================
 
+    /// Get the current camera's sensor rotation
+    fn current_camera_rotation(&self) -> crate::backends::camera::types::SensorRotation {
+        self.available_cameras
+            .get(self.current_camera_index)
+            .map(|c| c.rotation)
+            .unwrap_or_default()
+    }
+
     pub(crate) fn handle_set_mode(&mut self, mode: CameraMode) -> Task<cosmic::Action<Message>> {
         if self.mode == mode {
             return Task::none();
@@ -45,7 +53,7 @@ impl AppModel {
 
         if would_change_format {
             info!("Mode switch will change format - triggering camera reload with blur");
-            let _ = self.transition_state.start();
+            self.start_blur_transition();
             self.camera_cancel_flag
                 .store(true, std::sync::atomic::Ordering::Release);
             self.camera_cancel_flag =
@@ -142,7 +150,7 @@ impl AppModel {
                 "Switching to mode from consolidated dropdown"
             );
             self.change_format(format);
-            let _ = self.transition_state.start();
+            self.start_blur_transition();
 
             // Re-query exposure controls to reset to defaults for new format
             return self.query_exposure_controls_task();
@@ -156,7 +164,7 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         info!(pixel_format = %pixel_format, "Switching to pixel format");
         self.change_pixel_format(pixel_format);
-        let _ = self.transition_state.start();
+        self.start_blur_transition();
 
         // Re-query exposure controls to get fresh defaults for new format
         self.query_exposure_controls_task()
@@ -170,7 +178,7 @@ impl AppModel {
             info!(width, height, "Switching to resolution");
             self.change_resolution(width, height);
             self.zoom_level = 1.0; // Reset zoom when changing resolution
-            let _ = self.transition_state.start();
+            self.start_blur_transition();
 
             // Re-query exposure controls to get fresh defaults for new resolution
             return self.query_exposure_controls_task();
@@ -182,10 +190,18 @@ impl AppModel {
         &mut self,
         framerate_str: String,
     ) -> Task<cosmic::Action<Message>> {
+        // Handle "Auto" for VFR (variable framerate) - libcamera manages dynamically
+        if framerate_str == "Auto" {
+            info!("Switching to VFR (Auto framerate - libcamera managed)");
+            self.change_framerate_optional(None);
+            self.start_blur_transition();
+            return self.query_exposure_controls_task();
+        }
+
         if let Ok(fps) = framerate_str.parse::<u32>() {
             info!(fps, "Switching to framerate");
-            self.change_framerate(fps);
-            let _ = self.transition_state.start();
+            self.change_framerate_optional(Some(fps));
+            self.start_blur_transition();
 
             // Re-query exposure controls to get fresh defaults for new framerate
             return self.query_exposure_controls_task();
@@ -244,13 +260,16 @@ impl AppModel {
 
                 if let Some(fmt) = &self.active_format {
                     info!(width, format = %fmt, "Applied resolution with framerate preservation");
-                    // Update aspect ratio default for new dimensions
-                    self.photo_aspect_ratio =
-                        PhotoAspectRatio::default_for_frame(fmt.width, fmt.height);
+                    // Update aspect ratio default for new dimensions (accounting for rotation)
+                    self.photo_aspect_ratio = PhotoAspectRatio::default_for_frame_with_rotation(
+                        fmt.width,
+                        fmt.height,
+                        self.current_camera_rotation(),
+                    );
                 }
                 self.zoom_level = 1.0; // Reset zoom when changing resolution
                 self.save_settings();
-                let _ = self.transition_state.start();
+                self.start_blur_transition();
             }
         }
         Task::none()
@@ -266,13 +285,16 @@ impl AppModel {
 
             if let Some(fmt) = &self.active_format {
                 info!(format = %fmt, "Selected format from picker");
-                // Update aspect ratio default for new dimensions
-                self.photo_aspect_ratio =
-                    PhotoAspectRatio::default_for_frame(fmt.width, fmt.height);
+                // Update aspect ratio default for new dimensions (accounting for rotation)
+                self.photo_aspect_ratio = PhotoAspectRatio::default_for_frame_with_rotation(
+                    fmt.width,
+                    fmt.height,
+                    self.current_camera_rotation(),
+                );
             }
             self.zoom_level = 1.0; // Reset zoom when changing format
             self.save_settings();
-            let _ = self.transition_state.start();
+            self.start_blur_transition();
 
             // Re-query exposure controls to reset to defaults for new format
             return self.query_exposure_controls_task();

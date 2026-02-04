@@ -518,6 +518,9 @@ pub struct AppModel {
     pub virtual_camera_file_source: Option<FileSource>,
     /// Whether the current frame is from a file source (vs camera)
     pub current_frame_is_file_source: bool,
+    /// Rotation of the camera that produced the current frame
+    /// (used during blur transitions to maintain correct rotation)
+    pub current_frame_rotation: crate::backends::camera::types::SensorRotation,
     /// Video file playback progress (position_secs, duration_secs, progress 0.0-1.0)
     pub video_file_progress: Option<(f64, f64, f64)>,
     /// Video preview seek position (used when not streaming to store desired start position)
@@ -883,6 +886,71 @@ impl PhotoAspectRatio {
             let scale = frame_ratio / target_ratio;
             let offset = (1.0 - scale) / 2.0;
             Some((0.0, offset, 1.0, 1.0 - offset))
+        }
+    }
+
+    /// Get the default aspect ratio accounting for sensor rotation
+    /// For 90°/270° rotations, the frame dimensions are swapped after GStreamer applies rotation
+    pub fn default_for_frame_with_rotation(
+        width: u32,
+        height: u32,
+        rotation: crate::backends::camera::types::SensorRotation,
+    ) -> Self {
+        // For 90°/270° rotations, swap dimensions to match the rotated frame
+        let (effective_width, effective_height) = if rotation.swaps_dimensions() {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        Self::default_for_frame(effective_width, effective_height)
+    }
+
+    /// Calculate crop UV coordinates for shader use, accounting for sensor rotation
+    ///
+    /// Since rotation is now applied by the GPU shader (not GStreamer), the frame
+    /// arrives with original sensor dimensions. The shader applies rotation BEFORE
+    /// crop, so crop_uv should be calculated for the POST-rotation dimensions.
+    ///
+    /// Returns (u_min, v_min, u_max, v_max) in 0-1 range
+    pub fn crop_uv_with_rotation(
+        &self,
+        frame_width: u32,
+        frame_height: u32,
+        rotation: crate::backends::camera::types::SensorRotation,
+    ) -> Option<(f32, f32, f32, f32)> {
+        // For 90°/270° rotations, swap dimensions to get effective post-rotation size
+        // The shader applies rotation before crop, so crop is in rotated coordinate space
+        let (effective_width, effective_height) = if rotation.swaps_dimensions() {
+            (frame_height, frame_width)
+        } else {
+            (frame_width, frame_height)
+        };
+        self.crop_uv(effective_width, effective_height)
+    }
+
+    /// Calculate crop rectangle accounting for sensor rotation
+    ///
+    /// For photo processing where rotation is applied AFTER crop, we need to calculate
+    /// the crop on the original frame such that it produces the desired aspect ratio
+    /// after rotation.
+    ///
+    /// For 90°/270° rotations, the target aspect ratio is inverted because the
+    /// crop is applied before rotation.
+    pub fn crop_rect_with_rotation(
+        &self,
+        frame_width: u32,
+        frame_height: u32,
+        rotation: crate::backends::camera::types::SensorRotation,
+    ) -> (u32, u32, u32, u32) {
+        if rotation.swaps_dimensions() {
+            // For 90°/270° rotation: crop is applied BEFORE rotation
+            // If user wants W:H ratio after rotation, we need H:W ratio before rotation
+            // So we calculate crop for swapped dimensions, which inverts the aspect ratio
+            let (x, y, w, h) = self.crop_rect(frame_height, frame_width);
+            // Swap the crop coordinates to match the original frame orientation
+            (y, x, h, w)
+        } else {
+            self.crop_rect(frame_width, frame_height)
         }
     }
 }

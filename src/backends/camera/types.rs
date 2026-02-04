@@ -168,6 +168,16 @@ impl SensorRotation {
     pub fn swaps_dimensions(&self) -> bool {
         matches!(self, SensorRotation::Rotate90 | SensorRotation::Rotate270)
     }
+
+    /// Get the rotation as a GPU shader code (0=None, 1=90CW, 2=180, 3=270CW)
+    pub fn gpu_rotation_code(&self) -> u32 {
+        match self {
+            SensorRotation::None => 0,
+            SensorRotation::Rotate90 => 1,
+            SensorRotation::Rotate180 => 2,
+            SensorRotation::Rotate270 => 3,
+        }
+    }
 }
 
 impl std::fmt::Display for SensorRotation {
