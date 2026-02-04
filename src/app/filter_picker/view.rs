@@ -66,6 +66,13 @@ impl AppModel {
             let thumbnail: Element<'_, Message> = if let Some(frame) = &self.current_frame {
                 // Use video widget with the specific filter type
                 // The video widget fills its container and handles aspect ratio via Cover mode
+                // Get rotation from current camera
+                let rotation = self
+                    .available_cameras
+                    .get(self.current_camera_index)
+                    .map(|c| c.rotation.gpu_rotation_code())
+                    .unwrap_or(0);
+
                 video_widget::video_widget(
                     Arc::clone(frame),
                     video_widget::VideoWidgetConfig {
@@ -74,6 +81,7 @@ impl AppModel {
                         filter_type,
                         corner_radius,
                         mirror_horizontal: self.config.mirror_preview,
+                        rotation,
                         crop_uv: None,   // No aspect ratio cropping in filter previews
                         zoom_level: 1.0, // No zoom for filter previews
                         scroll_zoom_enabled: false, // No scroll zoom for filter previews

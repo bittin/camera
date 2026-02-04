@@ -12,7 +12,7 @@
 //! avoiding unnecessary format conversions.
 
 use crate::app::FilterType;
-use crate::backends::camera::types::{CameraFrame, PixelFormat};
+use crate::backends::camera::types::{CameraFrame, PixelFormat, SensorRotation};
 use crate::shaders::{GpuFrameInput, apply_filter_gpu_rgba, get_gpu_convert_pipeline};
 use image::RgbImage;
 use std::sync::Arc;
@@ -37,6 +37,8 @@ pub struct PostProcessingConfig {
     pub crop_rect: Option<(u32, u32, u32, u32)>,
     /// Zoom level (1.0 = no zoom, 2.0 = 2x zoom center crop)
     pub zoom_level: f32,
+    /// Sensor rotation to correct the image orientation
+    pub rotation: SensorRotation,
 }
 
 impl Default for PostProcessingConfig {
@@ -50,6 +52,7 @@ impl Default for PostProcessingConfig {
             filter_type: FilterType::Standard,
             crop_rect: None,
             zoom_level: 1.0,
+            rotation: SensorRotation::None,
         }
     }
 }
@@ -152,6 +155,14 @@ impl PostProcessor {
 
         // Step 4: Convert filtered RGBA to RGB (drop alpha channel)
         let rgb_image = Self::convert_rgba_to_rgb(&final_rgba, final_width, final_height)?;
+
+        // Step 4.5: Apply rotation correction if needed
+        let (rgb_image, final_width, final_height) = if config.rotation != SensorRotation::None {
+            debug!(rotation = ?config.rotation, "Applying rotation correction");
+            Self::apply_rotation(rgb_image, config.rotation)?
+        } else {
+            (rgb_image, final_width, final_height)
+        };
 
         // Step 5 & 6: Apply adjustments and sharpening (CPU-bound)
         let needs_adjustments =
@@ -454,6 +465,30 @@ impl PostProcessor {
                 }
             }
         }
+    }
+
+    /// Apply rotation correction to an RGB image
+    ///
+    /// Uses the image crate's rotation methods for efficient CPU rotation.
+    /// Rotation is applied at the end of post-processing to correct sensor orientation.
+    fn apply_rotation(
+        image: RgbImage,
+        rotation: SensorRotation,
+    ) -> Result<(RgbImage, u32, u32), String> {
+        use image::imageops;
+
+        let rotated = match rotation {
+            SensorRotation::None => return Ok((image.clone(), image.width(), image.height())),
+            // 90 CW sensor -> rotate 90 CCW to correct (same as rotate270 in image crate)
+            SensorRotation::Rotate90 => imageops::rotate270(&image),
+            // 180 sensor -> rotate 180 to correct
+            SensorRotation::Rotate180 => imageops::rotate180(&image),
+            // 270 CW sensor -> rotate 90 CW to correct (same as rotate90 in image crate)
+            SensorRotation::Rotate270 => imageops::rotate90(&image),
+        };
+
+        let (w, h) = rotated.dimensions();
+        Ok((rotated, w, h))
     }
 }
 

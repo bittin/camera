@@ -134,7 +134,6 @@ impl PipeWirePipeline {
                     decoder,
                     pixel_format,
                     PipelineBackend::PipeWire,
-                    device.rotation,
                 ) {
                     Ok(p) => {
                         info!(decoder = %decoder, "Successfully created pipeline");
@@ -157,7 +156,6 @@ impl PipeWirePipeline {
                 "",
                 pixel_format,
                 PipelineBackend::PipeWire,
-                device.rotation,
             ) {
                 Ok(p) => {
                     pipeline = Some(p);

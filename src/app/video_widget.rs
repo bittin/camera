@@ -42,6 +42,8 @@ pub struct VideoWidgetConfig {
     pub corner_radius: f32,
     /// Whether to mirror the video horizontally
     pub mirror_horizontal: bool,
+    /// Sensor rotation: 0=None, 1=90CW, 2=180, 3=270CW
+    pub rotation: u32,
     /// Optional crop UV coordinates (u_min, v_min, u_max, v_max) in 0-1 range
     pub crop_uv: Option<(f32, f32, f32, f32)>,
     /// Zoom level (1.0 = no zoom, 2.0 = 2x zoom)
@@ -72,21 +74,30 @@ impl VideoWidget {
         primitive.filter_type = config.filter_type;
         primitive.corner_radius = config.corner_radius;
         primitive.mirror_horizontal = config.mirror_horizontal;
+        primitive.rotation = config.rotation;
         primitive.crop_uv = config.crop_uv;
         primitive.zoom_level = config.zoom_level;
 
-        // Calculate aspect ratio from frame dimensions, adjusted for crop
+        // Calculate aspect ratio from frame dimensions, adjusted for crop and rotation
+        // For 90° and 270° rotations, swap width and height
+        let swaps_dimensions = config.rotation == 1 || config.rotation == 3;
+        let (effective_width, effective_height) = if swaps_dimensions {
+            (frame.height as f32, frame.width as f32)
+        } else {
+            (frame.width as f32, frame.height as f32)
+        };
+
         let aspect_ratio = if let Some((u_min, v_min, u_max, v_max)) = config.crop_uv {
-            // Use cropped region's aspect ratio
-            let crop_width = (u_max - u_min) * frame.width as f32;
-            let crop_height = (v_max - v_min) * frame.height as f32;
+            // Use cropped region's aspect ratio (crop is in rotated space)
+            let crop_width = (u_max - u_min) * effective_width;
+            let crop_height = (v_max - v_min) * effective_height;
             if crop_height > 0.0 {
                 crop_width / crop_height
             } else {
                 16.0 / 9.0
             }
-        } else if frame.height > 0 {
-            frame.width as f32 / frame.height as f32
+        } else if effective_height > 0.0 {
+            effective_width / effective_height
         } else {
             16.0 / 9.0 // Default aspect ratio
         };

@@ -360,6 +360,7 @@ pub fn process_burst_mode(
     input: Vec<PathBuf>,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use camera::backends::camera::types::SensorRotation;
     use camera::pipelines::photo::burst_mode::{
         BurstModeConfig, process_burst_mode as run_burst_mode, save_output,
     };
@@ -440,8 +441,9 @@ pub fn process_burst_mode(
             None,                 // no crop
             EncodingFormat::Jpeg, // Use JPEG for easier viewing
             camera_metadata,
-            None,          // no filter
-            Some("_HDR+"), // filename suffix
+            None,                 // no filter
+            SensorRotation::None, // no rotation (CLI doesn't have camera info)
+            Some("_HDR+"),        // filename suffix
         )
         .await
     })?;

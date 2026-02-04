@@ -19,7 +19,7 @@ struct ViewportUniform {
     crop_uv_min: vec2<f32>,     // Crop UV min (u_min, v_min) - normalized 0-1
     crop_uv_max: vec2<f32>,     // Crop UV max (u_max, v_max) - normalized 0-1
     zoom_level: f32,            // Zoom level (1.0 = no zoom, 2.0 = 2x zoom)
-    _padding: f32,              // Padding for 16-byte alignment
+    rotation: u32,              // Sensor rotation: 0=None, 1=90CW, 2=180, 3=270CW
 }
 
 @group(0) @binding(2)
@@ -82,8 +82,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var tex_coords = viewport.uv_offset + in.tex_coords * viewport.uv_scale;
 
     // Apply horizontal mirror if enabled (selfie mode)
+    // This happens BEFORE rotation so the mirror is in screen space
     if (viewport.mirror_horizontal == 1u) {
         tex_coords.x = 1.0 - tex_coords.x;
+    }
+
+    // Apply rotation correction for sensor orientation
+    // Transforms UV coordinates to correct for physical sensor rotation
+    // For a sensor mounted N degrees CW, we rotate the UV coords N degrees CW
+    // to sample from the correct position in the rotated texture
+    if (viewport.rotation == 1u) {
+        // 90 CW sensor -> sample rotated 90 CW: (u,v) -> (1-v, u)
+        tex_coords = vec2<f32>(1.0 - tex_coords.y, tex_coords.x);
+    } else if (viewport.rotation == 2u) {
+        // 180 sensor -> rotate 180: (u,v) -> (1-u, 1-v)
+        tex_coords = vec2<f32>(1.0 - tex_coords.x, 1.0 - tex_coords.y);
+    } else if (viewport.rotation == 3u) {
+        // 270 CW sensor -> sample rotated 270 CW: (u,v) -> (v, 1-u)
+        tex_coords = vec2<f32>(tex_coords.y, 1.0 - tex_coords.x);
     }
 
     // Apply crop UV mapping (aspect ratio cropping)
@@ -92,8 +108,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Apply Cover mode adjustment if enabled
     if (viewport.content_fit_mode == 1u) {
-        // Get texture dimensions
-        let tex_size = vec2<f32>(textureDimensions(texture_rgba));
+        // Get texture dimensions, accounting for rotation
+        // For 90/270 degree rotations, swap width and height since UV is already rotated
+        let raw_tex_size = vec2<f32>(textureDimensions(texture_rgba));
+        var tex_size = raw_tex_size;
+        if (viewport.rotation == 1u || viewport.rotation == 3u) {
+            tex_size = vec2<f32>(raw_tex_size.y, raw_tex_size.x);
+        }
 
         // Calculate aspect ratios
         let tex_aspect = tex_size.x / tex_size.y;

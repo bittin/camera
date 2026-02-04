@@ -86,12 +86,21 @@ impl AppModel {
             // Use the flag that tracks if the current frame is actually from a file source
             let should_mirror = self.config.mirror_preview && !self.current_frame_is_file_source;
 
+            // Get rotation from current camera (or None if no camera)
+            let sensor_rotation = self
+                .available_cameras
+                .get(self.current_camera_index)
+                .map(|c| c.rotation)
+                .unwrap_or_default();
+            let rotation = sensor_rotation.gpu_rotation_code();
+
             // Calculate crop UV for aspect ratio (only in Photo mode, not in theatre mode)
             // Theatre mode always uses native resolution for full-screen display
+            // Use rotation-aware crop since GPU shader rotates after sampling
             let crop_uv = match self.mode {
-                crate::app::state::CameraMode::Photo if !self.theatre.enabled => {
-                    self.photo_aspect_ratio.crop_uv(frame.width, frame.height)
-                }
+                crate::app::state::CameraMode::Photo if !self.theatre.enabled => self
+                    .photo_aspect_ratio
+                    .crop_uv_with_rotation(frame.width, frame.height, sensor_rotation),
                 _ => None,
             };
 
@@ -109,6 +118,7 @@ impl AppModel {
                     filter_type: filter_mode,
                     corner_radius: 0.0,
                     mirror_horizontal: should_mirror,
+                    rotation,
                     crop_uv,
                     zoom_level,
                     scroll_zoom_enabled,
