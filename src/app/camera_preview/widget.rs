@@ -145,14 +145,18 @@ impl AppModel {
             }
 
             // Themed canvas placeholder when no camera frame
-            widget::container(widget::Space::new(Length::Fill, Length::Fill))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|theme: &cosmic::Theme| widget::container::Style {
-                    background: Some(Background::Color(theme.cosmic().bg_color().into())),
-                    ..Default::default()
-                })
-                .into()
+            widget::container(
+                widget::Space::new()
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|theme: &cosmic::Theme| widget::container::Style {
+                background: Some(Background::Color(theme.cosmic().bg_color().into())),
+                ..Default::default()
+            })
+            .into()
         }
     }
 }

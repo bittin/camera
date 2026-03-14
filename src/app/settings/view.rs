@@ -79,13 +79,13 @@ impl AppModel {
 
         let device_label_with_info = widget::row()
             .push(widget::text::body(fl!("settings-device")))
-            .push(widget::horizontal_space().width(Length::Fixed(4.0)))
+            .push(widget::space::horizontal().width(Length::Fixed(4.0)))
             .push(
                 widget::button::icon(icon::from_name("dialog-information-symbolic").symbolic(true))
                     .extra_small()
                     .on_press(Message::ToggleDeviceInfo),
             )
-            .push(widget::horizontal_space())
+            .push(widget::space::horizontal())
             .push(device_control)
             .align_y(Alignment::Center)
             .width(Length::Fill);
@@ -284,7 +284,7 @@ impl AppModel {
 
             widget::row()
                 .push(bug_report_button)
-                .push(widget::horizontal_space().width(Length::Fixed(8.0)))
+                .push(widget::space::horizontal().width(Length::Fixed(8.0)))
                 .push(show_report_button)
                 .into()
         } else {
@@ -341,7 +341,7 @@ impl AppModel {
         fn info_row<'a>(label: String, value: &str) -> Element<'a, Message> {
             widget::row()
                 .push(widget::text(label).size(12).font(cosmic::font::bold()))
-                .push(widget::horizontal_space().width(Length::Fixed(8.0)))
+                .push(widget::space::horizontal().width(Length::Fixed(8.0)))
                 .push(widget::text(value.to_string()).size(12))
                 .into()
         }

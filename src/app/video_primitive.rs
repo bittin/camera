@@ -11,7 +11,7 @@ use crate::app::state::FilterType;
 use crate::backends::camera::types::{FrameData, PixelFormat, YuvPlanes};
 use cosmic::iced::Rectangle;
 use cosmic::iced_wgpu::graphics::Viewport;
-use cosmic::iced_wgpu::primitive::{self, Primitive as PrimitiveTrait};
+use cosmic::iced_wgpu::primitive::{Pipeline as PipelineTrait, Primitive as PrimitiveTrait};
 use cosmic::iced_wgpu::wgpu;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -207,18 +207,20 @@ pub struct VideoPipeline {
     // Allows shared texture with different filter uniforms
     bindings: std::collections::HashMap<(u64, u32), FilterBinding>,
     // Intermediate textures for multi-pass blur (recreated if size changes)
-    // Using RefCell for interior mutability since render() takes &self
-    blur_intermediate_1: std::cell::RefCell<Option<BlurIntermediateTexture>>,
-    blur_intermediate_2: std::cell::RefCell<Option<BlurIntermediateTexture>>,
+    // Using RwLock for interior mutability (Sync-safe) since render() takes &self
+    blur_intermediate_1: std::sync::RwLock<Option<BlurIntermediateTexture>>,
+    blur_intermediate_2: std::sync::RwLock<Option<BlurIntermediateTexture>>,
     // GPU timing tracking to detect and handle stalls
-    last_upload_duration: std::cell::Cell<std::time::Duration>,
-    frames_skipped: std::cell::Cell<u32>,
+    last_upload_duration: std::sync::Mutex<std::time::Duration>,
+    frames_skipped: std::sync::atomic::AtomicU32,
     // YUV→RGBA conversion compute pipeline
     yuv_compute_pipeline: Option<wgpu::ComputePipeline>,
     yuv_bind_group_layout: Option<wgpu::BindGroupLayout>,
     yuv_uniform_buffer: Option<wgpu::Buffer>,
     // YUV textures per video_id
     yuv_textures: std::collections::HashMap<u64, YuvTextures>,
+    // Store the texture format for use in prepare
+    output_format: wgpu::TextureFormat,
 }
 
 /// Intermediate texture for multi-pass blur
@@ -269,23 +271,33 @@ impl VideoPrimitive {
     }
 }
 
+impl PipelineTrait for VideoPipeline {
+    fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
+        VideoPipeline::new(device, format)
+    }
+
+    fn trim(&mut self) {
+        self.textures.clear();
+        self.bindings.clear();
+        self.yuv_textures.clear();
+        *self.blur_intermediate_1.write().unwrap() = None;
+        *self.blur_intermediate_2.write().unwrap() = None;
+    }
+}
+
 impl PrimitiveTrait for VideoPrimitive {
+    type Pipeline = VideoPipeline;
+
     fn prepare(
         &self,
+        pipeline: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _format: wgpu::TextureFormat,
-        storage: &mut primitive::Storage,
         bounds: &Rectangle,
         viewport: &Viewport,
     ) {
         use std::time::Instant;
         let prepare_start = Instant::now();
-
-        // Get or create pipeline
-        if !storage.has::<VideoPipeline>() {
-            storage.store(VideoPipeline::new(device, _format));
-        }
 
         // Calculate physical bounds from logical bounds using scale factor
         // Then clamp to render target to ensure valid viewport rect
@@ -346,7 +358,7 @@ impl PrimitiveTrait for VideoPrimitive {
 
         let lock_time = prepare_start.elapsed();
 
-        if let Some(pipeline) = storage.get_mut::<VideoPipeline>() {
+        {
             // Upload frame if available
             if let Some(frame) = frame_opt {
                 let upload_start = Instant::now();
@@ -357,7 +369,7 @@ impl PrimitiveTrait for VideoPrimitive {
                         device,
                         frame.width,
                         frame.height,
-                        _format,
+                        pipeline.output_format,
                     );
                 }
                 pipeline.upload(device, queue, frame);
@@ -461,7 +473,8 @@ impl PrimitiveTrait for VideoPrimitive {
                 // Update intermediate texture viewport buffers for blur passes
                 // intermediate_1: Contain mode (no cropping) for pass 2
                 // intermediate_2: Cover mode with screen viewport for final pass 3
-                if let Some(intermediate_1) = pipeline.blur_intermediate_1.borrow().as_ref() {
+                if let Some(intermediate_1) = pipeline.blur_intermediate_1.read().unwrap().as_ref()
+                {
                     let intermediate_uniform = ViewportUniform {
                         viewport_size: [intermediate_1.width as f32, intermediate_1.height as f32],
                         content_fit_mode: 0, // Contain mode - no Cover cropping in intermediate pass
@@ -481,7 +494,8 @@ impl PrimitiveTrait for VideoPrimitive {
                         bytemuck::cast_slice(&[intermediate_uniform]),
                     );
                 }
-                if let Some(intermediate_2) = pipeline.blur_intermediate_2.borrow().as_ref() {
+                if let Some(intermediate_2) = pipeline.blur_intermediate_2.read().unwrap().as_ref()
+                {
                     // Use screen viewport dimensions and Cover mode for final pass to screen
                     // Mirror is already applied in pass 1, don't apply again
                     let final_pass_uniform = ViewportUniform {
@@ -509,8 +523,8 @@ impl PrimitiveTrait for VideoPrimitive {
 
     fn render(
         &self,
+        _pipeline: &Self::Pipeline,
         encoder: &mut wgpu::CommandEncoder,
-        storage: &primitive::Storage,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
@@ -531,16 +545,14 @@ impl PrimitiveTrait for VideoPrimitive {
                 clip_bounds.height as f32,
             ));
 
-        if let Some(pipeline) = storage.get::<VideoPipeline>() {
-            pipeline.render(
-                self.video_id,
-                filter_mode,
-                encoder,
-                target,
-                clip_bounds,
-                widget_bounds,
-            );
-        }
+        _pipeline.render(
+            self.video_id,
+            filter_mode,
+            encoder,
+            target,
+            clip_bounds,
+            widget_bounds,
+        );
     }
 }
 
@@ -606,7 +618,7 @@ impl VideoPipeline {
             layout: Some(&pipeline_layout_rgba),
             vertex: wgpu::VertexState {
                 module: &shader_rgba,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
@@ -619,7 +631,7 @@ impl VideoPipeline {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader_rgba,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -686,7 +698,7 @@ impl VideoPipeline {
             layout: Some(&pipeline_layout_rgb),
             vertex: wgpu::VertexState {
                 module: &shader_rgb_blur,
-                entry_point: "vs_main",
+                entry_point: Some("vs_main"),
                 buffers: &[],
                 compilation_options: Default::default(),
             },
@@ -699,7 +711,7 @@ impl VideoPipeline {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader_rgb_blur,
-                entry_point: "fs_main",
+                entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -802,7 +814,7 @@ impl VideoPipeline {
                 label: Some("yuv_convert_compute_pipeline"),
                 layout: Some(&yuv_pipeline_layout),
                 module: &yuv_shader,
-                entry_point: "main",
+                entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -822,14 +834,15 @@ impl VideoPipeline {
             sampler,
             textures: std::collections::HashMap::new(),
             bindings: std::collections::HashMap::new(),
-            blur_intermediate_1: std::cell::RefCell::new(None),
-            blur_intermediate_2: std::cell::RefCell::new(None),
-            last_upload_duration: std::cell::Cell::new(std::time::Duration::ZERO),
-            frames_skipped: std::cell::Cell::new(0),
+            blur_intermediate_1: std::sync::RwLock::new(None),
+            blur_intermediate_2: std::sync::RwLock::new(None),
+            last_upload_duration: std::sync::Mutex::new(std::time::Duration::ZERO),
+            frames_skipped: std::sync::atomic::AtomicU32::new(0),
             yuv_compute_pipeline: Some(yuv_compute_pipeline),
             yuv_bind_group_layout: Some(yuv_bind_group_layout),
             yuv_uniform_buffer: Some(yuv_uniform_buffer),
             yuv_textures: std::collections::HashMap::new(),
+            output_format: format,
         }
     }
 
@@ -843,10 +856,12 @@ impl VideoPipeline {
 
         // Skip frame if GPU is behind (last upload took > 32ms = 2 frame periods at 60fps)
         // This prevents the GPU command queue from backing up and causing UI hangs
-        let last_duration = self.last_upload_duration.get();
+        let last_duration = *self.last_upload_duration.lock().unwrap();
         if last_duration.as_millis() > 32 {
-            let skipped = self.frames_skipped.get() + 1;
-            self.frames_skipped.set(skipped);
+            let skipped = self
+                .frames_skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
             if skipped % 10 == 1 {
                 tracing::warn!(
                     skipped_count = skipped,
@@ -855,7 +870,7 @@ impl VideoPipeline {
                 );
             }
             // Reset timing to allow next frame through
-            self.last_upload_duration.set(std::time::Duration::ZERO);
+            *self.last_upload_duration.lock().unwrap() = std::time::Duration::ZERO;
             return;
         }
 
@@ -921,14 +936,14 @@ impl VideoPipeline {
             tex.last_frame_ptr = frame_data_ptr;
 
             queue.write_texture(
-                wgpu::ImageCopyTexture {
+                wgpu::TexelCopyTextureInfo {
                     texture: &tex.texture,
                     mip_level: 0,
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
                 frame.rgba_data(),
-                wgpu::ImageDataLayout {
+                wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(frame.stride),
                     rows_per_image: None,
@@ -948,7 +963,7 @@ impl VideoPipeline {
 
         // Track upload duration for frame skipping decisions
         let upload_duration = upload_start.elapsed();
-        self.last_upload_duration.set(upload_duration);
+        *self.last_upload_duration.lock().unwrap() = upload_duration;
 
         // Log GPU upload performance periodically (every ~30 frames based on frame.id)
         if frame.id.is_multiple_of(30) {
@@ -965,12 +980,16 @@ impl VideoPipeline {
         }
 
         // Reset skip counter on successful upload
-        if self.frames_skipped.get() > 0 {
+        let skipped = self
+            .frames_skipped
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if skipped > 0 {
             tracing::info!(
-                frames_recovered = self.frames_skipped.get(),
+                frames_recovered = skipped,
                 "GPU caught up, resuming normal frame rate"
             );
-            self.frames_skipped.set(0);
+            self.frames_skipped
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1065,14 +1084,14 @@ impl VideoPipeline {
             PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
                 let packed_width = frame.width / 2;
                 queue.write_texture(
-                    wgpu::ImageCopyTexture {
+                    wgpu::TexelCopyTextureInfo {
                         texture: &yuv_textures.tex_y,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
                     buffer_data,
-                    wgpu::ImageDataLayout {
+                    wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(frame.stride),
                         rows_per_image: None,
@@ -1094,14 +1113,14 @@ impl VideoPipeline {
                     // Y plane: full resolution, R8 format
                     let y_end = yuv_planes.y_offset + yuv_planes.y_size;
                     queue.write_texture(
-                        wgpu::ImageCopyTexture {
+                        wgpu::TexelCopyTextureInfo {
                             texture: &yuv_textures.tex_y,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
                         },
                         &buffer_data[yuv_planes.y_offset..y_end],
-                        wgpu::ImageDataLayout {
+                        wgpu::TexelCopyBufferLayout {
                             offset: 0,
                             bytes_per_row: Some(frame.stride),
                             rows_per_image: None,
@@ -1116,14 +1135,14 @@ impl VideoPipeline {
                     // UV plane: interleaved UV as RG8
                     let uv_end = yuv_planes.uv_offset + yuv_planes.uv_size;
                     queue.write_texture(
-                        wgpu::ImageCopyTexture {
+                        wgpu::TexelCopyTextureInfo {
                             texture: &yuv_textures.tex_uv,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
                         },
                         &buffer_data[yuv_planes.uv_offset..uv_end],
-                        wgpu::ImageDataLayout {
+                        wgpu::TexelCopyBufferLayout {
                             offset: 0,
                             bytes_per_row: Some(yuv_planes.uv_stride),
                             rows_per_image: None,
@@ -1146,14 +1165,14 @@ impl VideoPipeline {
                     // Y plane: full resolution, R8 format
                     let y_end = yuv_planes.y_offset + yuv_planes.y_size;
                     queue.write_texture(
-                        wgpu::ImageCopyTexture {
+                        wgpu::TexelCopyTextureInfo {
                             texture: &yuv_textures.tex_y,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
                         },
                         &buffer_data[yuv_planes.y_offset..y_end],
-                        wgpu::ImageDataLayout {
+                        wgpu::TexelCopyBufferLayout {
                             offset: 0,
                             bytes_per_row: Some(frame.stride),
                             rows_per_image: None,
@@ -1168,14 +1187,14 @@ impl VideoPipeline {
                     // U plane: R8 format
                     let u_end = yuv_planes.uv_offset + yuv_planes.uv_size;
                     queue.write_texture(
-                        wgpu::ImageCopyTexture {
+                        wgpu::TexelCopyTextureInfo {
                             texture: &yuv_textures.tex_uv,
                             mip_level: 0,
                             origin: wgpu::Origin3d::ZERO,
                             aspect: wgpu::TextureAspect::All,
                         },
                         &buffer_data[yuv_planes.uv_offset..u_end],
-                        wgpu::ImageDataLayout {
+                        wgpu::TexelCopyBufferLayout {
                             offset: 0,
                             bytes_per_row: Some(yuv_planes.uv_stride),
                             rows_per_image: None,
@@ -1191,14 +1210,14 @@ impl VideoPipeline {
                     if yuv_planes.v_size > 0 {
                         let v_end = yuv_planes.v_offset + yuv_planes.v_size;
                         queue.write_texture(
-                            wgpu::ImageCopyTexture {
+                            wgpu::TexelCopyTextureInfo {
                                 texture: &yuv_textures.tex_v,
                                 mip_level: 0,
                                 origin: wgpu::Origin3d::ZERO,
                                 aspect: wgpu::TextureAspect::All,
                             },
                             &buffer_data[yuv_planes.v_offset..v_end],
-                            wgpu::ImageDataLayout {
+                            wgpu::TexelCopyBufferLayout {
                                 offset: 0,
                                 bytes_per_row: Some(yuv_planes.v_stride),
                                 rows_per_image: None,
@@ -1215,14 +1234,14 @@ impl VideoPipeline {
             // Grayscale: single channel R8 format
             PixelFormat::Gray8 => {
                 queue.write_texture(
-                    wgpu::ImageCopyTexture {
+                    wgpu::TexelCopyTextureInfo {
                         texture: &yuv_textures.tex_y,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
                     buffer_data,
-                    wgpu::ImageDataLayout {
+                    wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(frame.stride),
                         rows_per_image: None,
@@ -1245,14 +1264,14 @@ impl VideoPipeline {
             // ABGR/BGRA: Upload as RGBA8, shader will swizzle channels
             PixelFormat::ABGR | PixelFormat::BGRA => {
                 queue.write_texture(
-                    wgpu::ImageCopyTexture {
+                    wgpu::TexelCopyTextureInfo {
                         texture: &yuv_textures.tex_y,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
                     buffer_data,
-                    wgpu::ImageDataLayout {
+                    wgpu::TexelCopyBufferLayout {
                         offset: 0,
                         bytes_per_row: Some(frame.stride),
                         rows_per_image: None,
@@ -1363,7 +1382,7 @@ impl VideoPipeline {
             });
 
             compute_pass.set_pipeline(compute_pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.set_bind_group(0, Some(&bind_group), &[]);
 
             // Dispatch: workgroup size is 16x16, so divide and round up
             let workgroup_x = frame.width.div_ceil(16);
@@ -1582,7 +1601,7 @@ impl VideoPipeline {
     ) {
         // Check if we need to recreate intermediate textures
         let needs_recreation = {
-            let intermediate_1 = self.blur_intermediate_1.borrow();
+            let intermediate_1 = self.blur_intermediate_1.read().unwrap();
             match intermediate_1.as_ref() {
                 Some(intermediate) => intermediate.width != width || intermediate.height != height,
                 None => true,
@@ -1636,14 +1655,13 @@ impl VideoPipeline {
                 ],
             });
 
-            self.blur_intermediate_1
-                .replace(Some(BlurIntermediateTexture {
-                    view: view_1,
-                    bind_group: bind_group_1,
-                    viewport_buffer: viewport_buffer_1,
-                    width,
-                    height,
-                }));
+            *self.blur_intermediate_1.write().unwrap() = Some(BlurIntermediateTexture {
+                view: view_1,
+                bind_group: bind_group_1,
+                viewport_buffer: viewport_buffer_1,
+                width,
+                height,
+            });
 
             // Create intermediate texture 2
             let texture_2 = device.create_texture(&wgpu::TextureDescriptor {
@@ -1691,14 +1709,13 @@ impl VideoPipeline {
                 ],
             });
 
-            self.blur_intermediate_2
-                .replace(Some(BlurIntermediateTexture {
-                    view: view_2,
-                    bind_group: bind_group_2,
-                    viewport_buffer: viewport_buffer_2,
-                    width,
-                    height,
-                }));
+            *self.blur_intermediate_2.write().unwrap() = Some(BlurIntermediateTexture {
+                view: view_2,
+                bind_group: bind_group_2,
+                viewport_buffer: viewport_buffer_2,
+                width,
+                height,
+            });
         }
     }
 
@@ -1731,8 +1748,8 @@ impl VideoPipeline {
             // Video ID 1 is used for blurred transition frames with 3-pass blur
             if video_id == 1 {
                 // 3-PASS BLUR for transition frames
-                let intermediate_1_opt = self.blur_intermediate_1.borrow();
-                let intermediate_2_opt = self.blur_intermediate_2.borrow();
+                let intermediate_1_opt = self.blur_intermediate_1.read().unwrap();
+                let intermediate_2_opt = self.blur_intermediate_2.read().unwrap();
 
                 if intermediate_1_opt.is_none() || intermediate_2_opt.is_none() {
                     // Fallback to single-pass if intermediates aren't ready
@@ -1745,6 +1762,7 @@ impl VideoPipeline {
                                 load: wgpu::LoadOp::Load,
                                 store: wgpu::StoreOp::Store,
                             },
+                            depth_slice: None,
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
@@ -1770,7 +1788,7 @@ impl VideoPipeline {
                     );
 
                     render_pass.set_pipeline(&self.pipeline_rgb_blur);
-                    render_pass.set_bind_group(0, &binding.bind_group, &[]);
+                    render_pass.set_bind_group(0, Some(&binding.bind_group), &[]);
                     render_pass.draw(0..6, 0..1);
                     return;
                 }
@@ -1789,6 +1807,7 @@ impl VideoPipeline {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                                 store: wgpu::StoreOp::Store,
                             },
+                            depth_slice: None,
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
@@ -1796,7 +1815,7 @@ impl VideoPipeline {
                     });
 
                     render_pass.set_pipeline(&self.pipeline_rgb_blur);
-                    render_pass.set_bind_group(0, &binding.bind_group, &[]);
+                    render_pass.set_bind_group(0, Some(&binding.bind_group), &[]);
                     render_pass.draw(0..6, 0..1);
                 }
 
@@ -1811,6 +1830,7 @@ impl VideoPipeline {
                                 load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                                 store: wgpu::StoreOp::Store,
                             },
+                            depth_slice: None,
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
@@ -1818,7 +1838,7 @@ impl VideoPipeline {
                     });
 
                     render_pass.set_pipeline(&self.pipeline_rgb_blur);
-                    render_pass.set_bind_group(0, &intermediate_1.bind_group, &[]);
+                    render_pass.set_bind_group(0, Some(&intermediate_1.bind_group), &[]);
                     render_pass.draw(0..6, 0..1);
                 }
 
@@ -1833,6 +1853,7 @@ impl VideoPipeline {
                                 load: wgpu::LoadOp::Load,
                                 store: wgpu::StoreOp::Store,
                             },
+                            depth_slice: None,
                         })],
                         depth_stencil_attachment: None,
                         timestamp_writes: None,
@@ -1858,7 +1879,7 @@ impl VideoPipeline {
                     );
 
                     render_pass.set_pipeline(&self.pipeline_rgb_blur);
-                    render_pass.set_bind_group(0, &intermediate_2.bind_group, &[]);
+                    render_pass.set_bind_group(0, Some(&intermediate_2.bind_group), &[]);
                     render_pass.draw(0..6, 0..1);
                 }
             } else {
@@ -1872,6 +1893,7 @@ impl VideoPipeline {
                             load: wgpu::LoadOp::Load,
                             store: wgpu::StoreOp::Store,
                         },
+                        depth_slice: None,
                     })],
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
@@ -1897,7 +1919,7 @@ impl VideoPipeline {
                 );
 
                 render_pass.set_pipeline(&self.pipeline_rgba);
-                render_pass.set_bind_group(0, &binding.bind_group, &[]);
+                render_pass.set_bind_group(0, Some(&binding.bind_group), &[]);
                 render_pass.draw(0..6, 0..1);
             }
         }

@@ -657,22 +657,22 @@ impl GpuConvertPipeline {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&unpack_pipeline.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_bind_group(0, Some(&bind_group), &[]);
             pass.dispatch_workgroups(workgroups_x, height, 1);
         }
 
         // Copy unpacked buffer to R16Unorm texture
         let bytes_per_row = output_stride_u32 * 4;
         encoder.copy_buffer_to_texture(
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: output_buf,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(bytes_per_row),
                     rows_per_image: Some(height),
                 },
             },
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: tex_y,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
@@ -728,7 +728,7 @@ impl GpuConvertPipeline {
                 label: Some(&format!("{}_pipeline", name)),
                 layout: Some(&pipeline_layout),
                 module: &shader,
-                entry_point: "main",
+                entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
             });
@@ -990,7 +990,7 @@ impl GpuConvertPipeline {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&awb_pipeline.pipeline);
-            pass.set_bind_group(0, &awb_bind_group, &[]);
+            pass.set_bind_group(0, Some(&awb_bind_group), &[]);
             pass.dispatch_workgroups(awb_wg_x, awb_wg_y, 1);
         }
 
@@ -1001,7 +1001,7 @@ impl GpuConvertPipeline {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&awb_finalize_pipeline.pipeline);
-            pass.set_bind_group(0, &awb_finalize_bind_group, &[]);
+            pass.set_bind_group(0, Some(&awb_finalize_bind_group), &[]);
             pass.dispatch_workgroups(1, 1, 1);
         }
 
@@ -1138,7 +1138,7 @@ impl GpuConvertPipeline {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&debayer_pipeline.pipeline);
-            pass.set_bind_group(0, &debayer_bind_group, &[]);
+            pass.set_bind_group(0, Some(&debayer_bind_group), &[]);
             let workgroups_x = input.width.div_ceil(TILE_WORKGROUP_SIZE);
             let workgroups_y = input.height.div_ceil(TILE_WORKGROUP_SIZE);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
@@ -1259,7 +1259,7 @@ impl GpuConvertPipeline {
             });
 
             compute_pass.set_pipeline(&format_pipeline.pipeline);
-            compute_pass.set_bind_group(0, &bind_group, &[]);
+            compute_pass.set_bind_group(0, Some(&bind_group), &[]);
 
             let workgroups_x = input.width.div_ceil(TILE_WORKGROUP_SIZE);
             let workgroups_y = input.height.div_ceil(TILE_WORKGROUP_SIZE);
@@ -1294,14 +1294,14 @@ impl GpuConvertPipeline {
         height: u32,
     ) {
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             data,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(height),
@@ -1462,15 +1462,15 @@ impl GpuConvertPipeline {
             });
 
         encoder.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: output,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            wgpu::ImageCopyBuffer {
+            wgpu::TexelCopyBufferInfo {
                 buffer: &staging_buffer,
-                layout: wgpu::ImageDataLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
                     rows_per_image: Some(height),
@@ -1491,7 +1491,10 @@ impl GpuConvertPipeline {
             let _ = sender.send(result);
         });
 
-        let _ = self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
 
         receiver
             .await
@@ -1598,7 +1601,7 @@ impl GpuConvertPipeline {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&filter_pipeline.pipeline);
-            pass.set_bind_group(0, &filter_bind_group, &[]);
+            pass.set_bind_group(0, Some(&filter_bind_group), &[]);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
@@ -1647,7 +1650,10 @@ impl GpuConvertPipeline {
             let _ = sender.send(result);
         });
 
-        let _ = self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
 
         receiver
             .await
