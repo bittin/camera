@@ -290,20 +290,27 @@ fn capture_thread_setup_and_run(
 ) -> Result<(), BackendError> {
     use libcamera::camera_manager::CameraManager;
 
-    // Acquire global lock to prevent concurrent CameraManager creation with
-    // enumerate_cameras()/get_formats(). Mark capture active BEFORE creating the
-    // manager so other threads know not to try.
-    let _mgr_lock = super::super::CAMERA_MANAGER_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    CAPTURE_ACTIVE.store(true, Ordering::Release);
+    // Wait for any previous CameraManager to be fully dropped.
+    // libcamera enforces a singleton — creating a second instance is fatal.
+    // The old capture thread clears CAPTURE_ACTIVE after dropping its manager,
+    // so we spin here until that happens.
+    loop {
+        let _mgr_lock = super::super::CAMERA_MANAGER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !CAPTURE_ACTIVE.load(Ordering::Acquire) {
+            // No other CameraManager exists — claim ownership and proceed.
+            CAPTURE_ACTIVE.store(true, Ordering::Release);
+            break;
+        }
+        drop(_mgr_lock);
+        info!("Waiting for previous CameraManager to be released...");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
-    // Create camera manager (we hold the lock, so no other code will try concurrently)
+    // Create camera manager (CAPTURE_ACTIVE is set, lock was just released)
     let mgr = CameraManager::new()
         .map_err(|e| BackendError::InitializationFailed(format!("CameraManager::new: {}", e)))?;
-
-    // Release the lock - CAPTURE_ACTIVE flag now guards against concurrent creation
-    drop(_mgr_lock);
 
     info!(version = mgr.version(), "libcamera version");
 
