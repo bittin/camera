@@ -887,6 +887,10 @@ impl AppModel {
 
     pub(crate) fn handle_toggle_recording(&mut self) -> Task<cosmic::Action<Message>> {
         if self.recording.is_recording() {
+            // Turn off torch when stopping recording
+            if self.flash_enabled {
+                self.turn_off_flash_hardware();
+            }
             if let Some(sender) = self.recording.take_stop_sender() {
                 info!("Sending stop signal to recorder");
                 let _ = sender.send(());
@@ -923,6 +927,8 @@ impl AppModel {
         result: Result<String, String>,
     ) -> Task<cosmic::Action<Message>> {
         self.recording = RecordingState::Idle;
+        // Turn off torch when recording ends
+        self.turn_off_flash_hardware();
 
         match result {
             Ok(path) => {
@@ -979,6 +985,12 @@ impl AppModel {
             output = %output_path.display(),
             "Starting video recording"
         );
+
+        // Turn on hardware flash as torch during video recording
+        if self.flash_enabled && self.use_hardware_flash() {
+            info!("Flash enabled - turning on hardware flash torch for video recording");
+            self.turn_on_flash_hardware();
+        }
 
         let sensor_rotation = camera.rotation;
         let width = format.width;
