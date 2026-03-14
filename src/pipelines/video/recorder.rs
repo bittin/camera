@@ -10,7 +10,7 @@
 
 use super::encoder_selection::{EncoderConfig, select_encoders};
 use super::muxer::link_audio_to_muxer;
-use crate::backends::camera::types::{RecordingFrame, SensorRotation};
+use crate::backends::camera::types::{CameraFrame, PixelFormat, RecordingFrame, SensorRotation};
 use crate::media::encoders::video::SelectedVideoEncoder;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -261,6 +261,9 @@ pub struct AppsrcRecorderConfig<'a> {
     pub base: RecorderConfig<'a>,
     /// Pixel format of incoming frames
     pub pixel_format: crate::backends::camera::types::PixelFormat,
+    /// Live filter code (read each frame via AtomicU32, updated by UI thread).
+    /// Value is `FilterType::gpu_filter_code()`. 0 = Standard (no filter).
+    pub live_filter_code: Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Video recorder using the new pipeline architecture
@@ -664,6 +667,44 @@ fn install_muxer_fixup_probes(pipeline: &gst::Pipeline) {
     }
 }
 
+/// Convert a camera frame to tightly-packed RGBA using the GPU compute shader.
+///
+/// For frames already in RGBA format, strips stride padding.
+/// For YUV and other formats, uses the GPU compute pipeline.
+async fn convert_frame_to_rgba(frame: &CameraFrame) -> Result<Vec<u8>, String> {
+    if frame.format == PixelFormat::RGBA {
+        let row_bytes = (frame.width * 4) as usize;
+        let stride = frame.stride as usize;
+        if stride <= row_bytes {
+            return Ok(frame.data.to_vec());
+        }
+        let mut out = Vec::with_capacity(row_bytes * frame.height as usize);
+        for y in 0..frame.height as usize {
+            out.extend_from_slice(&frame.data[y * stride..y * stride + row_bytes]);
+        }
+        return Ok(out);
+    }
+
+    let input = crate::shaders::GpuFrameInput::from_camera_frame(frame)?;
+
+    let mut pipeline_guard = crate::shaders::get_gpu_convert_pipeline()
+        .await
+        .map_err(|e| format!("Failed to get GPU convert pipeline: {}", e))?;
+
+    let pipeline = pipeline_guard
+        .as_mut()
+        .ok_or("GPU convert pipeline not initialized")?;
+
+    pipeline
+        .convert(&input)
+        .map_err(|e| format!("GPU conversion failed: {}", e))?;
+
+    pipeline
+        .read_rgba_to_cpu(frame.width, frame.height)
+        .await
+        .map_err(|e| format!("Failed to read RGBA from GPU: {}", e))
+}
+
 /// Frame data prepared by a format-specific closure for the common pusher loop.
 struct PusherFrame {
     buffer: gst::Buffer,
@@ -798,13 +839,19 @@ impl VideoRecorder {
                     audio_levels,
                 },
             pixel_format,
+            live_filter_code,
         } = config;
+
+        // Always use the filtered (RGBA) pipeline so the user can toggle
+        // filters mid-recording and have them apply to the output file.
+        let initial_filter_code = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
 
         info!(
             width,
             height,
             framerate,
             format = ?pixel_format,
+            initial_filter = initial_filter_code,
             output = %output_path.display(),
             audio = enable_audio,
             audio_device = ?audio_device,
@@ -842,13 +889,10 @@ impl VideoRecorder {
         let needs_rotation = !flip_str.is_empty();
         let needs_scaling = final_width != base_width || final_height != base_height;
 
-        // Check if we can convert I420/Y42B → NV12 in the pusher task,
-        // eliminating the GStreamer videoconvert element entirely.
-        // openh264enc only accepts I420, so we must keep videoconvert for it.
-        let pusher_nv12_convert = !needs_rotation
-            && !needs_scaling
-            && pixel_format == crate::backends::camera::types::PixelFormat::I420
-            && setup.encoder_name != "openh264enc";
+        // Always use RGBA input: the filtered pusher converts each frame to RGBA
+        // (via GPU compute shader), applies the current filter, and pushes RGBA.
+        // This lets the user toggle filters mid-recording.
+        let initial_gst_format = "RGBA";
 
         let processing_chain = if needs_rotation || needs_scaling {
             format!(
@@ -860,16 +904,8 @@ impl VideoRecorder {
                 fh = final_height,
                 fps = framerate,
             )
-        } else if pusher_nv12_convert {
-            String::new()
         } else {
             "! videoconvert".to_string()
-        };
-
-        let initial_gst_format = if pusher_nv12_convert {
-            "NV12"
-        } else {
-            pixel_format.to_gst_format_string()
         };
 
         let pipeline_desc = format!(
@@ -907,26 +943,22 @@ impl VideoRecorder {
             &audio_levels,
         )?;
 
-        if pusher_nv12_convert {
-            info!("Pusher will convert YUV→NV12 (no videoconvert in pipeline)");
-        }
-        drop(Self::spawn_appsrc_pusher(
+        info!(
+            initial_filter = initial_filter_code,
+            "Pusher will apply live GPU filter (RGBA output)"
+        );
+        drop(Self::spawn_filtered_pusher(
             appsrc,
             frame_rx,
-            pixel_format,
-            width,
-            height,
             framerate,
-            pusher_nv12_convert,
+            live_filter_code,
         ));
 
         // Publish diagnostics for the insights drawer
-        let mode = if pusher_nv12_convert {
-            "NV12 pusher (no videoconvert)"
-        } else if needs_rotation || needs_scaling {
-            "Legacy (videoconvert + rotation/scale)"
+        let mode = if needs_rotation || needs_scaling {
+            "Filtered RGBA (videoconvert + rotation/scale)"
         } else {
-            "Legacy (videoconvert)"
+            "Filtered RGBA (videoconvert)"
         };
         publish_recording_diagnostics(RecordingDiagnostics {
             mode: mode.to_string(),
@@ -950,95 +982,138 @@ impl VideoRecorder {
 
     /// Spawn the legacy (decoded-frame) pusher task.
     ///
-    /// Handles NV12 conversion, stride stripping, and first-frame caps
-    /// correction via a closure passed to [`spawn_pusher`].
-    fn spawn_appsrc_pusher(
+    /// Spawn a pusher task that converts frames to RGBA and applies the live
+    /// GPU filter before pushing to appsrc.
+    ///
+    /// Reads the current filter code from `live_filter_code` each frame so
+    /// filter changes during recording are reflected in the output file.
+    /// When filter code is 0 (Standard), the RGBA data is pushed without
+    /// running the filter shader.
+    fn spawn_filtered_pusher(
         appsrc: gst_app::AppSrc,
-        frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
-        pixel_format: crate::backends::camera::types::PixelFormat,
-        width: u32,
-        height: u32,
+        mut frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
         framerate: u32,
-        convert_to_nv12: bool,
+        live_filter_code: Arc<std::sync::atomic::AtomicU32>,
     ) -> tokio::task::JoinHandle<()> {
-        let initial_format = if convert_to_nv12 {
-            "NV12"
-        } else {
-            pixel_format.to_gst_format_string()
-        };
-        let mut caps_corrected = convert_to_nv12;
+        tokio::spawn(async move {
+            let initial = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
+            info!(
+                initial_filter_code = initial,
+                "Filtered appsrc pusher task started"
+            );
 
-        spawn_pusher(
-            appsrc,
-            frame_rx,
-            framerate,
-            "Recorder",
-            move |rec_frame, appsrc| {
+            let start_epoch_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            RECORDING_STATS
+                .pusher_start_epoch_ns
+                .store(start_epoch_ns, Ordering::Relaxed);
+
+            let mut frame_count: u64 = 0;
+            let start_time = std::time::Instant::now();
+            let frame_duration_ns = 1_000_000_000u64 / framerate as u64;
+            let mut pipeline_playing = false;
+            let mut ts_offset: Option<(u64, u64)> = None;
+
+            while let Some(rec_frame) = frame_rx.recv().await {
                 let frame = match rec_frame {
                     RecordingFrame::Decoded(f) => f,
-                    RecordingFrame::Jpeg { .. } => return None,
+                    RecordingFrame::Jpeg { .. } => continue,
                 };
-
-                // On first frame, correct appsrc caps if the actual format
-                // differs (e.g. MJPEG decoded to I422 instead of I420).
-                if !caps_corrected {
-                    let actual_format = frame.gst_format_string();
-                    if actual_format != initial_format {
-                        let caps = gst::Caps::builder("video/x-raw")
-                            .field("format", actual_format)
-                            .field("width", width as i32)
-                            .field("height", height as i32)
-                            .field("framerate", gst::Fraction::new(framerate as i32, 1))
-                            .build();
-                        info!(
-                            initial = initial_format,
-                            actual = actual_format,
-                            "Correcting appsrc caps: {}",
-                            caps
-                        );
-                        appsrc.set_property("caps", &caps);
-                    }
-                    caps_corrected = true;
-                }
 
                 let sensor_ts = frame.sensor_timestamp_ns;
                 let sequence = frame.libcamera_metadata.as_ref().and_then(|m| m.sequence);
 
-                let data = if convert_to_nv12 {
-                    let t0 = std::time::Instant::now();
-                    let nv12 = yuv_to_nv12(&frame);
-                    RECORDING_STATS
-                        .last_convert_time_us
-                        .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    nv12
-                } else {
-                    // Strip stride padding so GStreamer sees tightly-packed rows.
-                    let bpp = frame.format.bytes_per_pixel();
-                    let row_bytes = (frame.width as f32 * bpp) as usize;
-                    let stride = frame.stride as usize;
-                    if stride > row_bytes && stride > 0 {
-                        let h = frame.height as usize;
-                        let mut tight = Vec::with_capacity(row_bytes * h);
-                        for y in 0..h {
-                            let start = y * stride;
-                            let end = start + row_bytes;
-                            if end <= frame.data.len() {
-                                tight.extend_from_slice(&frame.data[start..end]);
-                            }
-                        }
-                        tight
-                    } else {
-                        (*frame.data).to_vec()
+                // Convert to RGBA via GPU compute shader
+                let t0 = std::time::Instant::now();
+                let rgba = match convert_frame_to_rgba(&frame).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to convert frame to RGBA, skipping");
+                        continue;
                     }
                 };
 
-                Some(PusherFrame {
-                    buffer: gst::Buffer::from_mut_slice(data),
+                // Read current filter from shared atomic (UI thread updates this)
+                let filter_code = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
+                let filter_type = crate::app::FilterType::from_gpu_filter_code(filter_code);
+
+                // Apply GPU filter (skip for Standard — just use the RGBA as-is)
+                let filtered = if filter_type == crate::app::FilterType::Standard {
+                    rgba
+                } else {
+                    match crate::shaders::apply_filter_gpu_rgba(
+                        &rgba,
+                        frame.width,
+                        frame.height,
+                        filter_type,
+                    )
+                    .await
+                    {
+                        Ok(data) => data,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to apply filter, using unfiltered RGBA");
+                            rgba
+                        }
+                    }
+                };
+
+                RECORDING_STATS
+                    .last_convert_time_us
+                    .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+                let pts_ns = match compute_pts(
+                    &appsrc,
                     sensor_ts,
-                    sequence,
-                })
-            },
-        )
+                    frame_count,
+                    frame_duration_ns,
+                    &mut pipeline_playing,
+                    &mut ts_offset,
+                ) {
+                    PtsResult::Pts(pts) => pts,
+                    PtsResult::Skip => continue,
+                };
+
+                let mut buffer = gst::Buffer::from_mut_slice(filtered);
+                {
+                    let buf_ref = buffer.get_mut().unwrap();
+                    buf_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
+                    buf_ref.set_duration(gst::ClockTime::from_nseconds(frame_duration_ns));
+                }
+
+                RECORDING_STATS.last_pts_ns.store(pts_ns, Ordering::Relaxed);
+
+                if appsrc.push_buffer(buffer).is_err() {
+                    warn!("Filtered pusher: failed to push buffer, stopping");
+                    break;
+                }
+
+                RECORDING_STATS
+                    .pusher_pushed
+                    .fetch_add(1, Ordering::Relaxed);
+                frame_count += 1;
+                if frame_count.is_multiple_of(LOG_EVERY_N_FRAMES) {
+                    let elapsed = start_time.elapsed().as_secs_f64();
+                    warn!(
+                        frames = frame_count,
+                        seq = ?sequence,
+                        sensor_ts_ms = ?sensor_ts.map(|t| t / 1_000_000),
+                        pts_ms = pts_ns / 1_000_000,
+                        elapsed_secs = format!("{:.1}", elapsed),
+                        effective_fps = format!("{:.1}", frame_count as f64 / elapsed),
+                        filter_time_us = t0.elapsed().as_micros(),
+                        "Filtered pusher progress"
+                    );
+                }
+            }
+
+            info!(
+                total_frames = frame_count,
+                "Frame channel closed, sending EOS to filtered appsrc"
+            );
+            let _ = appsrc.end_of_stream();
+        })
     }
 
     /// Create a VA-API JPEG zero-copy recording pipeline.
@@ -1071,7 +1146,14 @@ impl VideoRecorder {
                     audio_levels,
                 },
             pixel_format: _,
+            live_filter_code,
         } = config;
+
+        if live_filter_code.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+            return Err(
+                "VA-API JPEG pipeline does not support filters; falling back to legacy".to_string(),
+            );
+        }
 
         info!(
             width,
@@ -1531,6 +1613,7 @@ struct AudioBranch {
 }
 
 /// Convert a YUV CameraFrame (I420 or Y42B) to tightly-packed NV12.
+#[allow(dead_code)]
 ///
 /// NV12 layout: Y plane (width × height) followed by interleaved UV plane
 /// (width × height/2). This eliminates GStreamer's `videoconvert` element

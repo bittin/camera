@@ -1019,8 +1019,8 @@ impl AppModel {
             ));
         }
 
-        // Filter button (only in photo mode)
-        if self.mode == CameraMode::Photo {
+        // Filter button (photo and video modes)
+        if self.mode == CameraMode::Photo || self.mode == CameraMode::Video {
             let filter_active = self.selected_filter != FilterType::Standard;
             buttons.push(self.build_tools_grid_button(
                 icon::from_name("image-filter-symbolic").symbolic(true),

@@ -644,7 +644,11 @@ impl VideoPipeline {
         });
 
         // ===== Blur Pipeline (for multi-pass blur) =====
-        let shader_blur_source = include_str!("video_shader_blur.wgsl");
+        let shader_blur_source = format!(
+            "{}\n{}",
+            crate::shaders::FILTER_FUNCTIONS,
+            include_str!("video_shader_blur.wgsl")
+        );
         let shader_rgb_blur = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("camera blur shader"),
             source: wgpu::ShaderSource::Wgsl(shader_blur_source.into()),

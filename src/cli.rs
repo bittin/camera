@@ -293,6 +293,7 @@ pub fn record_video(
                         audio_levels: Default::default(),
                     },
                     pixel_format,
+                    live_filter_code: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 },
                 frame_rx,
             )

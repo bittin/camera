@@ -85,13 +85,7 @@ impl AppModel {
                 VideoContentFit::Contain
             };
 
-            // Apply filters in Photo and Virtual modes (not in Video mode)
-            let filter_mode = match self.mode {
-                crate::app::state::CameraMode::Photo | crate::app::state::CameraMode::Virtual => {
-                    self.selected_filter
-                }
-                crate::app::state::CameraMode::Video => crate::app::state::FilterType::Standard,
-            };
+            let filter_mode = self.selected_filter;
             let should_mirror = self.should_mirror_preview();
 
             // Use the rotation stored with the current frame

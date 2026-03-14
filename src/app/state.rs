@@ -579,6 +579,9 @@ pub struct AppModel {
     pub hdr_override_disabled: bool,
     /// Currently selected filter
     pub selected_filter: FilterType,
+    /// Live filter code shared with the recording pusher (AtomicU32).
+    /// Updated on every filter change so the recorder sees it in real-time.
+    pub recording_filter_code: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Flash enabled for photo capture
     pub flash_enabled: bool,
     /// Flash is currently active (showing white overlay)
@@ -1045,6 +1048,30 @@ impl FilterType {
             FilterType::Solarize => 12,
             FilterType::ChromaticAberration => 13,
             FilterType::Pencil => 14,
+        }
+    }
+
+    /// Reconstruct a FilterType from a GPU shader filter code.
+    ///
+    /// Returns `Standard` for unknown codes.
+    #[inline]
+    pub fn from_gpu_filter_code(code: u32) -> Self {
+        match code {
+            1 => FilterType::Mono,
+            2 => FilterType::Sepia,
+            3 => FilterType::Noir,
+            4 => FilterType::Vivid,
+            5 => FilterType::Cool,
+            6 => FilterType::Warm,
+            7 => FilterType::Fade,
+            8 => FilterType::Duotone,
+            9 => FilterType::Vignette,
+            10 => FilterType::Negative,
+            11 => FilterType::Posterize,
+            12 => FilterType::Solarize,
+            13 => FilterType::ChromaticAberration,
+            14 => FilterType::Pencil,
+            _ => FilterType::Standard,
         }
     }
 }
