@@ -10,6 +10,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// queries must not create a new one while this is true.
 pub(crate) static CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Condvar notified when CAPTURE_ACTIVE transitions to false.
+/// Allows new capture threads to wake immediately instead of polling.
+pub(crate) static CAPTURE_RELEASED: (std::sync::Mutex<()>, std::sync::Condvar) =
+    (std::sync::Mutex::new(()), std::sync::Condvar::new());
+
 /// Pipeline diagnostics accessible by the insights handler.
 ///
 /// String/Option fields are behind a RwLock for consistent snapshots.

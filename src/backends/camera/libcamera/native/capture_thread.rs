@@ -7,8 +7,8 @@
 //! pointers.
 
 use super::diagnostics::{
-    CAPTURE_ACTIVE, DIAGNOSTICS, DiagnosticParams, MJPEG_DECODE_TIME_US, PREVIEW_FRAME_COUNT,
-    STILL_FRAME_COUNT, StreamDiag, publish_diagnostics,
+    CAPTURE_ACTIVE, CAPTURE_RELEASED, DIAGNOSTICS, DiagnosticParams, MJPEG_DECODE_TIME_US,
+    PREVIEW_FRAME_COUNT, STILL_FRAME_COUNT, StreamDiag, publish_diagnostics,
 };
 use super::pixel_formats::{map_pixel_format, pixel_format_name};
 use crate::backends::camera::types::*;
@@ -243,6 +243,7 @@ pub(crate) fn capture_thread_main(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 CAPTURE_ACTIVE.store(false, Ordering::Release);
+                CAPTURE_RELEASED.1.notify_all();
             }
             // If init_tx hasn't been used yet, report the error
             let _ = init_tx.try_send(Err(e));
@@ -292,23 +293,32 @@ fn capture_thread_setup_and_run(
 
     // Wait for any previous CameraManager to be fully dropped.
     // libcamera enforces a singleton — creating a second instance is fatal.
-    // The old capture thread clears CAPTURE_ACTIVE after dropping its manager,
-    // so we spin here until that happens.
-    loop {
+    // The old capture thread signals CAPTURE_RELEASED after dropping its manager.
+    {
         let _mgr_lock = super::super::CAMERA_MANAGER_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !CAPTURE_ACTIVE.load(Ordering::Acquire) {
-            // No other CameraManager exists — claim ownership and proceed.
-            CAPTURE_ACTIVE.store(true, Ordering::Release);
-            break;
+        if CAPTURE_ACTIVE.load(Ordering::Acquire) {
+            drop(_mgr_lock);
+            info!("Waiting for previous CameraManager to be released...");
+            let (lock, cvar) = &CAPTURE_RELEASED;
+            let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            // Wait until CAPTURE_ACTIVE is cleared (with timeout to avoid deadlock)
+            let _guard = cvar
+                .wait_timeout_while(guard, std::time::Duration::from_secs(5), |_| {
+                    CAPTURE_ACTIVE.load(Ordering::Acquire)
+                })
+                .unwrap_or_else(|e| e.into_inner());
         }
-        drop(_mgr_lock);
-        info!("Waiting for previous CameraManager to be released...");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // Delay for hardware release — the "simple" pipeline handler needs time
+        // to fully release V4L2 resources before a new CameraManager can start.
+        // This runs on the capture thread (not the UI thread) to avoid stutter.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        CAPTURE_ACTIVE.store(true, Ordering::Release);
     }
 
-    // Create camera manager (CAPTURE_ACTIVE is set, lock was just released)
     let mgr = CameraManager::new()
         .map_err(|e| BackendError::InitializationFailed(format!("CameraManager::new: {}", e)))?;
 
@@ -471,11 +481,13 @@ fn capture_thread_setup_and_run(
 
     // Now clear the flag under the lock so that any enumerate_cameras()/get_formats()
     // call that was waiting will see CAPTURE_ACTIVE=false and proceed normally.
+    // Clear the flag and wake any waiting capture thread immediately.
     {
         let _lock = super::super::CAMERA_MANAGER_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         CAPTURE_ACTIVE.store(false, Ordering::Release);
+        CAPTURE_RELEASED.1.notify_all();
     }
     info!("CameraManager released");
 
