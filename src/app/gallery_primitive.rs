@@ -60,7 +60,8 @@ impl PipelineTrait for GalleryPipeline {
     }
 
     fn trim(&mut self) {
-        self.texture_cache.clear();
+        // No-op: we manage texture cache lifecycle ourselves.
+        // Clearing here would destroy live textures and cause flickering.
     }
 }
 

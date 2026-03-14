@@ -277,11 +277,8 @@ impl PipelineTrait for VideoPipeline {
     }
 
     fn trim(&mut self) {
-        self.textures.clear();
-        self.bindings.clear();
-        self.yuv_textures.clear();
-        *self.blur_intermediate_1.write().unwrap() = None;
-        *self.blur_intermediate_2.write().unwrap() = None;
+        // No-op: we manage texture lifecycle ourselves via video_id keying.
+        // Clearing here would destroy live textures and cause flickering.
     }
 }
 
