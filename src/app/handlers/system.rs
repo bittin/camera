@@ -69,6 +69,11 @@ impl AppModel {
         filter: FilterType,
     ) -> Task<cosmic::Action<Message>> {
         self.selected_filter = filter;
+        // Update the shared atomic so the recording pusher picks up the change
+        self.recording_filter_code.store(
+            filter.gpu_filter_code(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         info!("Filter selected: {:?}", filter);
 
         // Update virtual camera filter if streaming

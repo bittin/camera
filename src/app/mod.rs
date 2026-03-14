@@ -359,6 +359,7 @@ impl cosmic::Application for AppModel {
             auto_detected_frame_count: 1, // Start with 1 (no HDR+) until first brightness evaluation
             hdr_override_disabled: false,
             selected_filter: FilterType::default(),
+            recording_filter_code: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             flash_enabled: false,
             flash_active: false,
             flash_hardware: {

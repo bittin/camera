@@ -1126,6 +1126,7 @@ impl AppModel {
 
         let backend_manager = self.backend_manager.clone();
         let va_jpeg_dec_name = va_jpeg_dec.map(|s| s.to_string());
+        let live_filter = self.recording_filter_code.clone();
 
         let recording_task = Task::perform(
             async move {
@@ -1173,6 +1174,7 @@ impl AppModel {
                                     audio_levels,
                                 },
                                 pixel_format,
+                                live_filter_code: live_filter.clone(),
                             }
                         };
 
