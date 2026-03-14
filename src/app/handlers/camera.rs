@@ -176,6 +176,18 @@ impl AppModel {
         // Recording frames are sent directly from the capture thread via
         // set_recording_sender (bypasses UI for lower latency / fewer drops).
 
+        // Drop stale frames from the old camera/mode that were already queued
+        // in the iced message queue when the switch happened — but only AFTER
+        // the transition blur has ended. During the blur period we want stale
+        // frames so the blurred old-camera image remains visible.
+        if !self.transition_state.in_transition
+            && let Some(transition_start) = self.transition_state.transition_start_time
+            && frame.captured_at < transition_start
+        {
+            debug!("Dropping stale frame captured before camera/mode switch");
+            return Task::none();
+        }
+
         // Track whether this frame is from a file source (for mirror handling)
         let is_file_source = self.virtual_camera.is_file_source();
 
@@ -189,7 +201,7 @@ impl AppModel {
                 .unwrap_or_default()
         };
 
-        if let Some(task) = self.transition_state.on_frame_received() {
+        if let Some(task) = self.transition_state.on_frame_received(frame.captured_at) {
             self.current_frame = Some(Arc::clone(&frame));
             self.current_frame_is_file_source = is_file_source;
             self.current_frame_rotation = frame_rotation;

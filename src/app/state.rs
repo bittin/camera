@@ -1441,15 +1441,19 @@ impl TransitionState {
         cosmic::Task::none()
     }
 
-    /// Called when a new frame arrives during transition
-    /// Returns a task to clear blur after the configured duration if this is the first frame
-    pub fn on_frame_received(&mut self) -> Option<cosmic::Task<Message>> {
+    /// Called when a new frame arrives during transition.
+    /// Only starts the blur countdown when the frame is from the NEW camera
+    /// (captured after the transition started), so stale queued frames from the
+    /// old camera don't prematurely trigger the countdown.
+    pub fn on_frame_received(&mut self, captured_at: Instant) -> Option<cosmic::Task<Message>> {
         if !self.in_transition {
             return None;
         }
 
-        // If this is the first frame since transition started
-        if self.first_frame_time.is_none() {
+        // Only start the blur countdown for frames from the new camera
+        let is_new_frame = self.transition_start_time.is_none_or(|t| captured_at >= t);
+
+        if self.first_frame_time.is_none() && is_new_frame {
             self.first_frame_time = Some(Instant::now());
 
             // Schedule blur removal after configured duration from NOW
@@ -1481,11 +1485,12 @@ impl TransitionState {
         first_frame_time.elapsed() < std::time::Duration::from_millis(self.blur_duration_ms)
     }
 
-    /// Clear the blur and end transition
+    /// Clear the blur and end transition.
+    /// Preserves `transition_start_time` so post-transition stale frames can still be filtered.
     pub fn clear(&mut self) {
         self.in_transition = false;
         self.ui_disabled = false; // Re-enable UI
-        self.transition_start_time = None;
+        // Keep transition_start_time — used by handle_camera_frame to drop stale frames
         self.first_frame_time = None;
     }
 }
