@@ -55,6 +55,7 @@ use crate::fl;
 use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::Subscription;
+use cosmic::iced_futures::subscription;
 use cosmic::widget::{self, about::About};
 use cosmic::{Element, Task};
 pub use state::{
@@ -64,6 +65,40 @@ pub use state::{
 };
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
+
+/// Helper to create a subscription with an ID and a stream, replacing the removed `run_with_id`.
+///
+/// The `id` is hashed for subscription identity. The `stream` is the actual event stream.
+fn subscription_with_id<I, S, T>(id: I, stream: S) -> Subscription<T>
+where
+    I: std::hash::Hash + 'static,
+    S: futures::Stream<Item = T> + Send + 'static,
+    T: 'static,
+{
+    use std::hash::Hash;
+    struct IdStream<I, S> {
+        id: I,
+        stream: S,
+    }
+    impl<I, S> subscription::Recipe for IdStream<I, S>
+    where
+        I: Hash + 'static,
+        S: futures::Stream + Send + 'static,
+    {
+        type Output = S::Item;
+        fn hash(&self, state: &mut subscription::Hasher) {
+            std::any::TypeId::of::<I>().hash(state);
+            self.id.hash(state);
+        }
+        fn stream(
+            self: Box<Self>,
+            _input: subscription::EventStream,
+        ) -> cosmic::iced_futures::BoxStream<Self::Output> {
+            Box::pin(self.stream)
+        }
+    }
+    subscription::from_recipe(IdStream { id, stream })
+}
 
 /// Get the photo save directory
 ///
@@ -669,7 +704,7 @@ impl cosmic::Application for AppModel {
             // No camera subscription when file source is active (file source handles preview)
             Subscription::none()
         } else {
-            Subscription::run_with_id(
+            subscription_with_id(
                 (
                     "camera",
                     camera_index,
@@ -680,7 +715,7 @@ impl cosmic::Application for AppModel {
                     restart_counter, // Forces restart after HDR+ processing
                     camera_mode,     // Restart pipeline when mode changes (different stream roles)
                 ),
-                cosmic::iced::stream::channel(100, move |mut output| async move {
+                cosmic::iced::stream::channel(100, async move |mut output| {
                     info!(camera_index, "Camera subscription started");
 
                     // No artificial delay needed - PipelineManager serializes all operations
@@ -1026,9 +1061,9 @@ impl cosmic::Application for AppModel {
         // Camera hotplug monitoring subscription
         // Monitors /dev/video* device nodes instead of calling enumerate_cameras(),
         // which returns stale cached results when a capture pipeline is active.
-        let hotplug_sub = Subscription::run_with_id(
+        let hotplug_sub = subscription_with_id(
             "camera_hotplug",
-            cosmic::iced::stream::channel(10, move |mut output| async move {
+            cosmic::iced::stream::channel(10, async move |mut output| {
                 info!("Camera hotplug monitoring started (device node scanning)");
 
                 // Collect initial set of /dev/video* device nodes
@@ -1109,9 +1144,9 @@ impl cosmic::Application for AppModel {
 
         // Audio device hotplug monitoring subscription
         let current_audio_devices = self.available_audio_devices.clone();
-        let audio_hotplug_sub = Subscription::run_with_id(
+        let audio_hotplug_sub = subscription_with_id(
             "audio_hotplug",
-            cosmic::iced::stream::channel(10, move |mut output| async move {
+            cosmic::iced::stream::channel(10, async move |mut output| {
                 info!("Audio device hotplug monitoring started");
 
                 let mut last_devices = current_audio_devices;
@@ -1163,9 +1198,9 @@ impl cosmic::Application for AppModel {
             (true, Some(frame)) => {
                 // Copy frame for background task - mapped buffers become invalid when pipeline stops
                 let frame = Arc::new(frame.to_copied());
-                Subscription::run_with_id(
+                subscription_with_id(
                     ("qr_detection", frame.captured_at),
-                    cosmic::iced::stream::channel(1, move |mut output| async move {
+                    cosmic::iced::stream::channel(1, async move |mut output| {
                         let detector = frame_processor::tasks::QrDetector::new();
                         let detections = detector.detect(frame).await;
                         let _ = output.send(Message::QrDetectionsUpdated(detections)).await;
@@ -1179,9 +1214,9 @@ impl cosmic::Application for AppModel {
         let file_source_preview_sub = if let Some(ref receiver) = self.file_source_preview_receiver
         {
             let receiver = receiver.clone();
-            Subscription::run_with_id(
+            subscription_with_id(
                 "file_source_preview",
-                cosmic::iced::stream::channel(10, move |mut output| async move {
+                cosmic::iced::stream::channel(10, async move |mut output| {
                     loop {
                         // Try to lock and receive a frame
                         let frame = {
@@ -1235,9 +1270,9 @@ impl cosmic::Application for AppModel {
             let device_path = self.get_v4l2_device_path();
             if let Some(path) = device_path {
                 let path = path.clone();
-                Subscription::run_with_id(
+                subscription_with_id(
                     ("privacy_polling", path.clone()),
-                    cosmic::iced::stream::channel(1, move |mut output| async move {
+                    cosmic::iced::stream::channel(1, async move |mut output| {
                         use crate::backends::camera::v4l2_controls;
                         loop {
                             // Poll privacy control status

@@ -22,7 +22,7 @@ impl AppModel {
                 widget::button::standard(fl!("insights-capture"))
                     .on_press(Message::InsightsCaptureFrames),
             )
-            .push(widget::horizontal_space().width(Length::Fixed(8.0)))
+            .push(widget::space::horizontal().width(Length::Fixed(8.0)))
             .push(
                 widget::button::standard(fl!("insights-capture-burst"))
                     .on_press(Message::InsightsCaptureBurst),
@@ -102,7 +102,7 @@ impl AppModel {
         if !self.insights.decoder_chain.is_empty() {
             section = section.add(
                 widget::settings::item::builder(fl!("insights-decoder-chain"))
-                    .control(widget::Space::new(0, 0)),
+                    .control(widget::Space::new().width(0).height(0)),
             );
 
             for decoder in &self.insights.decoder_chain {
@@ -118,7 +118,7 @@ impl AppModel {
 
                 let row = widget::row()
                     .push(widget::icon::from_name(icon_name).symbolic(true).size(16))
-                    .push(widget::horizontal_space().width(Length::Fixed(8.0)))
+                    .push(widget::space::horizontal().width(Length::Fixed(8.0)))
                     .push(
                         widget::column()
                             .push(widget::text::body(decoder.name).font(cosmic::font::mono()))
@@ -449,7 +449,7 @@ impl AppModel {
 
         section = section.add(
             widget::settings::item::builder(fl!("insights-recording-pipeline"))
-                .control(widget::Space::new(0, 0)),
+                .control(widget::Space::new().width(0).height(0)),
         );
         section = section.add(widget::settings::item_row(vec![pipeline_content.into()]));
 
@@ -679,7 +679,7 @@ impl AppModel {
         .width(Length::Fill);
         section = section.add(
             widget::settings::item::builder(fl!("insights-audio-pipeline"))
-                .control(widget::Space::new(0, 0)),
+                .control(widget::Space::new().width(0).height(0)),
         );
         section = section.add(widget::settings::item_row(vec![pipeline_content.into()]));
 
@@ -689,7 +689,7 @@ impl AppModel {
         {
             section = section.add(
                 widget::settings::item::builder(fl!("insights-audio-inputs"))
-                    .control(widget::Space::new(0, 0)),
+                    .control(widget::Space::new().width(0).height(0)),
             );
 
             let levels = &self.insights.audio_levels;
@@ -707,7 +707,7 @@ impl AppModel {
                             .size(12)
                             .width(Length::Fixed(48.0)),
                     )
-                    .push(widget::horizontal_space().width(Length::Fixed(8.0)))
+                    .push(widget::space::horizontal().width(Length::Fixed(8.0)))
                     .push(
                         widget::text::caption(vol_text)
                             .size(11)
@@ -717,9 +717,9 @@ impl AppModel {
                 // Live dB level bar (when recording)
                 if let Some(rms_db) = live_rms {
                     row = row
-                        .push(widget::horizontal_space().width(Length::Fixed(8.0)))
+                        .push(widget::space::horizontal().width(Length::Fixed(8.0)))
                         .push(Self::build_level_bar(rms_db))
-                        .push(widget::horizontal_space().width(Length::Fixed(4.0)))
+                        .push(widget::space::horizontal().width(Length::Fixed(4.0)))
                         .push(
                             widget::text::caption(format!("{:.0} dB", rms_db))
                                 .size(10)
@@ -743,9 +743,9 @@ impl AppModel {
                         .size(12)
                         .width(Length::Fixed(48.0)),
                 )
-                .push(widget::horizontal_space().width(Length::Fixed(8.0)))
+                .push(widget::space::horizontal().width(Length::Fixed(8.0)))
                 .push(Self::build_level_bar(levels.output_rms_db))
-                .push(widget::horizontal_space().width(Length::Fixed(4.0)))
+                .push(widget::space::horizontal().width(Length::Fixed(4.0)))
                 .push(
                     widget::text::caption(rms_text)
                         .size(10)
@@ -756,7 +756,7 @@ impl AppModel {
 
             section = section.add(
                 widget::settings::item::builder(fl!("insights-audio-output-level"))
-                    .control(widget::Space::new(0, 0)),
+                    .control(widget::Space::new().width(0).height(0)),
             );
             section = section.add(widget::settings::item_row(vec![output_row.into()]));
         } else if self.recording.is_recording() && self.config.record_audio {
@@ -787,7 +787,7 @@ impl AppModel {
             cosmic::iced::Color::from_rgb(0.9, 0.2, 0.2) // red
         };
 
-        widget::container(widget::Space::new(bar_width, 8))
+        widget::container(widget::Space::new().width(bar_width).height(8))
             .class(cosmic::style::Container::custom(move |_theme| {
                 cosmic::widget::container::Style {
                     background: Some(cosmic::iced::Background::Color(color)),

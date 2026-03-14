@@ -204,17 +204,14 @@ impl Drop for NativeLibcameraPipeline {
         clear_global_diagnostics();
         self.stop_flag.store(true, Ordering::Release);
 
-        // Wait for capture thread to finish (it will stop camera and drop all libcamera objects)
+        // Wait for capture thread to finish (it will stop camera and drop all libcamera objects).
+        // Hardware release delay is handled by the *new* capture thread (if any) to avoid
+        // blocking the UI thread here.
         if let Some(thread) = self.capture_thread.take()
             && let Err(e) = thread.join()
         {
             error!("Capture thread panicked: {:?}", e);
         }
-
-        // Delay for hardware release - the "simple" pipeline handler needs time
-        // to fully release V4L2 resources before a new pipeline can start.
-        // 200ms was insufficient and caused "Operation timed out" on rapid switching.
-        std::thread::sleep(std::time::Duration::from_millis(500));
 
         let (preview_count, still_count) = self.frame_counts();
         info!(
