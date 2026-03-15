@@ -1,6 +1,6 @@
 # Camera
 
-[![Flathub](https://img.shields.io/flathub/v/io.github.cosmic_utils.camera?logo=flathub&logoColor=white)](https://flathub.org/apps/io.github.cosmic_utils.camera)
+[![Flathub](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fflathub.org%2Fapi%2Fv2%2Fappstream%2Fio.github.cosmic_utils.camera&query=%24.releases%5B0%5D.version&prefix=v&label=flathub&logo=flathub&logoColor=white&color=blue)](https://flathub.org/apps/io.github.cosmic_utils.camera)
 [![CI](https://github.com/cosmic-utils/camera/actions/workflows/ci.yml/badge.svg)](https://github.com/cosmic-utils/camera/actions/workflows/ci.yml)
 [![Release](https://github.com/cosmic-utils/camera/actions/workflows/release.yml/badge.svg)](https://github.com/cosmic-utils/camera/actions/workflows/release.yml)
 
