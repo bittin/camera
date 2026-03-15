@@ -237,6 +237,9 @@ impl AppModel {
             // ===== Settings =====
             Message::UpdateConfig(config) => self.handle_update_config(config),
             Message::SetAppTheme(index) => self.handle_set_app_theme(index),
+            Message::PortalColorSchemeChanged(is_dark) => {
+                self.handle_portal_color_scheme_changed(is_dark)
+            }
             Message::SelectAudioDevice(index) => self.handle_select_audio_device(index),
             Message::SelectVideoEncoder(index) => self.handle_select_video_encoder(index),
             Message::SelectPhotoOutputFormat(index) => {

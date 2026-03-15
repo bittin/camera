@@ -543,6 +543,9 @@ impl cosmic::Application for AppModel {
             |result| cosmic::Action::App(Message::GpuPipelinesWarmed(result)),
         );
 
+        // Apply the theme from config on startup (THEME global defaults to Dark)
+        let theme_task = cosmic::command::set_theme(app.config.app_theme.theme());
+
         (
             app,
             Task::batch([
@@ -550,6 +553,7 @@ impl cosmic::Application for AppModel {
                 load_thumbnail_task,
                 preview_source_task,
                 gpu_warmup_task,
+                theme_task,
             ]),
         )
     }
@@ -1330,6 +1334,51 @@ impl cosmic::Application for AppModel {
                 Subscription::none()
             };
 
+        // On non-COSMIC desktops, subscribe to XDG portal color-scheme changes
+        // so theme updates when user changes their desktop appearance
+        let portal_theme_sub = if !crate::config::is_cosmic_desktop()
+            && self.config.app_theme == crate::config::AppTheme::System
+        {
+            subscription_with_id(
+                "portal-color-scheme",
+                cosmic::iced::stream::channel(10, async move |mut output| {
+                    use ashpd::desktop::settings::{ColorScheme, Settings};
+
+                    let Ok(settings) = Settings::new().await else {
+                        tracing::warn!("Failed to create XDG Settings portal proxy");
+                        std::future::pending::<()>().await;
+                        return;
+                    };
+
+                    let send_scheme =
+                        |output: &mut cosmic::iced::futures::channel::mpsc::Sender<Message>,
+                         scheme: ColorScheme| {
+                            let is_dark = !matches!(scheme, ColorScheme::PreferLight);
+                            output
+                                .try_send(Message::PortalColorSchemeChanged(is_dark))
+                                .ok();
+                        };
+
+                    // Send initial color scheme
+                    if let Ok(scheme) = settings.color_scheme().await {
+                        send_scheme(&mut output, scheme);
+                    }
+
+                    // Subscribe to live changes via ashpd's D-Bus signal stream
+                    if let Ok(mut stream) = settings.receive_color_scheme_changed().await {
+                        while let Some(scheme) = StreamExt::next(&mut stream).await {
+                            send_scheme(&mut output, scheme);
+                        }
+                    }
+
+                    tracing::warn!("Portal color-scheme stream ended");
+                    std::future::pending::<()>().await;
+                }),
+            )
+        } else {
+            Subscription::none()
+        };
+
         Subscription::batch([
             config_sub,
             camera_sub,
@@ -1341,6 +1390,7 @@ impl cosmic::Application for AppModel {
             privacy_polling_sub,
             brightness_eval_sub,
             insights_update_sub,
+            portal_theme_sub,
         ])
     }
 

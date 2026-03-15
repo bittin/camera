@@ -119,6 +119,26 @@ impl AppModel {
         cosmic::command::set_theme(app_theme.theme())
     }
 
+    pub(crate) fn handle_portal_color_scheme_changed(
+        &mut self,
+        is_dark: bool,
+    ) -> Task<cosmic::Action<Message>> {
+        use crate::config::AppTheme;
+
+        // Only apply if user wants to follow system theme
+        if self.config.app_theme != AppTheme::System {
+            return Task::none();
+        }
+
+        info!(is_dark, "Portal color scheme changed, updating theme");
+        let theme = if is_dark {
+            cosmic::Theme::dark()
+        } else {
+            cosmic::Theme::light()
+        };
+        cosmic::command::set_theme(theme)
+    }
+
     pub(crate) fn handle_select_audio_device(
         &mut self,
         index: usize,

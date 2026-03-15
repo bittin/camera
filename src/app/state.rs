@@ -1370,6 +1370,8 @@ pub enum Message {
     UpdateConfig(Config),
     /// Set application theme (System, Dark, Light)
     SetAppTheme(usize),
+    /// XDG portal color scheme changed (true = dark, false = light)
+    PortalColorSchemeChanged(bool),
     /// Select audio input device
     SelectAudioDevice(usize),
     /// Select video encoder
