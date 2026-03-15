@@ -105,8 +105,11 @@ impl AppModel {
                 crate::app::state::CameraMode::Photo
                     if !self.theatre.enabled && !self.current_frame_is_file_source =>
                 {
-                    self.photo_aspect_ratio
-                        .crop_uv_with_rotation(frame.width, frame.height, sensor_rotation)
+                    self.photo_aspect_ratio.crop_uv_with_rotation(
+                        frame.width,
+                        frame.height,
+                        sensor_rotation,
+                    )
                 }
                 _ => None,
             };
