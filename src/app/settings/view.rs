@@ -265,6 +265,22 @@ impl AppModel {
                 .toggler(self.config.mirror_preview, |_| Message::ToggleMirrorPreview),
         );
 
+        // Composition guide section
+        let current_guide_index = crate::config::CompositionGuide::ALL
+            .iter()
+            .position(|g| *g == self.config.composition_guide)
+            .unwrap_or(0);
+
+        let composition_guide_section = widget::settings::section().add(
+            widget::settings::item::builder(fl!("settings-composition-guide"))
+                .description(fl!("settings-composition-guide-description"))
+                .control(widget::dropdown(
+                    &self.composition_guide_dropdown_options,
+                    Some(current_guide_index),
+                    Message::SelectCompositionGuide,
+                )),
+        );
+
         // Virtual camera section
         let virtual_camera_section = widget::settings::section().add(
             widget::settings::item::builder(fl!("virtual-camera-title"))
@@ -320,6 +336,7 @@ impl AppModel {
             photo_section.into(),
             video_section.into(),
             mirror_section.into(),
+            composition_guide_section.into(),
             virtual_camera_section.into(),
             bug_reports_section.into(),
             reset_section.into(),
