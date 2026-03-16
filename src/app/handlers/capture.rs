@@ -819,8 +819,9 @@ impl AppModel {
     }
 
     pub(crate) fn handle_zoom_in(&mut self) -> Task<cosmic::Action<Message>> {
-        // Zoom in by 0.1x, max 10x
-        let new_zoom = (self.zoom_level + 0.1).min(10.0);
+        // Multiplicative zoom: each step is ~2% magnification change,
+        // so it feels consistent at any zoom level.
+        let new_zoom = (self.zoom_level * 1.02).min(10.0);
         if (new_zoom - self.zoom_level).abs() > 0.001 {
             self.zoom_level = new_zoom;
             debug!(zoom = self.zoom_level, "Zoom in");
@@ -829,8 +830,8 @@ impl AppModel {
     }
 
     pub(crate) fn handle_zoom_out(&mut self) -> Task<cosmic::Action<Message>> {
-        // Zoom out by 0.1x, min 1.0x
-        let new_zoom = (self.zoom_level - 0.1).max(1.0);
+        // Multiplicative zoom: each step is ~2% magnification change.
+        let new_zoom = (self.zoom_level / 1.02).max(1.0);
         if (new_zoom - self.zoom_level).abs() > 0.001 {
             self.zoom_level = new_zoom;
             debug!(zoom = self.zoom_level, "Zoom out");
