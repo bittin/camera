@@ -117,7 +117,7 @@ exposure-not-supported = stöds inte
 
 # Fokuskontroller
 fokus-auto = Fokus
-fokus-position = Fokus
+focus-position = Fokus
 
 # Färgkontroller
 color-title = Färg
