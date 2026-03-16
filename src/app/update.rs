@@ -248,6 +248,7 @@ impl AppModel {
             Message::ToggleRecordAudio => self.handle_toggle_record_audio(),
             Message::SelectAudioEncoder(index) => self.handle_select_audio_encoder(index),
             Message::ToggleSaveBurstRaw => self.handle_toggle_save_burst_raw(),
+            Message::SelectCompositionGuide(index) => self.handle_select_composition_guide(index),
             Message::ResetAllSettings => self.handle_reset_all_settings(),
 
             // ===== System & Recovery =====

@@ -407,6 +407,7 @@ impl AppModel {
 
                 let mut theatre_stack = cosmic::iced::widget::stack![
                     camera_preview,
+                    self.build_composition_overlay(),
                     // QR overlay (custom widget calculates positions at render time)
                     self.build_qr_overlay(),
                     // Privacy cover warning overlay (centered)
@@ -434,6 +435,7 @@ impl AppModel {
                 // Theatre mode with UI hidden - show only full-screen preview with QR overlay and privacy warning
                 let mut hidden_stack = cosmic::iced::widget::stack![
                     camera_preview,
+                    self.build_composition_overlay(),
                     self.build_qr_overlay(),
                     self.build_privacy_warning()
                 ];
@@ -449,6 +451,7 @@ impl AppModel {
             // Preview with top bar, QR overlay, privacy warning, and optional filter name label overlaid
             let mut preview_stack = cosmic::iced::widget::stack![
                 camera_preview,
+                self.build_composition_overlay(),
                 // QR overlay (custom widget calculates positions at render time)
                 self.build_qr_overlay(),
                 // Privacy cover warning overlay (centered)

@@ -666,6 +666,8 @@ pub struct AppModel {
     pub photo_output_format_dropdown_options: Vec<String>,
     /// Audio encoder dropdown options (Opus, AAC)
     pub audio_encoder_dropdown_options: Vec<String>,
+    /// Composition guide dropdown options
+    pub composition_guide_dropdown_options: Vec<String>,
     /// Whether the device info panel is visible
     pub device_info_visible: bool,
 
@@ -1384,6 +1386,8 @@ pub enum Message {
     SelectAudioEncoder(usize),
     /// Toggle saving raw burst frames as DNG (debugging feature)
     ToggleSaveBurstRaw,
+    /// Select composition guide overlay by dropdown index
+    SelectCompositionGuide(usize),
     /// Reset all settings to defaults
     ResetAllSettings,
     /// Toggle virtual camera feature enabled

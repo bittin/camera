@@ -313,6 +313,24 @@ impl AppModel {
         Task::none()
     }
 
+    pub(crate) fn handle_select_composition_guide(
+        &mut self,
+        index: usize,
+    ) -> Task<cosmic::Action<Message>> {
+        use crate::config::CompositionGuide;
+        if let Some(&guide) = CompositionGuide::ALL.get(index) {
+            self.config.composition_guide = guide;
+            info!(?guide, "Selected composition guide");
+
+            if let Some(handler) = self.config_handler.as_ref()
+                && let Err(err) = self.config.write_entry(handler)
+            {
+                error!(?err, "Failed to save composition guide setting");
+            }
+        }
+        Task::none()
+    }
+
     pub(crate) fn handle_reset_all_settings(&mut self) -> Task<cosmic::Action<Message>> {
         info!("Resetting all settings to defaults");
         self.config = crate::config::Config::default();

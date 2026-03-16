@@ -28,6 +28,7 @@
 mod bottom_bar;
 mod camera_ops;
 mod camera_preview;
+mod composition_overlay;
 mod controls;
 mod dropdowns;
 pub mod exposure_picker;
@@ -437,6 +438,17 @@ impl cosmic::Application for AppModel {
                 .iter()
                 .map(|e| e.display_name().to_string())
                 .collect(),
+            composition_guide_dropdown_options: vec![
+                fl!("guide-none"),
+                fl!("guide-rule-of-thirds"),
+                fl!("guide-phi-grid"),
+                fl!("guide-spiral-top-left"),
+                fl!("guide-spiral-top-right"),
+                fl!("guide-spiral-bottom-left"),
+                fl!("guide-spiral-bottom-right"),
+                fl!("guide-diagonal"),
+                fl!("guide-crosshair"),
+            ],
             device_info_visible: false,
             transition_state: crate::app::state::TransitionState::default(),
             // QR detection enabled by default

@@ -115,6 +115,45 @@ impl AudioEncoder {
     pub const ALL: [AudioEncoder; 2] = [AudioEncoder::Opus, AudioEncoder::AAC];
 }
 
+/// Composition guide overlay for camera preview
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum CompositionGuide {
+    /// No guide overlay
+    #[default]
+    None,
+    /// Rule of Thirds (2H + 2V lines at 1/3 and 2/3)
+    RuleOfThirds,
+    /// Phi Grid (2H + 2V lines at 0.382 and 0.618)
+    PhiGrid,
+    /// Fibonacci Spiral — focus top-left
+    SpiralTopLeft,
+    /// Fibonacci Spiral — focus top-right
+    SpiralTopRight,
+    /// Fibonacci Spiral — focus bottom-left
+    SpiralBottomLeft,
+    /// Fibonacci Spiral — focus bottom-right
+    SpiralBottomRight,
+    /// Diagonal lines from corners
+    Diagonals,
+    /// Crosshair (1H + 1V line through center)
+    Crosshair,
+}
+
+impl CompositionGuide {
+    /// Get all available guides
+    pub const ALL: [CompositionGuide; 9] = [
+        CompositionGuide::None,
+        CompositionGuide::RuleOfThirds,
+        CompositionGuide::PhiGrid,
+        CompositionGuide::SpiralTopLeft,
+        CompositionGuide::SpiralTopRight,
+        CompositionGuide::SpiralBottomLeft,
+        CompositionGuide::SpiralBottomRight,
+        CompositionGuide::Diagonals,
+        CompositionGuide::Crosshair,
+    ];
+}
+
 /// Application theme preference
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum AppTheme {
@@ -185,7 +224,7 @@ pub struct FormatSettings {
 pub type VideoSettings = FormatSettings;
 
 #[derive(Debug, Clone, CosmicConfigEntry, Eq, PartialEq, Serialize, Deserialize)]
-#[version = 13]
+#[version = 14]
 pub struct Config {
     /// Application theme preference (System, Dark, Light)
     pub app_theme: AppTheme,
@@ -217,6 +256,8 @@ pub struct Config {
     pub record_audio: bool,
     /// Audio encoder preference (Opus or AAC)
     pub audio_encoder: AudioEncoder,
+    /// Composition guide overlay for camera preview
+    pub composition_guide: CompositionGuide,
 }
 
 impl Default for Config {
@@ -239,6 +280,7 @@ impl Default for Config {
             burst_mode_setting: BurstModeSetting::default(), // Default to Auto
             record_audio: true,   // Enable audio recording by default
             audio_encoder: AudioEncoder::default(), // Default to Opus
+            composition_guide: CompositionGuide::default(), // Default to None
         }
     }
 }

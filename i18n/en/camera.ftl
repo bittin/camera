@@ -171,6 +171,19 @@ settings-burst-mode-quality-description = Quality uses FFT frequency domain merg
 settings-save-burst-raw = Save raw burst frames
 settings-save-burst-raw-description = Save individual burst frames as DNG files alongside HDR+ photos. Useful for debugging or reprocessing.
 
+# Composition guide
+settings-composition-guide = Composition guide
+settings-composition-guide-description = Overlay guide lines on the camera preview for framing
+guide-none = None
+guide-rule-of-thirds = Rule of Thirds
+guide-phi-grid = Phi Grid
+guide-spiral-top-left = Spiral ↖
+guide-spiral-top-right = Spiral ↗
+guide-spiral-bottom-left = Spiral ↙
+guide-spiral-bottom-right = Spiral ↘
+guide-diagonal = Diagonals
+guide-crosshair = Crosshair
+
 # About page
 about-support = Support & Feedback
 
