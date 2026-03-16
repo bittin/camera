@@ -187,7 +187,7 @@ insights-frame-latency = Latence d'image
 insights-dropped-frames = Images perdues
 insights-frame-size-decoded = Taille de l'image
 insights-decode-time-gst = Traitement du tampon
-insights-copy-time = Temps de retour à la ligne
+insights-copy-time = Temps d'encapsulation d'image
 insights-gpu-upload-time = Temps de chargement GPU
 insights-gpu-upload-bandwidth = Bande passante de chargement GPU
 
