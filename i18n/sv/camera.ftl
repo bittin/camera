@@ -116,7 +116,7 @@ exposure-auto-mode = Automatisk
 exposure-not-supported = stöds inte
 
 # Fokuskontroller
-fokus-auto = Fokus
+focus-auto = Fokus
 focus-position = Fokus
 
 # Färgkontroller
