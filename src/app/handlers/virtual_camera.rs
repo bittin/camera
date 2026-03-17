@@ -571,6 +571,7 @@ impl AppModel {
 
     pub(crate) fn handle_virtual_camera_started(&mut self) -> Task<cosmic::Action<Message>> {
         info!("Virtual camera streaming started successfully");
+        self.update_idle_inhibit();
         Task::perform(
             async {
                 tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
@@ -584,6 +585,7 @@ impl AppModel {
         result: Result<(), String>,
     ) -> Task<cosmic::Action<Message>> {
         self.virtual_camera = VirtualCameraState::Idle;
+        self.update_idle_inhibit();
         // Clear the file source preview receiver (only relevant for file source streaming)
         self.file_source_preview_receiver = None;
 

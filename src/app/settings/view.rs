@@ -3,7 +3,7 @@
 //! Settings drawer view
 
 use crate::app::state::{AppModel, Message};
-use crate::config::{AppTheme, AudioEncoder, PhotoOutputFormat};
+use crate::config::{AppTheme, AudioEncoder, PhotoOutputFormat, TimelapseInterval};
 use crate::constants::BitratePreset;
 use crate::fl;
 use cosmic::Element;
@@ -258,6 +258,39 @@ impl AppModel {
             );
         }
 
+        // Timelapse section
+        let current_timelapse_interval_index = TimelapseInterval::ALL
+            .iter()
+            .position(|i| *i == self.config.timelapse_interval)
+            .unwrap_or(0);
+
+        let timelapse_section = if self.timelapse.is_running() {
+            widget::settings::section()
+                .title(fl!("settings-timelapse"))
+                .add(
+                    widget::settings::item::builder(fl!("settings-timelapse-interval"))
+                        .description(fl!("settings-timelapse-interval-description"))
+                        .control(disabled_text(
+                            self.timelapse_interval_dropdown_options
+                                .get(current_timelapse_interval_index)
+                                .cloned()
+                                .unwrap_or_default(),
+                        )),
+                )
+        } else {
+            widget::settings::section()
+                .title(fl!("settings-timelapse"))
+                .add(
+                    widget::settings::item::builder(fl!("settings-timelapse-interval"))
+                        .description(fl!("settings-timelapse-interval-description"))
+                        .control(widget::dropdown(
+                            &self.timelapse_interval_dropdown_options,
+                            Some(current_timelapse_interval_index),
+                            Message::SetTimelapseInterval,
+                        )),
+                )
+        };
+
         // Mirror preview section
         let mirror_section = widget::settings::section().add(
             widget::settings::item::builder(fl!("settings-mirror-preview"))
@@ -334,6 +367,7 @@ impl AppModel {
             appearance_section.into(),
             camera_section.into(),
             photo_section.into(),
+            timelapse_section.into(),
             video_section.into(),
             mirror_section.into(),
             composition_guide_section.into(),

@@ -115,6 +115,70 @@ impl AudioEncoder {
     pub const ALL: [AudioEncoder; 2] = [AudioEncoder::Opus, AudioEncoder::AAC];
 }
 
+/// Timelapse interval setting
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum TimelapseInterval {
+    /// 2 frames per second (500ms between captures, default)
+    #[default]
+    Fps2,
+    /// 1 frame per second
+    Sec1,
+    /// 2 seconds between captures
+    Sec2,
+    /// 5 seconds between captures
+    Sec5,
+    /// 10 seconds between captures
+    Sec10,
+    /// 30 seconds between captures
+    Sec30,
+    /// 1 minute between captures
+    Min1,
+    /// 5 minutes between captures
+    Min5,
+}
+
+impl TimelapseInterval {
+    /// Get interval duration in milliseconds
+    pub fn millis(&self) -> u64 {
+        match self {
+            TimelapseInterval::Fps2 => 500,
+            TimelapseInterval::Sec1 => 1_000,
+            TimelapseInterval::Sec2 => 2_000,
+            TimelapseInterval::Sec5 => 5_000,
+            TimelapseInterval::Sec10 => 10_000,
+            TimelapseInterval::Sec30 => 30_000,
+            TimelapseInterval::Min1 => 60_000,
+            TimelapseInterval::Min5 => 300_000,
+        }
+    }
+
+    /// Get display name for this interval
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            TimelapseInterval::Fps2 => "2 fps",
+            TimelapseInterval::Sec1 => "1 second",
+            TimelapseInterval::Sec2 => "2 seconds",
+            TimelapseInterval::Sec5 => "5 seconds",
+            TimelapseInterval::Sec10 => "10 seconds",
+            TimelapseInterval::Sec30 => "30 seconds",
+            TimelapseInterval::Min1 => "1 minute",
+            TimelapseInterval::Min5 => "5 minutes",
+        }
+    }
+
+    /// Get all available intervals
+    pub const ALL: [TimelapseInterval; 8] = [
+        TimelapseInterval::Fps2,
+        TimelapseInterval::Sec1,
+        TimelapseInterval::Sec2,
+        TimelapseInterval::Sec5,
+        TimelapseInterval::Sec10,
+        TimelapseInterval::Sec30,
+        TimelapseInterval::Min1,
+        TimelapseInterval::Min5,
+    ];
+}
+
 /// Composition guide overlay for camera preview
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CompositionGuide {
@@ -224,7 +288,7 @@ pub struct FormatSettings {
 pub type VideoSettings = FormatSettings;
 
 #[derive(Debug, Clone, CosmicConfigEntry, Eq, PartialEq, Serialize, Deserialize)]
-#[version = 14]
+#[version = 15]
 pub struct Config {
     /// Application theme preference (System, Dark, Light)
     pub app_theme: AppTheme,
@@ -258,6 +322,8 @@ pub struct Config {
     pub audio_encoder: AudioEncoder,
     /// Composition guide overlay for camera preview
     pub composition_guide: CompositionGuide,
+    /// Timelapse capture interval
+    pub timelapse_interval: TimelapseInterval,
 }
 
 impl Default for Config {
@@ -281,6 +347,7 @@ impl Default for Config {
             record_audio: true,   // Enable audio recording by default
             audio_encoder: AudioEncoder::default(), // Default to Opus
             composition_guide: CompositionGuide::default(), // Default to None
+            timelapse_interval: TimelapseInterval::default(), // Default to 2 fps
         }
     }
 }

@@ -49,6 +49,12 @@ impl AppModel {
             self.recording = RecordingState::Idle;
         }
 
+        // Stop timelapse if active (dropping sender closes encoder channel)
+        if self.timelapse.is_active() {
+            info!("Stopping timelapse due to mode switch");
+            self.timelapse = crate::app::state::TimelapseState::Idle;
+        }
+
         let would_change_format = self.would_format_change_for_mode(mode);
 
         // Skip blur transition and camera restart when a file source is active

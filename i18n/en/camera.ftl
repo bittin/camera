@@ -9,6 +9,7 @@ git-description = Git commit {$hash} on {$date}
 # Mode switcher
 mode-video = VIDEO
 mode-photo = PHOTO
+mode-timelapse = TIMELAPSE
 mode-virtual = VIRTUAL
 
 # Virtual camera
@@ -282,6 +283,11 @@ insights-meta-lens-position = Lens Position
 insights-meta-lux = Illuminance
 insights-meta-focus-fom = Focus FoM
 insights-meta-na = N/A
+
+# Timelapse
+settings-timelapse = Timelapse
+settings-timelapse-interval = Interval
+settings-timelapse-interval-description = Time between consecutive photo captures
 
 # Insights - Capture
 insights-capture = Capture

@@ -201,6 +201,14 @@ impl AppModel {
             Message::UpdateRecordingDuration => self.handle_update_recording_duration(),
             Message::StartRecordingAfterDelay => self.handle_start_recording_after_delay(),
 
+            // ===== Timelapse =====
+            Message::ToggleTimelapse => self.handle_toggle_timelapse(),
+            Message::TimelapseTick => self.handle_timelapse_tick(),
+            Message::SetTimelapseInterval(i) => self.handle_set_timelapse_interval(i),
+            Message::TimelapseAssemblyComplete(result) => {
+                self.handle_timelapse_assembly_complete(result)
+            }
+
             // ===== Virtual Camera =====
             Message::ToggleVirtualCamera => self.handle_toggle_virtual_camera(),
             Message::VirtualCameraStarted => self.handle_virtual_camera_started(),

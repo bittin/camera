@@ -11,6 +11,7 @@
 pub mod encoder_selection;
 pub mod muxer;
 pub mod recorder;
+pub mod timelapse;
 
 // Re-export commonly used types
 pub use encoder_selection::EncoderConfig;

@@ -4,7 +4,7 @@
 //!
 //! Handles photo capture, video recording, flash, zoom, and timer functionality.
 
-use crate::app::state::{AppModel, CameraMode, Message, RecordingState};
+use crate::app::state::{AppModel, CameraMode, Message, RecordingState, TimelapseState};
 use crate::backends::camera::v4l2_controls::read_exposure_metadata;
 use crate::pipelines::photo::burst_mode::BurstModeConfig;
 use crate::pipelines::photo::burst_mode::burst::{
@@ -863,6 +863,7 @@ impl AppModel {
             Ok(path) => {
                 info!(path = %path, "Photo saved successfully");
                 self.last_media_path = Some(path.clone());
+
                 return Task::done(cosmic::Action::App(Message::RefreshGalleryThumbnail));
             }
             Err(err) => {
@@ -897,6 +898,7 @@ impl AppModel {
                 let _ = sender.send(());
             }
             self.recording = RecordingState::Idle;
+            self.update_idle_inhibit();
         } else {
             if self
                 .available_cameras
@@ -920,6 +922,7 @@ impl AppModel {
         path: String,
     ) -> Task<cosmic::Action<Message>> {
         info!(path = %path, "Recording started successfully");
+        self.update_idle_inhibit();
         Self::delay_task(1000, Message::UpdateRecordingDuration)
     }
 
@@ -928,6 +931,7 @@ impl AppModel {
         result: Result<String, String>,
     ) -> Task<cosmic::Action<Message>> {
         self.recording = RecordingState::Idle;
+        self.update_idle_inhibit();
         // Turn off torch when recording ends
         self.turn_off_flash_hardware();
 
@@ -1312,6 +1316,249 @@ impl AppModel {
             }
         }
     }
+
+    // =========================================================================
+    // Idle Inhibit
+    // =========================================================================
+
+    /// Update the system idle/suspend inhibit based on current activity.
+    ///
+    /// Call this whenever recording, streaming, or timelapse state changes.
+    /// Uses org.freedesktop.ScreenSaver.Inhibit (supported by cosmic-idle,
+    /// GNOME, KDE, etc.) to prevent the screen from turning off.
+    pub(crate) fn update_idle_inhibit(&mut self) {
+        let should_inhibit = self.recording.is_recording()
+            || self.virtual_camera.is_streaming()
+            || self.timelapse.is_active();
+
+        let is_inhibited = self.idle_inhibit.is_some() || self.idle_inhibit_fd.is_some();
+
+        if should_inhibit && !is_inhibited {
+            // ScreenSaver inhibit (cosmic-idle / GNOME / KDE screensaver)
+            // Connection must stay alive — cosmic-idle removes inhibitors on disconnect
+            match screensaver_inhibit() {
+                Ok(guard) => {
+                    info!(cookie = guard.cookie, "ScreenSaver inhibit active");
+                    self.idle_inhibit = Some(guard);
+                }
+                Err(e) => warn!(error = %e, "ScreenSaver inhibit failed"),
+            }
+            // systemd-logind inhibit (prevents idle lock + suspend)
+            match logind_inhibit() {
+                Ok(fd) => {
+                    info!("logind idle+sleep inhibit active");
+                    self.idle_inhibit_fd = Some(fd);
+                }
+                Err(e) => warn!(error = %e, "logind inhibit failed"),
+            }
+        } else if !should_inhibit && is_inhibited {
+            // Release ScreenSaver inhibit (Drop sends UnInhibit + closes connection)
+            if let Some(guard) = self.idle_inhibit.take() {
+                info!(cookie = guard.cookie, "ScreenSaver inhibit released");
+            }
+            // Release logind inhibit (dropping the fd closes it)
+            if self.idle_inhibit_fd.take().is_some() {
+                info!("logind idle+sleep inhibit released");
+            }
+        }
+    }
+
+    // =========================================================================
+    // Timelapse Handlers
+    // =========================================================================
+
+    pub(crate) fn handle_toggle_timelapse(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.timelapse.is_running() {
+            info!("Stopping timelapse");
+            return self.stop_timelapse();
+        }
+
+        if self.timelapse.is_finalising() {
+            return Task::none();
+        }
+
+        let interval_ms = self.config.timelapse_interval.millis();
+        info!(interval_ms, "Starting timelapse");
+
+        // Create channel for sending frames to the encoder
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        self.timelapse = TimelapseState::Running {
+            start_time: std::time::Instant::now(),
+            shots_taken: 0,
+            interval_ms,
+            frame_sender: frame_tx,
+        };
+
+        // Build output path
+        let folder_name = self.config.save_folder_name.clone();
+        let encoder_info = self
+            .available_video_encoders
+            .get(self.current_video_encoder_index)
+            .cloned();
+        let (w, h) = self
+            .active_format
+            .as_ref()
+            .map(|f| (f.width, f.height))
+            .unwrap_or((1920, 1080));
+        let bitrate_kbps = Some(self.config.bitrate_preset.bitrate_kbps(w, h));
+        let live_filter_code = Arc::clone(&self.recording_filter_code);
+
+        // Spawn the encoder task — it runs until the channel is closed
+        let encoder_task = Task::perform(
+            async move {
+                let video_dir = crate::app::get_video_directory(&folder_name);
+                if let Err(e) = std::fs::create_dir_all(&video_dir) {
+                    return Err(format!("Failed to create video directory: {e}"));
+                }
+
+                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let output_path = video_dir.join(format!("timelapse_{timestamp}.mp4"));
+
+                crate::pipelines::video::timelapse::run_timelapse_encoder(
+                    frame_rx,
+                    output_path,
+                    encoder_info,
+                    bitrate_kbps,
+                    live_filter_code,
+                )
+                .await
+            },
+            |result| cosmic::Action::App(Message::TimelapseAssemblyComplete(result)),
+        );
+
+        self.update_idle_inhibit();
+
+        // Send first frame immediately, then schedule next tick
+        self.timelapse_send_current_frame();
+
+        let tick_task = Self::delay_task(interval_ms, Message::TimelapseTick);
+
+        Task::batch([encoder_task, tick_task])
+    }
+
+    /// Send the current preview frame to the timelapse encoder.
+    fn timelapse_send_current_frame(&mut self) {
+        if let Some(frame) = &self.current_frame
+            && self.timelapse.send_frame(Arc::clone(frame))
+        {
+            self.timelapse.increment_shots();
+        }
+    }
+
+    /// Stop timelapse capture. Dropping the sender closes the channel,
+    /// which causes the encoder task to finalise the video and send
+    /// `TimelapseAssemblyComplete`.
+    fn stop_timelapse(&mut self) -> Task<cosmic::Action<Message>> {
+        let shots = self.timelapse.shots_taken();
+        let start_time = match &self.timelapse {
+            TimelapseState::Running { start_time, .. } => *start_time,
+            _ => std::time::Instant::now(),
+        };
+
+        // Transition to Finalising — the sender is dropped, closing the channel
+        self.timelapse = TimelapseState::Finalising {
+            start_time,
+            shots_taken: shots,
+        };
+
+        Task::none()
+    }
+
+    pub(crate) fn handle_timelapse_assembly_complete(
+        &mut self,
+        result: Result<String, String>,
+    ) -> Task<cosmic::Action<Message>> {
+        self.timelapse = TimelapseState::Idle;
+        self.update_idle_inhibit();
+        match result {
+            Ok(path) => {
+                info!(path = %path, "Timelapse video saved");
+                self.last_media_path = Some(path);
+                Task::done(cosmic::Action::App(Message::RefreshGalleryThumbnail))
+            }
+            Err(e) => {
+                error!(error = %e, "Timelapse video encoding failed");
+                Task::none()
+            }
+        }
+    }
+
+    pub(crate) fn handle_timelapse_tick(&mut self) -> Task<cosmic::Action<Message>> {
+        if !self.timelapse.is_running() {
+            return Task::none();
+        }
+
+        let interval_ms = match &self.timelapse {
+            TimelapseState::Running { interval_ms, .. } => *interval_ms,
+            _ => return Task::none(),
+        };
+
+        // Send the current frame to the encoder
+        self.timelapse_send_current_frame();
+
+        // Schedule next tick
+        Self::delay_task(interval_ms, Message::TimelapseTick)
+    }
+
+    pub(crate) fn handle_set_timelapse_interval(
+        &mut self,
+        index: usize,
+    ) -> Task<cosmic::Action<Message>> {
+        use cosmic::cosmic_config::CosmicConfigEntry;
+        if let Some(&interval) = crate::config::TimelapseInterval::ALL.get(index) {
+            self.config.timelapse_interval = interval;
+            if let Some(handler) = self.config_handler.as_ref()
+                && let Err(err) = self.config.write_entry(handler)
+            {
+                error!(?err, "Failed to save timelapse interval");
+            }
+        }
+        Task::none()
+    }
+}
+
+/// Call org.freedesktop.ScreenSaver.Inhibit to prevent idle/sleep.
+/// Returns a guard that keeps the D-Bus connection alive (required by cosmic-idle).
+fn screensaver_inhibit() -> Result<crate::app::state::IdleInhibitGuard, String> {
+    let conn = zbus::blocking::Connection::session()
+        .map_err(|e| format!("D-Bus session connection: {e}"))?;
+    let cookie: u32 = conn
+        .call_method(
+            Some("org.freedesktop.ScreenSaver"),
+            "/org/freedesktop/ScreenSaver",
+            Some("org.freedesktop.ScreenSaver"),
+            "Inhibit",
+            &("Camera", "Recording in progress"),
+        )
+        .map_err(|e| format!("ScreenSaver.Inhibit: {e}"))?
+        .body()
+        .deserialize()
+        .map_err(|e| format!("ScreenSaver.Inhibit response: {e}"))?;
+    Ok(crate::app::state::IdleInhibitGuard {
+        connection: conn,
+        cookie,
+    })
+}
+
+/// Call systemd-logind Inhibit to block idle lock and suspend.
+/// Returns an OwnedFd — dropping it releases the inhibit.
+fn logind_inhibit() -> Result<std::os::unix::io::OwnedFd, String> {
+    let conn = zbus::blocking::Connection::system()
+        .map_err(|e| format!("D-Bus system connection: {e}"))?;
+    let fd: zbus::zvariant::OwnedFd = conn
+        .call_method(
+            Some("org.freedesktop.login1"),
+            "/org/freedesktop/login1",
+            Some("org.freedesktop.login1.Manager"),
+            "Inhibit",
+            &("idle:sleep", "Camera", "Recording in progress", "block"),
+        )
+        .map_err(|e| format!("logind Inhibit: {e}"))?
+        .body()
+        .deserialize()
+        .map_err(|e| format!("logind Inhibit response: {e}"))?;
+    Ok(fd.into())
 }
 
 /// Async function to process collected burst mode frames (GPU-only)
