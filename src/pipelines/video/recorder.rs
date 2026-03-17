@@ -671,7 +671,7 @@ fn install_muxer_fixup_probes(pipeline: &gst::Pipeline) {
 ///
 /// For frames already in RGBA format, strips stride padding.
 /// For YUV and other formats, uses the GPU compute pipeline.
-async fn convert_frame_to_rgba(frame: &CameraFrame) -> Result<Vec<u8>, String> {
+pub(crate) async fn convert_frame_to_rgba(frame: &CameraFrame) -> Result<Vec<u8>, String> {
     if frame.format == PixelFormat::RGBA {
         let row_bytes = (frame.width * 4) as usize;
         let stride = frame.stride as usize;

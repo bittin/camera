@@ -21,7 +21,9 @@ impl AppModel {
     /// Disabled and grayed out during transitions and recording.
     /// Hidden during virtual camera streaming (camera cannot be switched while streaming).
     pub fn build_camera_switcher(&self) -> Element<'_, Message> {
-        let is_disabled = self.transition_state.ui_disabled || self.recording.is_recording();
+        let is_disabled = self.transition_state.ui_disabled
+            || self.recording.is_recording()
+            || self.timelapse.is_active();
 
         // Hide camera switcher during virtual camera streaming
         if self.virtual_camera.is_streaming() {

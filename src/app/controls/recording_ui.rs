@@ -94,6 +94,40 @@ impl AppModel {
         )
     }
 
+    /// Build the timelapse indicator widget
+    ///
+    /// Shows an orange dot, shot count, and elapsed time when timelapse is active.
+    /// Shows "Assembling..." when building the video.
+    /// Returns None when timelapse is idle.
+    pub fn build_timelapse_indicator<'a>(&self) -> Option<Element<'a, Message>> {
+        if !self.timelapse.is_active() {
+            return None;
+        }
+
+        let spacing = cosmic::theme::spacing();
+
+        let label = if self.timelapse.is_finalising() {
+            "Saving video...".to_string()
+        } else {
+            let taken = self.timelapse.shots_taken();
+            let elapsed = format_duration(self.timelapse.elapsed_duration());
+            format!("{taken} shots - {elapsed}")
+        };
+
+        let row = widget::row()
+            .push(indicator_dot(Color::from_rgb(1.0, 0.0, 0.0)))
+            .push(widget::text(label).size(14))
+            .align_y(Alignment::Center)
+            .spacing(spacing.space_xxs);
+
+        Some(
+            widget::container(row)
+                .padding([4, 8])
+                .style(overlay_container_style)
+                .into(),
+        )
+    }
+
     /// Build a full-width video progress bar for video file streaming
     ///
     /// Shows a slider-style progress bar with current time and duration labels,

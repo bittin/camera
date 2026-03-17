@@ -559,6 +559,12 @@ impl AppModel {
             row = row.push(widget::space::horizontal().width(spacing.space_s));
         }
 
+        // Show timelapse indicator when timelapse is running
+        if let Some(indicator) = self.build_timelapse_indicator() {
+            row = row.push(indicator);
+            row = row.push(widget::space::horizontal().width(spacing.space_s));
+        }
+
         // Show format/resolution button in both photo and video modes
         // Hide button when:
         // - Format picker is visible
@@ -567,10 +573,13 @@ impl AppModel {
         // - File source is set in Virtual mode (show file resolution instead)
         let has_file_source =
             self.mode == CameraMode::Virtual && self.virtual_camera_file_source.is_some();
-        let is_libcamera_no_picker =
-            self.mode == CameraMode::Photo || self.mode == CameraMode::Video;
+        let is_libcamera_no_picker = self.mode == CameraMode::Photo
+            || self.mode == CameraMode::Video
+            || self.mode == CameraMode::Timelapse;
         let show_format_button = !self.format_picker_visible
-            && (self.mode == CameraMode::Photo || !self.recording.is_recording())
+            && (self.mode == CameraMode::Photo
+                || self.mode == CameraMode::Timelapse
+                || !self.recording.is_recording())
             && !self.virtual_camera.is_streaming()
             && !has_file_source
             && !is_libcamera_no_picker;
@@ -596,8 +605,9 @@ impl AppModel {
             || self.motor_picker_visible;
 
         if !hide_top_bar_buttons {
-            // Flash toggle button (Photo mode, or Video mode with hardware flash for torch)
+            // Flash toggle button (Photo/Timelapse mode, or Video mode with hardware flash for torch)
             if self.mode == CameraMode::Photo
+                || self.mode == CameraMode::Timelapse
                 || (self.mode == CameraMode::Video && self.use_hardware_flash())
             {
                 let flash_icon_bytes = if self.flash_enabled {
@@ -1022,8 +1032,11 @@ impl AppModel {
             ));
         }
 
-        // Filter button (photo and video modes)
-        if self.mode == CameraMode::Photo || self.mode == CameraMode::Video {
+        // Filter button (photo, video, and timelapse modes)
+        if self.mode == CameraMode::Photo
+            || self.mode == CameraMode::Video
+            || self.mode == CameraMode::Timelapse
+        {
             let filter_active = self.selected_filter != FilterType::Standard;
             buttons.push(self.build_tools_grid_button(
                 icon::from_name("image-filter-symbolic").symbolic(true),

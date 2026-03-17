@@ -55,26 +55,35 @@ impl AppModel {
                         Color::WHITE // White for photo mode
                     }
                 }
+                CameraMode::Timelapse => {
+                    if self.timelapse.is_running() {
+                        Color::from_rgb(0.6, 0.05, 0.05) // Darker red when recording timelapse
+                    } else {
+                        Color::from_rgb(0.9, 0.1, 0.1) // Red for timelapse mode
+                    }
+                }
             }
         };
 
         // Apply size changes based on state
         // - Recording/Streaming: 70% smaller and stays that size while active
         // - Capturing photo: 85% press down effect (brief)
-        let (inner_size, outer_size) =
-            if self.recording.is_recording() || self.virtual_camera.is_streaming() {
-                (
-                    ui::CAPTURE_BUTTON_INNER * 0.70, // 70% smaller during recording/streaming
-                    ui::CAPTURE_BUTTON_OUTER * 0.70,
-                )
-            } else if self.is_capturing {
-                (
-                    ui::CAPTURE_BUTTON_INNER * 0.85, // Press down effect for photo
-                    ui::CAPTURE_BUTTON_OUTER * 0.85,
-                )
-            } else {
-                (ui::CAPTURE_BUTTON_INNER, ui::CAPTURE_BUTTON_OUTER)
-            };
+        let (inner_size, outer_size) = if self.recording.is_recording()
+            || self.virtual_camera.is_streaming()
+            || self.timelapse.is_running()
+        {
+            (
+                ui::CAPTURE_BUTTON_INNER * 0.70, // 70% smaller during recording/streaming/timelapse
+                ui::CAPTURE_BUTTON_OUTER * 0.70,
+            )
+        } else if self.is_capturing {
+            (
+                ui::CAPTURE_BUTTON_INNER * 0.85, // Press down effect for photo
+                ui::CAPTURE_BUTTON_OUTER * 0.85,
+            )
+        } else {
+            (ui::CAPTURE_BUTTON_INNER, ui::CAPTURE_BUTTON_OUTER)
+        };
 
         // Scale corner radius proportionally when button size changes
         let corner_radius = base_corner_radius * (inner_size / ui::CAPTURE_BUTTON_INNER);
@@ -106,6 +115,7 @@ impl AppModel {
                     CameraMode::Photo => Message::Capture,
                     CameraMode::Video => Message::ToggleRecording,
                     CameraMode::Virtual => Message::ToggleVirtualCamera,
+                    CameraMode::Timelapse => Message::ToggleTimelapse,
                 })
                 .padding(0)
                 .width(Length::Fixed(outer_size))

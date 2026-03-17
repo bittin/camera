@@ -62,7 +62,7 @@ use cosmic::{Element, Task};
 pub use state::{
     AppFlags, AppModel, BurstModeStage, BurstModeState, CameraMode, ContextPage, FileSource,
     FilterType, Message, PhotoAspectRatio, PhotoTimerSetting, RecordingState, TheatreState,
-    VirtualCameraState,
+    TimelapseState, VirtualCameraState,
 };
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -314,7 +314,6 @@ impl cosmic::Application for AppModel {
             }
         });
         let has_preview_source = preview_file_source.is_some();
-
         // Construct the app model with the runtime's core.
         let mut app = AppModel {
             core,
@@ -449,6 +448,11 @@ impl cosmic::Application for AppModel {
                 fl!("guide-diagonal"),
                 fl!("guide-crosshair"),
             ],
+            timelapse: TimelapseState::default(),
+            timelapse_interval_dropdown_options: crate::config::TimelapseInterval::ALL
+                .iter()
+                .map(|i| i.display_name().to_string())
+                .collect(),
             device_info_visible: false,
             transition_state: crate::app::state::TransitionState::default(),
             // QR detection enabled by default
@@ -457,6 +461,8 @@ impl cosmic::Application for AppModel {
             last_qr_detection_time: None,
             // Privacy cover detection
             privacy_cover_closed: false,
+            idle_inhibit: None,
+            idle_inhibit_fd: None,
             // Insights drawer
             insights: Default::default(),
         };

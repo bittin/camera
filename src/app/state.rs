@@ -200,6 +200,137 @@ impl VirtualCameraState {
     }
 }
 
+/// Timelapse capture state machine
+///
+/// Frames are sent directly to a video encoder via a channel — no photos
+/// are written to disk.
+#[derive(Default)]
+pub enum TimelapseState {
+    /// Not running
+    #[default]
+    Idle,
+    /// Actively capturing timelapse frames
+    Running {
+        /// When timelapse started
+        start_time: Instant,
+        /// Number of frames sent so far
+        shots_taken: u32,
+        /// Interval in milliseconds between captures
+        interval_ms: u64,
+        /// Channel to send frames to the encoder task
+        frame_sender: tokio::sync::mpsc::UnboundedSender<Arc<CameraFrame>>,
+    },
+    /// Encoder is finalising the video file
+    Finalising {
+        /// When timelapse started (for display)
+        start_time: Instant,
+        /// Total frames sent
+        shots_taken: u32,
+    },
+}
+
+impl std::fmt::Debug for TimelapseState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TimelapseState::Idle => write!(f, "Idle"),
+            TimelapseState::Running {
+                shots_taken,
+                start_time,
+                ..
+            } => f
+                .debug_struct("Running")
+                .field("shots_taken", shots_taken)
+                .field("elapsed", &start_time.elapsed())
+                .finish(),
+            TimelapseState::Finalising { shots_taken, .. } => f
+                .debug_struct("Finalising")
+                .field("shots_taken", shots_taken)
+                .finish(),
+        }
+    }
+}
+
+impl TimelapseState {
+    /// Check if timelapse is currently running (capturing)
+    pub fn is_running(&self) -> bool {
+        matches!(self, TimelapseState::Running { .. })
+    }
+
+    /// Check if the encoder is finalising the video
+    pub fn is_finalising(&self) -> bool {
+        matches!(self, TimelapseState::Finalising { .. })
+    }
+
+    /// Check if active (running or finalising)
+    pub fn is_active(&self) -> bool {
+        !matches!(self, TimelapseState::Idle)
+    }
+
+    /// Get elapsed duration in seconds
+    pub fn elapsed_duration(&self) -> u64 {
+        match self {
+            TimelapseState::Idle => 0,
+            TimelapseState::Running { start_time, .. }
+            | TimelapseState::Finalising { start_time, .. } => start_time.elapsed().as_secs(),
+        }
+    }
+
+    /// Get number of shots taken
+    pub fn shots_taken(&self) -> u32 {
+        match self {
+            TimelapseState::Idle => 0,
+            TimelapseState::Running { shots_taken, .. }
+            | TimelapseState::Finalising { shots_taken, .. } => *shots_taken,
+        }
+    }
+
+    /// Increment shot count, returns new count
+    pub fn increment_shots(&mut self) -> u32 {
+        match self {
+            TimelapseState::Running { shots_taken, .. } => {
+                *shots_taken += 1;
+                *shots_taken
+            }
+            _ => 0,
+        }
+    }
+
+    /// Send a frame to the encoder. Returns false if the channel is closed.
+    pub fn send_frame(&self, frame: Arc<CameraFrame>) -> bool {
+        match self {
+            TimelapseState::Running { frame_sender, .. } => frame_sender.send(frame).is_ok(),
+            _ => false,
+        }
+    }
+}
+
+/// Holds a D-Bus connection + cookie for org.freedesktop.ScreenSaver.Inhibit.
+/// The connection must remain open — cosmic-idle removes inhibitors when the client disconnects.
+pub struct IdleInhibitGuard {
+    pub connection: zbus::blocking::Connection,
+    pub cookie: u32,
+}
+
+impl Drop for IdleInhibitGuard {
+    fn drop(&mut self) {
+        let _ = self.connection.call_method(
+            Some("org.freedesktop.ScreenSaver"),
+            "/org/freedesktop/ScreenSaver",
+            Some("org.freedesktop.ScreenSaver"),
+            "UnInhibit",
+            &(self.cookie,),
+        );
+    }
+}
+
+impl std::fmt::Debug for IdleInhibitGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdleInhibitGuard")
+            .field("cookie", &self.cookie)
+            .finish()
+    }
+}
+
 /// Theatre mode state
 ///
 /// Consolidates theatre mode UI visibility state.
@@ -686,6 +817,18 @@ pub struct AppModel {
     /// Whether the camera privacy cover is closed (blocking the camera)
     pub privacy_cover_closed: bool,
 
+    // ===== Idle Inhibit =====
+    /// Active screensaver inhibit (connection must stay alive or cosmic-idle cleans up)
+    pub idle_inhibit: Option<IdleInhibitGuard>,
+    /// File descriptor from systemd-logind Inhibit (keeps idle+sleep inhibited while held)
+    pub idle_inhibit_fd: Option<std::os::unix::io::OwnedFd>,
+
+    // ===== Timelapse =====
+    /// Timelapse capture state
+    pub timelapse: TimelapseState,
+    /// Timelapse interval dropdown options (cached for UI)
+    pub timelapse_interval_dropdown_options: Vec<String>,
+
     // ===== Insights Drawer =====
     /// Insights drawer diagnostic state
     pub insights: super::insights::InsightsState,
@@ -725,6 +868,8 @@ pub enum CameraMode {
     Video,
     /// Virtual camera mode - streams filtered video to a virtual camera
     Virtual,
+    /// Timelapse mode - captures photos at a configurable interval
+    Timelapse,
 }
 
 /// File source for virtual camera streaming
@@ -1392,6 +1537,16 @@ pub enum Message {
     ResetAllSettings,
     /// Toggle virtual camera feature enabled
     ToggleVirtualCameraEnabled,
+
+    // ===== Timelapse =====
+    /// Start/stop timelapse capture
+    ToggleTimelapse,
+    /// Timelapse interval timer tick — capture next frame
+    TimelapseTick,
+    /// Set timelapse interval from dropdown
+    SetTimelapseInterval(usize),
+    /// Timelapse video assembly completed (path or error)
+    TimelapseAssemblyComplete(Result<String, String>),
 
     // ===== System & Recovery =====
     /// Camera backend recovery started
