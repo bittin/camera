@@ -5,9 +5,11 @@
   <project_license>GPL-3.0-only</project_license>
   <name>Camera</name>
   <name xml:lang="cs">Kamera</name>
+  <name xml:lang="zh-CN">相机</name>
   <summary>Capture photos and videos</summary>
   <summary xml:lang="cs">Pořizujte fotografie a videa</summary>
   <summary xml:lang="uk">Знімайте фото та відео</summary>
+  <summary xml:lang="zh-CN">拍摄照片和视频</summary>
   <description>
     <p>
       Camera is a third-party camera application for the COSMIC™ desktop environment.
@@ -24,6 +26,11 @@
       Потрібно швидко зробити знімок, записати відео чи відсканувати QR-код?
       Камера пропонує чистий, інтуїтивний інтерфейс, який не плутатиме вас.
     </p>
+    <p xml:lang="zh-CN">
+      相机是 COSMIC™ 桌面环境的第三方相机应用程序。
+      无论您需要快速拍照、录制视频还是扫描二维码，
+      相机都提供简洁直观的界面，不会妨碍您的操作。
+    </p>
     <p>
       Just open the app and start capturing moments.
       Add fun filters to your photos, scan QR codes to open links or connect to WiFi,
@@ -37,31 +44,43 @@
     </p>
     <p xml:lang="uk">
       Просто відкрийте застосунок і починайте творити.
-      Застосовуйте креативні фільтри до знімків, миттєво скануйте QR-коди для переходу за посиланнями чи підключення до Wi-Fi, 
+      Застосовуйте креативні фільтри до знімків, миттєво скануйте QR-коди для переходу за посиланнями чи підключення до Wi-Fi,
       або скористайтеся режимом віртуальної камери, щоб виглядати бездоганно у відеодзвінках з улюбленим фільтром.
+    </p>
+    <p xml:lang="zh-CN">
+      只需打开应用程序即可开始捕捉精彩瞬间。
+      为照片添加有趣的滤镜，扫描二维码打开链接或连接 WiFi，
+      或使用虚拟相机模式在视频通话中应用您喜爱的滤镜，展现最佳状态。
     </p>
     <p>Key features:</p>
     <p xml:lang="cs">Klíčové funkce:</p>
     <p xml:lang="uk">Основні можливості:</p>
+    <p xml:lang="zh-CN">主要功能：</p>
     <ul>
       <li>Photo and video capture: high quality and hardware accelerated</li>
       <li xml:lang="cs">Pořizování fotografií a videí: vysoká kvalita a hardwarová akcelerace</li>
       <li xml:lang="uk">Знімки та відеозйомка: висока якість і апаратне прискорення</li>
+      <li xml:lang="zh-CN">照片和视频捕捉：高质量且支持硬件加速</li>
       <li>QR code scanner: open links, connect to WiFi, and more</li>
       <li xml:lang="cs">Skener QR kódů: otevírání odkazů, připojení k Wi-Fi a další</li>
       <li xml:lang="uk">Сканер QR-кодів: відкривайте посилання, підключайтеся до Wi-Fi та багато іншого</li>
+      <li xml:lang="zh-CN">二维码扫描器：打开链接、连接 WiFi 等</li>
       <li>15 creative filters: Mono, Sepia, Vivid, Noir, Pencil Sketch, and more</li>
       <li xml:lang="cs">15 kreativních filtrů: Mono, Sepia, Vivid, Noir, Pencil Sketch a další</li>
       <li xml:lang="uk">15 креативних фільтрів: Моно, Сепія, Насичений, Нуар, Нарис олівцем та інші</li>
+      <li xml:lang="zh-CN">15 种创意滤镜：单色、复古棕褐、鲜艳、黑白、铅笔素描等</li>
       <li>Virtual camera: use your filtered camera feed in video calls and other apps</li>
       <li xml:lang="cs">Virtuální kamera: používejte filtrovaný obraz kamery při videohovorech a v dalších aplikacích</li>
       <li xml:lang="uk">Віртуальна камера: використовуйте відфільтроване зображення в відеодзвінках та інших застосунках</li>
+      <li xml:lang="zh-CN">虚拟相机：在视频通话和其他应用中使用带滤镜的摄像头画面</li>
       <li>Theatre mode: fullscreen, distraction-free preview</li>
       <li xml:lang="cs">Režim kina: celoobrazovkový náhled bez rušivých prvků</li>
       <li xml:lang="uk">Театральний режим: повноекранний перегляд без відволікань</li>
+      <li xml:lang="zh-CN">剧院模式：全屏无干扰预览</li>
       <li>Multi-camera support: easily switch between cameras and microphones</li>
       <li xml:lang="cs">Podpora více kamer: snadné přepínání mezi kamerami a mikrofony</li>
       <li xml:lang="uk">Підтримка кількох камер: легко перемикайтеся між камерами та мікрофонами</li>
+      <li xml:lang="zh-CN">多摄像头支持：轻松切换摄像头和麦克风</li>
     </ul>
   </description>
   <launchable type="desktop-id">io.github.cosmic_utils.camera.desktop</launchable>
@@ -85,54 +104,63 @@
       <caption>Main camera view (Photo mode)</caption>
       <caption xml:lang="cs">Náhled hlavní kamery (režim fotografie)</caption>
       <caption xml:lang="uk">Основний вигляд камери (режим фото)</caption>
+      <caption xml:lang="zh-CN">主相机视图（照片模式）</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-001.png</image>
     </screenshot>
     <screenshot>
       <caption>Main camera view (Photo mode)</caption>
       <caption xml:lang="cs">Náhled hlavní kamery (režim fotografie)</caption>
       <caption xml:lang="uk">Основний вигляд камери (режим фото)</caption>
+      <caption xml:lang="zh-CN">主相机视图（照片模式）</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-002.png</image>
     </screenshot>
     <screenshot>
       <caption>Filter picker</caption>
       <caption xml:lang="cs">Výběr filtrů</caption>
       <caption xml:lang="uk">Вибір фільтрів</caption>
+      <caption xml:lang="zh-CN">滤镜选择器</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-003.png</image>
     </screenshot>
     <screenshot>
       <caption>Video recording in progress</caption>
       <caption xml:lang="cs">Probíhající natáčení videa</caption>
       <caption xml:lang="uk">Запис відео триває</caption>
+      <caption xml:lang="zh-CN">视频录制中</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-004.png</image>
     </screenshot>
     <screenshot>
       <caption>QR code detection</caption>
       <caption xml:lang="cs">Detekce QR kódu</caption>
       <caption xml:lang="uk">Виявлення QR-коду</caption>
+      <caption xml:lang="zh-CN">二维码检测</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-005.png</image>
     </screenshot>
     <screenshot>
       <caption>Advanced settings</caption>
       <caption xml:lang="cs">Pokročilá nastavení</caption>
       <caption xml:lang="uk">Розширені налаштування</caption>
+      <caption xml:lang="zh-CN">高级设置</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-006.png</image>
     </screenshot>
     <screenshot>
       <caption>Virtual camera streaming</caption>
       <caption xml:lang="cs">Přenos virtuální kamery</caption>
       <caption xml:lang="uk">Трансляція віртуальної камери</caption>
+      <caption xml:lang="zh-CN">虚拟相机流媒体</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-007.png</image>
     </screenshot>
     <screenshot>
       <caption>Theatre/fullscreen mode</caption>
       <caption xml:lang="cs">Režim kina/celé obrazovky</caption>
       <caption xml:lang="uk">Режим театру/повноекранний режим</caption>
+      <caption xml:lang="zh-CN">剧院/全屏模式</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-008.png</image>
     </screenshot>
     <screenshot>
       <caption>Theatre/fullscreen mode</caption>
       <caption xml:lang="cs">Režim kina/celé obrazovky</caption>
       <caption xml:lang="uk">Режим театру/повноекранний режим</caption>
+      <caption xml:lang="zh-CN">剧院/全屏模式</caption>
       <image>https://raw.githubusercontent.com/cosmic-utils/camera/main/preview/preview-009.png</image>
     </screenshot>
   </screenshots>
@@ -456,6 +484,13 @@
     <keyword xml:lang="uk">відео</keyword>
     <keyword xml:lang="uk">запис</keyword>
     <keyword xml:lang="uk">космік</keyword>
+    <keyword xml:lang="zh-CN">相机</keyword>
+    <keyword xml:lang="zh-CN">摄像头</keyword>
+    <keyword xml:lang="zh-CN">照片</keyword>
+    <keyword xml:lang="zh-CN">视频</keyword>
+    <keyword xml:lang="zh-CN">录制</keyword>
+    <keyword xml:lang="zh-CN">捕捉</keyword>
+    <keyword xml:lang="zh-CN">cosmic</keyword>
   </keywords>
   <requires>
     <display_length compare="ge">360</display_length>
