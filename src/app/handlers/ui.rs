@@ -68,38 +68,21 @@ impl AppModel {
             info!("Exiting theatre mode");
             self.theatre.exit();
         } else {
-            info!("Entering theatre mode - UI will hide after 1 second");
+            info!("Entering theatre mode");
             self.theatre.enter();
-
-            return Task::perform(
-                async {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                },
-                |_| cosmic::Action::App(Message::TheatreHideUI),
-            );
         }
         Task::none()
     }
 
-    pub(crate) fn handle_theatre_show_ui(&mut self) -> Task<cosmic::Action<Message>> {
-        // show_ui() returns true only if state changed (debounces rapid mouse moves)
-        if self.theatre.show_ui() {
-            tracing::debug!("Theatre mode: showing UI");
-            return Task::perform(
-                async {
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                },
-                |_| cosmic::Action::App(Message::TheatreHideUI),
-            );
-        }
-        Task::none()
-    }
-
-    pub(crate) fn handle_theatre_hide_ui(&mut self) -> Task<cosmic::Action<Message>> {
-        if self.theatre.try_hide_ui() {
-            info!("Theatre mode: hiding UI");
+    pub(crate) fn handle_theatre_toggle_ui(&mut self) -> Task<cosmic::Action<Message>> {
+        self.theatre.toggle_ui();
+        if !self.theatre.ui_visible {
             self.close_all_pickers();
         }
+        info!(
+            visible = self.theatre.ui_visible,
+            "Theatre mode: UI toggled"
+        );
         Task::none()
     }
 

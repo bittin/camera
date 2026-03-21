@@ -365,8 +365,6 @@ pub struct TheatreState {
     pub enabled: bool,
     /// UI currently visible
     pub ui_visible: bool,
-    /// Last interaction time (for auto-hide)
-    pub last_interaction: Option<Instant>,
 }
 
 impl Default for TheatreState {
@@ -374,7 +372,6 @@ impl Default for TheatreState {
         Self {
             enabled: false,
             ui_visible: true,
-            last_interaction: None,
         }
     }
 }
@@ -384,57 +381,19 @@ impl TheatreState {
     pub fn enter(&mut self) {
         self.enabled = true;
         self.ui_visible = true;
-        self.last_interaction = Some(Instant::now());
     }
 
     /// Exit theatre mode
     pub fn exit(&mut self) {
         self.enabled = false;
         self.ui_visible = true;
-        self.last_interaction = None;
     }
 
-    /// Show UI (on interaction)
-    ///
-    /// Returns `true` if a new hide timer should be scheduled (UI was hidden or
-    /// interaction time was stale). Returns `false` if interaction was too recent
-    /// to warrant a new timer (debouncing).
-    pub fn show_ui(&mut self) -> bool {
-        if !self.enabled {
-            return false;
+    /// Toggle UI visibility
+    pub fn toggle_ui(&mut self) {
+        if self.enabled {
+            self.ui_visible = !self.ui_visible;
         }
-
-        let now = Instant::now();
-
-        // Debounce: if UI is already visible and last interaction was very recent,
-        // skip the state update entirely to avoid unnecessary re-renders
-        if self.ui_visible
-            && let Some(last) = self.last_interaction
-            && now.duration_since(last) < std::time::Duration::from_millis(100)
-        {
-            return false;
-        }
-
-        // UI was hidden, or enough time has passed - update state
-        self.ui_visible = true;
-        self.last_interaction = Some(now);
-
-        // Spawn a new hide timer to reset the countdown
-        true
-    }
-
-    /// Try to hide UI (only if enough time has passed)
-    pub fn try_hide_ui(&mut self) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        if let Some(last) = self.last_interaction
-            && last.elapsed() >= std::time::Duration::from_secs(1)
-        {
-            self.ui_visible = false;
-            return true;
-        }
-        false
     }
 }
 
@@ -1297,10 +1256,8 @@ pub enum Message {
     CloseFormatPicker,
     /// Toggle theatre mode
     ToggleTheatreMode,
-    /// Show UI in theatre mode (after user interaction)
-    TheatreShowUI,
-    /// Hide UI in theatre mode (auto-hide timer)
-    TheatreHideUI,
+    /// Toggle UI visibility in theatre mode
+    TheatreToggleUI,
     /// Toggle device info panel visibility
     ToggleDeviceInfo,
 

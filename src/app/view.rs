@@ -254,10 +254,9 @@ impl AppModel {
 
         // Wrap preview in mouse area for theatre mode interactions
         let camera_preview = if self.theatre.enabled {
-            // In theatre mode, show UI on click or mouse movement
+            // In theatre mode, toggle UI visibility on click/tap
             widget::mouse_area(camera_preview)
-                .on_press(Message::TheatreShowUI)
-                .on_move(|_| Message::TheatreShowUI)
+                .on_press(Message::TheatreToggleUI)
                 .into()
         } else {
             camera_preview
