@@ -611,10 +611,10 @@ impl AppModel {
             || self.motor_picker_visible;
 
         if !hide_top_bar_buttons {
-            // Flash toggle button (Photo/Timelapse mode, or Video mode with hardware flash for torch)
+            // Flash toggle button (Photo mode, or Video/Timelapse mode with hardware flash for torch)
             if self.mode == CameraMode::Photo
-                || self.mode == CameraMode::Timelapse
-                || (self.mode == CameraMode::Video && self.use_hardware_flash())
+                || ((self.mode == CameraMode::Video || self.mode == CameraMode::Timelapse)
+                    && self.use_hardware_flash())
             {
                 let flash_icon_bytes = if self.flash_enabled {
                     FLASH_ICON
