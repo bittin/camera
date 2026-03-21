@@ -1601,6 +1601,7 @@ impl AppModel {
             .unwrap_or((1920, 1080));
         let bitrate_kbps = Some(self.config.bitrate_preset.bitrate_kbps(w, h));
         let live_filter_code = Arc::clone(&self.recording_filter_code);
+        let rotation = self.current_camera_rotation();
 
         // Spawn the encoder task — it runs until the channel is closed
         let encoder_task = Task::perform(
@@ -1619,6 +1620,7 @@ impl AppModel {
                     encoder_info,
                     bitrate_kbps,
                     live_filter_code,
+                    rotation,
                 )
                 .await
             },
