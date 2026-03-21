@@ -1344,8 +1344,8 @@ impl AppModel {
                         RecorderConfig, VideoQuality, VideoRecorder,
                     };
 
-                    // Use Low quality for appsrc path (x264 veryfast preset) —
-                    // ARM devices can't encode 1080p in real-time with slower presets.
+                    // Use Low quality for appsrc path (x264 veryfast preset)
+                    // to stay real-time on ARM devices.
                     let config = EncoderConfig {
                         video_quality: VideoQuality::Low,
                         audio_quality: AudioQuality::High,

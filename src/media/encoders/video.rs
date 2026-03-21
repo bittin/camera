@@ -115,10 +115,15 @@ impl VideoQuality {
     }
 
     /// Get x264/x265 preset name
+    ///
+    /// Even the Low preset uses `veryfast` rather than `ultrafast` because
+    /// `ultrafast` disables CABAC and most motion estimation, producing
+    /// very poor quality even at high bitrates. `veryfast` is still
+    /// real-time capable on ARM devices at 1080p.
     pub fn x264_preset(&self) -> &'static str {
         match self {
-            VideoQuality::Low => "ultrafast",
-            VideoQuality::Medium => "fast",
+            VideoQuality::Low => "veryfast",
+            VideoQuality::Medium => "faster",
             VideoQuality::High => "medium",
             VideoQuality::Maximum => "slow",
         }
@@ -448,7 +453,6 @@ pub fn configure_video_encoder(
         // x264 software encoder
         "x264enc" => {
             encoder.set_property_from_str("speed-preset", quality.x264_preset());
-            encoder.set_property_from_str("tune", "zerolatency");
             encoder.set_property("bitrate", bitrate);
             debug!(
                 "Configured x264enc: preset={}, bitrate={} kbps",
@@ -460,10 +464,9 @@ pub fn configure_video_encoder(
         // x265 software encoder
         "x265enc" => {
             encoder.set_property_from_str("speed-preset", quality.x264_preset());
-            encoder.set_property_from_str("tune", "zerolatency");
             encoder.set_property("bitrate", bitrate);
             debug!(
-                "Configured x265enc: preset={}, tune=zerolatency, bitrate={} kbps",
+                "Configured x265enc: preset={}, bitrate={} kbps",
                 quality.x264_preset(),
                 bitrate
             );
@@ -502,11 +505,8 @@ pub fn configure_video_encoder(
 
         // OpenH264 (software H.264 encoder)
         "openh264enc" => {
-            // Set rate control mode to bitrate mode using string enum
             encoder.set_property_from_str("rate-control", "bitrate");
             encoder.set_property("bitrate", bitrate * 1000); // Bits per second
-            // Set usage type to camera for real-time encoding
-            encoder.set_property_from_str("usage-type", "camera");
             debug!(
                 "Configured openh264enc: rate-control=bitrate, bitrate={} bps",
                 bitrate * 1000
