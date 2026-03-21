@@ -81,6 +81,9 @@ impl AppModel {
             self.virtual_camera.set_filter(filter);
         }
 
+        // Close the filter drawer after selection
+        self.core.window.show_context = false;
+
         Task::none()
     }
 
