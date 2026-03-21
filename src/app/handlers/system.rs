@@ -341,8 +341,26 @@ impl AppModel {
             error!(?err, "Failed to save reset settings");
         }
 
+        // Reset UI state that shadows config values
+        self.current_video_encoder_index = 0;
+        self.selected_filter = FilterType::default();
+        self.recording_filter_code.store(
+            self.selected_filter.gpu_filter_code(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.photo_aspect_ratio = Default::default();
+        self.zoom_level = 1.0;
+
+        // Reset camera exposure and color controls to defaults
+        let exposure_task = self.handle_reset_exposure_settings();
+        let color_task = self.handle_reset_color_settings();
+
         self.update_all_dropdowns();
-        cosmic::command::set_theme(self.config.app_theme.theme())
+        Task::batch([
+            exposure_task,
+            color_task,
+            cosmic::command::set_theme(self.config.app_theme.theme()),
+        ])
     }
 
     // =========================================================================
