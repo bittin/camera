@@ -34,8 +34,7 @@ impl AppModel {
             Message::ToggleFormatPicker => self.handle_toggle_format_picker(),
             Message::CloseFormatPicker => self.handle_close_format_picker(),
             Message::ToggleTheatreMode => self.handle_toggle_theatre_mode(),
-            Message::TheatreShowUI => self.handle_theatre_show_ui(),
-            Message::TheatreHideUI => self.handle_theatre_hide_ui(),
+            Message::TheatreToggleUI => self.handle_theatre_toggle_ui(),
             Message::ToggleDeviceInfo => self.handle_toggle_device_info(),
 
             // ===== Tools Menu =====
