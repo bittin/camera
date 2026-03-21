@@ -105,45 +105,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Get texture dimensions
     let tex_size = textureDimensions(texture_blur);
 
-    // Optimized blur settings - fewer samples, better distribution
-    let blur_radius = 50.0;  // Large radius for smooth blur
-    let samples = 16;  // 16 samples per ring for efficiency
+    // Blur settings — runs on 1/4 resolution textures so a moderate radius
+    // gives a strong visual blur. 3 rings × 12 samples + center = 37 samples.
+    let blur_radius = 16.0;
+    let samples = 12;
 
-    // Calculate pixel steps in texture coordinates
     let pixel_step = vec2<f32>(1.0 / f32(tex_size.x), 1.0 / f32(tex_size.y));
 
     var rgb_sum = vec3<f32>(0.0, 0.0, 0.0);
     var weight_sum = 0.0;
 
-    // Standard deviation for Gaussian - controls blur spread
     let sigma = blur_radius / 2.5;
     let sigma_squared_2 = 2.0 * sigma * sigma;
 
-    // Sample in a spiral pattern with optimized ring distribution
-    // Using 3 rings with golden ratio offset for better coverage
-    let angle_step = 6.28318530718 / f32(samples);  // 2*PI / samples
-    let golden_angle = 2.399963229728653;  // Golden angle in radians
+    let angle_step = 6.28318530718 / f32(samples);
+    let golden_angle = 2.399963229728653;
 
     for (var ring = 1; ring <= 3; ring++) {
-        // Use exponential distribution for ring radii (more samples at outer edges)
         let ring_factor = f32(ring) / 3.0;
-        let radius = blur_radius * ring_factor * ring_factor;
+        let radius = blur_radius * ring_factor;
 
-        // Offset each ring by golden angle for better sampling pattern
         let ring_offset = f32(ring - 1) * golden_angle;
 
         for (var i = 0; i < samples; i++) {
             let angle = f32(i) * angle_step + ring_offset;
-            let offset_x = cos(angle) * radius;
-            let offset_y = sin(angle) * radius;
+            let offset_tex = vec2<f32>(
+                cos(angle) * radius * pixel_step.x,
+                sin(angle) * radius * pixel_step.y,
+            );
+            let rgb = textureSample(texture_blur, sampler_blur, tex_coords + offset_tex).rgb;
 
-            let offset_tex = vec2<f32>(offset_x * pixel_step.x, offset_y * pixel_step.y);
-            let sample_coords = tex_coords + offset_tex;
-
-            // Sample RGB texture
-            let rgb = textureSample(texture_blur, sampler_blur, sample_coords).rgb;
-
-            // Ring-level weight (same for all samples in this ring, not per-sample Gaussian)
             let dist_squared = radius * radius;
             let weight = exp(-dist_squared / sigma_squared_2);
 
@@ -152,12 +143,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Add center sample with Gaussian weight (distance=0 → exp(0)=1.0)
+    // Center sample
     let center_rgb = textureSample(texture_blur, sampler_blur, tex_coords).rgb;
-    let center_weight = 1.0;
-
-    rgb_sum += center_rgb * center_weight;
-    weight_sum += center_weight;
+    rgb_sum += center_rgb;
+    weight_sum += 1.0;
 
     // Normalize by total weight
     var rgb_val = rgb_sum / weight_sum;
