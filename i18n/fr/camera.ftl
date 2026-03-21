@@ -9,6 +9,7 @@ git-description = Commit Git {$hash} le {$date}
 # Sélecteur de mode
 mode-video = VIDÉO
 mode-photo = PHOTO
+mode-timelapse = ACCÉLÉRÉ
 mode-virtual = VIRTUEL
 
 # Caméra virtuelle
@@ -171,6 +172,19 @@ settings-burst-mode-quality-description = Qualité utilise la fusion FFT dans le
 settings-save-burst-raw = Enregistrer les images brutes de la rafale
 settings-save-burst-raw-description = Enregistrer les images individuelles de la rafale au format DNG, en plus des photos HDR+. Utile pour le débogage ou le retraitement.
 
+# Guide de composition
+settings-composition-guide = Guide de composition
+settings-composition-guide-description = Superposer des lignes de repère sur l'aperçu de la caméra pour le cadrage
+guide-none = Aucun
+guide-rule-of-thirds = Règle des tiers
+guide-phi-grid = Grille Phi
+guide-spiral-top-left = Spirale ↖
+guide-spiral-top-right = Spirale ↗
+guide-spiral-bottom-left = Spirale ↙
+guide-spiral-bottom-right = Spirale ↘
+guide-diagonal = Diagonales
+guide-crosshair = Réticule
+
 # À propos
 about-support = Assistance et commentaires
 
@@ -269,6 +283,11 @@ insights-meta-lens-position = Position de l'objectif
 insights-meta-lux = Éclairement
 insights-meta-focus-fom = Champ de mesure de la mise au point
 insights-meta-na = N/A
+
+# Accéléré
+settings-timelapse = Accéléré
+settings-timelapse-interval = Intervalle
+settings-timelapse-interval-description = Temps entre deux prises de vue consécutives
 
 # Informations - Capture
 insights-capture = Capture
