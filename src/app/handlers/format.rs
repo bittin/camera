@@ -47,7 +47,7 @@ impl AppModel {
 
     pub(crate) fn handle_set_mode(&mut self, mode: CameraMode) -> Task<cosmic::Action<Message>> {
         if self.mode == mode {
-            return Task::none();
+            return self.handle_toggle_tools_menu();
         }
 
         // When switching away from Virtual mode with a playing video, pause it first

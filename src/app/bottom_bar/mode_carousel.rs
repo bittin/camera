@@ -1329,7 +1329,8 @@ fn handle_drag_end(
             shell.request_redraw();
             return;
         }
-        // Tapped the selected label or no label — snap back
+        // Tapped the selected label — publish to toggle tools menu, then snap back
+        shell.publish(on_select(modes[selected_idx]));
         start_snap_animation(state, 0.0);
         shell.request_redraw();
         return;
