@@ -730,7 +730,7 @@ impl VideoPipeline {
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: Default::default(),
@@ -1624,11 +1624,20 @@ impl VideoPipeline {
         height: u32,
         format: wgpu::TextureFormat,
     ) {
+        // Downscale to 1/4 resolution for blur — the bilinear sampler handles
+        // the initial downscale, and the smaller textures make blur passes ~16x
+        // cheaper. The blur is visually identical since the image is heavily
+        // blurred anyway.
+        let blur_width = (width / 4).max(1);
+        let blur_height = (height / 4).max(1);
+
         // Check if we need to recreate intermediate textures
         let needs_recreation = {
             let intermediate_1 = self.blur_intermediate_1.read().unwrap();
             match intermediate_1.as_ref() {
-                Some(intermediate) => intermediate.width != width || intermediate.height != height,
+                Some(intermediate) => {
+                    intermediate.width != blur_width || intermediate.height != blur_height
+                }
                 None => true,
             }
         };
@@ -1638,8 +1647,8 @@ impl VideoPipeline {
             let texture_1 = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("camera blur intermediate 1"),
                 size: wgpu::Extent3d {
-                    width,
-                    height,
+                    width: blur_width,
+                    height: blur_height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -1684,16 +1693,16 @@ impl VideoPipeline {
                 view: view_1,
                 bind_group: bind_group_1,
                 viewport_buffer: viewport_buffer_1,
-                width,
-                height,
+                width: blur_width,
+                height: blur_height,
             });
 
             // Create intermediate texture 2
             let texture_2 = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("camera blur intermediate 2"),
                 size: wgpu::Extent3d {
-                    width,
-                    height,
+                    width: blur_width,
+                    height: blur_height,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -1738,8 +1747,8 @@ impl VideoPipeline {
                 view: view_2,
                 bind_group: bind_group_2,
                 viewport_buffer: viewport_buffer_2,
-                width,
-                height,
+                width: blur_width,
+                height: blur_height,
             });
         }
     }
