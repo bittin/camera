@@ -19,7 +19,8 @@ use crate::fl;
 use cosmic::Element;
 use cosmic::iced::{Alignment, Background, Color, Length};
 use cosmic::widget::{self, icon};
-use tracing::debug;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tracing::{debug, info};
 
 /// Flash icon SVG (lightning bolt)
 const FLASH_ICON: &[u8] = include_bytes!("../../resources/button_icons/flash.svg");
@@ -170,6 +171,11 @@ impl AppModel {
     ///
     /// Composes all UI components into a layered layout with overlays.
     pub fn view(&self) -> Element<'_, Message> {
+        static HAS_RENDERED: AtomicBool = AtomicBool::new(false);
+        if !HAS_RENDERED.swap(true, Ordering::Relaxed) {
+            info!("first UI render");
+        }
+
         // Camera preview from camera_preview module
         let camera_preview = self.build_camera_preview();
 

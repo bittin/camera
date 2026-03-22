@@ -7,8 +7,8 @@
 //! pointers.
 
 use super::diagnostics::{
-    CAPTURE_ACTIVE, CAPTURE_RELEASED, DIAGNOSTICS, DiagnosticParams, MJPEG_DECODE_TIME_US,
-    PREVIEW_FRAME_COUNT, STILL_FRAME_COUNT, StreamDiag, publish_diagnostics,
+    CAPTURE_ACTIVE, CAPTURE_EVER_RAN, CAPTURE_RELEASED, DIAGNOSTICS, DiagnosticParams,
+    MJPEG_DECODE_TIME_US, PREVIEW_FRAME_COUNT, STILL_FRAME_COUNT, StreamDiag, publish_diagnostics,
 };
 use super::pixel_formats::{map_pixel_format, pixel_format_name};
 use crate::backends::camera::types::*;
@@ -244,6 +244,7 @@ pub(crate) fn capture_thread_main(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 CAPTURE_ACTIVE.store(false, Ordering::Release);
+                CAPTURE_EVER_RAN.store(true, Ordering::Release);
                 CAPTURE_RELEASED.1.notify_all();
             }
             // If init_tx hasn't been used yet, report the error
@@ -338,8 +339,13 @@ fn capture_thread_setup_and_run(
 
         // Delay for hardware release — the "simple" pipeline handler needs time
         // to fully release V4L2 resources before a new CameraManager can start.
-        // This runs on the capture thread (not the UI thread) to avoid stutter.
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        // Skip on first startup: no previous CameraManager existed to release.
+        if CAPTURE_EVER_RAN.load(Ordering::Acquire) {
+            info!("Waiting 500ms for hardware release");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        } else {
+            info!("First capture — skipping hardware release delay");
+        }
 
         // Check cancel after the sleep
         if params.cancel_flag.load(Ordering::Acquire) {
@@ -491,6 +497,7 @@ fn capture_thread_setup_and_run(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         CAPTURE_ACTIVE.store(false, Ordering::Release);
+        CAPTURE_EVER_RAN.store(true, Ordering::Release);
         CAPTURE_RELEASED.1.notify_all();
     }
     info!("CameraManager released");

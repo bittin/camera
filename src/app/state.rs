@@ -882,12 +882,32 @@ pub enum FileSource {
 
 /// Application initialization flags
 ///
+/// Results from pre-warming work done before the iced event loop starts.
+/// By starting this work before `cosmic::app::run()`, it overlaps with
+/// Wayland/wgpu initialization and is ready by the time `init()` runs.
+pub struct PrewarmResults {
+    pub audio_devices: Vec<crate::backends::audio::AudioDevice>,
+    pub video_encoders: Vec<crate::media::encoders::video::EncoderInfo>,
+    /// Camera enumeration thread handle. Started before the event loop so it
+    /// overlaps with framework Vulkan init. Collected via async Task (not joined
+    /// in init()) to avoid blocking the first render.
+    pub camera_enum: Option<
+        std::thread::JoinHandle<(
+            Vec<crate::backends::camera::types::CameraDevice>,
+            Vec<crate::backends::camera::types::CameraFormat>,
+        )>,
+    >,
+}
+
 /// These are passed from the command line to configure the app on startup.
-#[derive(Debug, Clone, Default)]
+#[derive(Default)]
 pub struct AppFlags {
     /// Optional file to use as the camera preview source instead of a real camera.
     /// Can be an image (PNG, JPG, JPEG, WEBP) or video (MP4, WEBM, MKV).
     pub preview_source: Option<std::path::PathBuf>,
+    /// Pre-warmed results from background thread started before the event loop.
+    /// If present, init() skips the synchronous enumeration.
+    pub prewarm: Option<std::thread::JoinHandle<PrewarmResults>>,
 }
 
 /// Commands for controlling video file playback

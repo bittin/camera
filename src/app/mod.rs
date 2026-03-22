@@ -61,8 +61,8 @@ use cosmic::widget::{self, about::About};
 use cosmic::{Element, Task};
 pub use state::{
     AppFlags, AppModel, BurstModeStage, BurstModeState, CameraMode, ContextPage, FileSource,
-    FilterType, Message, PhotoAspectRatio, PhotoTimerSetting, RecordingState, TheatreState,
-    TimelapseState, VirtualCameraState,
+    FilterType, Message, PhotoAspectRatio, PhotoTimerSetting, PrewarmResults, RecordingState,
+    TheatreState, TimelapseState, VirtualCameraState,
 };
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
@@ -192,6 +192,8 @@ impl cosmic::Application for AppModel {
 
     /// Initializes the application with any given flags and startup commands.
     fn init(core: cosmic::Core, flags: Self::Flags) -> (Self, Task<cosmic::Action<Self::Message>>) {
+        let init_start = std::time::Instant::now();
+
         // Create the about widget
         let about = About::default()
             .name(fl!("app-title"))
@@ -240,11 +242,26 @@ impl cosmic::Application for AppModel {
             error!(error = %e, "Failed to create video directory");
         }
 
-        // Initialize GStreamer early (required before any GStreamer calls)
-        // This is safe to do on the main thread as it's a one-time initialization
-        if let Err(e) = gstreamer::init() {
-            error!(error = %e, "Failed to initialize GStreamer");
-        }
+        // Collect pre-warmed results from background thread (started before event loop).
+        // GStreamer init, audio/camera/video enumeration ran in parallel with
+        // Wayland/wgpu setup, so this join should be near-instant.
+        let prewarm = flags.prewarm.and_then(|h| h.join().ok());
+
+        let (available_audio_devices, available_video_encoders, camera_enum_handle) =
+            if let Some(pw) = prewarm {
+                // GStreamer was already initialized by the prewarm thread, but call again
+                // to ensure the main thread's state is consistent (gst::init is idempotent)
+                let _ = gstreamer::init();
+                (pw.audio_devices, pw.video_encoders, pw.camera_enum)
+            } else {
+                // Fallback: no prewarm available (e.g. CLI paths), do sync init
+                if let Err(e) = gstreamer::init() {
+                    error!(error = %e, "Failed to initialize GStreamer");
+                }
+                let audio = crate::backends::audio::enumerate_audio_devices();
+                let video = crate::media::encoders::video::enumerate_video_encoders();
+                (audio, video, None)
+            };
 
         // Start with empty camera list - will be populated by async task
         let available_cameras = Vec::new();
@@ -253,8 +270,6 @@ impl cosmic::Application for AppModel {
         let initial_format = None;
         let camera_dropdown_options = Vec::new();
 
-        // Enumerate audio devices synchronously (fast operation)
-        let available_audio_devices = crate::backends::audio::enumerate_audio_devices();
         let current_audio_device_index = 0; // Default device is sorted first
         let audio_dropdown_options: Vec<String> = available_audio_devices
             .iter()
@@ -267,8 +282,6 @@ impl cosmic::Application for AppModel {
             })
             .collect();
 
-        // Enumerate video encoders synchronously
-        let available_video_encoders = crate::media::encoders::video::enumerate_video_encoders();
         // Use saved encoder index, or default to 0 (best encoder is sorted first)
         let current_video_encoder_index = config
             .last_video_encoder_index
@@ -277,7 +290,6 @@ impl cosmic::Application for AppModel {
         let video_encoder_dropdown_options: Vec<String> = available_video_encoders
             .iter()
             .map(|enc| {
-                // Replace (HW) with (hardware accelerated) and (SW) with (software)
                 enc.display_name
                     .replace(" (HW)", " (hardware accelerated)")
                     .replace(" (SW)", " (software)")
@@ -490,57 +502,94 @@ impl cosmic::Application for AppModel {
         app.update_framerate_options();
         app.update_codec_options();
 
-        // Initialize cameras and video encoders asynchronously (non-blocking)
+        // Initialize cameras — camera enum thread was started before the event loop
+        // so it overlaps with framework Vulkan init (~280ms). We wrap the join in an
+        // async Task so it doesn't block init() or the first render.
         let last_camera_path = app.config.last_camera_path.clone();
 
-        let init_task = Task::perform(
-            async move {
-                // Enumerate cameras first (critical path to first frame)
-                info!("Enumerating cameras asynchronously");
-                let backend = crate::backends::camera::create_backend();
-                let cameras = backend.enumerate_cameras();
-                info!(count = cameras.len(), "Found camera(s)");
+        let init_task = if let Some(handle) = camera_enum_handle {
+            Task::perform(
+                async move {
+                    // Join the prewarm camera thread — it started ~170ms ago,
+                    // so it may already be done or nearly done
+                    let (cameras, default_formats) =
+                        handle.join().unwrap_or_else(|_| (Vec::new(), Vec::new()));
+                    info!(count = cameras.len(), "Prewarmed camera enumeration ready");
 
-                // Find the last used camera or default to first
-                let camera_index = if let Some(ref last_path) = last_camera_path {
-                    info!(path = %last_path, "Attempting to restore last camera");
-                    cameras
-                        .iter()
-                        .enumerate()
-                        .find(|(_, cam)| &cam.path == last_path)
-                        .map(|(idx, _)| {
-                            info!(index = idx, "Found saved camera");
-                            idx
-                        })
-                        .unwrap_or_else(|| {
-                            info!("Saved camera not found, using first camera");
-                            0
-                        })
-                } else {
-                    info!("No saved camera, using first camera");
-                    0
-                };
+                    // Find last used camera or default to first
+                    let camera_index = if let Some(ref last_path) = last_camera_path {
+                        cameras
+                            .iter()
+                            .enumerate()
+                            .find(|(_, cam)| &cam.path == last_path)
+                            .map(|(idx, _)| {
+                                info!(index = idx, "Found saved camera");
+                                idx
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
 
-                // Get formats for selected camera
-                let formats = if let Some(camera) = cameras.get(camera_index) {
-                    if !camera.path.is_empty() {
-                        backend.get_formats(camera, false)
+                    if camera_index == 0 {
+                        // Prewarm already queried formats for camera[0]
+                        (cameras, camera_index, default_formats)
+                    } else {
+                        // Saved camera is not camera[0] — query its formats
+                        let backend = crate::backends::camera::create_backend();
+                        let formats = if let Some(camera) = cameras.get(camera_index) {
+                            if !camera.path.is_empty() {
+                                backend.get_formats(camera, false)
+                            } else {
+                                Vec::new()
+                            }
+                        } else {
+                            Vec::new()
+                        };
+                        (cameras, camera_index, formats)
+                    }
+                },
+                |(cameras, index, formats)| {
+                    cosmic::Action::App(Message::CamerasInitialized(cameras, index, formats))
+                },
+            )
+        } else {
+            // No prewarm — fall back to full async enumeration
+            Task::perform(
+                async move {
+                    info!("Enumerating cameras asynchronously (no prewarm)");
+                    let backend = crate::backends::camera::create_backend();
+                    let cameras = backend.enumerate_cameras();
+                    info!(count = cameras.len(), "Found camera(s)");
+
+                    let camera_index = if let Some(ref last_path) = last_camera_path {
+                        cameras
+                            .iter()
+                            .enumerate()
+                            .find(|(_, cam)| &cam.path == last_path)
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+
+                    let formats = if let Some(camera) = cameras.get(camera_index) {
+                        if !camera.path.is_empty() {
+                            backend.get_formats(camera, false)
+                        } else {
+                            Vec::new()
+                        }
                     } else {
                         Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                };
+                    };
 
-                // Log available encoders after cameras are enumerated (non-critical)
-                crate::pipelines::video::check_available_encoders();
-
-                (cameras, camera_index, formats)
-            },
-            |(cameras, index, formats)| {
-                cosmic::Action::App(Message::CamerasInitialized(cameras, index, formats))
-            },
-        );
+                    (cameras, camera_index, formats)
+                },
+                |(cameras, index, formats)| {
+                    cosmic::Action::App(Message::CamerasInitialized(cameras, index, formats))
+                },
+            )
+        };
 
         // Load initial gallery thumbnail
         let folder_name = app.config.save_folder_name.clone();
@@ -566,6 +615,12 @@ impl cosmic::Application for AppModel {
             Task::none()
         };
 
+        // Log available encoders in parallel (non-critical, doesn't block camera init)
+        let encoder_log_task = Task::perform(
+            async { crate::pipelines::video::check_available_encoders() },
+            |_| cosmic::Action::App(Message::Noop),
+        );
+
         // Precompile GPU shader pipelines in background (eliminates ~270ms first-capture penalty)
         let gpu_warmup_task = Task::perform(
             async { crate::shaders::warmup_gpu_pipelines().await },
@@ -575,10 +630,16 @@ impl cosmic::Application for AppModel {
         // Apply the theme from config on startup (THEME global defaults to Dark)
         let theme_task = cosmic::command::set_theme(app.config.app_theme.theme());
 
+        info!(
+            elapsed_ms = init_start.elapsed().as_millis(),
+            "Application init complete"
+        );
+
         (
             app,
             Task::batch([
                 init_task,
+                encoder_log_task,
                 load_thumbnail_task,
                 preview_source_task,
                 gpu_warmup_task,
