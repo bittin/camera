@@ -115,9 +115,9 @@ modules:
       - -Dtest=false
     sources:
       - type: git
-        url: https://git.libcamera.org/libcamera/libcamera.git
-        tag: v0.7.0
-        commit: b7854fd07d42168f099b5ce30d1702e0e0875bf5
+        url: https://github.com/FreddyFunk/libcamera.git
+        branch: sandbox-ipa-fallback
+        commit: 2fbe050e113979fa60b2fbad957e08f6c9a09520
 
   - name: camera
     buildsystem: simple
