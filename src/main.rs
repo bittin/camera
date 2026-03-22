@@ -95,6 +95,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_level(true)
         .init();
 
+    tracing::info!("camera app starting");
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -115,6 +117,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_gui(preview_source: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    // Start pre-warming on background threads BEFORE the iced event loop.
+    // This overlaps GStreamer init, device enumeration, and camera discovery
+    // with Wayland/wgpu setup (~280ms of framework time we'd otherwise waste).
+    //
+    // Three parallel threads:
+    //   1. Audio: pw-dump for PipeWire sources (~10ms)
+    //   2. Camera: libcamera enumeration + format query (~170ms)
+    //   3. Main prewarm: GStreamer init + video encoders, then collects 1 & 2
+    let audio_handle = std::thread::spawn(|| {
+        tracing::info!("prewarm: enumerating audio devices");
+        let devices = camera::backends::audio::enumerate_audio_devices();
+        tracing::info!(count = devices.len(), "prewarm: audio devices ready");
+        devices
+    });
+    let camera_handle = std::thread::spawn(|| {
+        tracing::info!("prewarm: enumerating cameras");
+        let backend = camera::backends::camera::create_backend();
+        let cameras = backend.enumerate_cameras();
+        tracing::info!(count = cameras.len(), "prewarm: cameras enumerated");
+        let formats = if let Some(cam) = cameras.first() {
+            if !cam.path.is_empty() {
+                backend.get_formats(cam, false)
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        tracing::info!(
+            count = formats.len(),
+            "prewarm: formats for default camera ready"
+        );
+        (cameras, formats)
+    });
+    let prewarm_handle = std::thread::spawn(move || {
+        tracing::info!("prewarm: initializing GStreamer + video encoders");
+        if let Err(e) = gstreamer::init() {
+            tracing::error!(error = %e, "prewarm: failed to initialize GStreamer");
+        }
+        let video_encoders = camera::media::encoders::video::enumerate_video_encoders();
+        tracing::info!(
+            count = video_encoders.len(),
+            "prewarm: GStreamer + video encoders ready"
+        );
+
+        let audio_devices = audio_handle.join().unwrap_or_default();
+
+        // Don't join camera_handle here — it takes ~170ms and would block init().
+        // Pass it through so init() can wrap it in an async Task instead.
+        camera::app::PrewarmResults {
+            audio_devices,
+            video_encoders,
+            camera_enum: Some(camera_handle),
+        }
+    });
+
     // Get the system's preferred languages.
     let requested_languages = i18n_embed::DesktopLanguageRequester::requested_languages();
 
@@ -134,8 +192,11 @@ fn run_gui(preview_source: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
         settings = settings.size(cosmic::iced::Size::new(900.0, 700.0));
     }
 
-    // Create app flags with optional preview source
-    let flags = camera::app::AppFlags { preview_source };
+    // Create app flags with pre-warm handle
+    let flags = camera::app::AppFlags {
+        preview_source,
+        prewarm: Some(prewarm_handle),
+    };
 
     // Starts the application's event loop with flags
     cosmic::app::run::<AppModel>(settings, flags)?;

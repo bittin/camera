@@ -493,6 +493,19 @@ impl CameraBackend for LibcameraBackend {
     fn get_formats(&self, device: &CameraDevice, video_mode: bool) -> Vec<CameraFormat> {
         debug!(device_path = %device.path, video_mode, "Getting formats via libcamera-rs");
 
+        // Return cached formats if available (populated by enumerate_cameras).
+        // This avoids creating a redundant CameraManager (~130ms on ARM).
+        if !video_mode
+            && let Some(cached) = CACHED_FORMATS
+                .read()
+                .ok()
+                .and_then(|cache| cache.get(&device.path).cloned())
+            && !cached.is_empty()
+        {
+            debug!(count = cached.len(), "Returning cached formats");
+            return cached;
+        }
+
         // Try to acquire the lock without blocking. If the capture thread holds it
         // (e.g. during pipeline teardown), return cached formats so the UI stays responsive.
         let _lock = match CAMERA_MANAGER_LOCK.try_lock() {
