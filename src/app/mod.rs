@@ -165,9 +165,9 @@ fn ensure_video_directory(folder_name: &str) -> Result<std::path::PathBuf, std::
 
 const REPOSITORY: &str = "https://github.com/cosmic-utils/camera";
 
-/// App icon SVG for the about page (scalable, non-pixelated)
+/// App icon for the about page (pre-rendered PNG avoids SVG parsing lag on first open)
 const APP_ICON: &[u8] =
-    include_bytes!("../../resources/icons/hicolor/scalable/apps/io.github.cosmic_utils.camera.svg");
+    include_bytes!("../../resources/icons/hicolor/256x256/apps/io.github.cosmic_utils.camera.png");
 
 impl cosmic::Application for AppModel {
     /// The async executor that will be used to run your application's commands.
@@ -197,7 +197,7 @@ impl cosmic::Application for AppModel {
         // Create the about widget
         let about = About::default()
             .name(fl!("app-title"))
-            .icon(widget::icon::from_svg_bytes(APP_ICON).symbolic(false))
+            .icon(widget::icon::from_raster_bytes(APP_ICON))
             .version(env!("GIT_VERSION"))
             .author("Frederic Laing")
             .license("GPL-3.0-only")
