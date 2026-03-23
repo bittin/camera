@@ -201,7 +201,7 @@ impl AppModel {
         // Overlay timer seconds on the capture button when timer is set in Photo mode
         let circle: Element<'_, Message> = if self.mode == CameraMode::Photo
             && self.photo_timer_setting != PhotoTimerSetting::Off
-            && !self.photo_timer_countdown.is_some()
+            && self.photo_timer_countdown.is_none()
         {
             let seconds = self.photo_timer_setting.seconds();
             let ring_outer = (ui::CAPTURE_BUTTON_INNER + RING_GAP * 2.0) + RING_WIDTH * 2.0;
