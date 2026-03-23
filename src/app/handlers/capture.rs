@@ -5,6 +5,7 @@
 //! Handles photo capture, video recording, flash, zoom, and timer functionality.
 
 use crate::app::state::{AppModel, CameraMode, Message, RecordingState, TimelapseState};
+use crate::backends::camera::types::RecordingFrame;
 use crate::backends::camera::v4l2_controls::read_exposure_metadata;
 use crate::pipelines::photo::burst_mode::BurstModeConfig;
 use crate::pipelines::photo::burst_mode::burst::{
@@ -153,14 +154,16 @@ impl AppModel {
         zsl_frame: Option<Arc<crate::backends::camera::types::CameraFrame>>,
     ) -> Task<cosmic::Action<Message>> {
         // Use HDR+ burst mode only if it would actually be used (frame_count > 1)
-        // This respects auto-detected brightness and user override
-        if self.would_use_burst_mode() {
+        // This respects auto-detected brightness and user override.
+        // Skip when file source is active — burst needs multiple live frames.
+        if self.would_use_burst_mode() && !self.current_frame_is_file_source {
             return self.capture_burst_mode_photo();
         }
 
         // In multistream mode, capture from the raw stream (full sensor resolution)
-        // instead of the preview stream (1080p)
-        if self.is_current_camera_multistream() {
+        // instead of the preview stream (1080p).
+        // Skip when file source is active — there is no capture thread to provide raw frames.
+        if self.is_current_camera_multistream() && !self.current_frame_is_file_source {
             return self.capture_photo_from_raw_stream();
         }
 
@@ -1351,10 +1354,41 @@ impl AppModel {
 
         let path_for_message = output_path.display().to_string();
 
-        // Direct path: capture thread → appsrc (bypasses UI thread entirely)
-        if let Some(ref manager) = self.backend_manager {
-            manager.set_recording_sender(Some(frame_tx));
-            manager.set_jpeg_recording_mode(use_jpeg_pipeline);
+        // When a file source is active (--preview-source), there is no capture
+        // thread to forward frames. Spawn a task that pushes the static frame
+        // into the recording channel at the configured framerate.
+        if self.current_frame_is_file_source {
+            if let Some(ref frame) = self.current_frame {
+                let frame = Arc::new(frame.as_ref().clone());
+                let tx = frame_tx;
+                let interval = std::time::Duration::from_millis(1000 / framerate.max(1) as u64);
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(interval);
+                    loop {
+                        ticker.tick().await;
+                        if tx
+                            .send(RecordingFrame::Decoded(Arc::clone(&frame)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                // frame_tx moved into the task; create a dummy sender for the
+                // backend manager so the rest of the code doesn't panic.
+                let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
+                if let Some(ref manager) = self.backend_manager {
+                    manager.set_recording_sender(Some(dummy_tx));
+                    manager.set_jpeg_recording_mode(false);
+                }
+            }
+        } else {
+            // Direct path: capture thread → appsrc (bypasses UI thread entirely)
+            if let Some(ref manager) = self.backend_manager {
+                manager.set_recording_sender(Some(frame_tx));
+                manager.set_jpeg_recording_mode(use_jpeg_pipeline);
+            }
         }
 
         // Create audio levels handle upfront so the UI can read it immediately.
