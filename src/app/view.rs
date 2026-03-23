@@ -1153,7 +1153,8 @@ impl AppModel {
 
     /// Check if any tool settings are non-default (for highlighting tools button)
     fn has_non_default_tool_settings(&self) -> bool {
-        let timer_active = self.photo_timer_setting != crate::app::state::PhotoTimerSetting::Off;
+        let timer_active = self.mode == CameraMode::Photo
+            && self.photo_timer_setting != crate::app::state::PhotoTimerSetting::Off;
         let aspect_active = self.is_aspect_ratio_changed();
         let exposure_active = self.is_exposure_changed();
         let color_active = self.is_color_changed();
