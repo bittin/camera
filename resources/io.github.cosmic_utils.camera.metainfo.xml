@@ -96,8 +96,8 @@
   </developer>
   <content_rating type="oars-1.1" />
   <branding>
-    <color type="primary" scheme_preference="light">#62a0ea</color>
-    <color type="primary" scheme_preference="dark">#1a5fb4</color>
+    <color type="primary" scheme_preference="light">#d4e9fa</color>
+    <color type="primary" scheme_preference="dark">#0d2e5c</color>
   </branding>
   <screenshots>
     <screenshot type="default">

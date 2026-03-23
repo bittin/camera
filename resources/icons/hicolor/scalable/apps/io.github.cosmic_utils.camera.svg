@@ -18,22 +18,25 @@
     </linearGradient>
   </defs>
 
-  <!-- Background rounded square -->
-  <rect x="8" y="8" width="112" height="112" rx="28" fill="url(#bg)"/>
+  <!-- Background rounded square (~80% of canvas = 102x102, centered) -->
+  <rect x="13" y="13" width="102" height="102" rx="25.5" fill="url(#bg)"/>
 
-  <!-- Camera body -->
-  <path d="M 28 34 L 41 34 L 46 46 L 82 46 L 87 34 L 100 34 C 104 34 108 38 108 42 L 108 96 C 108 100 104 104 100 104 L 28 104 C 24 104 20 100 20 96 L 20 42 C 20 38 24 34 28 34 Z" fill="url(#camera)"/>
+  <!-- Camera body (scaled ~0.91x from center 64,64) -->
+  <path d="M 31.2 37 L 42.8 37 L 47.4 48 L 80.6 48 L 85.2 37 L 96.8 37 C 100.4 37 103.6 40.2 103.6 43.8 L 103.6 91.2 C 103.6 94.8 100.4 98 96.8 98 L 31.2 98 C 27.6 98 24.4 94.8 24.4 91.2 L 24.4 43.8 C 24.4 40.2 27.6 37 31.2 37 Z" fill="url(#camera)"/>
 
   <!-- Flash -->
-  <rect x="30" y="38" width="11" height="5" rx="1" fill="#d4d4d4"/>
+  <rect x="33" y="40.6" width="10" height="4.6" rx="1" fill="#d4d4d4"/>
+
+  <!-- Lens backing (fills gap between ring and lens with camera body color) -->
+  <circle cx="64" cy="67.3" r="25.5" fill="url(#camera)"/>
 
   <!-- Outer ring (cyan) -->
-  <circle cx="64" cy="72" r="28" fill="none" stroke="url(#ring)" stroke-width="6"/>
+  <circle cx="64" cy="67.3" r="25.5" fill="none" stroke="url(#ring)" stroke-width="5.5"/>
 
   <!-- Inner lens -->
-  <circle cx="64" cy="72" r="22" fill="url(#lens)"/>
+  <circle cx="64" cy="67.3" r="20" fill="url(#lens)"/>
 
   <!-- Lens highlight -->
-  <ellipse cx="58" cy="66" rx="6" ry="4" fill="#ffffff" opacity="0.3"/>
-  <ellipse cx="62" cy="68" rx="3" ry="2" fill="#ffffff" opacity="0.5"/>
+  <ellipse cx="58.5" cy="61.8" rx="5.5" ry="3.6" fill="#ffffff" opacity="0.3"/>
+  <ellipse cx="62.2" cy="63.7" rx="2.7" ry="1.8" fill="#ffffff" opacity="0.5"/>
 </svg>
