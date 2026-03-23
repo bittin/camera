@@ -27,8 +27,22 @@ use tracing::{error, info};
 
 /// Run the terminal camera viewer
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize GStreamer
-    gstreamer::init()?;
+    // Suppress libcamera's native C++ logging — it writes directly to stderr
+    // and corrupts the TUI since the alternate screen only covers stdout.
+    // SAFETY: called before any other threads are spawned in terminal mode.
+    unsafe { std::env::set_var("LIBCAMERA_LOG_LEVELS", "*:ERROR") };
+
+    // Redirect stderr to /dev/null so any remaining C++ log output
+    // (libcamera ERROR level, other native libraries) doesn't corrupt the TUI.
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(devnull) = std::fs::File::open("/dev/null") {
+            unsafe {
+                libc::dup2(devnull.as_raw_fd(), 2);
+            }
+        }
+    }
 
     // Set up terminal
     enable_raw_mode()?;
@@ -36,6 +50,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     // Run the app
     let result = run_app(&mut terminal);
@@ -416,16 +431,26 @@ fn sample_pixel_rgb(frame: &CameraFrame, x: u32, y: u32) -> (u8, u8, u8) {
             }
             let luma = data[y_idx];
 
-            // UV plane is after the Y plane, at half resolution
-            let (uv_offset, uv_stride) = if let Some(planes) = &frame.yuv_planes {
-                (planes.uv_offset, planes.uv_stride)
+            let (uv_offset, uv_stride, uv_w, uv_h) = if let Some(planes) = &frame.yuv_planes {
+                (
+                    planes.uv_offset,
+                    planes.uv_stride,
+                    planes.uv_width,
+                    planes.uv_height,
+                )
             } else {
-                // Fallback: UV plane starts right after Y plane
-                ((frame.stride * frame.height) as usize, frame.stride)
+                // Fallback: NV12/NV21 standard 4:2:0 layout
+                (
+                    (frame.stride * frame.height) as usize,
+                    frame.stride,
+                    frame.width / 2,
+                    frame.height / 2,
+                )
             };
-            let uv_x = (x & !1) as usize; // round down to even
-            let uv_y = (y / 2) as usize;
-            let uv_idx = uv_offset + uv_y * uv_stride as usize + uv_x;
+            // Interleaved UV: each chroma sample is 2 bytes (U,V pair)
+            let cx = (x as usize * uv_w as usize) / frame.width as usize;
+            let cy = (y as usize * uv_h as usize) / frame.height as usize;
+            let uv_idx = uv_offset + cy * uv_stride as usize + cx * 2;
 
             if uv_idx + 1 >= data.len() {
                 return (luma, luma, luma);
@@ -446,23 +471,36 @@ fn sample_pixel_rgb(frame: &CameraFrame, x: u32, y: u32) -> (u8, u8, u8) {
             }
             let luma = data[y_idx];
 
-            let (u_offset, u_stride, v_offset, v_stride) = if let Some(planes) = &frame.yuv_planes {
-                (
-                    planes.uv_offset,
-                    planes.uv_stride,
-                    planes.v_offset,
-                    planes.v_stride,
-                )
-            } else {
-                // Fallback: standard I420 layout
-                let y_size = (frame.stride * frame.height) as usize;
-                let half_stride = frame.stride / 2;
-                let u_size = (half_stride * frame.height / 2) as usize;
-                (y_size, half_stride, y_size + u_size, half_stride)
-            };
+            let (u_offset, u_stride, v_offset, v_stride, uv_w, uv_h) =
+                if let Some(planes) = &frame.yuv_planes {
+                    (
+                        planes.uv_offset,
+                        planes.uv_stride,
+                        planes.v_offset,
+                        planes.v_stride,
+                        planes.uv_width,
+                        planes.uv_height,
+                    )
+                } else {
+                    // Fallback: standard I420 (4:2:0) layout
+                    let y_size = (frame.stride * frame.height) as usize;
+                    let half_stride = frame.stride / 2;
+                    let u_size = (half_stride * frame.height / 2) as usize;
+                    (
+                        y_size,
+                        half_stride,
+                        y_size + u_size,
+                        half_stride,
+                        frame.width / 2,
+                        frame.height / 2,
+                    )
+                };
 
-            let cx = (x / 2) as usize;
-            let cy = (y / 2) as usize;
+            // Derive chroma coordinates from actual UV dimensions.
+            // I420 (4:2:0): uv_h == height/2 → cy = y/2
+            // I422 (4:2:2): uv_h == height   → cy = y
+            let cx = (x as usize * uv_w as usize) / frame.width as usize;
+            let cy = (y as usize * uv_h as usize) / frame.height as usize;
             let u_idx = u_offset + cy * u_stride as usize + cx;
             let v_idx = v_offset + cy * v_stride as usize + cx;
 
