@@ -83,21 +83,33 @@ enum ProcessMode {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+
+    let is_terminal_mode = matches!(cli.command, Some(Commands::Terminal));
+
     // Initialize logging
     // Set RUST_LOG environment variable to control log level
     // Examples: RUST_LOG=debug, RUST_LOG=camera=debug, RUST_LOG=info
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_target(true)
-        .with_level(true)
-        .init();
+    //
+    // In terminal mode, suppress all log output — stderr writes would corrupt
+    // the ratatui TUI since the alternate screen only covers stdout.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+
+    if is_terminal_mode {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(std::io::sink)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(true)
+            .with_level(true)
+            .init();
+    }
 
     tracing::info!("camera app starting");
-
-    let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Terminal) => camera::terminal::run(),

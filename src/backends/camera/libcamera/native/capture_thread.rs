@@ -155,6 +155,10 @@ struct FrameLayout {
 }
 
 /// Build a CameraFrame from copied buffer data and metadata.
+///
+/// For YUV formats (NV12, NV21, I420), computes `yuv_planes` from the
+/// stride and dimensions so that consumers (terminal preview, QR detector,
+/// burst mode) don't need format-specific fallback calculations.
 fn build_camera_frame(
     data: Arc<[u8]>,
     layout: FrameLayout,
@@ -162,16 +166,69 @@ fn build_camera_frame(
     sensor_timestamp_ns: Option<u64>,
     metadata: FrameMetadata,
 ) -> CameraFrame {
+    let yuv_planes = compute_yuv_planes(layout.format, layout.width, layout.height, layout.stride);
+
     CameraFrame {
         width: layout.width,
         height: layout.height,
         data: FrameData::Copied(data),
         format: layout.format,
         stride: layout.stride,
-        yuv_planes: None,
+        yuv_planes,
         captured_at,
         sensor_timestamp_ns,
         libcamera_metadata: Some(metadata),
+    }
+}
+
+/// Compute YUV plane offsets for multi-plane YUV formats.
+///
+/// Returns `None` for non-planar formats (RGBA, YUYV, Bayer, etc.)
+/// where the data is either single-plane or packed.
+fn compute_yuv_planes(
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    stride: u32,
+) -> Option<YuvPlanes> {
+    match format {
+        PixelFormat::NV12 | PixelFormat::NV21 => {
+            let y_size = (stride * height) as usize;
+            let uv_stride = stride; // interleaved UV, same stride as Y
+            let uv_height = height.div_ceil(2);
+            let uv_size = (uv_stride * uv_height) as usize;
+            Some(YuvPlanes {
+                y_offset: 0,
+                y_size,
+                uv_offset: y_size,
+                uv_size,
+                uv_stride,
+                v_offset: 0,
+                v_size: 0,
+                v_stride: 0,
+                uv_width: width.div_ceil(2),
+                uv_height,
+            })
+        }
+        PixelFormat::I420 => {
+            let y_size = (stride * height) as usize;
+            let uv_stride = stride.div_ceil(2);
+            let uv_height = height.div_ceil(2);
+            let uv_size = (uv_stride * uv_height) as usize;
+            Some(YuvPlanes {
+                y_offset: 0,
+                y_size,
+                uv_offset: y_size,
+                uv_size,
+                uv_stride,
+                v_offset: y_size + uv_size,
+                v_size: uv_size,
+                v_stride: uv_stride,
+                uv_width: width.div_ceil(2),
+                uv_height,
+            })
+        }
+        _ => None,
     }
 }
 
