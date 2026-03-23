@@ -641,6 +641,7 @@ impl AppModel {
             info!(seconds, "Starting photo timer countdown");
             self.photo_timer_countdown = Some(seconds);
             self.photo_timer_tick_start = Some(std::time::Instant::now());
+            self.start_bottom_bar_fade(0.0);
             return Self::delay_task(1000, Message::PhotoTimerTick);
         }
 
@@ -810,6 +811,7 @@ impl AppModel {
                 info!("Photo timer countdown complete - capturing");
                 self.photo_timer_countdown = None;
                 self.photo_timer_tick_start = None;
+                self.start_bottom_bar_fade(1.0);
                 // Check if flash is enabled
                 if self.flash_enabled && !self.flash_active {
                     if self.use_hardware_flash() {
@@ -838,6 +840,7 @@ impl AppModel {
             info!("Photo timer countdown aborted");
             self.photo_timer_countdown = None;
             self.photo_timer_tick_start = None;
+            self.start_bottom_bar_fade(1.0);
         }
         Task::none()
     }
@@ -1062,6 +1065,7 @@ impl AppModel {
                     info!(seconds, "Starting photo timer countdown");
                     self.photo_timer_countdown = Some(seconds);
                     self.photo_timer_tick_start = Some(std::time::Instant::now());
+                    self.start_bottom_bar_fade(0.0);
                     return Self::delay_task(1000, Message::PhotoTimerTick);
                 }
 
