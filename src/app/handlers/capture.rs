@@ -812,6 +812,7 @@ impl AppModel {
                 self.photo_timer_countdown = None;
                 self.photo_timer_tick_start = None;
                 self.start_bottom_bar_fade(1.0);
+                self.animate_capture_scale(1.0);
                 // Check if flash is enabled
                 if self.flash_enabled && !self.flash_active {
                     if self.use_hardware_flash() {
@@ -841,6 +842,7 @@ impl AppModel {
             self.photo_timer_countdown = None;
             self.photo_timer_tick_start = None;
             self.start_bottom_bar_fade(1.0);
+            self.animate_capture_scale(1.0);
         }
         Task::none()
     }
@@ -1023,9 +1025,9 @@ impl AppModel {
             return Task::none();
         }
 
-        // Don't start quick-record if photo timer is counting down
+        // If photo timer is counting down, abort it
         if self.photo_timer_countdown.is_some() {
-            return Task::none();
+            return self.handle_abort_photo_timer();
         }
 
         // Capture current frame for zero-shutter-lag photo
@@ -1045,8 +1047,6 @@ impl AppModel {
     pub(crate) fn handle_capture_button_released(&mut self) -> Task<cosmic::Action<Message>> {
         use crate::app::state::QuickRecordState;
 
-        self.animate_capture_scale(1.0);
-
         match std::mem::take(&mut self.quick_record) {
             QuickRecordState::Pressed { captured_frame, .. } => {
                 // Short tap: route through timer/flash logic before capturing
@@ -1054,10 +1054,12 @@ impl AppModel {
 
                 // If timer countdown is active, abort it
                 if self.photo_timer_countdown.is_some() {
+                    self.animate_capture_scale(1.0);
                     return self.handle_abort_photo_timer();
                 }
 
                 // In Photo mode with timer set, start countdown
+                // Keep button in pressed state until capture completes
                 if self.mode == CameraMode::Photo
                     && self.photo_timer_setting != crate::app::state::PhotoTimerSetting::Off
                 {
@@ -1070,6 +1072,7 @@ impl AppModel {
                 }
 
                 // Screen flash (front camera) or hardware flash (back camera)
+                self.animate_capture_scale(1.0);
                 if self.flash_enabled && !self.flash_active {
                     if self.use_hardware_flash() {
                         info!("Flash enabled - turning on hardware flash before capture");
@@ -1085,6 +1088,7 @@ impl AppModel {
                 self.capture_photo_with_frame(captured_frame)
             }
             QuickRecordState::Recording => {
+                self.animate_capture_scale(1.0);
                 // Long press ended: stop recording
                 self.quick_record = QuickRecordState::Idle;
 
@@ -1099,7 +1103,10 @@ impl AppModel {
                 self.update_idle_inhibit();
                 Task::none()
             }
-            QuickRecordState::Idle => Task::none(),
+            QuickRecordState::Idle => {
+                self.animate_capture_scale(1.0);
+                Task::none()
+            }
         }
     }
 

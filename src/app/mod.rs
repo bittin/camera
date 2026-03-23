@@ -708,6 +708,11 @@ impl cosmic::Application for AppModel {
 
     /// Handle escape key - close any open drawers or pickers
     fn on_escape(&mut self) -> Task<cosmic::Action<Self::Message>> {
+        // Abort photo timer countdown if active
+        if self.photo_timer_countdown.is_some() {
+            return self.handle_abort_photo_timer();
+        }
+
         // Close color picker and return to tools menu
         if self.color_picker_visible {
             self.color_picker_visible = false;

@@ -2,7 +2,7 @@
 
 //! Capture button widget implementation
 
-use crate::app::state::{AppModel, CameraMode, Message};
+use crate::app::state::{AppModel, CameraMode, Message, PhotoTimerSetting};
 use crate::constants::ui;
 use cosmic::Element;
 use cosmic::iced::{Background, Color, Length};
@@ -196,7 +196,30 @@ impl AppModel {
         };
 
         let scale = self.current_capture_scale();
-        let circle = build_ringed_circle(color, color, 1.0, scale);
+        let base_circle = build_ringed_circle(color, color, 1.0, scale);
+
+        // Overlay timer seconds on the capture button when timer is set in Photo mode
+        let circle: Element<'_, Message> = if self.mode == CameraMode::Photo
+            && self.photo_timer_setting != PhotoTimerSetting::Off
+            && !self.photo_timer_countdown.is_some()
+        {
+            let seconds = self.photo_timer_setting.seconds();
+            let ring_outer = (ui::CAPTURE_BUTTON_INNER + RING_GAP * 2.0) + RING_WIDTH * 2.0;
+            let timer_label = widget::text(format!("{seconds}"))
+                .size(32.0)
+                .font(cosmic::font::bold())
+                .center()
+                .width(Length::Fill)
+                .height(Length::Fill);
+            let timer_overlay = widget::container(timer_label)
+                .width(Length::Fixed(ring_outer))
+                .height(Length::Fixed(ring_outer))
+                .center_x(ring_outer)
+                .center_y(ring_outer);
+            cosmic::iced::widget::stack![base_circle, timer_overlay].into()
+        } else {
+            base_circle
+        };
 
         if is_disabled {
             circle
