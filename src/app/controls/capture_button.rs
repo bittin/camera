@@ -169,7 +169,7 @@ impl AppModel {
 
         let theme = cosmic::theme::active();
         let cosmic_theme = theme.cosmic();
-        let text_hint = cosmic_theme.on_bg_color().into();
+        let accent: Color = cosmic_theme.accent_color().into();
         let destructive: Color = cosmic_theme.destructive_color().into();
 
         let color = if is_disabled {
@@ -180,7 +180,7 @@ impl AppModel {
                     if self.quick_record.is_recording() {
                         destructive
                     } else {
-                        text_hint
+                        accent
                     }
                 }
                 CameraMode::Video => destructive,
@@ -233,7 +233,10 @@ impl AppModel {
     /// Build the photo capture button shown during video recording (right side).
     pub fn build_photo_during_recording_button(&self) -> Element<'_, Message> {
         let scale = self.current_photo_btn_scale();
-        let circle = build_ringed_circle(Color::WHITE, Color::WHITE, PHOTO_BTN_SIZE_RATIO, scale);
+        let theme = cosmic::theme::active();
+        let cosmic_theme = theme.cosmic();
+        let accent: Color = cosmic_theme.accent_color().into();
+        let circle = build_ringed_circle(accent, accent, PHOTO_BTN_SIZE_RATIO, scale);
 
         widget::mouse_area(circle)
             .on_press(Message::Capture)
