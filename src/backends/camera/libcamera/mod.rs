@@ -403,12 +403,15 @@ impl CameraBackend for LibcameraBackend {
                 generate_pretty_name(sensor_model.as_deref(), camera_location.as_deref())
                     .unwrap_or_else(|| sensor_model.as_deref().unwrap_or(&camera_id).to_string());
 
-            // Detect pipeline handler from camera path
-            let pipeline_handler = if camera_id.starts_with("/base/") {
-                Some("simple".to_string())
-            } else {
-                None
-            };
+            // Detect pipeline handler from camera path.
+            // The "simple" pipeline handler uses device-tree paths that start
+            // with "/base/" (older libcamera) or "platform/" (libcamera 0.7+).
+            let pipeline_handler =
+                if camera_id.starts_with("/base/") || camera_id.starts_with("platform/") {
+                    Some("simple".to_string())
+                } else {
+                    None
+                };
 
             let supports_multistream =
                 v4l2_utils::supports_multistream(pipeline_handler.as_deref());
