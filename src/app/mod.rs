@@ -627,8 +627,29 @@ impl cosmic::Application for AppModel {
             |result| cosmic::Action::App(Message::GpuPipelinesWarmed(result)),
         );
 
-        // Apply the theme from config on startup (THEME global defaults to Dark)
-        let theme_task = cosmic::command::set_theme(app.config.app_theme.theme());
+        // Apply the theme from config on startup.
+        // On non-COSMIC desktops with System theme, query the XDG portal for the
+        // actual color scheme so we don't briefly flash the wrong theme.
+        let theme_task = if !crate::config::is_cosmic_desktop()
+            && app.config.app_theme == crate::config::AppTheme::System
+        {
+            Task::perform(
+                async {
+                    use ashpd::desktop::settings::{ColorScheme, Settings};
+                    match Settings::new().await {
+                        Ok(settings) => settings
+                            .color_scheme()
+                            .await
+                            .map(|scheme| matches!(scheme, ColorScheme::PreferDark))
+                            .unwrap_or(false),
+                        Err(_) => false,
+                    }
+                },
+                |is_dark| cosmic::Action::App(Message::PortalColorSchemeChanged(is_dark)),
+            )
+        } else {
+            cosmic::command::set_theme(app.config.app_theme.theme())
+        };
 
         info!(
             elapsed_ms = init_start.elapsed().as_millis(),
