@@ -225,36 +225,6 @@ impl AppModel {
             .into();
         }
 
-        // Timer countdown mode - show only preview with countdown overlay and capture button
-        if let Some(remaining) = self.photo_timer_countdown {
-            let countdown_overlay = self.build_timer_overlay(remaining);
-
-            // Capture button (acts as abort during countdown)
-            let capture_button = self.build_capture_button();
-            let capture_area = widget::container(capture_button)
-                .width(Length::Fill)
-                .align_x(cosmic::iced::alignment::Horizontal::Center);
-
-            let content = widget::column()
-                .push(
-                    cosmic::iced::widget::stack![camera_preview, countdown_overlay]
-                        .width(Length::Fill)
-                        .height(Length::Fill),
-                )
-                .push(capture_area)
-                .width(Length::Fill)
-                .height(Length::Fill);
-
-            return widget::container(content)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .style(|theme| widget::container::Style {
-                    background: Some(Background::Color(theme.cosmic().bg_color().into())),
-                    ..Default::default()
-                })
-                .into();
-        }
-
         // Build top bar
         let top_bar = self.build_top_bar();
 
@@ -443,6 +413,11 @@ impl AppModel {
                     theatre_stack = theatre_stack.push(popup);
                 }
 
+                // Timer countdown overlay (centered on preview)
+                if let Some(remaining) = self.photo_timer_countdown {
+                    theatre_stack = theatre_stack.push(self.build_timer_overlay(remaining));
+                }
+
                 theatre_stack
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -480,6 +455,11 @@ impl AppModel {
             // Flash permission error popup (centered in preview area)
             if self.flash_error_popup.is_some() {
                 preview_stack = preview_stack.push(self.build_flash_error_popup());
+            }
+
+            // Timer countdown overlay (centered on preview)
+            if let Some(remaining) = self.photo_timer_countdown {
+                preview_stack = preview_stack.push(self.build_timer_overlay(remaining));
             }
 
             // Add zoom label overlapping bottom of preview (centered above capture button)
