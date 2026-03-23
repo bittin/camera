@@ -374,9 +374,9 @@ dependencies = [
 
 [[package]]
 name = "ashpd"
-version = "0.13.8"
+version = "0.13.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51b9019bd7f3beac5fbef5b756f5ef67777ab068035ec15683c1e635ad476f54"
+checksum = "13bdf0fd848239dcd5e64eeeee35dbc00378ebcc6f3aa4ead0a305eec83d0cfb"
 dependencies = [
  "enumflags2",
  "futures-util",
@@ -932,7 +932,7 @@ dependencies = [
 name = "camera"
 version = "0.3.0"
 dependencies = [
- "ashpd 0.13.8",
+ "ashpd 0.13.9",
  "async-stream",
  "bytemuck",
  "chrono",
