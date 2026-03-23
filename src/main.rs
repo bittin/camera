@@ -183,7 +183,7 @@ fn run_gui(preview_source: Option<PathBuf>) -> Result<(), Box<dyn std::error::Er
     let mut settings = cosmic::app::Settings::default().size_limits(
         cosmic::iced::Limits::NONE
             .min_width(360.0)
-            .min_height(180.0),
+            .min_height(360.0),
     );
 
     // When preview source is provided, set optimal window size for Flathub screenshots
