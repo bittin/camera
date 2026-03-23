@@ -165,6 +165,67 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.0" date="2026-03-23">
+      <description>
+        <p>Release 0.3.0 includes the following changes:</p>
+        <ul>
+          <li>Add commit hashes to git source tags for flathub linter</li>
+          <li>i18n(fr): Add French translation</li>
+          <li>Update camera.ftl</li>
+          <li>Create Swedish localization for camera.ftl</li>
+          <li>Use multiplicative zoom stepping for natural feel</li>
+          <li>Add composition guide overlay setting</li>
+          <li>deps(cargo): bump libcosmic from `c52ef97` to `9602dfd`</li>
+          <li>Bump ashpd to 0.13.7, enable settings feature</li>
+          <li>Pin all dependencies to exact latest versions</li>
+          <li>feat: add timelapse mode with direct-to-video encoding</li>
+          <li>deps(cargo): bump libcosmic from `9602dfd` to `3da55e8`</li>
+          <li>deps(cargo): bump ashpd from 0.13.7 to 0.13.8 in the rust-dependencies group</li>
+          <li>deps(cargo): bump naga from 28.0.0 to 29.0.0</li>
+          <li>deps(cargo): bump libcosmic from `3da55e8` to `36cba69`</li>
+          <li>feat: rewrite mode switcher, capture button, and recording UI to optimize for mobile use and touch input</li>
+          <li>Update i18n/fr/camera.ftl</li>
+          <li>fix: match timelapse indicator color to capture button</li>
+          <li>fix: apply sensor rotation to timelapse recordings</li>
+          <li>fix: prefer x264 over x265 over openh264 for software encoders</li>
+          <li>fix: reset all UI state when resetting settings</li>
+          <li>fix: only show flash in timelapse mode with hardware flash</li>
+          <li>feat: tap selected mode to toggle tools menu</li>
+          <li>fix: improve software encoder quality settings</li>
+          <li>fix: compute aspect ratio crop in texture space for rotated sensors</li>
+          <li>feat: close filter drawer on selection</li>
+          <li>feat: toggle theatre mode UI on tap instead of auto-hide</li>
+          <li>fix: correct theme detection on GNOME desktops</li>
+          <li>perf: downscale blur to 1/4 res and reduce sample count</li>
+          <li>feat: add haptic feedback for capture, mode switch, and camera switch</li>
+          <li>fix: compute photo aspect ratio crop in sensor space for rotated sensors</li>
+          <li>perf: parallelize startup and skip first-launch capture delay</li>
+          <li>perf: use pre-rendered PNG for about page icon</li>
+          <li>perf: optimize release profile with fat LTO and strip</li>
+          <li>fix: use libcamera fork with sandbox IPA fallback for Flatpak</li>
+          <li>feat: use theme accent color for capture buttons</li>
+          <li>feat: add fast release build profile for mobile testing</li>
+          <li>feat: use release-fast profile for dev run commands</li>
+          <li>fix: restore screen flash and timer countdown for photo capture</li>
+          <li>fix: detect simple pipeline handler for platform/ camera IDs</li>
+          <li>fix: overlay timer countdown on normal layout instead of replacing it</li>
+          <li>feat: show timer seconds in capture button and improve countdown UX</li>
+          <li>fix: use is_none() instead of !is_some() for clippy</li>
+          <li>i18n(zh-CN): Add simplified Chinese translation</li>
+          <li>Update i18n/fr/camera.ftl</li>
+          <li>fix: set min window height equal to min width to prevent hidden preview</li>
+          <li>fix: only highlight tools button for timer when in photo mode</li>
+          <li>feat: add multi-pass filter support and improve Pencil filter</li>
+          <li>fix: query portal color scheme at init to avoid theme race on GNOME</li>
+          <li>chore: update libcamera to b16952df</li>
+          <li>fix: terminal mode YUV sampling and log output corruption</li>
+          <li>chore: update libcosmic to d7fd880a</li>
+          <li>fix: improve app icon sizing and brand colors for Flathub</li>
+          <li>chore: update preview screenshots</li>
+          <li>fix: video recording and photo capture with --preview-source</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-03-15">
       <description>
         <p>Release 0.2.0 includes the following changes:</p>
