@@ -165,6 +165,15 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.1" date="2026-03-24">
+      <description>
+        <p>Release 0.3.1 includes the following changes:</p>
+        <ul>
+          <li>deps(cargo): bump ashpd from 0.13.8 to 0.13.9 in the rust-dependencies group</li>
+          <li>feat: include full insights, settings, and libcamera metadata in bug report</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.0" date="2026-03-23">
       <description>
         <p>Release 0.3.0 includes the following changes:</p>

@@ -603,14 +603,14 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/ashpd/ashpd-0.13.8.crate",
-        "sha256": "51b9019bd7f3beac5fbef5b756f5ef67777ab068035ec15683c1e635ad476f54",
-        "dest": "cargo/vendor/ashpd-0.13.8"
+        "url": "https://static.crates.io/crates/ashpd/ashpd-0.13.9.crate",
+        "sha256": "13bdf0fd848239dcd5e64eeeee35dbc00378ebcc6f3aa4ead0a305eec83d0cfb",
+        "dest": "cargo/vendor/ashpd-0.13.9"
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"51b9019bd7f3beac5fbef5b756f5ef67777ab068035ec15683c1e635ad476f54\", \"files\": {}}",
-        "dest": "cargo/vendor/ashpd-0.13.8",
+        "contents": "{\"package\": \"13bdf0fd848239dcd5e64eeeee35dbc00378ebcc6f3aa4ead0a305eec83d0cfb\", \"files\": {}}",
+        "dest": "cargo/vendor/ashpd-0.13.9",
         "dest-filename": ".cargo-checksum.json"
     },
     {
