@@ -171,6 +171,19 @@ settings-burst-mode-quality-description = Kvalitet använder FFT-frekvensdomäns
 settings-save-burst-raw = Spara råa burst-bildrutor
 settings-save-burst-raw-description = Spara enskilda bildserier som DNG-filer tillsammans med HDR+-foton. Användbart för felsökning eller ombearbetning.
 
+# Kompositionsguide
+settings-composition-guide = Kompositionsguide
+settings-composition-guide-description = Lägg över guidelinjer på kamerans förhandsgranskning för komposition
+guide-none = Inga
+guide-rule-of-thirds = Tredjedelsregeln
+guide-phi-grid = Phi-rutnät
+guide-spiral-top-left = Gyllene snittet ↖
+guide-spiral-top-right = Gyllene snittet ↗
+guide-spiral-bottom-left = Gyllene snittet ↙
+guide-spiral-bottom-right = Gyllene snittet ↘
+guide-diagonal = Diagonaler
+guide-crosshair = Korshår
+
 # Om sida
 about-support = Support & feedback
 
@@ -265,6 +278,12 @@ insights-meta-lens-position = Linsposition
 insights-meta-lux = Belysningsstyrka
 insights-meta-focus-fom = Fokus FoM
 insights-meta-na = Inte tillgängligt
+
+
+# Tidsförlopp
+settings-timelapse = Tidsförlopp
+settings-timelapse-interval = Intervall
+settings-timelapse-interval-description = Tid mellan på varandra följande fototagningar
 
 # Insikter - Fånga
 insights-capture = Fånga
