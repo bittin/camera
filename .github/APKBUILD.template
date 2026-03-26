@@ -27,12 +27,12 @@ makedepends="
 	libseat-dev
 	libxkbcommon-dev
 	nasm
+	samurai
 	pkgconf
 	wayland-dev
 "
 options="net !check"  # fetch dependencies, no tests
 source="$pkgname-$pkgver.tar.gz::https://github.com/cosmic-utils/camera/archive/refs/tags/v$pkgver.tar.gz"
-builddir="$srcdir/camera-$pkgver"
 
 prepare() {
 	default_prepare
