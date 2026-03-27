@@ -45,6 +45,7 @@ const ASPECT_1_1_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspe
 /// Exposure icon SVG
 const EXPOSURE_ICON: &[u8] = include_bytes!("../../resources/button_icons/exposure.svg");
 const TOOLS_GRID_ICON: &[u8] = include_bytes!("../../resources/button_icons/tools-grid.svg");
+const FILTER_ICON: &[u8] = include_bytes!("../../resources/button_icons/image-filter.svg");
 /// Moon icon SVG (burst mode)
 const MOON_ICON: &[u8] = include_bytes!("../../resources/button_icons/moon.svg");
 /// Moon off icon SVG (burst mode disabled, with strike-through)
@@ -1015,7 +1016,7 @@ impl AppModel {
         {
             let filter_active = self.selected_filter != FilterType::Standard;
             buttons.push(self.build_tools_grid_button(
-                icon::from_name("image-filter-symbolic").symbolic(true),
+                widget::icon::from_svg_bytes(FILTER_ICON).symbolic(true),
                 fl!("tools-filter"),
                 Message::ToggleContextPage(crate::app::state::ContextPage::Filters),
                 filter_active,
