@@ -40,6 +40,8 @@ const ASPECT_NATIVE_ICON: &[u8] = include_bytes!("../../resources/button_icons/a
 const ASPECT_4_3_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-4-3.svg");
 /// Aspect ratio 16:9 icon SVG
 const ASPECT_16_9_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-16-9.svg");
+/// Aspect ratio 2:1 (18:9) icon SVG
+const ASPECT_2_1_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-2-1.svg");
 /// Aspect ratio 1:1 icon SVG
 const ASPECT_1_1_ICON: &[u8] = include_bytes!("../../resources/button_icons/aspect-1-1.svg");
 /// Exposure icon SVG
@@ -974,6 +976,7 @@ impl AppModel {
                 crate::app::state::PhotoAspectRatio::Native => ASPECT_NATIVE_ICON,
                 crate::app::state::PhotoAspectRatio::Ratio4x3 => ASPECT_4_3_ICON,
                 crate::app::state::PhotoAspectRatio::Ratio16x9 => ASPECT_16_9_ICON,
+                crate::app::state::PhotoAspectRatio::Ratio2x1 => ASPECT_2_1_ICON,
                 crate::app::state::PhotoAspectRatio::Ratio1x1 => ASPECT_1_1_ICON,
             };
             let aspect_icon = widget::icon::from_svg_bytes(aspect_icon_bytes).symbolic(true);
