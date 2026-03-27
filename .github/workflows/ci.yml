@@ -260,6 +260,7 @@ jobs:
 
       - name: Generate APKBUILD and source tarball
         run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
           # Create source tarball matching GitHub's archive format
