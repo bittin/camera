@@ -165,6 +165,18 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.4" date="2026-03-27">
+      <description>
+        <p>Release 0.3.4 includes the following changes:</p>
+        <ul>
+          <li>deps(cargo): bump libcosmic from `d7fd880` to `adb3e34`</li>
+          <li>deps(cargo): bump naga from 29.0.0 to 29.0.1 in the rust-dependencies group</li>
+          <li>Update  Swedish localization</li>
+          <li>Add default camera mode setting</li>
+          <li>Add Alpine Linux APKBUILD generation to release workflow</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.3" date="2026-03-25">
       <description>
         <p>Release 0.3.3 includes the following changes:</p>
