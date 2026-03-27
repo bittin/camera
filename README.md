@@ -33,6 +33,7 @@ flatpak install camera-x86_64.flatpak
 #### Dependencies
 
 - Rust (stable)
+- [cosmic-icons](https://github.com/pop-os/cosmic-icons)
 - GStreamer 1.0 with plugins (base, good, bad, ugly)
 - libcamera (>= 0.4.0)
 - cmake (for building embedded libjpeg-turbo)

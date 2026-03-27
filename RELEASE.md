@@ -39,8 +39,9 @@ This triggers the **Release** workflow, which:
 
 1. **Builds binaries** - For x86_64, aarch64, and riscv64
 2. **Builds Flatpak bundles** - For x86_64 and aarch64
-3. **Creates GitHub Release** - With all artifacts and release notes
-4. **Publishes to Flathub** - Updates the Flathub repository (if `FLATHUB_TOKEN` is configured)
+3. **Generates APKBUILD** - Alpine Linux package recipe with correct sha512sum
+4. **Creates GitHub Release** - With all artifacts and release notes
+5. **Publishes to Flathub** - Updates the Flathub repository (if `FLATHUB_TOKEN` is configured)
 
 ## Version Numbering
 
@@ -112,7 +113,11 @@ Each release includes:
 |----------|-------------|
 | `camera-x86_64-linux.tar.gz` | Linux binary for x86_64 |
 | `camera-aarch64-linux.tar.gz` | Linux binary for ARM64 |
+| `camera-armhf-linux.tar.gz` | Linux binary for armhf (32-bit) |
 | `camera-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
+| `camera-x86_64-musl-linux.tar.gz` | Linux binary for x86_64 (musl/static) |
+| `camera-aarch64-musl-linux.tar.gz` | Linux binary for ARM64 (musl/static) |
 | `camera-x86_64.flatpak` | Flatpak bundle for x86_64 |
 | `camera-aarch64.flatpak` | Flatpak bundle for ARM64 |
 | `camera-vX.Y.Z-source.zip` | Source code archive |
+| `APKBUILD` | Alpine Linux package build recipe |

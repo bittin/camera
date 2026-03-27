@@ -1,0 +1,59 @@
+# Contributor: Frederic Laing <dev@fredfunk.tech>
+# Maintainer: Frederic Laing <dev@fredfunk.tech>
+pkgname=camera
+pkgver=@@VERSION@@
+pkgrel=0
+pkgdesc="Camera application for the COSMIC Desktop Environment"
+url="https://github.com/cosmic-utils/camera"
+arch="all"
+license="GPL-3.0-only"
+depends="
+	cosmic-icons
+	gst-plugins-base
+	gst-plugins-bad
+"
+makedepends="
+	cargo
+	clang-libclang
+	cmake
+	eudev-dev
+	glib-dev
+	gst-plugins-bad-dev
+	gst-plugins-base-dev
+	gstreamer-dev
+	just
+	libcamera-dev
+	libinput-dev
+	libseat-dev
+	libxkbcommon-dev
+	nasm
+	samurai
+	pkgconf
+	wayland-dev
+"
+options="net !check"  # fetch dependencies, no tests
+source="$pkgname-$pkgver.tar.gz::https://github.com/cosmic-utils/camera/archive/refs/tags/v$pkgver.tar.gz"
+
+prepare() {
+	default_prepare
+	cargo fetch --target="$CTARGET" --locked
+}
+
+build() {
+	export VERGEN_GIT_COMMIT_DATE="$(date -d @"$SOURCE_DATE_EPOCH" '+%Y-%m-%d')"
+	export VERGEN_GIT_SHA="unknown"
+
+	just build-release --frozen
+}
+
+check() {
+	cargo test --release --frozen
+}
+
+package() {
+	just rootdir="$pkgdir" install
+}
+
+sha512sums="
+@@CHECKSUM@@  camera-@@VERSION@@.tar.gz
+"

@@ -107,6 +107,7 @@ jobs:
       - name: Run checks
         run: just check
 
+
   # Cross-compiled debug builds to verify compilation on all target architectures
   build:
     name: Build (${{ matrix.arch }})
@@ -213,6 +214,78 @@ jobs:
           else
             just build-debug --target ${{ matrix.target }}
           fi
+
+  apkbuild:
+    name: APKBUILD
+    runs-on: ubuntu-latest
+    needs: check
+    container:
+      image: alpine:edge
+    steps:
+      - name: Install build dependencies
+        run: |
+          apk add --no-cache \
+            alpine-sdk sudo git atools \
+            cargo \
+            clang-libclang \
+            cmake \
+            cosmic-icons \
+            eudev-dev \
+            glib-dev \
+            gst-plugins-bad-dev \
+            gst-plugins-base-dev \
+            gstreamer-dev \
+            just \
+            libcamera-dev \
+            libinput-dev \
+            libseat-dev \
+            libxkbcommon-dev \
+            nasm \
+            pkgconf \
+            samurai \
+            wayland-dev
+
+      - name: Set up abuild
+        run: |
+          adduser -D builder
+          addgroup builder abuild
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          sudo -Hu builder abuild-keygen -a -n
+          cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-tags: true
+
+      - name: Generate APKBUILD and source tarball
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          # Create source tarball matching GitHub's archive format
+          git archive --format=tar.gz --prefix=camera-$VERSION/ HEAD > /tmp/camera-$VERSION.tar.gz
+          CHECKSUM=$(sha512sum /tmp/camera-$VERSION.tar.gz | awk '{print $1}')
+
+          # Place tarball in distfiles cache where abuild expects it
+          mkdir -p /var/cache/distfiles
+          cp /tmp/camera-$VERSION.tar.gz /var/cache/distfiles/camera-$VERSION.tar.gz
+          chmod 644 /var/cache/distfiles/camera-$VERSION.tar.gz
+
+          # Generate APKBUILD from template
+          mkdir -p /home/builder/apkbuild
+          sed -e "s/@@VERSION@@/$VERSION/g" \
+              -e "s/@@CHECKSUM@@/$CHECKSUM/g" \
+              .github/APKBUILD.template > /home/builder/apkbuild/APKBUILD
+          chown -R builder:builder /home/builder/apkbuild
+
+      - name: Lint APKBUILD
+        run: apkbuild-lint /home/builder/apkbuild/APKBUILD
+
+      - name: Build package
+        run: |
+          cd /home/builder/apkbuild
+          sudo -Hu builder abuild -r
 
   flatpak-x86_64:
     name: Flatpak (x86_64)

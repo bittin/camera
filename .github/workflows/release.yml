@@ -302,6 +302,23 @@ jobs:
           fi
           git archive --format=zip --prefix=camera-${{ github.ref_name }}/ -o release-assets/camera-${{ github.ref_name }}-source.zip HEAD
 
+      - name: Generate Alpine Linux APKBUILD
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          # Download the source tarball that Alpine will use and compute checksum
+          curl -sL -o /tmp/source.tar.gz \
+            "https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz"
+          CHECKSUM=$(sha512sum /tmp/source.tar.gz | awk '{print $1}')
+
+          # Generate APKBUILD from template
+          sed -e "s/@@VERSION@@/${VERSION}/g" \
+              -e "s/@@CHECKSUM@@/${CHECKSUM}/g" \
+              .github/APKBUILD.template > release-assets/APKBUILD
+
+          echo "Generated APKBUILD for camera ${VERSION}"
+
       - name: Generate release notes
         run: |
           cat << 'EOF' > release_notes_footer.md
@@ -331,6 +348,7 @@ jobs:
           | `camera-x86_64-musl-linux.tar.gz` | Linux binary for x86_64 (musl/static) |
           | `camera-aarch64-musl-linux.tar.gz` | Linux binary for ARM64 (musl/static) |
           | `camera-${{ github.ref_name }}-source.zip` | Source code |
+          | `APKBUILD` | Alpine Linux package build recipe |
           EOF
           # Add aarch64 flatpak to release notes if it was built
           if [ -f "release-assets/camera-aarch64.flatpak" ]; then
