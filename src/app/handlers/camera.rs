@@ -5,9 +5,7 @@
 //! Handles camera selection, switching, frame processing, initialization,
 //! hotplug events, and mirror/virtual camera settings.
 
-use crate::app::state::{
-    AppModel, CameraMode, Message, PhotoAspectRatio, RecordingState, VirtualCameraState,
-};
+use crate::app::state::{AppModel, CameraMode, Message, RecordingState, VirtualCameraState};
 use crate::backends::camera::v4l2_controls;
 use cosmic::Task;
 use std::sync::Arc;
@@ -93,7 +91,7 @@ impl AppModel {
         self.current_frame = None;
         self.current_camera_index = new_index;
         self.zoom_level = 1.0;
-        self.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Native;
+        self.photo_aspect_ratio = self.config.photo_aspect_ratio;
 
         // If switching to a back camera with flash enabled and permission errors,
         // reset flash and show the permission popup
@@ -280,16 +278,8 @@ impl AppModel {
 
         self.select_format_from_cache(self.mode);
 
-        // Set default aspect ratio based on selected format dimensions (accounting for rotation)
-        if let Some(fmt) = &self.active_format {
-            let rotation = self
-                .available_cameras
-                .get(self.current_camera_index)
-                .map(|c| c.rotation)
-                .unwrap_or_default();
-            self.photo_aspect_ratio =
-                PhotoAspectRatio::default_for_frame_with_rotation(fmt.width, fmt.height, rotation);
-        }
+        // Restore aspect ratio from config (or default for frame dimensions if not set)
+        self.photo_aspect_ratio = self.config.photo_aspect_ratio;
 
         self.update_mode_options();
         self.update_resolution_options();

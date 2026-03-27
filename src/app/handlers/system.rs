@@ -380,7 +380,7 @@ impl AppModel {
             self.selected_filter.gpu_filter_code(),
             std::sync::atomic::Ordering::Relaxed,
         );
-        self.photo_aspect_ratio = Default::default();
+        self.photo_aspect_ratio = self.config.photo_aspect_ratio;
         self.zoom_level = 1.0;
 
         // Reset camera exposure and color controls to defaults

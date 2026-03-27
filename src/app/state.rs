@@ -973,7 +973,7 @@ impl PhotoTimerSetting {
 }
 
 /// Photo aspect ratio settings
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PhotoAspectRatio {
     /// Native camera aspect ratio (no cropping)
     #[default]

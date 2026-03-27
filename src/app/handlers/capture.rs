@@ -788,6 +788,17 @@ impl AppModel {
 
         self.photo_aspect_ratio = self.photo_aspect_ratio.next_for_frame(width, height);
         info!(aspect_ratio = ?self.photo_aspect_ratio, "Photo aspect ratio changed");
+
+        self.config.photo_aspect_ratio = self.photo_aspect_ratio;
+        {
+            use cosmic::cosmic_config::CosmicConfigEntry;
+            if let Some(handler) = self.config_handler.as_ref()
+                && let Err(err) = self.config.write_entry(handler)
+            {
+                tracing::error!(?err, "Failed to save photo aspect ratio setting");
+            }
+        }
+
         Task::none()
     }
 
