@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
     <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
       <stop offset="0%" style="stop-color:#62a0ea;stop-opacity:1" />
@@ -16,27 +16,74 @@
       <stop offset="0%" style="stop-color:#1e3a5f;stop-opacity:1" />
       <stop offset="100%" style="stop-color:#0f172a;stop-opacity:1" />
     </linearGradient>
+    <linearGradient id="lens-inner" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#162d4a;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0c1220;stop-opacity:1" />
+    </linearGradient>
+    <!-- Glass effect gradients -->
+    <radialGradient id="gl_glass" cx="0.42" cy="0.38" r="0.52">
+      <stop offset="0%" stop-color="#e8f4f8" stop-opacity="0.2"/>
+      <stop offset="35%" stop-color="#c5dfe8" stop-opacity="0.13"/>
+      <stop offset="70%" stop-color="#a8cdd8" stop-opacity="0.1"/>
+      <stop offset="100%" stop-color="#8ab8c8" stop-opacity="0.07"/>
+    </radialGradient>
+    <radialGradient id="gl_highlight" cx="0.35" cy="0.3" r="0.35">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="gl_edge_shadow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="75%" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.03"/>
+    </radialGradient>
+    <radialGradient id="gl_inner_light" cx="0.55" cy="0.6" r="0.4">
+      <stop offset="0%" stop-color="#d0eaf2" stop-opacity="0.07"/>
+      <stop offset="100%" stop-color="#d0eaf2" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Drop shadow filter for camera body -->
+    <filter id="shadow" x="-5%" y="-5%" width="115%" height="125%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2.5" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
   </defs>
 
-  <!-- Background rounded square (~91% of canvas = 116x116, centered) -->
-  <rect x="6" y="6" width="116" height="116" rx="29" fill="url(#bg)"/>
+  <!-- Background rounded square with dark-theme border -->
+  <rect x="6" y="6" width="116" height="116" rx="32" fill="url(#bg)" stroke="#0d47a1" stroke-width="1"/>
 
-  <!-- Camera body (scaled ~0.91x from center 64,64) -->
-  <path d="M 31.2 37 L 42.8 37 L 47.4 48 L 80.6 48 L 85.2 37 L 96.8 37 C 100.4 37 103.6 40.2 103.6 43.8 L 103.6 91.2 C 103.6 94.8 100.4 98 96.8 98 L 31.2 98 C 27.6 98 24.4 94.8 24.4 91.2 L 24.4 43.8 C 24.4 40.2 27.6 37 31.2 37 Z" fill="url(#camera)"/>
+  <!-- Camera body with drop shadow (scaled 1.15x from center 64,67.3) -->
+  <path d="M 26.2 32.5 L 39.6 32.5 L 44.9 45.1 L 83.1 45.1 L 88.4 32.5 L 101.8 32.5 C 105.9 32.5 109.6 36.1 109.6 40.3 L 109.6 94.8 C 109.6 99 105.9 102.6 101.8 102.6 L 26.2 102.6 C 22.1 102.6 18.4 99 18.4 94.8 L 18.4 40.3 C 18.4 36.1 22.1 32.5 26.2 32.5 Z" fill="url(#camera)" filter="url(#shadow)"/>
 
   <!-- Flash -->
-  <rect x="33" y="40.6" width="10" height="4.6" rx="1" fill="#d4d4d4"/>
+  <rect x="28.4" y="36.6" width="11.5" height="5.3" rx="1" fill="#d4d4d4"/>
 
-  <!-- Lens backing (fills gap between ring and lens with camera body color) -->
-  <circle cx="64" cy="67.3" r="25.5" fill="url(#camera)"/>
+  <!-- Lens backing -->
+  <circle cx="64" cy="67.3" r="29.3" fill="url(#camera)"/>
 
   <!-- Outer ring (cyan) -->
-  <circle cx="64" cy="67.3" r="25.5" fill="none" stroke="url(#ring)" stroke-width="5.5"/>
+  <circle cx="64" cy="67.3" r="29.3" fill="none" stroke="url(#ring)" stroke-width="6.3"/>
 
   <!-- Inner lens -->
-  <circle cx="64" cy="67.3" r="20" fill="url(#lens)"/>
+  <circle cx="64" cy="67.3" r="23" fill="url(#lens)"/>
 
-  <!-- Lens highlight -->
-  <ellipse cx="58.5" cy="61.8" rx="5.5" ry="3.6" fill="#ffffff" opacity="0.3"/>
-  <ellipse cx="62.2" cy="63.7" rx="2.7" ry="1.8" fill="#ffffff" opacity="0.5"/>
+  <!-- Iris ring details -->
+  <circle cx="64" cy="67.3" r="18.4" fill="none" stroke="#1a3050" stroke-width="0.8" opacity="0.5"/>
+  <circle cx="64" cy="67.3" r="13.8" fill="url(#lens-inner)"/>
+  <circle cx="64" cy="67.3" r="9.2" fill="none" stroke="#253d57" stroke-width="0.6" opacity="0.4"/>
+
+  <!-- Lens center (deepest glass) -->
+  <circle cx="64" cy="67.3" r="5.75" fill="#080e18"/>
+
+  <!-- Glass effect (adapted from flat_round_glass_lens.svg) -->
+  <clipPath id="lens-clip"><circle cx="64" cy="67.3" r="23"/></clipPath>
+  <g clip-path="url(#lens-clip)">
+    <!-- Glass pane: radial gradient, highlight offset upper-left -->
+    <circle cx="64" cy="67.3" r="23" fill="url(#gl_glass)"/>
+    <!-- Edge shadow -->
+    <circle cx="64" cy="67.3" r="23" fill="url(#gl_edge_shadow)"/>
+    <!-- Secondary inner glow (lower-right) -->
+    <circle cx="64" cy="67.3" r="23" fill="url(#gl_inner_light)"/>
+    <!-- Primary specular highlight (upper-left) -->
+    <circle cx="64" cy="67.3" r="23" fill="url(#gl_highlight)"/>
+    <!-- Inner rim catch-light -->
+    <circle cx="64" cy="67.3" r="23" fill="none" stroke="#c8dce6" stroke-width="0.3" stroke-opacity="0.2"/>
+  </g>
+
 </svg>
