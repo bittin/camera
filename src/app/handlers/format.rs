@@ -5,9 +5,7 @@
 //! Handles mode switching, resolution selection, framerate selection,
 //! codec/pixel format selection, and format picker interactions.
 
-use crate::app::state::{
-    AppModel, CameraMode, FileSource, Message, PhotoAspectRatio, RecordingState,
-};
+use crate::app::state::{AppModel, CameraMode, FileSource, Message, RecordingState};
 use crate::app::utils::{parse_codec, parse_resolution};
 use cosmic::Task;
 use cosmic::cosmic_config::CosmicConfigEntry;
@@ -308,12 +306,7 @@ impl AppModel {
 
                 if let Some(fmt) = &self.active_format {
                     info!(width, format = %fmt, "Applied resolution with framerate preservation");
-                    // Update aspect ratio default for new dimensions (accounting for rotation)
-                    self.photo_aspect_ratio = PhotoAspectRatio::default_for_frame_with_rotation(
-                        fmt.width,
-                        fmt.height,
-                        self.current_camera_rotation(),
-                    );
+                    self.photo_aspect_ratio = self.config.photo_aspect_ratio;
                 }
                 self.zoom_level = 1.0; // Reset zoom when changing resolution
                 self.save_settings();
@@ -333,12 +326,7 @@ impl AppModel {
 
             if let Some(fmt) = &self.active_format {
                 info!(format = %fmt, "Selected format from picker");
-                // Update aspect ratio default for new dimensions (accounting for rotation)
-                self.photo_aspect_ratio = PhotoAspectRatio::default_for_frame_with_rotation(
-                    fmt.width,
-                    fmt.height,
-                    self.current_camera_rotation(),
-                );
+                self.photo_aspect_ratio = self.config.photo_aspect_ratio;
             }
             self.zoom_level = 1.0; // Reset zoom when changing format
             self.save_settings();

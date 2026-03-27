@@ -328,6 +328,7 @@ impl cosmic::Application for AppModel {
         let has_preview_source = preview_file_source.is_some();
         // Construct the app model with the runtime's core.
         let initial_mode = config.default_mode;
+        let initial_aspect_ratio = config.photo_aspect_ratio;
         let virtual_camera_enabled = config.virtual_camera_enabled;
         let mut app = AppModel {
             core,
@@ -406,7 +407,7 @@ impl cosmic::Application for AppModel {
             photo_timer_setting: PhotoTimerSetting::default(),
             photo_timer_countdown: None,
             photo_timer_tick_start: None,
-            photo_aspect_ratio: PhotoAspectRatio::default(),
+            photo_aspect_ratio: initial_aspect_ratio,
             zoom_level: 1.0,
             last_bug_report_path: None,
             last_media_path: None,
