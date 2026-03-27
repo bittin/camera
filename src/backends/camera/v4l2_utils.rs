@@ -221,6 +221,24 @@ pub fn find_v4l2_device_for_libcamera(camera_id: &str) -> Option<String> {
             continue;
         }
 
+        // Verify this device actually has enumerable formats.
+        // Some UVC cameras expose multiple /dev/videoX nodes where one is
+        // metadata-only and reports no formats despite having VIDEO_CAPTURE.
+        let mut fmtdesc: V4l2Fmtdesc = unsafe { std::mem::zeroed() };
+        fmtdesc.index = 0;
+        fmtdesc.buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        let has_formats = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                VIDIOC_ENUM_FMT as _,
+                &mut fmtdesc as *mut _,
+            )
+        } >= 0;
+        if !has_formats {
+            debug!(device = %dev_path, "V4L2 device has no formats, skipping");
+            continue;
+        }
+
         debug!(camera_id, device = %dev_path, "Found V4L2 device for libcamera camera");
         return Some(dev_path);
     }
@@ -318,4 +336,192 @@ pub fn supports_multistream(pipeline_handler: Option<&str>) -> bool {
     // handlers like "vc4", "ipu3", "rkisp1") support ViewFinder + Raw dual-stream.
     // If no handler is known, assume single-stream to be safe.
     pipeline_handler.is_some()
+}
+
+// ===== V4L2 Format Enumeration =====
+
+/// VIDIOC_ENUM_FMT ioctl number (v4l2_fmtdesc: 64 bytes, nr=2)
+const VIDIOC_ENUM_FMT: libc::c_ulong = 0xC0405602;
+
+/// VIDIOC_ENUM_FRAMESIZES ioctl number (v4l2_frmsizeenum: 44 bytes, nr=74)
+const VIDIOC_ENUM_FRAMESIZES: libc::c_ulong = 0xC02C564A;
+
+/// VIDIOC_ENUM_FRAMEINTERVALS ioctl number (v4l2_frmivalenum: 52 bytes, nr=75)
+const VIDIOC_ENUM_FRAMEINTERVALS: libc::c_ulong = 0xC034564B;
+
+/// V4L2 buffer type for video capture
+const V4L2_BUF_TYPE_VIDEO_CAPTURE: u32 = 1;
+
+/// Frame size type: discrete
+const V4L2_FRMSIZE_TYPE_DISCRETE: u32 = 1;
+
+/// Frame interval type: discrete
+const V4L2_FRMIVAL_TYPE_DISCRETE: u32 = 1;
+
+/// V4L2 format description structure
+#[repr(C)]
+struct V4l2Fmtdesc {
+    index: u32,
+    buf_type: u32,
+    flags: u32,
+    description: [u8; 32],
+    pixelformat: u32,
+    mbus_code: u32,
+    reserved: [u32; 3],
+}
+
+/// V4L2 discrete frame size within frmsizeenum union
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct V4l2FrmsizeDiscrete {
+    width: u32,
+    height: u32,
+}
+
+/// V4L2 frame size enumeration structure
+#[repr(C)]
+struct V4l2Frmsizeenum {
+    index: u32,
+    pixel_format: u32,
+    size_type: u32,
+    discrete: V4l2FrmsizeDiscrete,
+    _reserved: [u32; 6],
+}
+
+/// V4L2 fraction (for frame intervals)
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct V4l2Fract {
+    numerator: u32,
+    denominator: u32,
+}
+
+/// V4L2 frame interval enumeration structure
+#[repr(C)]
+struct V4l2Frmivalenum {
+    index: u32,
+    pixel_format: u32,
+    width: u32,
+    height: u32,
+    interval_type: u32,
+    discrete: V4l2Fract,
+    _reserved: [u32; 6],
+}
+
+/// A single V4L2 format with resolution and frame rates
+#[derive(Debug, Clone)]
+pub struct V4l2FormatInfo {
+    /// FourCC string (e.g., "MJPG", "YUYV", "H264")
+    pub fourcc: String,
+    /// Human-readable description from the driver
+    pub description: String,
+    /// Available resolutions with their frame rates
+    pub sizes: Vec<V4l2SizeInfo>,
+}
+
+/// A resolution with its available frame rates
+#[derive(Debug, Clone)]
+pub struct V4l2SizeInfo {
+    pub width: u32,
+    pub height: u32,
+    /// Frame rates as (numerator, denominator) fractions
+    pub framerates: Vec<(u32, u32)>,
+}
+
+/// Convert a V4L2 pixelformat u32 to a FourCC string
+fn fourcc_to_string(fourcc: u32) -> String {
+    let bytes = fourcc.to_le_bytes();
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Enumerate all V4L2 formats, resolutions, and frame rates for a device.
+///
+/// Returns an empty Vec if the device cannot be opened or doesn't support
+/// format enumeration.
+pub fn enumerate_v4l2_formats(device_path: &str) -> Vec<V4l2FormatInfo> {
+    let file = match std::fs::File::open(device_path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let fd = file.as_raw_fd();
+    let mut formats = Vec::new();
+
+    // Enumerate pixel formats
+    for fmt_idx in 0u32..64 {
+        let mut fmtdesc: V4l2Fmtdesc = unsafe { std::mem::zeroed() };
+        fmtdesc.index = fmt_idx;
+        fmtdesc.buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+
+        let ret = unsafe { libc::ioctl(fd, VIDIOC_ENUM_FMT as _, &mut fmtdesc as *mut _) };
+        if ret < 0 {
+            break;
+        }
+
+        let fourcc = fourcc_to_string(fmtdesc.pixelformat);
+        let desc_len = fmtdesc
+            .description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(32);
+        let description = String::from_utf8_lossy(&fmtdesc.description[..desc_len]).to_string();
+
+        // Enumerate frame sizes for this format
+        let mut sizes = Vec::new();
+        for size_idx in 0u32..256 {
+            let mut frmsize: V4l2Frmsizeenum = unsafe { std::mem::zeroed() };
+            frmsize.index = size_idx;
+            frmsize.pixel_format = fmtdesc.pixelformat;
+
+            let ret =
+                unsafe { libc::ioctl(fd, VIDIOC_ENUM_FRAMESIZES as _, &mut frmsize as *mut _) };
+            if ret < 0 {
+                break;
+            }
+
+            if frmsize.size_type != V4L2_FRMSIZE_TYPE_DISCRETE {
+                break; // Only handle discrete sizes
+            }
+
+            let width = frmsize.discrete.width;
+            let height = frmsize.discrete.height;
+
+            // Enumerate frame intervals for this format+size
+            let mut framerates = Vec::new();
+            for ival_idx in 0u32..64 {
+                let mut frmival: V4l2Frmivalenum = unsafe { std::mem::zeroed() };
+                frmival.index = ival_idx;
+                frmival.pixel_format = fmtdesc.pixelformat;
+                frmival.width = width;
+                frmival.height = height;
+
+                let ret = unsafe {
+                    libc::ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS as _, &mut frmival as *mut _)
+                };
+                if ret < 0 {
+                    break;
+                }
+
+                if frmival.interval_type != V4L2_FRMIVAL_TYPE_DISCRETE {
+                    break;
+                }
+
+                // Frame interval is numerator/denominator (e.g., 1/30 = 30fps)
+                framerates.push((frmival.discrete.numerator, frmival.discrete.denominator));
+            }
+
+            sizes.push(V4l2SizeInfo {
+                width,
+                height,
+                framerates,
+            });
+        }
+
+        formats.push(V4l2FormatInfo {
+            fourcc,
+            description,
+            sizes,
+        });
+    }
+
+    formats
 }

@@ -840,6 +840,56 @@ impl BugReportGenerator {
             ));
         }
 
+        // V4L2 device formats
+        if !insights.v4l2_formats.is_empty() {
+            for fmt in &insights.v4l2_formats {
+                info.push_str(&format!(
+                    "\n### V4L2: {} ({})\n\n",
+                    fmt.fourcc.trim(),
+                    fmt.description
+                ));
+                let fourcc_trimmed = fmt.fourcc.trim();
+                let mut sorted_sizes = fmt.sizes.clone();
+                sorted_sizes.sort_by(|a, b| (b.width * b.height).cmp(&(a.width * a.height)));
+                for size in &sorted_sizes {
+                    let in_libcamera = insights.libcamera_formats.iter().any(|lf| {
+                        lf.width == size.width
+                            && lf.height == size.height
+                            && (lf.pixel_format.eq_ignore_ascii_case(fourcc_trimmed)
+                                || matches!(
+                                    (lf.pixel_format.as_str(), fourcc_trimmed),
+                                    ("MJPEG", "MJPG") | ("MJPG", "MJPEG")
+                                ))
+                    });
+                    let status = if in_libcamera {
+                        "\u{2713} libcamera"
+                    } else {
+                        "\u{2717} not in libcamera"
+                    };
+                    if size.framerates.is_empty() {
+                        info.push_str(&format!("- {}x{} — {}\n", size.width, size.height, status));
+                    } else {
+                        for &(num, denom) in &size.framerates {
+                            let fps = if num > 0 {
+                                let fps = denom as f64 / num as f64;
+                                if fps == fps.round() {
+                                    format!("{} fps", fps as u32)
+                                } else {
+                                    format!("{:.2} fps", fps)
+                                }
+                            } else {
+                                "? fps".to_string()
+                            };
+                            info.push_str(&format!(
+                                "- {}x{} @ {} — {}\n",
+                                size.width, size.height, fps, status
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         info.push('\n');
         info
     }

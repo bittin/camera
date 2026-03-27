@@ -648,6 +648,7 @@ impl AppModel {
     pub(crate) fn handle_update_insights_metrics(&mut self) -> Task<cosmic::Action<Message>> {
         self.update_insights_pipeline();
         self.update_insights_backend();
+        self.update_insights_measured_fps();
         self.update_insights_format_chain();
         self.update_insights_performance();
         self.update_insights_frame_metadata();
@@ -689,6 +690,18 @@ impl AppModel {
             self.insights.libcamera_version = camera.libcamera_version.clone();
             self.insights.sensor_model = camera.sensor_model.clone();
             self.insights.libcamera_multistream_capable = camera.pipeline_handler.is_some();
+
+            // Populate V4L2 format list (refresh when camera changes)
+            let current_v4l2_path = camera.v4l2_path().unwrap_or("").to_string();
+            if self.insights.v4l2_formats_device != current_v4l2_path {
+                self.insights.v4l2_formats_device = current_v4l2_path.clone();
+                self.insights.v4l2_formats = if !current_v4l2_path.is_empty() {
+                    crate::backends::camera::v4l2_utils::enumerate_v4l2_formats(&current_v4l2_path)
+                } else {
+                    Vec::new()
+                };
+                self.insights.libcamera_formats = self.available_formats.clone();
+            }
         }
 
         self.insights.mjpeg_decoder = diag::get_mjpeg_decoder();
@@ -732,6 +745,29 @@ impl AppModel {
         } else if !self.insights.is_multistream {
             self.insights.capture_stream = None;
         }
+    }
+
+    fn update_insights_measured_fps(&mut self) {
+        let current_count = self
+            .insights
+            .preview_stream
+            .as_ref()
+            .map(|s| s.frame_count)
+            .unwrap_or(0);
+        let now = std::time::Instant::now();
+
+        if let Some(prev_instant) = self.insights.prev_fps_instant {
+            let elapsed = now.duration_since(prev_instant).as_secs_f64();
+            let delta = current_count.saturating_sub(self.insights.prev_frame_count);
+            if elapsed > 0.1 && delta > 0 {
+                let instantaneous = delta as f64 / elapsed;
+                // Exponential moving average for stability (alpha=0.3)
+                self.insights.measured_fps = self.insights.measured_fps * 0.7 + instantaneous * 0.3;
+            }
+        }
+
+        self.insights.prev_frame_count = current_count;
+        self.insights.prev_fps_instant = Some(now);
     }
 
     fn update_insights_format_chain(&mut self) {

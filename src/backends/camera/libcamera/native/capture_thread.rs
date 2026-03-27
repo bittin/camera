@@ -42,15 +42,24 @@ pub(crate) struct CaptureThreadInitResult {
     pub(crate) is_multistream: bool,
 }
 
-/// Extract the number of bytes actually written to the first plane of a frame buffer.
-/// Falls back to the full plane length if metadata is unavailable.
-fn plane_bytes_used(
+/// Extract the number of bytes actually written to each plane of a frame buffer.
+/// Returns a Vec with one entry per plane. Falls back to `fallback_lens` if
+/// metadata is unavailable.
+fn planes_bytes_used(
     buf: &impl libcamera::framebuffer::AsFrameBuffer,
-    fallback_len: usize,
-) -> usize {
-    buf.metadata()
-        .and_then(|m| m.planes().into_iter().next().map(|p| p.bytes_used as usize))
-        .unwrap_or(fallback_len)
+    fallback_lens: &[usize],
+) -> Vec<usize> {
+    if let Some(meta) = buf.metadata() {
+        let meta_planes: Vec<usize> = meta
+            .planes()
+            .into_iter()
+            .map(|p| p.bytes_used as usize)
+            .collect();
+        if !meta_planes.is_empty() {
+            return meta_planes;
+        }
+    }
+    fallback_lens.to_vec()
 }
 
 /// Memory-map a vec of frame buffers, returning an error with the given label on failure.
@@ -251,14 +260,32 @@ fn process_buffer(
 
     let buf = req.buffer::<MmapFB>(stream)?;
     let planes = buf.data();
-    let plane_data = planes.first()?;
-    let bytes_used = plane_bytes_used(buf, plane_data.len());
-    if bytes_used == 0 {
+    if planes.is_empty() {
         return None;
     }
 
-    let data_slice = &plane_data[..bytes_used.min(plane_data.len())];
-    let data: Arc<[u8]> = Arc::from(data_slice);
+    let fallback_lens: Vec<usize> = planes.iter().map(|p| p.len()).collect();
+    let used = planes_bytes_used(buf, &fallback_lens);
+
+    // Concatenate all mmap planes into a single contiguous buffer.
+    // libcamera may return multi-plane formats (e.g. NV12) as separate
+    // mmap regions depending on the driver/platform.
+    let total_bytes: usize = used.iter().sum();
+    if total_bytes == 0 {
+        return None;
+    }
+
+    let data: Arc<[u8]> = if planes.len() == 1 {
+        let bytes = used[0].min(planes[0].len());
+        Arc::from(&planes[0][..bytes])
+    } else {
+        let mut combined = Vec::with_capacity(total_bytes);
+        for (plane, &bytes) in planes.iter().zip(used.iter()) {
+            let bytes = bytes.min(plane.len());
+            combined.extend_from_slice(&plane[..bytes]);
+        }
+        Arc::from(combined)
+    };
 
     let stride = if config_stride > 0 {
         config_stride
@@ -793,14 +820,17 @@ fn run_capture_loop(
             // Extract kernel buffer timestamp (CLOCK_BOOTTIME ns) for video recording PTS
             let sensor_timestamp_ns = vf_buf.metadata().map(|m| m.timestamp());
             let planes = vf_buf.data();
-            if let Some(plane_data) = planes.first() {
-                let bytes_used = plane_bytes_used(vf_buf, plane_data.len());
+            if !planes.is_empty() {
+                let fallback_lens: Vec<usize> = planes.iter().map(|p| p.len()).collect();
+                let used = planes_bytes_used(vf_buf, &fallback_lens);
+                let total_bytes_used: usize = used.iter().sum();
 
                 let expected_size = formats.vf_stride as usize * formats.vf_size.height as usize;
                 if frame_num == 0 {
                     info!(
-                        bytes_used,
-                        plane_len = plane_data.len(),
+                        bytes_used = total_bytes_used,
+                        num_planes = planes.len(),
+                        plane_lens = ?fallback_lens,
                         expected_size,
                         vf_stride = formats.vf_stride,
                         width = formats.vf_size.width,
@@ -810,13 +840,27 @@ fn run_capture_loop(
                 }
 
                 // Skip frames with no data (e.g. first frame from some UVC cameras)
-                if bytes_used == 0 {
+                if total_bytes_used == 0 {
                     req.reuse(ReuseFlag::REUSE_BUFFERS);
                     requeue_request(active_cam, req, &params.stop_flag);
                     continue;
                 }
 
-                let data_slice = &plane_data[..bytes_used.min(plane_data.len())];
+                // Concatenate all mmap planes into a single contiguous buffer.
+                // libcamera may return multi-plane formats (e.g. NV12) as separate
+                // mmap regions depending on the driver/platform.
+                let combined_data: Vec<u8> = if planes.len() == 1 {
+                    let bytes = used[0].min(planes[0].len());
+                    planes[0][..bytes].to_vec()
+                } else {
+                    let mut combined = Vec::with_capacity(total_bytes_used);
+                    for (plane, &bytes) in planes.iter().zip(used.iter()) {
+                        let bytes = bytes.min(plane.len());
+                        combined.extend_from_slice(&plane[..bytes]);
+                    }
+                    combined
+                };
+                let data_slice = combined_data.as_slice();
 
                 // If JPEG recording mode is active and this is an MJPEG stream,
                 // send raw JPEG bytes to the recorder BEFORE the CPU decode.

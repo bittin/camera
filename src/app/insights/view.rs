@@ -11,6 +11,44 @@ use cosmic::widget;
 
 use super::types::FallbackState;
 
+/// Theme-aware destructive/error text style.
+fn error_text_style(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Style {
+    cosmic::iced::widget::text::Style {
+        color: Some(cosmic::iced::Color::from(
+            theme.cosmic().destructive_color(),
+        )),
+    }
+}
+
+/// Create a status text widget, styled based on availability and active state.
+fn v4l2_status_text(text: String, available: bool, is_active: bool) -> Element<'static, Message> {
+    if is_active {
+        widget::text::body(text)
+            .class(cosmic::theme::style::Text::Accent)
+            .into()
+    } else if available {
+        widget::text::body(text).into()
+    } else {
+        widget::text::body(text)
+            .class(cosmic::theme::style::iced::Text::Custom(error_text_style))
+            .into()
+    }
+}
+
+/// Check if a libcamera pixel format name matches a V4L2 FourCC string.
+///
+/// libcamera may use different names (e.g., "MJPEG" vs V4L2's "MJPG").
+fn format_matches_fourcc(libcamera_fmt: &str, v4l2_fourcc: &str) -> bool {
+    if libcamera_fmt.eq_ignore_ascii_case(v4l2_fourcc) {
+        return true;
+    }
+    // Common aliases between libcamera and V4L2
+    matches!(
+        (libcamera_fmt, v4l2_fourcc),
+        ("MJPEG", "MJPG") | ("MJPG", "MJPEG")
+    )
+}
+
 impl AppModel {
     /// Create the insights view for the context drawer
     ///
@@ -59,6 +97,11 @@ impl AppModel {
         // Per-frame metadata section (libcamera only)
         if self.insights.has_libcamera_metadata {
             sections.push(self.build_metadata_section().into());
+        }
+
+        // V4L2 device formats sections (one per pixel format)
+        for fmt in &self.insights.v4l2_formats {
+            sections.push(self.build_v4l2_format_section(fmt).into());
         }
 
         let content: Element<'_, Message> = widget::settings::view_column(sections).into();
@@ -253,7 +296,7 @@ impl AppModel {
 
     /// Add stream info items to a section
     fn add_stream_items<'a>(
-        &self,
+        &'a self,
         mut section: widget::settings::Section<'a, Message>,
         stream: &'a super::types::StreamInfo,
     ) -> widget::settings::Section<'a, Message> {
@@ -265,6 +308,22 @@ impl AppModel {
             widget::settings::item::builder(fl!("insights-stream-resolution"))
                 .control(widget::text::body(&stream.resolution)),
         );
+        // Show configured framerate, or measured FPS from frame count
+        let framerate_text = if self.insights.format_chain.framerate != "N/A"
+            && !self.insights.format_chain.framerate.is_empty()
+        {
+            self.insights.format_chain.framerate.clone()
+        } else if self.insights.measured_fps > 0.0 {
+            format!("{:.1} fps (measured)", self.insights.measured_fps)
+        } else {
+            String::new()
+        };
+        if !framerate_text.is_empty() {
+            section = section.add(
+                widget::settings::item::builder(fl!("insights-format-framerate"))
+                    .control(widget::text::body(framerate_text)),
+            );
+        }
         section = section.add(
             widget::settings::item::builder(fl!("insights-stream-pixel-format"))
                 .control(widget::text::body(&stream.pixel_format)),
@@ -800,6 +859,90 @@ impl AppModel {
             }))
             .width(Length::Fixed(bar_width))
             .into()
+    }
+
+    /// Build a V4L2 format section for a single pixel format (e.g., MJPG, YUYV, H264).
+    /// Each resolution+framerate combination gets its own row.
+    fn build_v4l2_format_section(
+        &self,
+        fmt: &crate::backends::camera::v4l2_utils::V4l2FormatInfo,
+    ) -> widget::settings::Section<'_, Message> {
+        let title = format!("{} ({})", fmt.fourcc.trim(), fmt.description);
+        let mut section = widget::settings::section().title(title);
+        let fourcc_trimmed = fmt.fourcc.trim();
+
+        // Get the actual running stream info for highlighting.
+        // Use preview_stream (the actual negotiated format) rather than active_format
+        // (user-selected format) since libcamera may negotiate differently
+        // (e.g., user selects YUYV but libcamera uses MJPEG for better framerate).
+        let stream = self.insights.preview_stream.as_ref();
+
+        let mut sorted_sizes = fmt.sizes.clone();
+        sorted_sizes.sort_by(|a, b| (b.width * b.height).cmp(&(a.width * a.height)));
+
+        for size in &sorted_sizes {
+            let in_libcamera = self.insights.libcamera_formats.iter().any(|lf| {
+                lf.width == size.width
+                    && lf.height == size.height
+                    && format_matches_fourcc(&lf.pixel_format, fourcc_trimmed)
+            });
+
+            // Check if this resolution+format matches the actual running stream.
+            // The stream pixel_format may be e.g. "I422 (MJPEG)" or "NV12",
+            // so check if it contains the V4L2 fourcc or its alias.
+            let is_active_resolution = stream.is_some_and(|s| {
+                let res_parts: Vec<&str> = s.resolution.split('x').collect();
+                let matches_res = res_parts.len() == 2
+                    && res_parts[0].parse::<u32>().ok() == Some(size.width)
+                    && res_parts[1].parse::<u32>().ok() == Some(size.height);
+                let stream_fmt = &s.pixel_format;
+                let matches_fmt = stream_fmt.eq_ignore_ascii_case(fourcc_trimmed)
+                    || stream_fmt.contains(fourcc_trimmed)
+                    || (fourcc_trimmed == "MJPG"
+                        && (stream_fmt.contains("MJPEG") || stream_fmt.contains("MJPG")))
+                    || (fourcc_trimmed == "YUYV" && stream_fmt.contains("YUYV"));
+                matches_res && matches_fmt
+            });
+
+            let status_text = if is_active_resolution {
+                format!("\u{2713} {}", fl!("insights-v4l2-active-in-libcamera"))
+            } else if in_libcamera {
+                format!("\u{2713} {}", fl!("insights-v4l2-in-libcamera"))
+            } else {
+                format!("\u{2717} {}", fl!("insights-v4l2-not-in-libcamera"))
+            };
+
+            let resolution_label = format!("{}x{}", size.width, size.height);
+
+            if size.framerates.is_empty() {
+                let status_widget =
+                    v4l2_status_text(status_text, in_libcamera, is_active_resolution);
+                section = section
+                    .add(widget::settings::item::builder(resolution_label).control(status_widget));
+            } else {
+                for &(num, denom) in &size.framerates {
+                    let fps = if num > 0 {
+                        let fps = denom as f64 / num as f64;
+                        if fps == fps.round() {
+                            format!("{} fps", fps as u32)
+                        } else {
+                            format!("{:.2} fps", fps)
+                        }
+                    } else {
+                        "? fps".to_string()
+                    };
+
+                    let row_status =
+                        v4l2_status_text(status_text.clone(), in_libcamera, is_active_resolution);
+                    section = section.add(
+                        widget::settings::item::builder(format!("{} @ {}", resolution_label, fps))
+                            .control(row_status),
+                    );
+                }
+            }
+        }
+
+        section
     }
 
     /// Build the Backend section (libcamera-specific info)
