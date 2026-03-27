@@ -982,6 +982,8 @@ pub enum PhotoAspectRatio {
     Ratio4x3,
     /// 16:9 aspect ratio
     Ratio16x9,
+    /// 2:1 aspect ratio (18:9)
+    Ratio2x1,
     /// 1:1 square aspect ratio
     Ratio1x1,
 }
@@ -1003,6 +1005,8 @@ impl PhotoAspectRatio {
             Some(PhotoAspectRatio::Ratio4x3)
         } else if (frame_ratio - 16.0 / 9.0).abs() < Self::RATIO_TOLERANCE {
             Some(PhotoAspectRatio::Ratio16x9)
+        } else if (frame_ratio - 2.0).abs() < Self::RATIO_TOLERANCE {
+            Some(PhotoAspectRatio::Ratio2x1)
         } else if (frame_ratio - 1.0).abs() < Self::RATIO_TOLERANCE {
             Some(PhotoAspectRatio::Ratio1x1)
         } else {
@@ -1024,7 +1028,8 @@ impl PhotoAspectRatio {
         match self {
             PhotoAspectRatio::Native => PhotoAspectRatio::Ratio4x3,
             PhotoAspectRatio::Ratio4x3 => PhotoAspectRatio::Ratio16x9,
-            PhotoAspectRatio::Ratio16x9 => PhotoAspectRatio::Ratio1x1,
+            PhotoAspectRatio::Ratio16x9 => PhotoAspectRatio::Ratio2x1,
+            PhotoAspectRatio::Ratio2x1 => PhotoAspectRatio::Ratio1x1,
             PhotoAspectRatio::Ratio1x1 => {
                 if native_matches_defined {
                     // Skip Native, go directly to 4:3
@@ -1042,6 +1047,7 @@ impl PhotoAspectRatio {
             PhotoAspectRatio::Native => None,
             PhotoAspectRatio::Ratio4x3 => Some(4.0 / 3.0),
             PhotoAspectRatio::Ratio16x9 => Some(16.0 / 9.0),
+            PhotoAspectRatio::Ratio2x1 => Some(2.0),
             PhotoAspectRatio::Ratio1x1 => Some(1.0),
         }
     }
