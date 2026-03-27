@@ -294,6 +294,13 @@ settings-timelapse = Timelapse
 settings-timelapse-interval = Interval
 settings-timelapse-interval-description = Time between consecutive photo captures
 
+# Insights - V4L2 Formats
+insights-v4l2-formats = V4L2 Device Formats
+insights-v4l2-no-device = No V4L2 device
+insights-v4l2-in-libcamera = Available in libcamera
+insights-v4l2-active-in-libcamera = Active in libcamera
+insights-v4l2-not-in-libcamera = Not available in libcamera
+
 # Insights - Capture
 insights-capture = Capture
 insights-capture-burst = Capture Burst

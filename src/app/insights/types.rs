@@ -24,6 +24,14 @@ pub struct InsightsState {
     /// Current format pipeline information
     pub format_chain: FormatChain,
 
+    // Measured framerate (computed from frame count deltas)
+    /// Measured FPS from preview stream frame count
+    pub measured_fps: f64,
+    /// Previous frame count for FPS calculation
+    pub prev_frame_count: u64,
+    /// Timestamp of previous FPS measurement
+    pub prev_fps_instant: Option<std::time::Instant>,
+
     // Performance metrics
     /// Frame latency in microseconds
     pub frame_latency_us: u64,
@@ -90,6 +98,14 @@ pub struct InsightsState {
     // Audio levels (snapshot from SharedAudioLevels)
     /// Last polled audio level data (updated by insights tick)
     pub audio_levels: Option<AudioLevels>,
+
+    // V4L2 format enumeration
+    /// All V4L2 formats reported by the kernel driver
+    pub v4l2_formats: Vec<crate::backends::camera::v4l2_utils::V4l2FormatInfo>,
+    /// Formats available through libcamera (for comparison)
+    pub libcamera_formats: Vec<crate::backends::camera::types::CameraFormat>,
+    /// V4L2 device path that was used to populate v4l2_formats (for cache invalidation)
+    pub v4l2_formats_device: String,
 
     // Multi-stream info
     /// Whether dual-stream mode is active
