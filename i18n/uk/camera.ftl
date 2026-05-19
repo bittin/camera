@@ -10,7 +10,7 @@ git-description = Git {$hash} від {$date}
 mode-video = Відео
 mode-photo = Знімок
 mode-timelapse = Прискорено
-timelapse-saving = Збереження відео...
+timelapse-saving = Збирання запису...
 mode-virtual = Віртуальна
 mode-view = Вид
 
@@ -253,7 +253,7 @@ insights-recording-resolution = Роздільна здатність
 insights-recording-framerate = Частота кадрів
 insights-recording-capture = Потік захоплення
 insights-recording-channel = Канал
-insights-recording-pusher = Надсилання appsrc
+insights-recording-pusher = Передача appsrc
 insights-recording-fps = Ефективний FPS
 insights-recording-delay = Затримка обробки
 insights-recording-convert = Перетворення NV12
@@ -292,7 +292,7 @@ insights-meta-focus-fom = Показник фокуса
 insights-meta-na = N/A
 
 # Timelapse
-settings-timelapse = Уповільнення
+settings-timelapse = Прискорення (інтервальна зйомка)
 settings-timelapse-interval = Інтервал
 settings-timelapse-interval-description = Час між послідовними знімками
 
