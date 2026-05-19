@@ -1536,7 +1536,7 @@ impl VideoRecorder {
         if let Some(bus) = self.pipeline.bus() {
             info!("Waiting for pipeline EOS on bus...");
             match bus.timed_pop_filtered(
-                gst::ClockTime::from_seconds(10),
+                gst::ClockTime::from_seconds(60),
                 &[gst::MessageType::Eos, gst::MessageType::Error],
             ) {
                 Some(msg) => match msg.view() {
@@ -1555,7 +1555,7 @@ impl VideoRecorder {
                     _ => {}
                 },
                 None => {
-                    warn!("Timeout (10s) waiting for pipeline EOS, forcing shutdown");
+                    warn!("Timeout (60s) waiting for pipeline EOS, forcing shutdown");
                     eos_timeout = true;
                 }
             }
