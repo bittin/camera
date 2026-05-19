@@ -9,7 +9,7 @@ git-description = Git {$hash} від {$date}
 # Mode switcher
 mode-video = Відео
 mode-photo = Знімок
-mode-timelapse = Уповільнено
+mode-timelapse = Прискорено
 timelapse-saving = Збереження відео...
 mode-virtual = Віртуальна
 mode-view = Вид
