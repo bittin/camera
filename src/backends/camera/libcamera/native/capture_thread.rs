@@ -888,7 +888,7 @@ fn run_capture_loop(
                             crate::pipelines::video::recorder::rec_stats_capture_sent();
                         }
                         if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-                            warn!(
+                            debug!(
                                 frame = frame_num,
                                 seq = ?seq,
                                 sensor_ts_ms = ?sensor_timestamp_ns.map(|t| t / 1_000_000),
@@ -1058,7 +1058,7 @@ fn dispatch_viewfinder_frame(
             crate::pipelines::video::recorder::rec_stats_capture_sent();
         }
         if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-            warn!(
+            debug!(
                 frame = frame_num,
                 seq = ?seq,
                 sensor_ts_ms = ?frame.sensor_timestamp_ns.map(|t| t / 1_000_000),

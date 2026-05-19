@@ -587,7 +587,7 @@ fn compute_pts(
     let (first_ts, pts_base) = *ts_offset.get_or_insert((ts, rt.saturating_sub(processing_delay)));
     let pts = pts_base + ts.saturating_sub(first_ts);
     if is_first {
-        warn!(
+        info!(
             running_time_ms = rt / 1_000_000,
             processing_delay_ms = processing_delay / 1_000_000,
             pts_base_ms = pts_base / 1_000_000,
@@ -656,7 +656,7 @@ fn install_muxer_fixup_probes(pipeline: &gst::Pipeline) {
             if n < 3
                 && let Some(buffer) = info.buffer()
             {
-                warn!(
+                debug!(
                     pad = pad_name.as_str(),
                     frame = n,
                     pts_ms = buffer.pts().map(|p| p.mseconds()),
@@ -789,7 +789,7 @@ where
             frame_count += 1;
             if frame_count.is_multiple_of(LOG_EVERY_N_FRAMES) {
                 let elapsed = start_time.elapsed().as_secs_f64();
-                warn!(
+                debug!(
                     label,
                     frames = frame_count,
                     seq = ?sequence,
@@ -1106,7 +1106,7 @@ impl VideoRecorder {
                 frame_count += 1;
                 if frame_count.is_multiple_of(LOG_EVERY_N_FRAMES) {
                     let elapsed = start_time.elapsed().as_secs_f64();
-                    warn!(
+                    debug!(
                         frames = frame_count,
                         seq = ?sequence,
                         sensor_ts_ms = ?sensor_ts.map(|t| t / 1_000_000),
@@ -1259,7 +1259,7 @@ impl VideoRecorder {
         info!(desc = %pipeline_desc, "Launching JPEG zero-copy pipeline");
 
         if setup.audio_elements.is_some() {
-            warn!("A/V sync: audio branch active, video PTS compensated in compute_pts");
+            info!("A/V sync: audio branch active, video PTS compensated in compute_pts");
         }
 
         let (pipeline, appsrc) = build_recorder_pipeline(
