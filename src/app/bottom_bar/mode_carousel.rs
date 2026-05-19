@@ -658,7 +658,7 @@ impl<'a> Widget<Message, Theme, Renderer> for ModeCarousel<'a> {
         let state = tree.state.downcast_mut::<CarouselState>();
 
         // Tick animations here — update() runs on events including redraw requests.
-        if tick_animations(state, &self.modes, self.selected_index()) {
+        if tick_animations(state, &self.modes, self.selected_index(), shell) {
             shell.request_redraw();
         }
 
@@ -1023,9 +1023,17 @@ fn total_strip_width(state: &CarouselState) -> f32 {
     total + (state.label_widths.len() - 1) as f32 * LABEL_GAP
 }
 
-/// Tick all animations forward. Called from layout() (runs every frame) and
-/// update() (runs on events). Returns true if more frames are needed.
-fn tick_animations(state: &mut CarouselState, modes: &[CameraMode], selected_idx: usize) -> bool {
+/// Tick all animations forward. Called from update() (runs on events,
+/// including each requested redraw frame). Returns `true` if a next-frame
+/// redraw is required for an active animation; for idle delay timers it
+/// instead schedules a single one-shot wake-up on `shell` so we don't
+/// repaint at vsync rate while only counting down a timer.
+fn tick_animations(
+    state: &mut CarouselState,
+    modes: &[CameraMode],
+    selected_idx: usize,
+    shell: &mut Shell<'_, Message>,
+) -> bool {
     let mut needs_redraw = false;
 
     // Compute delta time for frame-rate independent spring.
@@ -1097,7 +1105,11 @@ fn tick_animations(state: &mut CarouselState, modes: &[CameraMode], selected_idx
             start_full_expand(state);
             needs_redraw = true;
         } else if state.full_expand_t < 0.01 && state.full_expand_start.is_none() {
-            needs_redraw = true;
+            // Idle wait for the hold threshold: schedule a single wake-up at
+            // the deadline instead of polling every frame.
+            shell.request_redraw_at(
+                press_time + std::time::Duration::from_millis(HOLD_TO_FULL_EXPAND_MS as u64),
+            );
         }
     }
 
@@ -1113,7 +1125,10 @@ fn tick_animations(state: &mut CarouselState, modes: &[CameraMode], selected_idx
             }
             needs_redraw = true;
         } else {
-            needs_redraw = true;
+            // Idle wait — schedule a single redraw at the deadline.
+            shell.request_redraw_at(
+                leave_time + std::time::Duration::from_millis(HOVER_LEAVE_COLLAPSE_DELAY_MS as u64),
+            );
         }
     }
 
@@ -1128,7 +1143,11 @@ fn tick_animations(state: &mut CarouselState, modes: &[CameraMode], selected_idx
             start_collapse(state);
             needs_redraw = true;
         } else {
-            needs_redraw = true;
+            // Idle wait — schedule a single redraw at the deadline.
+            shell.request_redraw_at(
+                done_time
+                    + std::time::Duration::from_millis(STAGE1_COLLAPSE_AFTER_STAGE2_MS as u64),
+            );
         }
     }
 
