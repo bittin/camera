@@ -8,6 +8,11 @@ repository = "https://github.com/cosmic-utils/camera"
 authors = ["Frederic Laing <frederic.laing.development@gmail.com>"]
 
 [dependencies]
+# Pure-Rust client for the PulseAudio wire protocol. Used to enumerate audio
+# sources and to boost the selected source to 100% before recording — avoids
+# shelling out to `pactl`/`pw-dump`, which are not shipped inside the
+# `org.freedesktop.Platform` flatpak runtime.
+pulseaudio = "0.3"
 futures = "0.3.32"
 i18n-embed = { version = "0.16.0", features = [
     "fluent-system",

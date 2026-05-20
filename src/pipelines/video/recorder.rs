@@ -217,6 +217,11 @@ pub struct RecorderConfig<'a> {
     pub enable_audio: bool,
     /// Optional audio device path
     pub audio_device: Option<&'a str>,
+    /// Native sample rate (Hz) of the selected audio source. Used to pin the
+    /// audio capsfilter so PulseAudio passes through unchanged when Opus
+    /// accepts the rate, and avoids a GStreamer `audioresample` element.
+    /// `0` means "unknown" and falls back to 48 kHz.
+    pub audio_source_rate_hz: u32,
     /// Specific encoder info (if None, auto-select)
     pub encoder_info: Option<&'a crate::media::encoders::video::EncoderInfo>,
     /// Sensor rotation to correct video orientation
@@ -247,6 +252,11 @@ pub struct AppsrcRecorderConfig<'a> {
 pub struct VideoRecorder {
     pipeline: gst::Pipeline,
     file_path: PathBuf,
+    /// Lifetime-tied PA source-volume restore. Constructed when a non-default
+    /// audio device is configured; dropping (here or when `VideoRecorder`
+    /// drops) restores the user's prior PA volume. `None` for default-device
+    /// recordings or when the PulseAudio socket is unreachable.
+    _pulse_volume_guard: Option<crate::backends::audio::PulseSourceVolumeGuard>,
 }
 
 /// Map sensor rotation to the GStreamer videoflip `video-direction` value.
@@ -262,6 +272,21 @@ fn rotation_to_flip_direction(rotation: SensorRotation) -> Option<&'static str> 
 
 /// OpenH264 maximum pixel count (roughly 3072x3072).
 const OPENH264_MAX_PIXELS: u32 = 9_437_184;
+
+/// Build the optional PA-source-volume guard for a recording. Returns `None`
+/// when audio is disabled, no device was picked (PA default-source path), or
+/// PA can't be reached. Centralised so both recorder entry points
+/// (`new_from_appsrc`, `new_from_appsrc_jpeg`) keep their guard semantics in
+/// sync.
+fn build_pulse_volume_guard(
+    enable_audio: bool,
+    audio_device: Option<&str>,
+) -> Option<crate::backends::audio::PulseSourceVolumeGuard> {
+    if !enable_audio {
+        return None;
+    }
+    audio_device.and_then(crate::backends::audio::PulseSourceVolumeGuard::boost_to_full)
+}
 
 /// Downscale dimensions if they exceed OpenH264's pixel limit.
 /// Returns the original dimensions if the encoder is not OpenH264 or the limit is not exceeded.
@@ -321,13 +346,18 @@ fn prepare_recorder(
     encoder_config: &EncoderConfig,
     enable_audio: bool,
     audio_device: Option<&str>,
+    audio_source_rate_hz: u32,
     output_path: PathBuf,
     framerate: u32,
 ) -> Result<RecorderSetup, String> {
     let encoders = select_encoder_set(encoder_info, encoder_config, enable_audio)?;
 
     let audio_elements = if let Some(audio_encoder_config) = encoders.audio {
-        VideoRecorder::create_audio_branch(audio_device, audio_encoder_config)?
+        VideoRecorder::create_audio_branch(
+            audio_device,
+            audio_source_rate_hz,
+            audio_encoder_config,
+        )?
     } else {
         None
     };
@@ -436,9 +466,11 @@ fn add_audio_branch_to_pipeline(
             &audio_branch.queue,
             &audio_branch.convert,
             &audio_branch.resample,
-            &audio_branch.level_input,
             &audio_branch.capsfilter,
-            &audio_branch.level_output,
+            &audio_branch.compressor,
+            &audio_branch.makeup_gain,
+            &audio_branch.limiter,
+            &audio_branch.level,
             &audio_branch.encoder,
         ])
         .map_err(|e| format!("Failed to add audio elements to pipeline: {}", e))?;
@@ -810,6 +842,7 @@ impl VideoRecorder {
                     encoder_config,
                     enable_audio,
                     audio_device,
+                    audio_source_rate_hz,
                     encoder_info,
                     rotation,
                     mirror_horizontal,
@@ -837,11 +870,18 @@ impl VideoRecorder {
             "Creating appsrc-based video recorder (libcamera backend)"
         );
 
+        // Boost the PA source to 100% before pulsesrc opens — see
+        // `PulseSourceVolumeGuard`. Created here so it lives at least as long
+        // as the recorder pipeline; dropped automatically when the
+        // `VideoRecorder` itself drops (i.e. when recording stops).
+        let pulse_volume_guard = build_pulse_volume_guard(enable_audio, audio_device);
+
         let setup = prepare_recorder(
             encoder_info,
             &encoder_config,
             enable_audio,
             audio_device,
+            audio_source_rate_hz,
             output_path,
             framerate,
         )?;
@@ -956,6 +996,7 @@ impl VideoRecorder {
         let recorder = VideoRecorder {
             pipeline,
             file_path: setup.output_path,
+            _pulse_volume_guard: pulse_volume_guard,
         };
 
         // Eagerly start: if a hardware encoder fails (e.g. VA-API backed by
@@ -1126,6 +1167,7 @@ impl VideoRecorder {
                     encoder_config,
                     enable_audio,
                     audio_device,
+                    audio_source_rate_hz,
                     encoder_info,
                     rotation: _,
                     mirror_horizontal,
@@ -1152,11 +1194,16 @@ impl VideoRecorder {
             "Creating VA-API JPEG zero-copy recording pipeline"
         );
 
+        // Boost PA source volume to 100% before pulsesrc opens — see
+        // `PulseSourceVolumeGuard` and the matching block in `new_from_appsrc`.
+        let pulse_volume_guard = build_pulse_volume_guard(enable_audio, audio_device);
+
         let mut setup = prepare_recorder(
             encoder_info,
             &encoder_config,
             enable_audio,
             audio_device,
+            audio_source_rate_hz,
             output_path,
             framerate,
         )?;
@@ -1267,6 +1314,7 @@ impl VideoRecorder {
         let recorder = VideoRecorder {
             pipeline,
             file_path: setup.output_path,
+            _pulse_volume_guard: pulse_volume_guard,
         };
 
         // Eagerly start the pipeline so failures (e.g. NVIDIA encoder not
@@ -1312,10 +1360,15 @@ impl VideoRecorder {
     /// audio capture from all device types including pro-audio (multi-channel)
     /// and standard stereo/mono sources.
     ///
-    /// All input channels are mixed down to mono via a capsfilter, using the
-    /// hardware input gains as-is (no software volume adjustment).
+    /// All input channels are mixed down to mono via a capsfilter. The same
+    /// capsfilter pins the sample rate to `opus_target_rate(audio_source_rate_hz)`
+    /// — the source's native rate when Opus can encode it, else 48 kHz — so
+    /// no `audioresample` element is needed in the GStreamer graph; PulseAudio
+    /// handles any conversion internally and `opusenc` always sees a rate it
+    /// accepts.
     fn create_audio_branch(
         audio_device: Option<&str>,
+        audio_source_rate_hz: u32,
         audio_encoder_config: crate::media::encoders::audio::SelectedAudioEncoder,
     ) -> Result<Option<AudioBranch>, String> {
         let mut source_builder = gst::ElementFactory::make("pulsesrc")
@@ -1359,37 +1412,98 @@ impl VideoRecorder {
             .build()
             .map_err(|e| format!("Failed to create audioconvert: {}", e))?;
 
+        // Defensive `audioresample`: in the steady-state case the source
+        // already emits at the rate `opus_target_rate` requested (PA negotiates
+        // it server-side, see the capsfilter below), and this element acts as a
+        // zero-cost pass-through. It exists for the default-source edge case
+        // where `audio_source_rate_hz` is 0 (unknown), `opus_target_rate`
+        // defaults to 48 kHz, and PA happens to serve a card at a rate it
+        // won't or can't resample (some PA configs disable resampling). In
+        // that case GStreamer needs an in-pipeline resampler or the audio
+        // branch fails to negotiate.
         let resample = gst::ElementFactory::make("audioresample")
             .build()
             .map_err(|e| format!("Failed to create audioresample: {}", e))?;
 
-        // Level meter BEFORE mono mix — reports per-channel input levels
-        let level_input = gst::ElementFactory::make("level")
-            .name("audio-level-input")
-            .property("post-messages", true)
-            .property("interval", 100_000_000u64) // 100ms
-            .build()
-            .map_err(|e| format!("Failed to create input level meter: {}", e))?;
-
-        // Force mono output — mixes all input channels (stereo, 6ch pro-audio, etc.)
-        // down to a single channel using the hardware input levels as-is.
+        // Force mono output + an Opus-compatible sample rate. `opus_target_rate`
+        // returns the source's native rate when Opus accepts it (no resampling
+        // anywhere); otherwise 48 kHz, in which case either PulseAudio resamples
+        // internally or the `audioresample` element above picks up the slack.
+        let target_rate =
+            crate::media::encoders::audio::opus_target_rate(audio_source_rate_hz) as i32;
         let capsfilter = gst::ElementFactory::make("capsfilter")
             .property(
                 "caps",
                 gst::Caps::builder("audio/x-raw")
                     .field("channels", 1i32)
+                    .field("rate", target_rate)
                     .build(),
             )
             .build()
             .map_err(|e| format!("Failed to create audio capsfilter: {}", e))?;
+        info!(
+            source_rate_hz = audio_source_rate_hz,
+            target_rate_hz = target_rate,
+            "Audio capsfilter rate negotiated"
+        );
 
-        // Level meter AFTER mono mix — reports mono output level
-        let level_output = gst::ElementFactory::make("level")
+        // Soft-knee downward compressor — squashes loud peaks so the following
+        // makeup-gain stage can lift quiet content without clipping. Without
+        // this, on-camera mics with low sensitivity (USB webcams) or PA
+        // sources that get attenuated by their ALSA UCM profile (e.g. the
+        // Pixel 3a's VoiceCall mic clamped at -30 dB) record audio at
+        // -40 LUFS or worse.
+        //
+        // gstreamer1.0-plugins-good `audiodynamic`:
+        // - mode=compressor, characteristics=soft-knee
+        // - threshold is normalized [0..1] amplitude; 0.2 ≈ -14 dBFS.
+        // - ratio is the *output* slope above threshold: 0.3 ≈ 3:1 ratio
+        //   (signals 12 dB over threshold land 4 dB over).
+        // NB: `audiodynamic.threshold` / `.ratio` are GLib `gfloat` (f32),
+        // not `gdouble` — passing f64 triggers a runtime "can't be set from
+        // the given type" GObject type-mismatch panic. Parameter values are
+        // shared with the settings probe via `pipelines::audio_level::dynamics`.
+        use crate::pipelines::audio_level::dynamics;
+        let compressor = gst::ElementFactory::make("audiodynamic")
+            .property_from_str("mode", "compressor")
+            .property_from_str("characteristics", "soft-knee")
+            .property("threshold", dynamics::COMPRESSOR_THRESHOLD)
+            .property("ratio", dynamics::COMPRESSOR_RATIO)
+            .build()
+            .map_err(|e| format!("Failed to create audio compressor: {}", e))?;
+
+        // Makeup gain — lifts the compressed signal back to a sane recording
+        // level. Linear scale: 2.0 ≈ +6 dB. With the upstream
+        // `PulseSourceVolumeGuard` already boosting PA to 100%, +6 dB sits
+        // safely below the brick-wall limiter that follows; on platforms
+        // without `pactl` (so PA is wherever the user left it) +6 dB still
+        // provides a noticeable lift.
+        let makeup_gain = gst::ElementFactory::make("volume")
+            .property("volume", dynamics::MAKEUP_GAIN)
+            .build()
+            .map_err(|e| format!("Failed to create makeup-gain element: {}", e))?;
+
+        // Brick-wall limiter after makeup gain. Catches transients that the
+        // 3:1 compressor lets slip through, capping output around -0.45 dBFS
+        // (threshold 0.95 → 20·log10(0.95)). Ratio 0.05 ≈ 20:1, effectively
+        // a limiter; characteristics=hard-knee for the sharpest cutoff.
+        // Without this the boosted Pixel 3a recordings clip at +4 dBFS.
+        let limiter = gst::ElementFactory::make("audiodynamic")
+            .property_from_str("mode", "compressor")
+            .property_from_str("characteristics", "hard-knee")
+            .property("threshold", dynamics::LIMITER_THRESHOLD)
+            .property("ratio", dynamics::LIMITER_RATIO)
+            .build()
+            .map_err(|e| format!("Failed to create audio limiter: {}", e))?;
+
+        // Single level meter AFTER compressor + makeup gain — the UI then
+        // reads the actual recorded signal level, not the raw mic level.
+        let level = gst::ElementFactory::make("level")
             .name("audio-level-output")
             .property("post-messages", true)
             .property("interval", 100_000_000u64) // 100ms
             .build()
-            .map_err(|e| format!("Failed to create output level meter: {}", e))?;
+            .map_err(|e| format!("Failed to create level meter: {}", e))?;
 
         let encoder = audio_encoder_config.encoder;
 
@@ -1398,24 +1512,28 @@ impl VideoRecorder {
             queue,
             convert,
             resample,
-            level_input,
             capsfilter,
-            level_output,
+            compressor,
+            makeup_gain,
+            limiter,
+            level,
             encoder,
         }))
     }
 
     /// Link audio chain:
-    /// source → queue → convert → resample → level(input) → capsfilter(mono) → level(output) → encoder
+    /// source → queue → convert → resample → capsfilter(mono) → compressor → makeup_gain → limiter → level → encoder
     fn link_audio_chain(audio_branch: &AudioBranch) -> Result<(), String> {
         gst::Element::link_many([
             &audio_branch.source,
             &audio_branch.queue,
             &audio_branch.convert,
             &audio_branch.resample,
-            &audio_branch.level_input,
             &audio_branch.capsfilter,
-            &audio_branch.level_output,
+            &audio_branch.compressor,
+            &audio_branch.makeup_gain,
+            &audio_branch.limiter,
+            &audio_branch.level,
             &audio_branch.encoder,
         ])
         .map_err(|_| "Failed to link audio chain")?;
@@ -1557,12 +1675,26 @@ struct AudioBranch {
     source: gst::Element,
     queue: gst::Element,
     convert: gst::Element,
+    /// Zero-cost pass-through when the source already produces the target rate;
+    /// only does work when PA can't (or won't) serve the requested rate.
     resample: gst::Element,
-    /// Level meter before mono mix (per-channel input levels)
-    level_input: gst::Element,
     capsfilter: gst::Element,
-    /// Level meter after mono mix (mono output level)
-    level_output: gst::Element,
+    /// Soft-knee downward compressor. Squashes loud peaks so the following
+    /// makeup-gain stage can lift quiet content without clipping. Same chain
+    /// is used by the settings audio probe so the meter reflects what the
+    /// recording captures.
+    compressor: gst::Element,
+    /// Makeup gain applied after the compressor. Linear scale; the user-facing
+    /// "audio gain" setting will eventually drive this property.
+    makeup_gain: gst::Element,
+    /// Brick-wall limiter after makeup gain — caps output around -0.4 dBFS
+    /// so a strong source plus +6 dB makeup never clips the encoder.
+    limiter: gst::Element,
+    /// Level meter after compressor + makeup gain so the UI reads the actual
+    /// recorded signal level. The pre-mix per-channel meter was removed to
+    /// cut CPU pressure on weak ARM hardware — same reason `audioresample`
+    /// is gone (source rate flows through unchanged).
+    level: gst::Element,
     encoder: gst::Element,
 }
 
