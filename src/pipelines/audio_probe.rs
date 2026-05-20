@@ -4,8 +4,10 @@
 //! microphone meter before recording starts.
 //!
 //! Spins up a minimal GStreamer pipeline that mirrors the recorder's audio
-//! branch (minus the encoder and muxer): pulsesrc → audioconvert →
-//! audioresample → level → mono capsfilter → level → fakesink. The shared
+//! branch (minus the encoder and muxer): pulsesrc → audioconvert → mono
+//! capsfilter → level → fakesink. The source's native sample rate flows
+//! through unchanged — no `audioresample` element, so the meter reflects
+//! exactly what the recording will capture. The shared
 //! [`install_level_sync_handler`] writes peak/RMS values into a
 //! [`SharedAudioLevels`] mutex that the UI then snapshots on a 100 ms tick.
 //!
@@ -18,7 +20,7 @@ use gstreamer::prelude::*;
 use tracing::{info, warn};
 
 use crate::pipelines::audio_level::{
-    PULSESRC_SLAVE_METHOD, SharedAudioLevels, install_level_sync_handler,
+    PULSESRC_SLAVE_METHOD, SharedAudioLevels, dynamics, install_level_sync_handler,
 };
 
 /// Running probe pipeline. Drop or call [`AudioLevelProbe::stop`] to tear down.
@@ -31,21 +33,42 @@ pub struct AudioLevelProbe {
 impl AudioLevelProbe {
     /// Build and start the probe. `device` is the PipeWire/PulseAudio node
     /// name (e.g. `"alsa_input.usb-…"`). Pass `None` to capture from the
-    /// system default.
-    pub fn start(device: Option<&str>) -> Result<Self, String> {
+    /// system default. `source_rate_hz` is the source's native sample rate
+    /// (0 for "unknown") — the probe pins the capsfilter to the same Opus-
+    /// compatible rate the recorder will use, so the meter reflects what the
+    /// recording actually captures.
+    pub fn start(device: Option<&str>, source_rate_hz: u32) -> Result<Self, String> {
         let device_str = device
             .map(|d| format!("device=\"{}\" ", d.replace('"', "\\\"")))
             .unwrap_or_default();
 
+        let target_rate = crate::media::encoders::audio::opus_target_rate(source_rate_hz);
+
+        // Same compressor + makeup-gain chain the recorder uses, so the meter
+        // shows what the recording captures, not the raw mic. See
+        // `VideoRecorder::create_audio_branch` for the threshold/ratio/gain
+        // rationale.
+        // `audioresample` is a defensive pass-through; see the comment in
+        // `VideoRecorder::create_audio_branch` for the rationale. Dynamics
+        // parameters come from `dynamics::*` so the meter reflects exactly
+        // what the recording will capture.
         let desc = format!(
             "pulsesrc name=probe-src {device_str}slave-method={slave} do-timestamp=true provide-clock=false \
              ! audioconvert \
              ! audioresample \
-             ! level name=audio-level-input post-messages=true interval=100000000 \
-             ! capsfilter caps=audio/x-raw,channels=1 \
+             ! capsfilter caps=audio/x-raw,channels=1,rate={rate} \
+             ! audiodynamic mode=compressor characteristics=soft-knee threshold={ct} ratio={cr} \
+             ! volume volume={mg} \
+             ! audiodynamic mode=compressor characteristics=hard-knee threshold={lt} ratio={lr} \
              ! level name=audio-level-output post-messages=true interval=100000000 \
              ! fakesink sync=false",
             slave = PULSESRC_SLAVE_METHOD,
+            rate = target_rate,
+            ct = dynamics::COMPRESSOR_THRESHOLD,
+            cr = dynamics::COMPRESSOR_RATIO,
+            mg = dynamics::MAKEUP_GAIN,
+            lt = dynamics::LIMITER_THRESHOLD,
+            lr = dynamics::LIMITER_RATIO,
         );
 
         info!(desc = %desc, "Starting audio-level probe pipeline");

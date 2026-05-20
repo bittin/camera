@@ -16,6 +16,24 @@ use gstreamer::prelude::*;
 /// settings shows what the recording will record.
 pub const PULSESRC_SLAVE_METHOD: &str = "skew";
 
+/// Shared parameters for the dynamics-processing chain used by both the
+/// recorder pipeline and the settings audio probe. Single source of truth
+/// avoids the two pipelines drifting apart.
+pub mod dynamics {
+    /// Soft-knee compressor threshold in normalised amplitude (0..1). 0.2 ≈
+    /// -14 dBFS — start squashing once the input passes that level.
+    pub const COMPRESSOR_THRESHOLD: f32 = 0.2;
+    /// Soft-knee compressor ratio. `audiodynamic` uses 0..1 where 1 is no
+    /// compression and 0 is infinite (true limiter). 0.3 ≈ ~3:1.
+    pub const COMPRESSOR_RATIO: f32 = 0.3;
+    /// Linear post-compressor gain. 2.0 ≈ +6 dB makeup.
+    pub const MAKEUP_GAIN: f64 = 2.0;
+    /// Brick-wall limiter threshold (normalised amplitude). 0.95 ≈ -0.45 dBFS.
+    pub const LIMITER_THRESHOLD: f32 = 0.95;
+    /// Brick-wall limiter ratio. 0.05 ≈ ~20:1 — close enough to a true limiter.
+    pub const LIMITER_RATIO: f32 = 0.05;
+}
+
 /// Live audio level data shared between a GStreamer pipeline and the UI.
 #[derive(Debug, Clone)]
 pub struct AudioLevels {
