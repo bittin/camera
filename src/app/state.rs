@@ -1825,10 +1825,11 @@ impl AppModel {
             self.context_page == ContextPage::Settings && self.core.window.show_context;
         let want = drawer_open && self.config.record_audio && !self.recording.is_recording();
 
-        let desired_device: Option<String> = self
+        let selected_device = self
             .available_audio_devices
-            .get(self.current_audio_device_index)
-            .map(|d| d.node_name.clone());
+            .get(self.current_audio_device_index);
+        let desired_device: Option<String> = selected_device.map(|d| d.node_name.clone());
+        let desired_rate_hz: u32 = selected_device.map(|d| d.sample_rate).unwrap_or(0);
 
         // Tear down if running and no longer wanted, or if the device changed.
         if let Some(probe) = self.audio_probe.take() {
@@ -1844,7 +1845,10 @@ impl AppModel {
 
         // Start if wanted and not running.
         if want && self.audio_probe.is_none() {
-            match crate::pipelines::audio_probe::AudioLevelProbe::start(desired_device.as_deref()) {
+            match crate::pipelines::audio_probe::AudioLevelProbe::start(
+                desired_device.as_deref(),
+                desired_rate_hz,
+            ) {
                 Ok(probe) => {
                     self.probe_audio_levels = Some(probe.levels());
                     self.audio_probe = Some(probe);

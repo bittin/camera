@@ -288,6 +288,7 @@ pub fn record_video(
                         encoder_config,
                         enable_audio,
                         audio_device: None,
+                        audio_source_rate_hz: 0,
                         encoder_info: None,
                         rotation,
                         mirror_horizontal: false,
