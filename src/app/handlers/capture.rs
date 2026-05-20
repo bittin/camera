@@ -25,6 +25,8 @@ struct AppsrcRecordingConfig {
     output_path: PathBuf,
     sensor_rotation: crate::backends::camera::types::SensorRotation,
     audio_device: Option<String>,
+    /// Native sample rate of the selected audio source; 0 if unknown.
+    audio_source_rate_hz: u32,
     selected_encoder: Option<crate::media::encoders::video::EncoderInfo>,
     bitrate_kbps: u32,
 }
@@ -1371,12 +1373,22 @@ impl AppModel {
             .map(|f| (f.width, f.height))
             .unwrap_or((format.width, format.height));
 
+        let selected_audio_device = self
+            .available_audio_devices
+            .get(self.current_audio_device_index);
         let audio_device = if self.config.record_audio {
-            self.available_audio_devices
-                .get(self.current_audio_device_index)
-                .map(|dev| dev.node_name.clone())
+            selected_audio_device.map(|dev| dev.node_name.clone())
         } else {
             None
+        };
+        // Gate symmetrically with `audio_device`: when the user disabled audio,
+        // both `audio_device` and `audio_source_rate_hz` are zero/None so the
+        // downstream capsfilter can't accidentally pin a rate that doesn't
+        // match whatever PA would otherwise produce.
+        let audio_source_rate_hz = if self.config.record_audio {
+            selected_audio_device.map(|d| d.sample_rate).unwrap_or(0)
+        } else {
+            0
         };
 
         let selected_encoder = self
@@ -1397,6 +1409,7 @@ impl AppModel {
             output_path,
             sensor_rotation,
             audio_device,
+            audio_source_rate_hz,
             selected_encoder,
             bitrate_kbps: appsrc_bitrate,
         })
@@ -1441,12 +1454,22 @@ impl AppModel {
         let framerate = format.framerate.map(|f| f.as_int()).unwrap_or(30);
 
         // Only get audio device if audio recording is enabled in settings
+        let selected_audio_device = self
+            .available_audio_devices
+            .get(self.current_audio_device_index);
         let audio_device = if self.config.record_audio {
-            self.available_audio_devices
-                .get(self.current_audio_device_index)
-                .map(|dev| dev.node_name.clone())
+            selected_audio_device.map(|dev| dev.node_name.clone())
         } else {
             None
+        };
+        // Gate symmetrically with `audio_device`: when the user disabled audio,
+        // both `audio_device` and `audio_source_rate_hz` are zero/None so the
+        // downstream capsfilter can't accidentally pin a rate that doesn't
+        // match whatever PA would otherwise produce.
+        let audio_source_rate_hz = if self.config.record_audio {
+            selected_audio_device.map(|d| d.sample_rate).unwrap_or(0)
+        } else {
+            0
         };
 
         let selected_encoder = self
@@ -1473,6 +1496,7 @@ impl AppModel {
             output_path,
             sensor_rotation,
             audio_device,
+            audio_source_rate_hz,
             selected_encoder,
             bitrate_kbps: appsrc_bitrate,
         })
@@ -1497,6 +1521,7 @@ impl AppModel {
             output_path,
             sensor_rotation,
             audio_device,
+            audio_source_rate_hz,
             selected_encoder,
             bitrate_kbps,
         } = config;
@@ -1602,6 +1627,7 @@ impl AppModel {
         let backend_manager = self.backend_manager.clone();
         let va_jpeg_dec_name = va_jpeg_dec.map(|s| s.to_string());
         let live_filter = self.recording_filter_code.clone();
+        let record_audio = self.config.record_audio;
 
         let recording_task = Task::perform(
             async move {
@@ -1642,8 +1668,13 @@ impl AppModel {
                                     framerate,
                                     output_path: output_path.clone(),
                                     encoder_config: config.clone(),
-                                    enable_audio: audio_device.is_some(),
+                                    // Honor the user's `record_audio` preference directly. With
+                                    // an empty device list (e.g. PipeWire not enumerating, fallback
+                                    // also empty), `audio_device` is None — let `pulsesrc` open the
+                                    // PA default source rather than dropping the audio branch.
+                                    enable_audio: record_audio,
                                     audio_device: audio_device.as_deref(),
+                                    audio_source_rate_hz,
                                     encoder_info: selected_encoder.as_ref(),
                                     rotation: sensor_rotation,
                                     mirror_horizontal,

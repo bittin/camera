@@ -93,11 +93,32 @@ pub struct SelectedAudioEncoder {
     pub codec: AudioCodec,
 }
 
-/// Select the best available audio encoder
+/// Sample rates accepted by `opusenc` (libopus is fixed to this set).
+pub const OPUS_SUPPORTED_RATES: &[u32] = &[8000, 12000, 16000, 24000, 48000];
+
+/// Pick the sample rate the audio branch should target for Opus encoding.
+///
+/// If the source's native rate is one Opus accepts, use it as-is — that
+/// preserves the source rate end-to-end with no resampling work anywhere.
+/// Otherwise fall back to 48 kHz, the highest Opus rate; PulseAudio will do
+/// the conversion internally so we still avoid a GStreamer `audioresample`
+/// element. `0` (unknown) falls back to 48 kHz for safety.
+pub fn opus_target_rate(source_rate_hz: u32) -> u32 {
+    if source_rate_hz != 0 && OPUS_SUPPORTED_RATES.contains(&source_rate_hz) {
+        source_rate_hz
+    } else {
+        48000
+    }
+}
+
+/// Select the best available audio encoder.
 ///
 /// Priority order:
 /// 1. Opus (opusenc) - best quality, all channel configs
-/// 2. AAC (avenc_aac, faac, voaacenc) - good fallback
+/// 2. AAC (avenc_aac, faac, voaacenc) - fallback only when opusenc is
+///    absent on the system. AAC is *not* selected based on source rate —
+///    `opus_target_rate` arranges for Opus to always see a rate it can
+///    encode, so codec choice is purely a function of plugin availability.
 ///
 /// # Arguments
 /// * `quality` - Quality preset for encoding
@@ -137,7 +158,7 @@ pub fn select_audio_encoder(
                 codec = "AAC",
                 encoder = %encoder_name,
                 channels = channels.count(),
-                "Selected audio encoder"
+                "Selected audio encoder (opusenc unavailable)"
             );
 
             configure_aac_encoder(&encoder, encoder_name, quality, channels);
