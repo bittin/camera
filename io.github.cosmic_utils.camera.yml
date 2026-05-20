@@ -39,6 +39,12 @@ finish-args:
   - --talk-name=org.freedesktop.FileManager1
   # D-Bus access for WiFi connection from QR codes (system bus, not session bus)
   - --system-talk-name=org.freedesktop.NetworkManager
+  # D-Bus access for screensaver inhibit (cosmic-idle / GNOME / KDE) — keeps
+  # the screen on while the camera is active (issue #365)
+  - --talk-name=org.freedesktop.ScreenSaver
+  # D-Bus access for systemd-logind Inhibit — blocks idle lock + suspend
+  # while the camera is active (issue #365)
+  - --system-talk-name=org.freedesktop.login1
 
 modules:
   # Python build dependencies required by libcamera's meson build.

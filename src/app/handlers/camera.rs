@@ -289,6 +289,11 @@ impl AppModel {
 
         info!("Camera initialization complete, preview will start");
 
+        // Camera is now usable — request idle/suspend inhibit so the screen
+        // doesn't blank and the system doesn't sleep while the app is active
+        // (issue #365).
+        self.update_idle_inhibit();
+
         let mut tasks: Vec<Task<cosmic::Action<Message>>> = Vec::new();
 
         // Query exposure controls for the current camera
@@ -462,6 +467,12 @@ impl AppModel {
         {
             self.current_camera_index = new_index;
         }
+
+        // Sleep inhibit follows camera availability — release when the list
+        // goes empty (e.g. all cameras unplugged) and re-take when cameras
+        // reappear via hotplug (issue #365).
+        self.update_idle_inhibit();
+
         Task::none()
     }
 
@@ -564,6 +575,10 @@ impl AppModel {
         }
 
         self.camera_dropdown_options = Self::build_camera_dropdown_labels(&self.available_cameras);
+
+        // First camera appeared (e.g. user plugged in a USB webcam after the
+        // app started with none available) — take the inhibit (issue #365).
+        self.update_idle_inhibit();
 
         Task::none()
     }

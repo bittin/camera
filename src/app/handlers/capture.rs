@@ -1825,11 +1825,21 @@ impl AppModel {
 
     /// Update the system idle/suspend inhibit based on current activity.
     ///
-    /// Call this whenever recording, streaming, or timelapse state changes.
+    /// Inhibit is active whenever the app is in a usable state — cameras have
+    /// finished initializing, or any active session (recording / virtual
+    /// camera streaming / timelapse) is in progress. The session triggers
+    /// also act as fallbacks if the camera list becomes empty mid-operation
+    /// (e.g. hotplug-removed during recording).
+    ///
+    /// Call this whenever recording / streaming / timelapse state changes,
+    /// or when the camera list transitions to/from empty.
+    ///
     /// Uses org.freedesktop.ScreenSaver.Inhibit (supported by cosmic-idle,
-    /// GNOME, KDE, etc.) to prevent the screen from turning off.
+    /// GNOME, KDE, etc.) to prevent the screen from turning off, plus
+    /// systemd-logind Inhibit to block idle-lock + suspend. Issue #365.
     pub(crate) fn update_idle_inhibit(&mut self) {
-        let should_inhibit = self.recording.is_recording()
+        let should_inhibit = !self.available_cameras.is_empty()
+            || self.recording.is_recording()
             || self.virtual_camera.is_streaming()
             || self.timelapse.is_active();
 
@@ -2050,7 +2060,7 @@ fn screensaver_inhibit() -> Result<crate::app::state::IdleInhibitGuard, String> 
             "/org/freedesktop/ScreenSaver",
             Some("org.freedesktop.ScreenSaver"),
             "Inhibit",
-            &("Camera", "Recording in progress"),
+            &("Camera", "Camera active"),
         )
         .map_err(|e| format!("ScreenSaver.Inhibit: {e}"))?
         .body()
@@ -2073,7 +2083,7 @@ fn logind_inhibit() -> Result<std::os::unix::io::OwnedFd, String> {
             "/org/freedesktop/login1",
             Some("org.freedesktop.login1.Manager"),
             "Inhibit",
-            &("idle:sleep", "Camera", "Recording in progress", "block"),
+            &("idle:sleep", "Camera", "Camera active", "block"),
         )
         .map_err(|e| format!("logind Inhibit: {e}"))?
         .body()
