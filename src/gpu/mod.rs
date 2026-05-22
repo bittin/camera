@@ -63,9 +63,25 @@ static SEED_NOTIFY: Notify = Notify::const_new();
 /// compute work shares the same GPU context as iced/libcosmic — no second
 /// `wgpu::Instance`, no second device, no CPU round-trip between contexts.
 ///
-/// Returns `true` if this call performed the seeding, `false` if the shared
-/// GPU was already initialized (subsequent calls are no-ops).
+/// Skips seeding when the renderer's device is missing features compute
+/// pipelines require (`TEXTURE_FORMAT_16BIT_NORM`, used for Bayer R16Unorm
+/// upload). On Adreno/Turnip the renderer device is created by libcosmic
+/// without that feature, so without this guard a Bayer photo capture
+/// crashes in `Device::create_texture(label="convert_tex_y")`. When skipped,
+/// `get_shared_gpu` falls back to creating a dedicated compute device that
+/// explicitly requests the feature.
 pub fn try_seed_shared_gpu_from_renderer(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) {
+    if !device
+        .features()
+        .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+    {
+        debug!(
+            "Renderer device lacks TEXTURE_FORMAT_16BIT_NORM; \
+             skipping seed and letting get_shared_gpu open a dedicated compute device"
+        );
+        return;
+    }
+
     let ctx = SharedGpuContext {
         device,
         queue,
