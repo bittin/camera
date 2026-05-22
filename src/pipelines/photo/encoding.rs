@@ -259,8 +259,8 @@ impl PhotoEncoder {
             ));
         }
 
-        // Generate filename with timestamp
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        // Generate filename with timestamp (millisecond precision so two rapid captures don't collide).
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("IMG_{}.{}", timestamp, encoded.format.extension());
         let filepath = output_dir.join(&filename);
 
