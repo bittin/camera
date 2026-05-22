@@ -1044,6 +1044,10 @@ impl AppModel {
         &mut self,
         result: Result<String, String>,
     ) -> Task<cosmic::Action<Message>> {
+        // Always release the capture lock here; the separate
+        // `ClearCaptureAnimation` task may be dropped on backpressure or panic,
+        // which would otherwise leave the capture button permanently disabled.
+        self.is_capturing = false;
         match result {
             Ok(path) => {
                 info!(path = %path, "Photo saved successfully");
