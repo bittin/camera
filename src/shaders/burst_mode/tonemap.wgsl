@@ -346,8 +346,12 @@ var<storage, read_write> lum_output: array<f32>;
 @group(0) @binding(2)
 var<uniform> lum_params: LocalLumParams;
 
-// Global brightness accumulator (for atomic integer operations)
-// Uses fixed-point: multiply by 65536, accumulate, then divide
+// Global brightness accumulator (for atomic integer operations).
+// Uses fixed-point with scale 256 (8 bits of fractional precision). The
+// previous scale of 65536 overflows u32 for large images: a 12 MP frame at
+// block_size=1 sums to ~7.8e11, vs. u32 max ~4.3e9. Scale 256 keeps a 12 MP
+// worst-case sum at ~3.1e9 (still within u32) while preserving more than
+// enough precision for the adaptive shadow-boost gate.
 @group(0) @binding(3)
 var<storage, read_write> global_brightness_accum: array<atomic<u32>>;  // [0]=sum, [1]=count
 
@@ -388,9 +392,9 @@ fn compute_local_luminance(@builtin(global_invocation_id) gid: vec3<u32>) {
     let avg = select(0.5, sum / count, count > 0.0);
     lum_output[ly * lum_params.lum_width + lx] = avg;
 
-    // Accumulate for global brightness calculation (HDR+ adaptive tone mapping)
-    // Use fixed-point: multiply by 65536 to preserve precision in u32
-    let fixed_avg = u32(avg * 65536.0);
+    // Accumulate for global brightness calculation (HDR+ adaptive tone mapping).
+    // Scale 256 keeps the per-frame sum within u32 even at block_size=1.
+    let fixed_avg = u32(avg * 256.0);
     atomicAdd(&global_brightness_accum[0], fixed_avg);
     atomicAdd(&global_brightness_accum[1], 1u);
 }
