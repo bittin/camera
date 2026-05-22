@@ -1496,10 +1496,11 @@ impl AppModel {
             ));
         }
 
-        // Filter button (photo, video, and timelapse modes)
+        // Filter button (photo, video, timelapse, and virtual-camera modes)
         if self.mode == CameraMode::Photo
             || self.mode == CameraMode::Video
             || self.mode == CameraMode::Timelapse
+            || self.mode == CameraMode::Virtual
         {
             let filter_active = self.selected_filter != FilterType::Standard;
             buttons.push(self.build_tools_grid_button(
