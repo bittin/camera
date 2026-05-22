@@ -1575,6 +1575,10 @@ pub enum Message {
     FitAnimationTick,
     /// Animation tick for the zoom-reset transition
     ZoomAnimationTick,
+    /// Wayland keyboard-focus changed for the app window. Toggles the
+    /// volume-key `EVIOCGRAB` and dispatch gate so we only consume the
+    /// hardware shutter buttons while the camera is in focus.
+    WindowFocusChanged(bool),
     /// Window control: close
     WindowClose,
     /// Window control: minimize
