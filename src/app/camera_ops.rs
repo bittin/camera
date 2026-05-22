@@ -269,6 +269,18 @@ impl AppModel {
     /// `pending_camera_path` to disk so a crash before the first frame is
     /// detectable on next launch (issue #410).
     fn mark_camera_pending(&mut self, camera_path: String) {
+        // Skip if this camera is already the known-good one and there is no
+        // stale tombstone to clear. The function runs from every mode switch
+        // via `select_format_from_cache`; without this short-circuit, every
+        // Photo↔Video↔Timelapse tap triggers a synchronous `config.write_entry`
+        // that stalls the UI thread for 200-300 ms on eMMC, with no
+        // crash-recovery benefit (the camera is already proven good).
+        if self.config.last_camera_path.as_ref() == Some(&camera_path)
+            && self.config.pending_camera_path.is_none()
+        {
+            return;
+        }
+
         self.pending_persist_camera = Some((camera_path.clone(), std::time::Instant::now()));
 
         // Persist the intent to disk so a crash before first-frame leaves a
