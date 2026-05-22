@@ -232,7 +232,7 @@ pub fn record_video(
     } else {
         let dir = get_default_video_dir();
         std::fs::create_dir_all(&dir)?;
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S_%3f");
         dir.join(format!("video_{}.mp4", timestamp))
     };
 
