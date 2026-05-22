@@ -377,6 +377,71 @@ fn extract_planes_16bit(
     );
 }
 
+/// Read a single pixel value from a CSI-2 packed row.
+///
+/// Extracted as a free function so the bit-packing logic can be exercised by
+/// unit tests independently of the GPU pipeline plumbing.
+fn read_csi2_packed_pixel(row_data: &[u8], pixel_x: usize, bit_depth: u32) -> f32 {
+    match bit_depth {
+        10 => {
+            // 10-bit: 4 pixels packed in 5 bytes
+            // Bytes 0-3: MSBs of pixels 0-3 (bits 9..2)
+            // Byte 4: LSBs of pixels 0-3 (bits 1..0), 2 bits each
+            let group = pixel_x / 4;
+            let pos = pixel_x % 4;
+            let base = group * 5;
+            if base + 4 >= row_data.len() {
+                return 0.0;
+            }
+            let msb = row_data[base + pos] as u16;
+            let lsb = ((row_data[base + 4] >> (pos * 2)) & 0x03) as u16;
+            ((msb << 2) | lsb) as f32
+        }
+        12 => {
+            // 12-bit: 2 pixels packed in 3 bytes
+            let group = pixel_x / 2;
+            let pos = pixel_x % 2;
+            let base = group * 3;
+            if base + 2 >= row_data.len() {
+                return 0.0;
+            }
+            let msb = row_data[base + pos] as u16;
+            let lsb = if pos == 0 {
+                (row_data[base + 2] & 0x0F) as u16
+            } else {
+                ((row_data[base + 2] >> 4) & 0x0F) as u16
+            };
+            ((msb << 4) | lsb) as f32
+        }
+        14 => {
+            // 14-bit: 4 pixels packed in 7 bytes (MIPI CSI-2 RAW14).
+            //   Byte 0..3: MSBs (bits 13..6) of pixels 0..3
+            //   Byte 4   : P1[1:0] | P0[5:0]
+            //   Byte 5   : P2[3:0] | P1[5:2]
+            //   Byte 6   : P3[5:0] | P2[5:4]
+            let group = pixel_x / 4;
+            let pos = pixel_x % 4;
+            let base = group * 7;
+            if base + 6 >= row_data.len() {
+                return 0.0;
+            }
+            let msb = row_data[base + pos] as u16;
+            let b4 = row_data[base + 4] as u16;
+            let b5 = row_data[base + 5] as u16;
+            let b6 = row_data[base + 6] as u16;
+            let lsb: u16 = match pos {
+                0 => b4 & 0x3F,
+                1 => ((b5 & 0x0F) << 2) | (b4 >> 6),
+                2 => ((b6 & 0x03) << 4) | (b5 >> 4),
+                3 => b6 >> 2,
+                _ => 0,
+            };
+            ((msb << 6) | lsb) as f32
+        }
+        _ => 0.0,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Extract Bayer planes from CSI-2 packed data (10/12/14-bit)
 fn extract_planes_csi2_packed(
@@ -390,68 +455,8 @@ fn extract_planes_csi2_packed(
     off: &BayerOffsets,
     planes: &mut [f32],
 ) {
-    // Read a pixel value from CSI-2 packed row data
     let read_packed_pixel = |row_data: &[u8], pixel_x: usize| -> f32 {
-        match bit_depth {
-            10 => {
-                // 10-bit: 4 pixels packed in 5 bytes
-                // Bytes 0-3: MSBs of pixels 0-3 (bits 9..2)
-                // Byte 4: LSBs of pixels 0-3 (bits 1..0), 2 bits each
-                let group = pixel_x / 4;
-                let pos = pixel_x % 4;
-                let base = group * 5;
-                if base + 4 >= row_data.len() {
-                    return 0.0;
-                }
-                let msb = row_data[base + pos] as u16;
-                let lsb = ((row_data[base + 4] >> (pos * 2)) & 0x03) as u16;
-                ((msb << 2) | lsb) as f32
-            }
-            12 => {
-                // 12-bit: 2 pixels packed in 3 bytes
-                let group = pixel_x / 2;
-                let pos = pixel_x % 2;
-                let base = group * 3;
-                if base + 2 >= row_data.len() {
-                    return 0.0;
-                }
-                let msb = row_data[base + pos] as u16;
-                let lsb = if pos == 0 {
-                    (row_data[base + 2] & 0x0F) as u16
-                } else {
-                    ((row_data[base + 2] >> 4) & 0x0F) as u16
-                };
-                ((msb << 4) | lsb) as f32
-            }
-            14 => {
-                // 14-bit: 4 pixels packed in 7 bytes (MIPI CSI-2 RAW14).
-                //   Byte 0..3: MSBs (bits 13..6) of pixels 0..3
-                //   Byte 4   : P1[1:0] | P0[5:0]
-                //   Byte 5   : P2[3:0] | P1[5:2]
-                //   Byte 6   : P3[5:0] | P2[5:4]
-                // The previous implementation never read byte 6 and used a
-                // single-byte LSB read which is incorrect for pos 1..3.
-                let group = pixel_x / 4;
-                let pos = pixel_x % 4;
-                let base = group * 7;
-                if base + 6 >= row_data.len() {
-                    return 0.0;
-                }
-                let msb = row_data[base + pos] as u16;
-                let b4 = row_data[base + 4] as u16;
-                let b5 = row_data[base + 5] as u16;
-                let b6 = row_data[base + 6] as u16;
-                let lsb: u16 = match pos {
-                    0 => b4 & 0x3F,
-                    1 => ((b5 & 0x0F) << 2) | (b4 >> 6),
-                    2 => ((b6 & 0x03) << 4) | (b5 >> 4),
-                    3 => b6 >> 2,
-                    _ => 0,
-                };
-                ((msb << 6) | lsb) as f32
-            }
-            _ => 0.0,
-        }
+        read_csi2_packed_pixel(row_data, pixel_x, bit_depth)
     };
 
     extract_planes_generic(
@@ -3683,6 +3688,71 @@ mod tests {
         let config = BurstModeConfig::default();
         assert_eq!(config.frame_count, 8);
         assert!(!config.export_raw_frames);
+    }
+
+    /// Encode 4 pixel values (each 10 bits) into a CSI-2 RAW10 group of 5 bytes.
+    fn pack_csi2_10bit(p0: u16, p1: u16, p2: u16, p3: u16) -> [u8; 5] {
+        let msb = |v: u16| (v >> 2) as u8;
+        let lsb = |v: u16| (v & 0x03) as u8;
+        [
+            msb(p0),
+            msb(p1),
+            msb(p2),
+            msb(p3),
+            lsb(p0) | (lsb(p1) << 2) | (lsb(p2) << 4) | (lsb(p3) << 6),
+        ]
+    }
+
+    /// Encode 2 pixel values (each 12 bits) into a CSI-2 RAW12 group of 3 bytes.
+    fn pack_csi2_12bit(p0: u16, p1: u16) -> [u8; 3] {
+        [
+            (p0 >> 4) as u8,
+            (p1 >> 4) as u8,
+            ((p0 & 0x0F) as u8) | (((p1 & 0x0F) as u8) << 4),
+        ]
+    }
+
+    #[test]
+    fn test_csi2_10bit_unpack_roundtrip() {
+        // Cover the corners and a few mid-range values.
+        for &(p0, p1, p2, p3) in &[
+            (0, 0, 0, 0),
+            (1023, 1023, 1023, 1023),
+            (1, 2, 3, 4),
+            (511, 512, 1, 1022),
+            (300, 600, 900, 1000),
+        ] {
+            let packed = pack_csi2_10bit(p0, p1, p2, p3);
+            assert_eq!(read_csi2_packed_pixel(&packed, 0, 10) as u16, p0);
+            assert_eq!(read_csi2_packed_pixel(&packed, 1, 10) as u16, p1);
+            assert_eq!(read_csi2_packed_pixel(&packed, 2, 10) as u16, p2);
+            assert_eq!(read_csi2_packed_pixel(&packed, 3, 10) as u16, p3);
+        }
+    }
+
+    #[test]
+    fn test_csi2_12bit_unpack_roundtrip() {
+        for &(p0, p1) in &[(0, 0), (4095, 4095), (1, 4094), (2048, 1024), (15, 240)] {
+            let packed = pack_csi2_12bit(p0, p1);
+            assert_eq!(read_csi2_packed_pixel(&packed, 0, 12) as u16, p0);
+            assert_eq!(read_csi2_packed_pixel(&packed, 1, 12) as u16, p1);
+        }
+    }
+
+    #[test]
+    fn test_csi2_unpack_out_of_bounds() {
+        let short = [0u8; 3]; // not enough for any of the formats
+        assert_eq!(read_csi2_packed_pixel(&short, 0, 10), 0.0);
+        assert_eq!(read_csi2_packed_pixel(&short, 0, 12), 0.0);
+        assert_eq!(read_csi2_packed_pixel(&short, 0, 14), 0.0);
+    }
+
+    #[test]
+    fn test_csi2_unsupported_bit_depth() {
+        let buf = [0xFFu8; 8];
+        // 16-bit and other unsupported depths return 0.0
+        assert_eq!(read_csi2_packed_pixel(&buf, 0, 16), 0.0);
+        assert_eq!(read_csi2_packed_pixel(&buf, 0, 8), 0.0);
     }
 
     /// Validate that a WGSL shader compiles successfully using naga
