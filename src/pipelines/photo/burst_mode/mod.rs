@@ -424,7 +424,13 @@ fn extract_planes_csi2_packed(
                 ((msb << 4) | lsb) as f32
             }
             14 => {
-                // 14-bit: 4 pixels packed in 7 bytes
+                // 14-bit: 4 pixels packed in 7 bytes (MIPI CSI-2 RAW14).
+                //   Byte 0..3: MSBs (bits 13..6) of pixels 0..3
+                //   Byte 4   : P1[1:0] | P0[5:0]
+                //   Byte 5   : P2[3:0] | P1[5:2]
+                //   Byte 6   : P3[5:0] | P2[5:4]
+                // The previous implementation never read byte 6 and used a
+                // single-byte LSB read which is incorrect for pos 1..3.
                 let group = pixel_x / 4;
                 let pos = pixel_x % 4;
                 let base = group * 7;
@@ -432,11 +438,15 @@ fn extract_planes_csi2_packed(
                     return 0.0;
                 }
                 let msb = row_data[base + pos] as u16;
-                let lsb_byte_offset = 4 + pos / 2;
-                let lsb = if pos.is_multiple_of(2) {
-                    (row_data[base + lsb_byte_offset] & 0x3F) as u16
-                } else {
-                    ((row_data[base + lsb_byte_offset] >> 2) & 0x3F) as u16
+                let b4 = row_data[base + 4] as u16;
+                let b5 = row_data[base + 5] as u16;
+                let b6 = row_data[base + 6] as u16;
+                let lsb: u16 = match pos {
+                    0 => b4 & 0x3F,
+                    1 => ((b5 & 0x0F) << 2) | (b4 >> 6),
+                    2 => ((b6 & 0x03) << 4) | (b5 >> 4),
+                    3 => b6 >> 2,
+                    _ => 0,
                 };
                 ((msb << 6) | lsb) as f32
             }
