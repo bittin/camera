@@ -36,15 +36,16 @@
 //! Output Image
 //! ```
 
+mod bayer_planes;
 pub mod burst;
 pub mod fft_gpu;
 mod gpu_helpers;
 pub mod params;
 
 use crate::backends::camera::types::{CameraFrame, PixelFormat, SensorRotation};
-use crate::backends::camera::v4l2_utils::detect_csi2_bit_depth;
 use crate::gpu::{self, wgpu};
 use crate::shaders::{GpuFrameInput, get_gpu_convert_pipeline};
+use bayer_planes::{BayerPlanes, extract_bayer_planes};
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
 
@@ -102,376 +103,8 @@ pub(crate) fn u8_to_f32_normalized(data: &[u8]) -> Vec<f32> {
     data.iter().map(|&x| x as f32 / 255.0).collect()
 }
 
-/// Bayer pattern sub-pixel offsets within a 2×2 quad.
-///
-/// Each field is `(dx, dy)` giving the column and row offset of that colour
-/// channel inside the repeating 2×2 Bayer tile.
-struct BayerOffsets {
-    r: (usize, usize),
-    gr: (usize, usize),
-    gb: (usize, usize),
-    b: (usize, usize),
-}
-
-/// Result of extracting Bayer color planes from raw sensor data.
-///
-/// Per the HDR+ paper (Section 5), the merge operates on each Bayer color plane
-/// independently. We extract R, Gr, Gb, B planes at half resolution and pack them
-/// as RGBA f32 for efficient GPU processing with existing vec4 shader infrastructure.
-pub(crate) struct BayerPlanes {
-    /// RGBA f32 data where R=red, G=green_r, B=blue, A=green_b
-    /// Dimensions: (width/2) × (height/2) × 4 floats
-    pub data: Vec<f32>,
-    /// Width of each plane (half of full Bayer width)
-    pub width: u32,
-    /// Height of each plane (half of full Bayer height)
-    pub height: u32,
-    /// ISP white balance gains [R, B] from camera metadata
-    pub colour_gains: Option<[f32; 2]>,
-    /// 3x3 colour correction matrix from camera metadata
-    pub colour_correction_matrix: Option<[[f32; 3]; 3]>,
-    /// Bit depth of the raw data (8, 10, 12, or 14)
-    pub bit_depth: u32,
-}
-
-/// Extract Bayer color planes from a raw camera frame.
-///
-/// HDR+ paper Section 5: "We merge each Bayer color channel independently."
-/// This function extracts the 4 Bayer color planes (R, Gr, Gb, B) from raw sensor
-/// data and packs them as RGBA at half resolution for GPU processing.
-///
-/// Handles:
-/// - CSI-2 packed formats (10/12/14-bit)
-/// - Standard 8-bit Bayer
-/// - 16-bit Bayer
-///
-/// Black level is subtracted during extraction so all downstream processing
-/// operates on linear data above the noise floor (HDR+ Section 6 Step 1).
-pub(crate) fn extract_bayer_planes(frame: &CameraFrame) -> Result<BayerPlanes, String> {
-    if !frame.format.is_bayer() {
-        return Err(format!(
-            "extract_bayer_planes: expected Bayer format, got {:?}",
-            frame.format
-        ));
-    }
-
-    let width = frame.width;
-    let height = frame.height;
-    let stride = frame.stride as usize;
-    let data = frame.data.as_ref();
-    let meta = frame.libcamera_metadata.as_ref();
-
-    // Determine bit depth and whether data is CSI-2 packed
-    let bytes_per_pixel_u16 = width as usize * 2;
-    let (bit_depth, is_packed) = if stride > bytes_per_pixel_u16 {
-        // stride > width*2: check for CSI-2 packed, otherwise padded 16-bit
-        match detect_csi2_bit_depth(width, stride as u32) {
-            Some(bd) => (bd, true),
-            None => (16, false),
-        }
-    } else if stride == width as usize {
-        (8, false)
-    } else if stride >= bytes_per_pixel_u16 {
-        (16, false)
-    } else {
-        // stride < width: CSI-2 packed
-        match detect_csi2_bit_depth(width, stride as u32) {
-            Some(bd) => (bd, true),
-            None => (8, false), // fallback
-        }
-    };
-
-    let half_w = width / 2;
-    let half_h = height / 2;
-    let plane_pixels = (half_w * half_h) as usize;
-    let mut planes = vec![0.0f32; plane_pixels * 4]; // RGBA packed
-
-    // Get black level from metadata (normalized 0..1 for the bit depth range)
-    let black_level_raw = meta.and_then(|m| m.black_level);
-    let max_val = ((1u32 << bit_depth) - 1) as f32;
-    // black_level from metadata is normalized 0..1, convert to raw counts
-    let black_counts = black_level_raw.unwrap_or(0.0) * max_val;
-    let scale = 1.0 / (max_val - black_counts).max(1.0);
-
-    // Get Bayer pattern offsets: (r_dx, r_dy) tells where R is in the 2×2 quad
-    let pattern = frame.format.bayer_pattern_code().unwrap_or(0);
-    // Pattern layout (dx, dy offsets within 2×2 quad):
-    // RGGB (0): R=(0,0) Gr=(1,0) Gb=(0,1) B=(1,1)
-    // BGGR (1): B=(0,0) Gb=(1,0) Gr=(0,1) R=(1,1)
-    // GRBG (2): Gr=(0,0) R=(1,0) B=(0,1) Gb=(1,1)
-    // GBRG (3): Gb=(0,0) B=(1,0) R=(0,1) Gr=(1,1)
-    let offsets = match pattern {
-        0 => BayerOffsets {
-            r: (0, 0),
-            gr: (1, 0),
-            gb: (0, 1),
-            b: (1, 1),
-        }, // RGGB
-        1 => BayerOffsets {
-            r: (1, 1),
-            gr: (0, 1),
-            gb: (1, 0),
-            b: (0, 0),
-        }, // BGGR
-        2 => BayerOffsets {
-            r: (1, 0),
-            gr: (0, 0),
-            gb: (1, 1),
-            b: (0, 1),
-        }, // GRBG
-        3 => BayerOffsets {
-            r: (0, 1),
-            gr: (1, 1),
-            gb: (0, 0),
-            b: (1, 0),
-        }, // GBRG
-        _ => BayerOffsets {
-            r: (0, 0),
-            gr: (1, 0),
-            gb: (0, 1),
-            b: (1, 1),
-        }, // default RGGB
-    };
-
-    if is_packed {
-        extract_planes_csi2_packed(
-            data,
-            stride,
-            bit_depth,
-            half_w,
-            half_h,
-            black_counts,
-            scale,
-            &offsets,
-            &mut planes,
-        );
-    } else if bit_depth == 8 {
-        extract_planes_8bit(
-            data,
-            stride,
-            half_w,
-            half_h,
-            black_counts,
-            scale,
-            &offsets,
-            &mut planes,
-        );
-    } else {
-        extract_planes_16bit(
-            data,
-            stride,
-            half_w,
-            half_h,
-            black_counts,
-            scale,
-            &offsets,
-            &mut planes,
-        );
-    }
-
-    debug!(
-        half_w,
-        half_h,
-        bit_depth,
-        is_packed,
-        pattern,
-        black_level = ?black_counts,
-        "Extracted Bayer planes"
-    );
-
-    Ok(BayerPlanes {
-        data: planes,
-        width: half_w,
-        height: half_h,
-        colour_gains: meta.and_then(|m| m.colour_gains),
-        colour_correction_matrix: meta.and_then(|m| m.colour_correction_matrix),
-        bit_depth,
-    })
-}
-
-/// Extract Bayer planes using a generic pixel-reading closure.
-///
-/// All Bayer extraction (8-bit, 16-bit, CSI-2 packed) shares the same loop structure
-/// and normalization logic. Only the pixel-reading differs, provided by the closure.
-fn extract_planes_generic(
-    half_w: u32,
-    half_h: u32,
-    black_counts: f32,
-    scale: f32,
-    off: &BayerOffsets,
-    planes: &mut [f32],
-    read_pixel: impl Fn(usize, usize) -> f32,
-) {
-    let (r_dx, r_dy) = off.r;
-    let (gr_dx, gr_dy) = off.gr;
-    let (gb_dx, gb_dy) = off.gb;
-    let (b_dx, b_dy) = off.b;
-    for y in 0..half_h as usize {
-        let by = y * 2;
-        for x in 0..half_w as usize {
-            let bx = x * 2;
-            let r_val = read_pixel(by + r_dy, bx + r_dx);
-            let gr_val = read_pixel(by + gr_dy, bx + gr_dx);
-            let gb_val = read_pixel(by + gb_dy, bx + gb_dx);
-            let b_val = read_pixel(by + b_dy, bx + b_dx);
-
-            let idx = (y * half_w as usize + x) * 4;
-            planes[idx] = ((r_val - black_counts).max(0.0)) * scale;
-            planes[idx + 1] = ((gr_val - black_counts).max(0.0)) * scale;
-            planes[idx + 2] = ((b_val - black_counts).max(0.0)) * scale;
-            planes[idx + 3] = ((gb_val - black_counts).max(0.0)) * scale;
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Extract Bayer planes from 8-bit data
-fn extract_planes_8bit(
-    data: &[u8],
-    stride: usize,
-    half_w: u32,
-    half_h: u32,
-    black_counts: f32,
-    scale: f32,
-    off: &BayerOffsets,
-    planes: &mut [f32],
-) {
-    extract_planes_generic(
-        half_w,
-        half_h,
-        black_counts,
-        scale,
-        off,
-        planes,
-        |row, col| data[row * stride + col] as f32,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Extract Bayer planes from 16-bit data (little-endian u16)
-fn extract_planes_16bit(
-    data: &[u8],
-    stride: usize,
-    half_w: u32,
-    half_h: u32,
-    black_counts: f32,
-    scale: f32,
-    off: &BayerOffsets,
-    planes: &mut [f32],
-) {
-    extract_planes_generic(
-        half_w,
-        half_h,
-        black_counts,
-        scale,
-        off,
-        planes,
-        |row, col| {
-            let offset = row * stride + col * 2;
-            if offset + 1 < data.len() {
-                u16::from_le_bytes([data[offset], data[offset + 1]]) as f32
-            } else {
-                0.0
-            }
-        },
-    );
-}
-
-/// Read a single pixel value from a CSI-2 packed row.
-///
-/// Extracted as a free function so the bit-packing logic can be exercised by
-/// unit tests independently of the GPU pipeline plumbing.
-fn read_csi2_packed_pixel(row_data: &[u8], pixel_x: usize, bit_depth: u32) -> f32 {
-    match bit_depth {
-        10 => {
-            // 10-bit: 4 pixels packed in 5 bytes
-            // Bytes 0-3: MSBs of pixels 0-3 (bits 9..2)
-            // Byte 4: LSBs of pixels 0-3 (bits 1..0), 2 bits each
-            let group = pixel_x / 4;
-            let pos = pixel_x % 4;
-            let base = group * 5;
-            if base + 4 >= row_data.len() {
-                return 0.0;
-            }
-            let msb = row_data[base + pos] as u16;
-            let lsb = ((row_data[base + 4] >> (pos * 2)) & 0x03) as u16;
-            ((msb << 2) | lsb) as f32
-        }
-        12 => {
-            // 12-bit: 2 pixels packed in 3 bytes
-            let group = pixel_x / 2;
-            let pos = pixel_x % 2;
-            let base = group * 3;
-            if base + 2 >= row_data.len() {
-                return 0.0;
-            }
-            let msb = row_data[base + pos] as u16;
-            let lsb = if pos == 0 {
-                (row_data[base + 2] & 0x0F) as u16
-            } else {
-                ((row_data[base + 2] >> 4) & 0x0F) as u16
-            };
-            ((msb << 4) | lsb) as f32
-        }
-        14 => {
-            // 14-bit: 4 pixels packed in 7 bytes (MIPI CSI-2 RAW14).
-            //   Byte 0..3: MSBs (bits 13..6) of pixels 0..3
-            //   Byte 4   : P1[1:0] | P0[5:0]
-            //   Byte 5   : P2[3:0] | P1[5:2]
-            //   Byte 6   : P3[5:0] | P2[5:4]
-            let group = pixel_x / 4;
-            let pos = pixel_x % 4;
-            let base = group * 7;
-            if base + 6 >= row_data.len() {
-                return 0.0;
-            }
-            let msb = row_data[base + pos] as u16;
-            let b4 = row_data[base + 4] as u16;
-            let b5 = row_data[base + 5] as u16;
-            let b6 = row_data[base + 6] as u16;
-            let lsb: u16 = match pos {
-                0 => b4 & 0x3F,
-                1 => ((b5 & 0x0F) << 2) | (b4 >> 6),
-                2 => ((b6 & 0x03) << 4) | (b5 >> 4),
-                3 => b6 >> 2,
-                _ => 0,
-            };
-            ((msb << 6) | lsb) as f32
-        }
-        _ => 0.0,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Extract Bayer planes from CSI-2 packed data (10/12/14-bit)
-fn extract_planes_csi2_packed(
-    data: &[u8],
-    stride: usize,
-    bit_depth: u32,
-    half_w: u32,
-    half_h: u32,
-    black_counts: f32,
-    scale: f32,
-    off: &BayerOffsets,
-    planes: &mut [f32],
-) {
-    let read_packed_pixel = |row_data: &[u8], pixel_x: usize| -> f32 {
-        read_csi2_packed_pixel(row_data, pixel_x, bit_depth)
-    };
-
-    extract_planes_generic(
-        half_w,
-        half_h,
-        black_counts,
-        scale,
-        off,
-        planes,
-        |row, col| {
-            let row_data = &data[row * stride..];
-            read_packed_pixel(row_data, col)
-        },
-    );
-}
+// `BayerOffsets` / `BayerPlanes` / `extract_bayer_planes` / extract_planes_*
+// helpers live in the `bayer_planes` sub-module; see that file for details.
 
 /// Convert a camera frame to RGBA format using GPU compute shader
 ///
@@ -782,7 +415,7 @@ pub struct BurstModeGpuPipeline {
 use gpu_helpers::BindingKind;
 
 impl BurstModeGpuPipeline {
-    /// Create a compute pipeline with common defaults (delegates to `gpu_helpers`).
+    /// Create a compute pipeline with common defaults
     fn create_pipeline(
         device: &wgpu::Device,
         label: &str,
@@ -790,7 +423,14 @@ impl BurstModeGpuPipeline {
         module: &wgpu::ShaderModule,
         entry_point: &str,
     ) -> wgpu::ComputePipeline {
-        gpu_helpers::create_pipeline(device, label, layout, module, entry_point)
+        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            module,
+            entry_point: Some(entry_point),
+            compilation_options: Default::default(),
+            cache: None,
+        })
     }
 
     /// Create a GPU buffer with the specified usage pattern
@@ -2583,8 +2223,7 @@ impl BurstModeGpuPipeline {
             .write_buffer(&block_size_buffer, 0, bytemuck::cast_slice(&[block_size]));
 
         // Create global brightness accumulator buffer (for adaptive shadow boost - HDR+ paper Section 6)
-        // [0] = fixed-point sum (value * 256), [1] = count.
-        // Scale 256 keeps the sum within u32 for large frames; see comment in tonemap.wgsl.
+        // [0] = fixed-point sum (value * 65536), [1] = count
         let brightness_accum_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("brightness_accum_buffer"),
             size: 8, // 2 x u32
@@ -2658,9 +2297,9 @@ impl BurstModeGpuPipeline {
         drop(brightness_data);
         brightness_staging.unmap();
 
-        // Compute average brightness (convert from fixed-point — scale matches the shader)
+        // Compute average brightness (convert from fixed-point)
         let avg_brightness = if count > 0.0 {
-            (sum_fixed / count / 256.0) as f32
+            (sum_fixed / count / 65536.0) as f32
         } else {
             0.5 // Fallback to mid-gray
         };
@@ -2831,15 +2470,7 @@ impl BurstModeGpuPipeline {
             ccm_row0: [ccm[0][0], ccm[0][1], ccm[0][2], 0.0],
             ccm_row1: [ccm[1][0], ccm[1][1], ccm[1][2], 0.0],
             ccm_row2: [ccm[2][0], ccm[2][1], ccm[2][2], 0.0],
-            // Apply the colour pipeline when either white-balance gains or a
-            // colour-correction matrix is available; the two correct different
-            // things (channel amplitude vs. crosstalk) and either may stand on
-            // its own.
-            use_colour: if colour_gains.is_some() || colour_correction_matrix.is_some() {
-                1
-            } else {
-                0
-            },
+            use_colour: if colour_gains.is_some() { 1 } else { 0 },
             _pad0: 0,
             _pad1: 0,
             _pad2: 0,
@@ -3406,7 +3037,7 @@ pub async fn save_output(
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_secs())
         .unwrap_or(0);
 
     let suffix = filename_suffix.unwrap_or("");
@@ -3541,7 +3172,7 @@ pub async fn export_raw_frames(
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_secs())
         .unwrap_or(0);
 
     // Create a subdirectory for this burst
@@ -3610,7 +3241,7 @@ pub async fn export_burst_frames_dng(
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_secs())
         .unwrap_or(0);
 
     // Create a subdirectory for this burst
@@ -3688,71 +3319,6 @@ mod tests {
         let config = BurstModeConfig::default();
         assert_eq!(config.frame_count, 8);
         assert!(!config.export_raw_frames);
-    }
-
-    /// Encode 4 pixel values (each 10 bits) into a CSI-2 RAW10 group of 5 bytes.
-    fn pack_csi2_10bit(p0: u16, p1: u16, p2: u16, p3: u16) -> [u8; 5] {
-        let msb = |v: u16| (v >> 2) as u8;
-        let lsb = |v: u16| (v & 0x03) as u8;
-        [
-            msb(p0),
-            msb(p1),
-            msb(p2),
-            msb(p3),
-            lsb(p0) | (lsb(p1) << 2) | (lsb(p2) << 4) | (lsb(p3) << 6),
-        ]
-    }
-
-    /// Encode 2 pixel values (each 12 bits) into a CSI-2 RAW12 group of 3 bytes.
-    fn pack_csi2_12bit(p0: u16, p1: u16) -> [u8; 3] {
-        [
-            (p0 >> 4) as u8,
-            (p1 >> 4) as u8,
-            ((p0 & 0x0F) as u8) | (((p1 & 0x0F) as u8) << 4),
-        ]
-    }
-
-    #[test]
-    fn test_csi2_10bit_unpack_roundtrip() {
-        // Cover the corners and a few mid-range values.
-        for &(p0, p1, p2, p3) in &[
-            (0, 0, 0, 0),
-            (1023, 1023, 1023, 1023),
-            (1, 2, 3, 4),
-            (511, 512, 1, 1022),
-            (300, 600, 900, 1000),
-        ] {
-            let packed = pack_csi2_10bit(p0, p1, p2, p3);
-            assert_eq!(read_csi2_packed_pixel(&packed, 0, 10) as u16, p0);
-            assert_eq!(read_csi2_packed_pixel(&packed, 1, 10) as u16, p1);
-            assert_eq!(read_csi2_packed_pixel(&packed, 2, 10) as u16, p2);
-            assert_eq!(read_csi2_packed_pixel(&packed, 3, 10) as u16, p3);
-        }
-    }
-
-    #[test]
-    fn test_csi2_12bit_unpack_roundtrip() {
-        for &(p0, p1) in &[(0, 0), (4095, 4095), (1, 4094), (2048, 1024), (15, 240)] {
-            let packed = pack_csi2_12bit(p0, p1);
-            assert_eq!(read_csi2_packed_pixel(&packed, 0, 12) as u16, p0);
-            assert_eq!(read_csi2_packed_pixel(&packed, 1, 12) as u16, p1);
-        }
-    }
-
-    #[test]
-    fn test_csi2_unpack_out_of_bounds() {
-        let short = [0u8; 3]; // not enough for any of the formats
-        assert_eq!(read_csi2_packed_pixel(&short, 0, 10), 0.0);
-        assert_eq!(read_csi2_packed_pixel(&short, 0, 12), 0.0);
-        assert_eq!(read_csi2_packed_pixel(&short, 0, 14), 0.0);
-    }
-
-    #[test]
-    fn test_csi2_unsupported_bit_depth() {
-        let buf = [0xFFu8; 8];
-        // 16-bit and other unsupported depths return 0.0
-        assert_eq!(read_csi2_packed_pixel(&buf, 0, 16), 0.0);
-        assert_eq!(read_csi2_packed_pixel(&buf, 0, 8), 0.0);
     }
 
     /// Validate that a WGSL shader compiles successfully using naga
