@@ -754,6 +754,9 @@ pub struct AppModel {
     pub still_capture_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared storage for the latest still frame from the raw stream (multistream mode)
     pub latest_still_frame: std::sync::Arc<std::sync::Mutex<Option<CameraFrame>>>,
+    /// Notifier fired by the capture thread when a new still frame is stored.
+    /// Lets `wait_for_still_frame` await on a notification instead of polling.
+    pub still_frame_notify: std::sync::Arc<tokio::sync::Notify>,
     /// Current camera frame
     pub current_frame: Option<Arc<CameraFrame>>,
     /// Available camera devices

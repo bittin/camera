@@ -313,6 +313,7 @@ impl AppModel {
             .store(true, std::sync::atomic::Ordering::Release);
 
         let still_frame = Arc::clone(&self.latest_still_frame);
+        let still_frame_notify = Arc::clone(&self.still_frame_notify);
         let save_dir = crate::app::get_photo_directory(&self.config.save_folder_name);
         let filter_type = self.selected_filter;
         let zoom_level = self.zoom_level;
@@ -346,20 +347,12 @@ impl AppModel {
                     EncodingQuality, PhotoPipeline, PostProcessingConfig,
                 };
 
-                // Wait for the raw frame with a timeout
+                // Wait for the raw frame with a timeout, blocking on the
+                // capture-thread notifier instead of polling.
                 let timeout = std::time::Duration::from_secs(2);
-                let start = std::time::Instant::now();
-                let frame = loop {
-                    if let Ok(mut guard) = still_frame.lock()
-                        && let Some(frame) = guard.take()
-                    {
-                        break frame;
-                    }
-                    if start.elapsed() > timeout {
-                        return Err("Timeout waiting for raw frame from still stream".to_string());
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                };
+                let frame = wait_for_still_frame(&still_frame, &still_frame_notify, timeout)
+                    .await
+                    .ok_or_else(|| "Timeout waiting for raw frame from still stream".to_string())?;
 
                 info!(
                     width = frame.width,
@@ -470,6 +463,7 @@ impl AppModel {
             // These are connected to the subscription's NativeLibcameraPipeline
             let still_requested = Arc::clone(&self.still_capture_requested);
             let still_frame = Arc::clone(&self.latest_still_frame);
+            let still_frame_notify = Arc::clone(&self.still_frame_notify);
             info!(
                 frame_count,
                 "Starting burst mode capture - raw frames from raw stream (multistream)"
@@ -486,15 +480,19 @@ impl AppModel {
 
                         // Wait for raw frame with timeout
                         let timeout = std::time::Duration::from_secs(2);
-                        let frame = wait_for_still_frame(&still_frame, timeout)
-                            .await
-                            .ok_or_else(|| {
-                                format!(
-                                    "Failed to capture raw frame {}/{}: timeout waiting for raw stream",
-                                    i + 1,
-                                    frame_count
-                                )
-                            })?;
+                        let frame = wait_for_still_frame(
+                            &still_frame,
+                            &still_frame_notify,
+                            timeout,
+                        )
+                        .await
+                        .ok_or_else(|| {
+                            format!(
+                                "Failed to capture raw frame {}/{}: timeout waiting for raw stream",
+                                i + 1,
+                                frame_count
+                            )
+                        })?;
 
                         info!(
                             frame = i + 1,
@@ -2290,23 +2288,36 @@ async fn save_first_burst_frame(
     Ok(path)
 }
 
-/// Wait for a still frame to appear in the shared mutex, polling with a timeout.
+/// Wait for a still frame to appear in the shared mutex.
 ///
-/// Returns `Some(frame)` if a frame arrives before the deadline, `None` on timeout.
+/// Awaits a notification from the capture thread (no polling), then takes the
+/// frame out of the shared slot. Returns `None` on timeout.
+///
+/// Subscribing to `Notify` *before* checking the slot is important: the
+/// capture thread may have already stored the frame between the caller's
+/// `still_requested.store(true, …)` and this await, in which case we'd miss
+/// the notification. The pre-await check below catches that case.
 pub(super) async fn wait_for_still_frame(
     still_frame: &std::sync::Mutex<Option<crate::backends::camera::types::CameraFrame>>,
+    still_frame_notify: &tokio::sync::Notify,
     timeout: std::time::Duration,
 ) -> Option<crate::backends::camera::types::CameraFrame> {
-    let start = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
+        // Register interest BEFORE checking the slot, otherwise we'd race
+        // with a frame stored between the take attempt and the await.
+        let notified = still_frame_notify.notified();
         if let Ok(mut guard) = still_frame.lock()
             && let Some(frame) = guard.take()
         {
             return Some(frame);
         }
-        if start.elapsed() > timeout {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             return None;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if tokio::time::timeout(remaining, notified).await.is_err() {
+            return None;
+        }
     }
 }

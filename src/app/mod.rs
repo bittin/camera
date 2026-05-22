@@ -500,6 +500,7 @@ impl cosmic::Application for AppModel {
             camera_stream_restart_counter: 0,
             still_capture_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             latest_still_frame: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            still_frame_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             current_frame: None,
             available_cameras,
             current_camera_index,
@@ -883,6 +884,7 @@ impl cosmic::Application for AppModel {
         let cancel_flag = Arc::clone(&self.camera_cancel_flag);
         let still_capture_requested = Arc::clone(&self.still_capture_requested);
         let latest_still_frame = Arc::clone(&self.latest_still_frame);
+        let still_frame_notify = Arc::clone(&self.still_frame_notify);
         // Create a unique ID based on format properties to trigger restart when format changes
         let format_id = current_format
             .as_ref()
@@ -1113,6 +1115,7 @@ impl cosmic::Application for AppModel {
                                         frame_sender: sender,
                                         still_requested: Arc::clone(&still_capture_requested),
                                         still_frame: Arc::clone(&latest_still_frame),
+                                        still_frame_notify: Arc::clone(&still_frame_notify),
                                         recording_sender: rec_sender,
                                         jpeg_recording_mode: Arc::clone(&jpeg_recording_mode),
                                         cancel_flag: Arc::clone(&cancel_flag),
