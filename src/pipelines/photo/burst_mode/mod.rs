@@ -2575,7 +2575,8 @@ impl BurstModeGpuPipeline {
             .write_buffer(&block_size_buffer, 0, bytemuck::cast_slice(&[block_size]));
 
         // Create global brightness accumulator buffer (for adaptive shadow boost - HDR+ paper Section 6)
-        // [0] = fixed-point sum (value * 65536), [1] = count
+        // [0] = fixed-point sum (value * 256), [1] = count.
+        // Scale 256 keeps the sum within u32 for large frames; see comment in tonemap.wgsl.
         let brightness_accum_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("brightness_accum_buffer"),
             size: 8, // 2 x u32
@@ -2649,9 +2650,9 @@ impl BurstModeGpuPipeline {
         drop(brightness_data);
         brightness_staging.unmap();
 
-        // Compute average brightness (convert from fixed-point)
+        // Compute average brightness (convert from fixed-point — scale matches the shader)
         let avg_brightness = if count > 0.0 {
-            (sum_fixed / count / 65536.0) as f32
+            (sum_fixed / count / 256.0) as f32
         } else {
             0.5 // Fallback to mid-gray
         };
