@@ -1328,6 +1328,10 @@ fn reset_interaction_state(state: &mut CarouselState) {
     state.hovered = false;
     state.hovered_carousel = false;
     state.drag_nearest_idx = None;
+    // Drop any in-flight tap-initiated mode change; otherwise the next layout
+    // pass would compute snap math from a stale pending_mode after the
+    // gesture has already been cancelled (e.g. FingerLost / palm rejection).
+    state.pending_mode = None;
     start_full_collapse(state);
     if state.full_expand_t < 0.01 {
         start_collapse(state);
