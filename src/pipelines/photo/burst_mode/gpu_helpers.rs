@@ -57,7 +57,6 @@ pub fn create_layout(
 }
 
 /// Create a compute pipeline with common defaults
-#[allow(dead_code)]
 pub fn create_pipeline(
     device: &wgpu::Device,
     label: &str,
