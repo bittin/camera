@@ -716,13 +716,27 @@ impl AppModel {
                 &self.available_modes(),
             );
 
-            // Vertical padding matches build_capture_button so the circle
-            // doesn't shift when the layout flips between idle and recording.
-            crate::app::bottom_bar::three_col_row(
+            // While the virtual camera is streaming a video file source, keep
+            // the play/pause control reachable in the left slot (it's hidden
+            // by the streaming layout otherwise). For the camera-source
+            // streaming case `play_pause_button` is `None` and we fall back
+            // to the original spacer.
+            let left_slot: Element<'_, Message> = if let Some(pp_button) = play_pause_button {
+                widget::container(pp_button)
+                    .width(Length::Fixed(side_width))
+                    .center_x(side_width)
+                    .into()
+            } else {
                 widget::Space::new()
                     .width(Length::Fixed(side_width))
                     .height(Length::Shrink)
-                    .into(),
+                    .into()
+            };
+
+            // Vertical padding matches build_capture_button so the circle
+            // doesn't shift when the layout flips between idle and recording.
+            crate::app::bottom_bar::three_col_row(
+                left_slot,
                 widget::container(stop_circle)
                     .width(Length::Fixed(center_width))
                     .center_x(center_width)
