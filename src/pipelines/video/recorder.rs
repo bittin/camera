@@ -295,7 +295,9 @@ fn openh264_downscale(base_width: u32, base_height: u32, encoder_name: &str) -> 
     if encoder_name == "openh264enc" && pixels > OPENH264_MAX_PIXELS {
         let aspect_ratio = base_width as f64 / base_height as f64;
         let target_width = 1920u32;
-        let target_height = (target_width as f64 / aspect_ratio) as u32 & !1; // even height
+        // Even height, and at least 2 pixels — `& !1` on small values can
+        // round down to 0, which would cause GStreamer caps negotiation to fail.
+        let target_height = ((target_width as f64 / aspect_ratio) as u32 & !1).max(2);
         warn!(
             "OpenH264 resolution limit exceeded ({}x{} = {} pixels > {} max), downscaling to {}x{}",
             base_width, base_height, pixels, OPENH264_MAX_PIXELS, target_width, target_height,
