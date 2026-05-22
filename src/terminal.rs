@@ -48,6 +48,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = stdout();
     execute!(stdout, EnterAlternateScreen)?;
+
+    // Install a panic hook so a panic inside the TUI doesn't leave the user's
+    // shell in raw mode with the alternate screen active.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        eprintln!("{info}");
+    }));
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -59,6 +69,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+    let _ = std::panic::take_hook();
+    std::panic::set_hook(original_hook);
 
     result
 }
