@@ -215,6 +215,11 @@ impl AppModel {
                 self.zoom_animation.map(|a| a.start.elapsed()),
                 |s| s.zoom_animation = None,
             ),
+            Message::WindowFocusChanged(focused) => {
+                info!(focused, "WindowFocusChanged");
+                crate::backends::volume_keys::set_focused(focused);
+                Task::none()
+            }
             Message::WindowClose => self.handle_window_close(),
             Message::WindowMinimize => self.core.minimize(None),
             Message::WindowToggleMaximize => self.core.toggle_maximize(None),

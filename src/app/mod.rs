@@ -1588,6 +1588,43 @@ impl cosmic::Application for AppModel {
             )
         };
 
+        // Volume-key shutter on phones: the compositor swallows the keys
+        // for system audio so they never reach iced as keyboard events.
+        // The `volume_keys` backend reads `/dev/input/event*` directly,
+        // grabs each device exclusively while the window is focused
+        // (so the compositor doesn't *also* change the volume) and
+        // forwards presses as `Message::Capture` — same as the spacebar.
+        let volume_keys_sub = subscription_with_id(
+            "volume_keys",
+            cosmic::iced::stream::channel(8, async move |mut output| {
+                let mut rx = crate::backends::volume_keys::start();
+                while let Some(_key) = rx.recv().await {
+                    if output.send(Message::Capture).await.is_err() {
+                        break;
+                    }
+                }
+            }),
+        );
+
+        // Translate Wayland keyboard-focus transitions for the camera
+        // window into `WindowFocusChanged` messages; the update handler
+        // forwards them into the volume_keys backend so we only grab the
+        // hardware shutter buttons while the camera is in focus.
+        let window_focus_sub = subscription::filter_map("window_focus", |event| {
+            let subscription::Event::Interaction { event, .. } = event else {
+                return None;
+            };
+            match event {
+                cosmic::iced::Event::Window(cosmic::iced::window::Event::Focused) => {
+                    Some(Message::WindowFocusChanged(true))
+                }
+                cosmic::iced::Event::Window(cosmic::iced::window::Event::Unfocused) => {
+                    Some(Message::WindowFocusChanged(false))
+                }
+                _ => None,
+            }
+        });
+
         Subscription::batch([
             config_sub,
             camera_sub,
@@ -1602,6 +1639,8 @@ impl cosmic::Application for AppModel {
             audio_level_sub,
             portal_theme_sub,
             keybind_sub,
+            volume_keys_sub,
+            window_focus_sub,
         ])
     }
 
