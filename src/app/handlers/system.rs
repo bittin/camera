@@ -1000,7 +1000,7 @@ impl AppModel {
                     .await
                     .map_err(|e| format!("Failed to create insights dir: {e}"))?;
 
-                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
                 let mut saved_paths = Vec::new();
 
                 // Save insights state JSON (once per capture session)
