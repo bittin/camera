@@ -1353,7 +1353,7 @@ impl AppModel {
         let camera = &self.available_cameras[self.current_camera_index];
         let format = self.active_format.as_ref().unwrap();
 
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("VID_{}.mp4", timestamp);
         let save_dir = crate::app::get_video_directory(&self.config.save_folder_name);
         let output_path = save_dir.join(&filename);
@@ -1428,7 +1428,7 @@ impl AppModel {
             return Task::none();
         };
 
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("VID_{}.mp4", timestamp);
         let save_dir = crate::app::get_video_directory(&self.config.save_folder_name);
         let output_path = save_dir.join(&filename);
@@ -1932,7 +1932,7 @@ impl AppModel {
                     return Err(format!("Failed to create video directory: {e}"));
                 }
 
-                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
                 let output_path = video_dir.join(format!("timelapse_{timestamp}.mp4"));
 
                 crate::pipelines::video::timelapse::run_timelapse_encoder(

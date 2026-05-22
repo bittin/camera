@@ -3389,7 +3389,7 @@ pub async fn save_output(
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
 
     let suffix = filename_suffix.unwrap_or("");
@@ -3524,7 +3524,7 @@ pub async fn export_raw_frames(
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
 
     // Create a subdirectory for this burst
@@ -3593,7 +3593,7 @@ pub async fn export_burst_frames_dng(
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis())
         .unwrap_or(0);
 
     // Create a subdirectory for this burst

@@ -273,7 +273,8 @@ fn save_photo(frame: &CameraFrame) -> Result<PathBuf, Box<dyn std::error::Error>
     let photo_dir = crate::app::get_photo_directory(crate::constants::DEFAULT_SAVE_FOLDER);
     std::fs::create_dir_all(&photo_dir)?;
 
-    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+    // Use millisecond precision so two rapid presses don't collide.
+    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
     let filename = format!("IMG_{}.jpg", timestamp);
     let filepath = photo_dir.join(&filename);
 
