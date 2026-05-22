@@ -429,12 +429,16 @@ impl PhotoEncoder {
         let pixel_data_16 = if bit_depth == 10 && is_packed {
             unpack_csi2p_10bit_to_16bit(&raw.data, width, height, stride)
         } else {
-            // 8-bit: promote each byte to 16-bit (shift left by 8 for full range)
+            // 8-bit: promote each byte to 16-bit and bit-replicate so the
+            // value occupies the full 16-bit range (0..=255 → 0..=65535).
+            // Without the shift, readers that map sample/65535 (instead of
+            // sample/WhiteLevel) render the image extremely dark.
             let mut out = Vec::with_capacity((width * height * 2) as usize);
             for row in 0..height {
                 let row_start = (row * stride) as usize;
                 for col in 0..width {
-                    let val = raw.data[row_start + col as usize] as u16;
+                    let byte = raw.data[row_start + col as usize] as u16;
+                    let val = (byte << 8) | byte;
                     out.extend_from_slice(&val.to_le_bytes());
                 }
             }
@@ -447,7 +451,7 @@ impl PhotoEncoder {
         } else if bit_depth == 12 {
             4095
         } else {
-            255
+            65535
         };
 
         // Get CFA pattern bytes: 0=R, 1=G, 2=B
