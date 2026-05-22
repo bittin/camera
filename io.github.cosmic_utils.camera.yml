@@ -17,7 +17,10 @@ finish-args:
   - --socket=fallback-x11
   # Webcam access (currently no better option than this)
   # https://docs.flatpak.org/en/latest/sandbox-permissions.html#device-access
-  # Automatically includes GPU support since "dri" is part of "all"
+  # Automatically includes GPU support since "dri" is part of "all".
+  # Also exposes /dev/input/event*, which the haptic backend uses for
+  # vibration and the volume_keys backend reads as a shutter trigger on
+  # phones.
   - --device=all
   # Home directory access for saving photos/videos
   - --filesystem=xdg-pictures:rw
