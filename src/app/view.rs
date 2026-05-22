@@ -516,7 +516,16 @@ impl AppModel {
     /// Settled cover blend: 0.0 (Contain) when fit-to-view is enabled in a
     /// mode that supports it (Photo, View), 1.0 (Cover) everywhere else.
     /// The single source of truth for the preview's geometry target.
+    ///
+    /// Virtual mode is forced to Contain regardless of the toggle — the
+    /// fit/fill chip is hidden there anyway (it's gated on
+    /// `supports_fit_and_zoom`), and Cover would silently crop edges off
+    /// what's being streamed to consumer apps, which doesn't match the
+    /// "what you see is what you send" expectation.
     pub fn settled_blend(&self) -> f32 {
+        if matches!(self.mode, crate::app::state::CameraMode::Virtual) {
+            return 0.0;
+        }
         if self.preview_fit_to_view && self.mode.supports_fit_and_zoom() {
             0.0
         } else {
@@ -707,13 +716,27 @@ impl AppModel {
                 &self.available_modes(),
             );
 
-            // Vertical padding matches build_capture_button so the circle
-            // doesn't shift when the layout flips between idle and recording.
-            crate::app::bottom_bar::three_col_row(
+            // While the virtual camera is streaming a video file source, keep
+            // the play/pause control reachable in the left slot (it's hidden
+            // by the streaming layout otherwise). For the camera-source
+            // streaming case `play_pause_button` is `None` and we fall back
+            // to the original spacer.
+            let left_slot: Element<'_, Message> = if let Some(pp_button) = play_pause_button {
+                widget::container(pp_button)
+                    .width(Length::Fixed(side_width))
+                    .center_x(side_width)
+                    .into()
+            } else {
                 widget::Space::new()
                     .width(Length::Fixed(side_width))
                     .height(Length::Shrink)
-                    .into(),
+                    .into()
+            };
+
+            // Vertical padding matches build_capture_button so the circle
+            // doesn't shift when the layout flips between idle and recording.
+            crate::app::bottom_bar::three_col_row(
+                left_slot,
                 widget::container(stop_circle)
                     .width(Length::Fixed(center_width))
                     .center_x(center_width)
