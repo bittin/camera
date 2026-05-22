@@ -99,11 +99,31 @@ impl AppModel {
 
         // Spawn the dedicated thread immediately (fire-and-forget from thread perspective)
         std::thread::spawn(move || {
+            use crate::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
             use crate::backends::virtual_camera::VirtualCameraManager;
 
             // Create and start the virtual camera on this dedicated thread
             let mut manager = VirtualCameraManager::new();
             manager.set_filter(filter_type);
+
+            // Build a tokio runtime once. The virtual-camera output pipeline
+            // accepts RGBA only, so YUV-format frames (e.g. MJPEG → I420 from
+            // libcamera) must be converted before they're pushed; that
+            // conversion lives behind an async API. Without it, the appsrc
+            // buffer would interpret Y-only data as RGBA and downstream
+            // consumer apps would see a stretched / tiled grayscale image
+            // (4× horizontal tiles for a width:stride ratio of 1:4).
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ =
+                        done_tx.send(Err(format!("Failed to create virtual-cam runtime: {}", e)));
+                    return;
+                }
+            };
 
             let result = (|| {
                 if let Err(e) = manager.start(width, height) {
@@ -149,8 +169,39 @@ impl AppModel {
                         );
                     }
 
-                    // CPU filtering happens here - blocking is fine on dedicated thread
-                    if let Err(e) = manager.push_frame(&latest_frame) {
+                    // If the camera delivered YUV (or any non-RGBA format),
+                    // run it through the shared GPU convert pipeline to get
+                    // tightly-packed RGBA that the virtual-camera appsrc
+                    // expects. Skip the round-trip when the frame is
+                    // already RGBA.
+                    let push_result = if latest_frame.format == PixelFormat::RGBA {
+                        manager.push_frame(&latest_frame)
+                    } else {
+                        match rt.block_on(crate::pipelines::video::recorder::convert_frame_to_rgba(
+                            &latest_frame,
+                        )) {
+                            Ok(rgba) => {
+                                let rgba_arc: std::sync::Arc<[u8]> = rgba.into();
+                                let rgba_frame = CameraFrame {
+                                    width: latest_frame.width,
+                                    height: latest_frame.height,
+                                    data: FrameData::Copied(rgba_arc),
+                                    format: PixelFormat::RGBA,
+                                    stride: latest_frame.width * 4,
+                                    yuv_planes: None,
+                                    captured_at: latest_frame.captured_at,
+                                    sensor_timestamp_ns: latest_frame.sensor_timestamp_ns,
+                                    libcamera_metadata: latest_frame.libcamera_metadata.clone(),
+                                };
+                                manager.push_frame(&rgba_frame)
+                            }
+                            Err(e) => {
+                                warn!(?e, format = ?latest_frame.format, "YUV→RGBA convert failed; dropping frame");
+                                continue;
+                            }
+                        }
+                    };
+                    if let Err(e) = push_result {
                         warn!(?e, "Failed to push frame to virtual camera");
                     }
                 }
