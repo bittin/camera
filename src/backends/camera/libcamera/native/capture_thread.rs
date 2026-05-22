@@ -27,6 +27,9 @@ pub(crate) struct CaptureThreadParams {
     pub(crate) latest_preview: Arc<Mutex<Option<CameraFrame>>>,
     pub(crate) latest_still: Arc<Mutex<Option<CameraFrame>>>,
     pub(crate) still_requested: Arc<AtomicBool>,
+    /// Notified when a new still frame has been stored. Lets consumers await
+    /// the next still instead of polling the mutex.
+    pub(crate) still_frame_notify: Arc<tokio::sync::Notify>,
     pub(crate) preview_frame_count: Arc<AtomicU64>,
     pub(crate) still_frame_count: Arc<AtomicU64>,
     pub(crate) frame_sender: FrameSender,
@@ -991,9 +994,15 @@ fn run_capture_loop(
                     "Raw still frame captured"
                 );
 
-                if let Ok(mut still) = params.latest_still.lock() {
+                let stored = if let Ok(mut still) = params.latest_still.lock() {
                     *still = Some(still_frame);
                     params.still_requested.store(false, Ordering::Release);
+                    true
+                } else {
+                    false
+                };
+                if stored {
+                    params.still_frame_notify.notify_waiters();
                 }
             }
         }
@@ -1040,10 +1049,16 @@ fn dispatch_viewfinder_frame(
             height = frame.height,
             "Still frame captured from preview stream"
         );
-        if let Ok(mut still) = params.latest_still.lock() {
+        let stored = if let Ok(mut still) = params.latest_still.lock() {
             *still = Some(frame.clone());
-        }
+            true
+        } else {
+            false
+        };
         params.still_requested.store(false, Ordering::Release);
+        if stored {
+            params.still_frame_notify.notify_waiters();
+        }
     }
 
     // Send ViewFinder frames to recording (via appsrc encoder pipeline).

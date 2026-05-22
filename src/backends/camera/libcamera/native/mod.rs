@@ -46,6 +46,9 @@ pub(crate) struct PipelineSharedState {
     pub(crate) frame_sender: FrameSender,
     pub(crate) still_requested: Arc<AtomicBool>,
     pub(crate) still_frame: Arc<Mutex<Option<CameraFrame>>>,
+    /// Notifier fired by the capture thread when a new still frame is stored.
+    /// Allows consumers to await rather than poll.
+    pub(crate) still_frame_notify: Arc<tokio::sync::Notify>,
     pub(crate) recording_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<RecordingFrame>>>>,
     pub(crate) jpeg_recording_mode: Arc<AtomicBool>,
     /// Cancel flag from the subscription — allows the capture thread to abort
@@ -118,6 +121,7 @@ impl NativeLibcameraPipeline {
             latest_preview: Arc::clone(&latest_preview),
             latest_still: Arc::clone(&shared.still_frame),
             still_requested: Arc::clone(&shared.still_requested),
+            still_frame_notify: Arc::clone(&shared.still_frame_notify),
             preview_frame_count: Arc::clone(&preview_frame_count),
             still_frame_count: Arc::clone(&still_frame_count),
             frame_sender: shared.frame_sender,
