@@ -547,15 +547,29 @@ impl VideoDecoder {
             .and_then(|s| self.sample_to_frame(s))
     }
 
-    /// Check if the video has reached the end
+    /// Check if the video has reached the end.
+    ///
+    /// Also returns `true` when an error message is posted to the bus so the
+    /// caller drops the current playback and restarts, rather than spinning
+    /// against a broken pipeline that will never deliver more frames.
     pub fn is_eos(&self) -> bool {
         use gstreamer::prelude::*;
 
         if let Some(bus) = self.video_pipeline.bus() {
             while let Some(msg) = bus.pop() {
                 use gstreamer::MessageView;
-                if let MessageView::Eos(_) = msg.view() {
-                    return true;
+                match msg.view() {
+                    MessageView::Eos(_) => return true,
+                    MessageView::Error(err) => {
+                        tracing::warn!(
+                            src = ?err.src().map(|s| s.path_string()),
+                            error = %err.error(),
+                            debug = ?err.debug(),
+                            "Virtual-camera file source pipeline error; treating as EOS"
+                        );
+                        return true;
+                    }
+                    _ => {}
                 }
             }
         }
