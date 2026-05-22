@@ -33,6 +33,24 @@ pub struct AppStateSnapshot {
 /// Bug report generator
 pub struct BugReportGenerator;
 
+/// Replace the user's home directory and current username in `text` with
+/// generic placeholders so bug reports filed publicly don't leak them.
+fn redact_paths(text: &str) -> String {
+    let mut out = text.to_string();
+    if let Some(home) = dirs::home_dir()
+        && let Some(home_str) = home.to_str()
+        && !home_str.is_empty()
+    {
+        out = out.replace(home_str, "$HOME");
+    }
+    if let Ok(user) = std::env::var("USER")
+        && !user.is_empty()
+    {
+        out = out.replace(&user, "$USER");
+    }
+    out
+}
+
 impl BugReportGenerator {
     /// Generate a comprehensive bug report and save it to a file
     ///
@@ -168,11 +186,13 @@ impl BugReportGenerator {
         if app_info::is_flatpak() {
             info.push_str("**Runtime:** Flatpak\n");
 
-            // Get flatpak runtime details
+            // Get flatpak runtime details — redact the user's home path so the
+            // bug-report attachment doesn't leak it into public GitHub issues.
             if let Ok(flatpak_info) = tokio::fs::read_to_string("/.flatpak-info").await {
+                let redacted = redact_paths(&flatpak_info);
                 info.push_str("\n### Flatpak Details\n\n");
                 info.push_str("```ini\n");
-                info.push_str(&flatpak_info);
+                info.push_str(&redacted);
                 info.push_str("```\n");
             }
         } else {
