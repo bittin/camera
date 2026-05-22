@@ -85,7 +85,7 @@ impl AppModel {
             "Starting virtual camera streaming from camera"
         );
 
-        let (stop_tx, _stop_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
         let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel();
         let (filter_tx, mut filter_rx) = tokio::sync::watch::channel(filter_type);
         self.virtual_camera = VirtualCameraState::start(stop_tx, frame_tx, filter_tx, false);
@@ -117,6 +117,14 @@ impl AppModel {
                 let mut dropped_count = 0u64;
 
                 loop {
+                    // Check for an explicit stop signal first — the channel-close
+                    // fallback only fires when the frame sender is dropped, which
+                    // we can't rely on if a future caller forgets to drop it.
+                    if let Ok(()) = stop_rx.try_recv() {
+                        info!("Received stop signal, stopping virtual camera");
+                        break;
+                    }
+
                     // Check for filter updates (non-blocking)
                     if filter_rx.has_changed().unwrap_or(false) {
                         let new_filter = *filter_rx.borrow_and_update();
