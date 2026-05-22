@@ -1175,10 +1175,29 @@ fn decode_mjpeg_frame(
     };
 
     if let Err(e) = decompressor.decompress_to_yuv(jpeg_data, yuv_image) {
-        if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-            warn!(error = %e, subsamp = ?header.subsamp, "MJPEG decompress to YUV failed, skipping frame");
+        // libjpeg-turbo classifies some MJPEG quirks as *warnings* — the YUV
+        // output is still written and visually fine. The Rust `turbojpeg`
+        // wrapper surfaces these as `Err`, which would otherwise make us drop
+        // every frame from cameras that emit them.
+        //
+        // Known offenders: Logitech C270 (046d:0825) and several other UVC
+        // webcams emit MJPEG with restart-marker stuffing bytes between
+        // segments, triggering "extraneous bytes before marker 0xdN".
+        let msg = e.to_string();
+        let recoverable = msg.contains("extraneous bytes") || msg.contains("Premature end");
+        if !recoverable {
+            if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
+                warn!(error = %e, subsamp = ?header.subsamp, "MJPEG decompress to YUV failed, skipping frame");
+            }
+            return None;
         }
-        return None;
+        if frame_num == 0 {
+            debug!(
+                error = %e,
+                subsamp = ?header.subsamp,
+                "Recoverable MJPEG warning — accepting decoded YUV anyway"
+            );
+        }
     }
 
     // Compute UV plane dimensions based on subsampling
