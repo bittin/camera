@@ -319,10 +319,16 @@ impl AppModel {
         let width = frame.width;
         let height = frame.height;
 
-        // Create and start virtual camera manager
+        // Create and start virtual camera manager.
+        //
+        // File sources are streamed exactly as they appear in the file — the
+        // app's `mirror_preview` setting is for selfie-cam ergonomics and
+        // doesn't apply here. Pin `flip_horizontal` to `false` defensively so
+        // a future change to the default can't silently start mirroring
+        // streamed images to consumer apps.
         let mut manager = VirtualCameraManager::new();
         manager.set_filter(initial_filter);
-        // File sources should not be mirrored - output exactly as the file content
+        manager.set_flip_horizontal(false);
 
         if let Err(e) = manager.start(width, height) {
             return Err(format!("Failed to start virtual camera: {}", e));
@@ -408,10 +414,16 @@ impl AppModel {
 
         let (width, height) = decoder.dimensions();
 
-        // Create and start virtual camera manager
+        // Create and start virtual camera manager.
+        //
+        // File sources are streamed exactly as they appear in the file — the
+        // app's `mirror_preview` setting is for selfie-cam ergonomics and
+        // doesn't apply here. Pin `flip_horizontal` to `false` defensively so
+        // a future change to the default can't silently start mirroring
+        // streamed video files to consumer apps.
         let mut manager = VirtualCameraManager::new();
         manager.set_filter(initial_filter);
-        // File sources should not be mirrored - output exactly as the file content
+        manager.set_flip_horizontal(false);
 
         if let Err(e) = manager.start(width, height) {
             return Err(format!("Failed to start virtual camera: {}", e));
@@ -425,13 +437,21 @@ impl AppModel {
             "Streaming video to virtual camera (looping)"
         );
 
-        // Get preroll frame immediately for instant preview
+        // Get preroll frame immediately for instant preview.
+        // We keep an Arc handle to the most recent frame so we can re-push it
+        // while playback is paused — otherwise consumer apps connecting to
+        // the virtual-camera PipeWire node receive a single frame and then
+        // nothing, which most apps render as a black window (whereas the
+        // image-source path stays "alive" by re-pushing the same image at
+        // 30fps).
+        let mut last_frame: Option<Arc<crate::backends::camera::types::CameraFrame>> = None;
         if let Some(preroll) = decoder.preroll_frame() {
             let frame_arc = Arc::new(preroll);
             if let Err(e) = manager.push_frame(&frame_arc) {
                 warn!(?e, "Failed to push preroll frame to virtual camera");
             }
             let _ = preview_tx.send(Arc::clone(&frame_arc));
+            last_frame = Some(frame_arc);
         }
 
         let mut frame_count = 0u64;
@@ -455,13 +475,16 @@ impl AppModel {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
 
-            // Check for playback control commands
+            // Check for playback control commands. Coalesce queued Seeks so
+            // a continuous slider drag only triggers one (expensive)
+            // GStreamer seek per loop iteration — the intermediate positions
+            // would have produced frames the user never sees anyway.
             let mut needs_frame_update = false;
+            let mut latest_seek: Option<f64> = None;
             while let Ok(cmd) = control_rx.try_recv() {
                 match cmd {
                     VideoPlaybackCommand::Seek(position) => {
-                        info!(position, "Seeking video");
-                        decoder.seek(position);
+                        latest_seek = Some(position);
                         // When seeking while paused, we need to pull a frame to update display
                         if paused {
                             needs_frame_update = true;
@@ -478,6 +501,10 @@ impl AppModel {
                         info!(paused, "Video pause set");
                     }
                 }
+            }
+            if let Some(position) = latest_seek {
+                info!(position, "Seeking video (coalesced)");
+                decoder.seek(position);
             }
 
             // Check for filter updates
@@ -501,8 +528,16 @@ impl AppModel {
                 last_progress_update = std::time::Instant::now();
             }
 
-            // If paused and no frame update needed, sleep briefly and continue
+            // If paused and no frame update needed, keep re-pushing the last
+            // frame so the consumer app sees a still image instead of going
+            // black. The decoder itself stays paused — we just refresh the
+            // virtual-camera pipeline's input.
             if paused && !needs_frame_update {
+                if let Some(ref frame_arc) = last_frame
+                    && let Err(e) = manager.push_frame(frame_arc)
+                {
+                    warn!(?e, "Failed to re-push paused frame to virtual camera");
+                }
                 std::thread::sleep(vc_timing::PAUSE_CHECK_INTERVAL);
                 continue;
             }
@@ -526,6 +561,7 @@ impl AppModel {
 
                     // Send frame to preview
                     let _ = preview_tx.send(Arc::clone(&frame_arc));
+                    last_frame = Some(Arc::clone(&frame_arc));
 
                     // If we got a frame update while paused (after seeking), re-pause and send progress
                     if needs_frame_update && paused {
@@ -803,6 +839,15 @@ impl AppModel {
             let position = self.video_preview_seek_position;
             let progress = if dur > 0.0 { position / dur } else { 0.0 };
             self.video_file_progress = Some((position, dur, progress));
+
+            // Kick off the persistent preview decoder (in whatever paused
+            // state the user is in — defaults to true right after picking).
+            // This way subsequent slider scrubs route a Seek command through
+            // the existing pipeline instead of spinning a new one per scrub
+            // via `load_video_frame_at_position`.
+            if matches!(self.virtual_camera_file_source, Some(FileSource::Video(_))) {
+                return self.start_video_preview_playback();
+            }
         }
 
         Task::none()
@@ -913,15 +958,14 @@ impl AppModel {
             if let Some(ref tx) = self.video_playback_control_tx {
                 let _ = tx.send(VideoPlaybackCommand::TogglePause);
             }
-        } else {
-            // If not streaming, start or stop preview playback
-            if self.video_file_paused {
-                // Stop preview playback
-                self.stop_video_preview_playback();
-            } else {
-                // Start preview playback
-                return self.start_video_preview_playback();
-            }
+        } else if let Some(ref tx) = self.video_preview_control_tx {
+            // Persistent preview decoder is already running — just toggle it.
+            let _ = tx.send(VideoPlaybackCommand::SetPaused(self.video_file_paused));
+        } else if !self.video_file_paused {
+            // Defensive: preview decoder isn't up (decoder failed to start, or
+            // the file source was loaded before this code path existed). Start
+            // one so play actually plays.
+            return self.start_video_preview_playback();
         }
         Task::none()
     }
@@ -949,7 +993,12 @@ impl AppModel {
         Task::none()
     }
 
-    /// Start video preview playback (when not streaming)
+    /// Start video preview playback (when not streaming).
+    ///
+    /// Kept alive for the entire lifetime of the video file source so seek
+    /// requests reuse the same `VideoDecoder` instead of spinning a fresh
+    /// GStreamer pipeline per scrub (which the old `load_video_frame_at_position`
+    /// fallback did, and which made scrubbing the slider visibly laggy).
     pub(crate) fn start_video_preview_playback(&mut self) -> Task<cosmic::Action<Message>> {
         // Only start if we have a video file and are not already playing
         let path = match &self.virtual_camera_file_source {
@@ -960,7 +1009,10 @@ impl AppModel {
         // Stop any existing preview playback
         self.stop_video_preview_playback();
 
-        info!("Starting video preview playback");
+        info!(
+            paused = self.video_file_paused,
+            "Starting video preview playback"
+        );
 
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -970,10 +1022,18 @@ impl AppModel {
         self.video_preview_control_tx = Some(control_tx);
 
         let initial_position = self.video_preview_seek_position;
+        let initial_paused = self.video_file_paused;
 
         // Spawn preview playback thread
         std::thread::spawn(move || {
-            Self::run_video_preview_playback(path, initial_position, stop_rx, control_rx, frame_tx);
+            Self::run_video_preview_playback(
+                path,
+                initial_position,
+                initial_paused,
+                stop_rx,
+                control_rx,
+                frame_tx,
+            );
         });
 
         // Return a task that receives frames and sends messages
@@ -1006,6 +1066,7 @@ impl AppModel {
     fn run_video_preview_playback(
         path: std::path::PathBuf,
         initial_position: f64,
+        initial_paused: bool,
         mut stop_rx: tokio::sync::oneshot::Receiver<()>,
         mut control_rx: tokio::sync::mpsc::UnboundedReceiver<VideoPlaybackCommand>,
         frame_tx: tokio::sync::mpsc::UnboundedSender<(
@@ -1032,7 +1093,10 @@ impl AppModel {
 
         use crate::constants::virtual_camera as vc_timing;
 
-        let mut paused = false;
+        let mut paused = initial_paused;
+        if paused {
+            decoder.set_paused(true);
+        }
         let mut last_frame_time = std::time::Instant::now();
         let frame_duration = vc_timing::IMAGE_STREAM_FRAME_DURATION; // ~30fps
 
@@ -1045,11 +1109,21 @@ impl AppModel {
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
             }
 
-            // Check for control commands
+            // Check for control commands. When we Seek while paused we need
+            // to temporarily unpause the decoder to pull one frame at the new
+            // position — otherwise the slider preview would stay stuck on the
+            // pre-seek frame. Coalesce queued Seeks (e.g. from a slider drag)
+            // so we only execute the latest one — intermediate positions
+            // would have produced frames the user never sees.
+            let mut needs_frame_update = false;
+            let mut latest_seek: Option<f64> = None;
             while let Ok(cmd) = control_rx.try_recv() {
                 match cmd {
                     VideoPlaybackCommand::Seek(position) => {
-                        decoder.seek(position);
+                        latest_seek = Some(position);
+                        if paused {
+                            needs_frame_update = true;
+                        }
                     }
                     VideoPlaybackCommand::TogglePause => {
                         paused = !paused;
@@ -1061,10 +1135,18 @@ impl AppModel {
                     }
                 }
             }
+            if let Some(position) = latest_seek {
+                decoder.seek(position);
+            }
 
-            if paused {
+            if paused && !needs_frame_update {
                 std::thread::sleep(vc_timing::PAUSE_CHECK_INTERVAL);
                 continue;
+            }
+
+            // Briefly unpause to pull a single frame at the new seek position.
+            if needs_frame_update && paused {
+                decoder.set_paused(false);
             }
 
             // Get next frame
@@ -1088,16 +1170,28 @@ impl AppModel {
                     break; // Receiver dropped
                 }
 
+                // Re-pause after a seek-while-paused frame pull.
+                if needs_frame_update && paused {
+                    decoder.set_paused(true);
+                }
+
                 // Rate limiting
                 let elapsed = last_frame_time.elapsed();
                 if elapsed < frame_duration {
                     std::thread::sleep(frame_duration - elapsed);
                 }
                 last_frame_time = std::time::Instant::now();
-            } else if decoder.is_eos() {
-                // Video ended, loop
-                if decoder.restart().is_err() {
-                    break;
+            } else {
+                // If we temporarily unpaused to satisfy a seek, re-pause even if
+                // no frame came back so we don't accidentally play.
+                if needs_frame_update && paused {
+                    decoder.set_paused(true);
+                }
+                if decoder.is_eos() {
+                    // Video ended, loop
+                    if decoder.restart().is_err() {
+                        break;
+                    }
                 }
             }
         }
