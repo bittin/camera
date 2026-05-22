@@ -767,7 +767,7 @@ pub struct BurstModeGpuPipeline {
 use gpu_helpers::BindingKind;
 
 impl BurstModeGpuPipeline {
-    /// Create a compute pipeline with common defaults
+    /// Create a compute pipeline with common defaults (delegates to `gpu_helpers`).
     fn create_pipeline(
         device: &wgpu::Device,
         label: &str,
@@ -775,14 +775,7 @@ impl BurstModeGpuPipeline {
         module: &wgpu::ShaderModule,
         entry_point: &str,
     ) -> wgpu::ComputePipeline {
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
-            layout: Some(layout),
-            module,
-            entry_point: Some(entry_point),
-            compilation_options: Default::default(),
-            cache: None,
-        })
+        gpu_helpers::create_pipeline(device, label, layout, module, entry_point)
     }
 
     /// Create a GPU buffer with the specified usage pattern
