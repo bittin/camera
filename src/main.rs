@@ -41,6 +41,9 @@ fn parse_window_size(s: &str) -> Result<(f32, f32), String> {
         .trim()
         .parse()
         .map_err(|e| format!("invalid height: {e}"))?;
+    if !width.is_finite() || !height.is_finite() {
+        return Err("window dimensions must be finite".to_string());
+    }
     if width < 1.0 || height < 1.0 {
         return Err("window dimensions must be positive".to_string());
     }
