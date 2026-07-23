@@ -320,3 +320,5 @@ metainfo-caption-qr = QR-Code-Erkennung
 metainfo-caption-settings = Erweiterte Einstellungen
 action-toggle-tools-menu = Werkzeugmenü umschalten
 action-toggle-filters = Filterauswahl umschalten
+action-toggle-ui-chrome = Bedienelemente ein-/ausblenden
+action-toggle-preview-fit = Einpassen / Ausfüllen umschalten
