@@ -268,6 +268,171 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.0.0" date="2026-07-24">
+      <description>
+        <p>Release 1.0.0 includes the following changes:</p>
+        <ul>
+          <li>Add local APK build with cross-compilation</li>
+          <li>Bundle filter icon instead of using theme icon</li>
+          <li>Enlarge app icon and add 512/1024px sizes</li>
+          <li>Fix multi-plane NV12 crash and add V4L2 format enumeration to insights</li>
+          <li>Improve app icon with glass lens effect and Flathub best practices</li>
+          <li>Use actual negotiated stream format in insights instead of user-selected format</li>
+          <li>Add 2:1 (18:9) aspect ratio option</li>
+          <li>Persist photo aspect ratio setting across sessions</li>
+          <li>deps(cargo): bump uuid from 1.22.0 to 1.23.0 in the rust-dependencies group</li>
+          <li>Add GitHub Sponsors funding configuration</li>
+          <li>Add GitHub Sponsors badge to README</li>
+          <li>deps(cargo): bump libcosmic from `adb3e34` to `f6eb314`</li>
+          <li>deps(actions): bump extractions/setup-just from 3 to 4</li>
+          <li>Update Swedish translation</li>
+          <li>i18n(cs): Update Czech translation</li>
+          <li>Immersive preview, fit toggle, and custom title bar</li>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 7 updates</li>
+          <li>deps: bump libcosmic to 99c038a and migrate iced 0.14 / wgpu 28 APIs</li>
+          <li>deps(cargo): bump libcosmic from `99c038a` to `564ef83`</li>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 2 updates</li>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 5 updates</li>
+          <li>i18n(fr): Update French translations</li>
+          <li>i18n(cs): Update Czech translation</li>
+          <li>update libcosmic</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>feat: keyboard shortcuts</li>
+          <li>deps(cargo): bump ashpd from 0.13.10 to 0.13.11 in the rust-dependencies group across 1 directory</li>
+          <li>feat: mirror captures</li>
+          <li>fix(keybind): pass physical key to KeyBind::matches</li>
+          <li>fix(recorder): use pulsesrc slave-method=skew to avoid long-recording drift</li>
+          <li>fix(recorder): raise EOS finalization timeout from 10s to 60s</li>
+          <li>fix(recorder): use fragmented MP4 to survive unclean shutdown</li>
+          <li>chore(recorder): downgrade noisy recording trace logs</li>
+          <li>deps(cargo): bump the libcosmic group across 1 directory with 4 updates</li>
+          <li>feat: audio loudness meter</li>
+          <li>fix: gracefully stop recording/timelapse before exit on close</li>
+          <li>Update Ukrainian translations in camera.ftl</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>Minnor update Ukrainian translations in camera.ftl</li>
+          <li>fix(audio): native PA enumeration, volume guard, dynamics chain</li>
+          <li>fix(shader): rotate pivot and crop_range to display orientation</li>
+          <li>deps(cargo): bump the libcosmic group</li>
+          <li>fix(idle): inhibit sleep while app is active, allow D-Bus calls from flatpak</li>
+          <li>fix(camera): self-heal across crashes by deferring last_camera_path persistence</li>
+          <li>deps(cargo): bump serde_json from 1.0.149 to 1.0.150 in the rust-dependencies group</li>
+          <li>fix(shutdown): _exit instead of exit to avoid SIGSEGV during atexit</li>
+          <li>fix(gallery): defer thumbnail apply during recording/timelapse</li>
+          <li>fix(burst): use 8-bit fixed-point scale for brightness accumulator (u32 overflow)</li>
+          <li>perf(carousel): schedule one-shot redraws instead of polling delay timers</li>
+          <li>fix(terminal): install panic hook so TUI restores raw mode on panic</li>
+          <li>fix(capture): always release is_capturing in handle_photo_saved</li>
+          <li>fix(dng): bit-replicate 8-bit Bayer to fill 16-bit range</li>
+          <li>fix(burst): correct CSI-2 RAW14 LSB unpacking (read all 3 LSB bytes)</li>
+          <li>fix(mjpeg): accept recoverable libjpeg-turbo warnings (extraneous bytes / premature end)</li>
+          <li>fix(libcamera): use Acquire/Release ordering for still_requested flag</li>
+          <li>fix(cli): refuse to overwrite existing --output file for photo/video</li>
+          <li>fix(bug-report): redact user home/username from /.flatpak-info dump</li>
+          <li>refactor(state): group flash fields into FlashState sub-struct</li>
+          <li>fix(virtual-cam): treat bus errors as EOS to break spin-on-broken-pipeline</li>
+          <li>fix(recorder): abort pusher task before pipeline NULL transition</li>
+          <li>fix(qr): reassemble multi-byte UTF-8 in urlencoding_decode</li>
+          <li>refactor(gpu): share renderer wgpu device with compute pipelines via OnceCell seed</li>
+          <li>fix(cli): recurse into subdirectories when collecting image paths</li>
+          <li>refactor(video): extract recording stats + diagnostics into stats.rs</li>
+          <li>refactor(burst): dedupe create_pipeline helpers via gpu_helpers</li>
+          <li>perf(histogram): parallel reduce + prefix-scan instead of serial 256-iter loop</li>
+          <li>refactor(recorder): remove dead yuv_to_nv12 helper</li>
+          <li>fix(app): simplify file-source preview subscription lock cycle</li>
+          <li>fix(virtual-cam): escape backslash/quote when interpolating file paths into GStreamer pipelines</li>
+          <li>fix(main): surface audio prewarm thread panic at warn level</li>
+          <li>fix(cli): reject NaN/inf in --preview-window dimensions</li>
+          <li>fix(capture): use millisecond-precision timestamp to avoid file overwrite</li>
+          <li>fix(recorder): guard openh264_downscale against zero target height</li>
+          <li>fix(burst): apply CCM when only colour matrix (no WB gains) is provided</li>
+          <li>test(burst): cover CSI-2 10/12-bit unpacking and out-of-bounds paths</li>
+          <li>fix(libcamera): use tokio::sync::Notify for still-frame readiness instead of polling</li>
+          <li>fix(mode-carousel): clear pending_mode on cancelled gesture</li>
+          <li>fix(qr-overlay): preserve sensor aspect in Cover mode</li>
+          <li>fix(qr-overlay): keep small detections centred when clamping to min size</li>
+          <li>refactor(burst): extract Bayer plane extraction into bayer_planes module</li>
+          <li>fix(camera): don't tear down stream on unrelated hotplug when path unknown</li>
+          <li>fix(blur): correct aspect on rotated sensors and paint letterbox</li>
+          <li>fix(mode-switch): skip pending-camera write when camera is unchanged</li>
+          <li>fix(gpu): skip renderer-device seed when missing TEXTURE_FORMAT_16BIT_NORM</li>
+          <li>fix(libcamera): map R8 / GREY / Y8 to PixelFormat::Gray8</li>
+          <li>chore(flatpak): bump libcamera to 0f85ffed (v0.7.1, sandbox-ipa-fallback rebase)</li>
+          <li>feat(volume-keys): capture on hardware volume buttons</li>
+          <li>fix(theme): re-apply on cosmic_config palette/mode changes</li>
+          <li>Improve virtual camera video file source user experience</li>
+          <li>fix(virtual-cam): honor stop signal in camera-source streaming thread</li>
+          <li>fix(virtual-cam): convert YUV camera frames to RGBA before push</li>
+          <li>feat(virtual-camera): show filter picker in tools menu</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the rust-dependencies group with 2 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 2 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(actions): bump actions/cache from 5 to 6</li>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 3 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(actions): bump actions/checkout from 6 to 7</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the rust-dependencies group with 3 updates</li>
+          <li>i18n(uk): update Ukrainian translation</li>
+          <li>feat(ui): frosted-glass support</li>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 7 updates</li>
+          <li>deps(cargo): bump the libcosmic group across 1 directory with 4 updates</li>
+          <li>deps(cargo): bump naga from 29.0.3 to 30.0.0</li>
+          <li>Speed up camera switching</li>
+          <li>chore: bump libcamera fork to v0.7.2 rebase</li>
+          <li>Shorten overlay System entry label</li>
+          <li>Move motor/PTZ control button into tools menu</li>
+          <li>feat(settings): re-organize settings menu with sub-menus</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump tokio from 1.52.4 to 1.53.0 in the rust-dependencies group</li>
+          <li>deps(cargo): bump pollster from 0.4.0 to 1.0.1</li>
+          <li>chore(l10n): update translations</li>
+          <li>Improve localization and add translator context comments</li>
+          <li>chore(i18n): translate desktop and metainfo files</li>
+          <li>chore(l10n): merge Weblate translations (resolves #514 conflicts)</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the rust-dependencies group with 8 updates</li>
+          <li>chore(l10n): update translations</li>
+          <li>chore(i18n): move metadata strings into camera.ftl</li>
+          <li>chore(i18n): collapse duplicate Camera strings into one key</li>
+          <li>chore(metadata): drop COSMIC desktop framing and highlight camera features</li>
+          <li>deps(cargo): bump libc from 0.2.186 to 0.2.188 in the rust-dependencies group</li>
+          <li>Chore/weblate merge</li>
+          <li>chore(l10n): update translations</li>
+          <li>Chore/weblate merge 2</li>
+          <li>chore(l10n): update translations</li>
+          <li>chore(i18n): pull filter names into the listing from the filter picker</li>
+          <li>chore(metadata): drop the Linux phone feature bullet</li>
+          <li>chore(l10n): update translations</li>
+          <li>chore: fix cargo fmt and clippy warnings</li>
+          <li>feat: generate preview README from en translations</li>
+          <li>chore(l10n): update translations</li>
+          <li>feat: automated localized preview screenshots</li>
+          <li>feat: default overlay effect to translucent</li>
+          <li>ci: regenerate cargo-sources.json before Flatpak build</li>
+          <li>fix: left-align the localized languages list on GitHub</li>
+          <li>fix: show camera switch button in generated previews</li>
+          <li>feat: spoof video recording in generated previews</li>
+          <li>ci: speed up CI jobs</li>
+          <li>ci: regenerate preview screenshots via pull request</li>
+          <li>ci: synthetic preview camera</li>
+          <li>fix: locate preview binary via CARGO_TARGET_DIR</li>
+          <li>chore: regenerate preview screenshots</li>
+          <li>ci: cache preview build and gate capture on readiness marker</li>
+          <li>deps(cargo): bump the rust-dependencies group across 1 directory with 3 updates</li>
+          <li>Fix photo-during-recording button position when carousel is absent</li>
+          <li>chore: regenerate preview screenshots</li>
+          <li>deps(actions): bump actions/cache from 4 to 6</li>
+          <li>Add H shortcut to hide all UI chrome and V for fit/fill</li>
+          <li>chore(l10n): update translations</li>
+          <li>chore: regenerate preview screenshots</li>
+          <li>chore(l10n): update translations</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.3.4" date="2026-03-27">
       <description>
         <p>Release 0.3.4 includes the following changes:</p>
