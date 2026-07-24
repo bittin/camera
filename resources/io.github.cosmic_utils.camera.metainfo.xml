@@ -120,6 +120,17 @@
     <color type="primary" scheme_preference="light">#d4e9fa</color>
     <color type="primary" scheme_preference="dark">#0d2e5c</color>
   </branding>
+  <!--
+    The screenshot images below are stored via Git LFS (see .gitattributes).
+    This is safe for end users because Flathub mirrors these screenshots onto
+    its own CDN (https://dl.flathub.org/media) at build/compose time, so software
+    centers fetch from Flathub rather than from GitHub. The raw.githubusercontent
+    URLs are only hit during a Flathub compose, so recurring LFS bandwidth against
+    the GitHub quota is limited to build events, not per-user downloads.
+    Reference: https://docs.flathub.org/docs/for-app-authors/linter
+    (screenshot mirroring uses flatpak-builder args compose-url-policy=full
+     and mirror-screenshots-url=https://dl.flathub.org/media)
+  -->
   <screenshots>
     <screenshot type="default">
       <caption>Photo mode with tools menu</caption>
