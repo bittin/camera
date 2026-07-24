@@ -607,7 +607,6 @@ impl cosmic::Application for AppModel {
             // Privacy cover detection
             privacy_cover_closed: false,
             idle_inhibit: None,
-            idle_inhibit_fd: None,
             // Insights drawer
             insights: Default::default(),
         };

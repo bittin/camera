@@ -1878,43 +1878,39 @@ impl AppModel {
     /// Call this whenever recording / streaming / timelapse state changes,
     /// or when the camera list transitions to/from empty.
     ///
-    /// Uses org.freedesktop.ScreenSaver.Inhibit (supported by cosmic-idle,
-    /// GNOME, KDE, etc.) to prevent the screen from turning off, plus
-    /// systemd-logind Inhibit to block idle-lock + suspend. Issue #365.
+    /// Uses the XDG Inhibit portal (org.freedesktop.portal.Inhibit) to block
+    /// idle lock + suspend while the camera is active. Issue #365.
+    ///
+    /// The portal is used because it needs no finish-args: portals are always
+    /// reachable in the Flatpak sandbox, unlike direct D-Bus calls to logind
+    /// (system bus) or the screensaver. Desktops that ship no Inhibit backend
+    /// (COSMIC: pop-os/xdg-desktop-portal-cosmic#342) return an error here and
+    /// simply won't inhibit; we keep no direct-D-Bus fallback on purpose.
     pub(crate) fn update_idle_inhibit(&mut self) {
         let should_inhibit = !self.available_cameras.is_empty()
             || self.recording.is_recording()
             || self.virtual_camera.is_streaming()
             || self.timelapse.is_active();
 
-        let is_inhibited = self.idle_inhibit.is_some() || self.idle_inhibit_fd.is_some();
+        let is_inhibited = self.idle_inhibit.is_some();
 
         if should_inhibit && !is_inhibited {
-            // ScreenSaver inhibit (cosmic-idle / GNOME / KDE screensaver)
-            // Connection must stay alive — cosmic-idle removes inhibitors on disconnect
-            match screensaver_inhibit() {
+            // XDG Inhibit portal (prevents idle lock + suspend, no finish-args).
+            // Connection must stay alive: the inhibition ends when it drops.
+            match portal_inhibit() {
                 Ok(guard) => {
-                    info!(cookie = guard.cookie, "ScreenSaver inhibit active");
+                    info!(
+                        handle = guard.handle.as_str(),
+                        "idle+suspend inhibit active"
+                    );
                     self.idle_inhibit = Some(guard);
                 }
-                Err(e) => warn!(error = %e, "ScreenSaver inhibit failed"),
-            }
-            // systemd-logind inhibit (prevents idle lock + suspend)
-            match logind_inhibit() {
-                Ok(fd) => {
-                    info!("logind idle+sleep inhibit active");
-                    self.idle_inhibit_fd = Some(fd);
-                }
-                Err(e) => warn!(error = %e, "logind inhibit failed"),
+                Err(e) => warn!(error = %e, "idle+suspend inhibit failed"),
             }
         } else if !should_inhibit && is_inhibited {
-            // Release ScreenSaver inhibit (Drop sends UnInhibit + closes connection)
-            if let Some(guard) = self.idle_inhibit.take() {
-                info!(cookie = guard.cookie, "ScreenSaver inhibit released");
-            }
-            // Release logind inhibit (dropping the fd closes it)
-            if self.idle_inhibit_fd.take().is_some() {
-                info!("logind idle+sleep inhibit released");
+            // Release the inhibit (Drop calls Request.Close on the handle)
+            if self.idle_inhibit.take().is_some() {
+                info!("idle+suspend inhibit released");
             }
         }
     }
@@ -2093,47 +2089,43 @@ impl AppModel {
     }
 }
 
-/// Call org.freedesktop.ScreenSaver.Inhibit to prevent idle/sleep.
-/// Returns a guard that keeps the D-Bus connection alive (required by cosmic-idle).
-fn screensaver_inhibit() -> Result<crate::app::state::IdleInhibitGuard, String> {
+/// Call the XDG Inhibit portal (org.freedesktop.portal.Inhibit) to block idle
+/// lock + suspend. Returns a guard whose Drop closes the request handle.
+///
+/// The portal is always reachable inside the Flatpak sandbox, so it needs no
+/// finish-args, unlike direct D-Bus calls to logind (system bus) or the
+/// screensaver. Desktops that ship no Inhibit backend (e.g. COSMIC, tracked at
+/// pop-os/xdg-desktop-portal-cosmic#342) return an error here and the caller
+/// leaves the session un-inhibited; there is no direct-D-Bus fallback.
+fn portal_inhibit() -> Result<crate::app::state::InhibitGuard, String> {
+    use std::collections::HashMap;
+    use zbus::zvariant::Value;
+
+    // Inhibit flags bitmask: 4 = Suspend, 8 = Idle. Together these match the
+    // previous logind "idle:sleep" request.
+    const INHIBIT_SUSPEND: u32 = 4;
+    const INHIBIT_IDLE: u32 = 8;
+
     let conn = zbus::blocking::Connection::session()
         .map_err(|e| format!("D-Bus session connection: {e}"))?;
-    let cookie: u32 = conn
+    let options: HashMap<&str, Value> = HashMap::from([("reason", Value::from("Camera active"))]);
+    let handle: zbus::zvariant::OwnedObjectPath = conn
         .call_method(
-            Some("org.freedesktop.ScreenSaver"),
-            "/org/freedesktop/ScreenSaver",
-            Some("org.freedesktop.ScreenSaver"),
+            Some("org.freedesktop.portal.Desktop"),
+            "/org/freedesktop/portal/desktop",
+            Some("org.freedesktop.portal.Inhibit"),
             "Inhibit",
-            &("Camera", "Camera active"),
+            // (window, flags, options): empty window means no parent surface.
+            &("", INHIBIT_SUSPEND | INHIBIT_IDLE, options),
         )
-        .map_err(|e| format!("ScreenSaver.Inhibit: {e}"))?
+        .map_err(|e| format!("portal Inhibit: {e}"))?
         .body()
         .deserialize()
-        .map_err(|e| format!("ScreenSaver.Inhibit response: {e}"))?;
-    Ok(crate::app::state::IdleInhibitGuard {
+        .map_err(|e| format!("portal Inhibit response: {e}"))?;
+    Ok(crate::app::state::InhibitGuard {
         connection: conn,
-        cookie,
+        handle,
     })
-}
-
-/// Call systemd-logind Inhibit to block idle lock and suspend.
-/// Returns an OwnedFd — dropping it releases the inhibit.
-fn logind_inhibit() -> Result<std::os::unix::io::OwnedFd, String> {
-    let conn = zbus::blocking::Connection::system()
-        .map_err(|e| format!("D-Bus system connection: {e}"))?;
-    let fd: zbus::zvariant::OwnedFd = conn
-        .call_method(
-            Some("org.freedesktop.login1"),
-            "/org/freedesktop/login1",
-            Some("org.freedesktop.login1.Manager"),
-            "Inhibit",
-            &("idle:sleep", "Camera", "Camera active", "block"),
-        )
-        .map_err(|e| format!("logind Inhibit: {e}"))?
-        .body()
-        .deserialize()
-        .map_err(|e| format!("logind Inhibit response: {e}"))?;
-    Ok(fd.into())
 }
 
 /// Async function to process collected burst mode frames (GPU-only)

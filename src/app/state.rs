@@ -345,29 +345,35 @@ impl TimelapseState {
     }
 }
 
-/// Holds a D-Bus connection + cookie for org.freedesktop.ScreenSaver.Inhibit.
-/// The connection must remain open — cosmic-idle removes inhibitors when the client disconnects.
-pub struct IdleInhibitGuard {
+/// Holds a D-Bus connection + request handle for org.freedesktop.portal.Inhibit.
+///
+/// The inhibition lasts until Close() is called on the request handle (done on
+/// Drop) or the connection is dropped, so the connection must stay alive. The
+/// Inhibit portal is used because it needs no finish-args: portals are always
+/// reachable in the Flatpak sandbox. Desktops that ship no Inhibit backend
+/// (COSMIC, tracked upstream in pop-os/xdg-desktop-portal-cosmic#342) simply
+/// don't inhibit; we intentionally keep no direct-D-Bus fallback for them.
+pub struct InhibitGuard {
     pub connection: zbus::blocking::Connection,
-    pub cookie: u32,
+    pub handle: zbus::zvariant::OwnedObjectPath,
 }
 
-impl Drop for IdleInhibitGuard {
+impl Drop for InhibitGuard {
     fn drop(&mut self) {
         let _ = self.connection.call_method(
-            Some("org.freedesktop.ScreenSaver"),
-            "/org/freedesktop/ScreenSaver",
-            Some("org.freedesktop.ScreenSaver"),
-            "UnInhibit",
-            &(self.cookie,),
+            Some("org.freedesktop.portal.Desktop"),
+            &self.handle,
+            Some("org.freedesktop.portal.Request"),
+            "Close",
+            &(),
         );
     }
 }
 
-impl std::fmt::Debug for IdleInhibitGuard {
+impl std::fmt::Debug for InhibitGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IdleInhibitGuard")
-            .field("cookie", &self.cookie)
+        f.debug_struct("InhibitGuard")
+            .field("handle", &self.handle.as_str())
             .finish()
     }
 }
@@ -867,10 +873,10 @@ pub struct AppModel {
     pub privacy_cover_closed: bool,
 
     // ===== Idle Inhibit =====
-    /// Active screensaver inhibit (connection must stay alive or cosmic-idle cleans up)
-    pub idle_inhibit: Option<IdleInhibitGuard>,
-    /// File descriptor from systemd-logind Inhibit (keeps idle+sleep inhibited while held)
-    pub idle_inhibit_fd: Option<std::os::unix::io::OwnedFd>,
+    /// Active idle + suspend inhibit via the XDG Inhibit portal (held while the
+    /// camera is in use; released on Drop). Absent on desktops that ship no
+    /// Inhibit portal backend (e.g. COSMIC).
+    pub idle_inhibit: Option<InhibitGuard>,
 
     // ===== Timelapse =====
     /// Timelapse capture state
