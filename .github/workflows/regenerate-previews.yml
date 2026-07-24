@@ -54,7 +54,12 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout repository
+        # Fetch Git LFS objects (the committed preview screenshots).
+        # LFS download bandwidth is billed to the repository owner even for public repos:
+        # https://docs.github.com/en/billing/managing-billing-for-git-large-file-storage/about-billing-for-git-large-file-storage
         uses: actions/checkout@v7
+        with:
+          lfs: true
 
       - name: Free up disk space
         # The pinned Fedora image, the release build and the container layers do
@@ -112,29 +117,58 @@ jobs:
         run: just generate-previews
 
       - name: Open pull request if screenshots changed
-        uses: peter-evans/create-pull-request@v8
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # Scope the PR to preview/ (PNGs + generated galleries). Any metadata
-          # the generate-metadata pass rewrites under resources/ is left to the
-          # "Regenerate Derived Files" job, which owns those files.
-          add-paths: |
-            preview
-          commit-message: "chore: regenerate preview screenshots"
-          title: "chore: regenerate preview screenshots"
-          body: |
-            ## Preview screenshots
+        # peter-evans/create-pull-request does not support Git LFS: it rebuilds
+        # commits from a computed diff, which bypasses the LFS clean filter and
+        # never uploads the LFS objects, so the regenerated PNGs would land as
+        # broken pointers. Commit with plain git plus an explicit `git lfs push`
+        # instead, which routes the images through .gitattributes as pointers
+        # and uploads their backing objects.
+        # See https://github.com/peter-evans/create-pull-request/issues/422
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
 
-            The UI changed on `main`, so the committed preview screenshots were
-            re-rendered in the pinned container. Only images whose pixels
-            actually changed are included; if this PR is empty the previews were
-            already up to date.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-            Please review the image diffs before merging — this is a visual
-            change that no automated check can sign off on.
+          # Scope the commit to preview/ (PNGs + generated galleries). Metadata
+          # under resources/ is owned by the "Regenerate Derived Files" job.
+          git add preview
 
-            ---
-            *Automatically created by the Regenerate Preview Screenshots workflow.*
-          branch: ci/regenerate-previews
-          delete-branch: true
-          labels: previews
+          if git diff --cached --quiet; then
+            echo "Previews already up to date; no pull request needed."
+            exit 0
+          fi
+
+          branch=ci/regenerate-previews
+          git switch -C "$branch"
+          git commit -m "chore: regenerate preview screenshots"
+
+          # Upload the LFS objects first, then force-update the branch so a
+          # re-run refreshes the existing PR rather than failing on it.
+          git lfs push origin "$branch"
+          git push --force origin "$branch"
+
+          state="$(gh pr view "$branch" --json state --jq .state 2>/dev/null || echo NONE)"
+          if [ "$state" = "OPEN" ]; then
+            echo "Pull request already open for $branch; its branch was updated."
+            exit 0
+          fi
+
+          body="$(printf '%s\n' \
+            '## Preview screenshots' \
+            '' \
+            'The UI changed on `main`, so the committed preview screenshots were re-rendered in the pinned container. Only images whose pixels actually changed are included.' \
+            '' \
+            'Please review the image diffs before merging. This is a visual change that no automated check can sign off on.' \
+            '' \
+            '---' \
+            '*Automatically created by the Regenerate Preview Screenshots workflow.*')"
+
+          gh pr create \
+            --base main \
+            --head "$branch" \
+            --label previews \
+            --title "chore: regenerate preview screenshots" \
+            --body "$body"
