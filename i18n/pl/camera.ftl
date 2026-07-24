@@ -290,3 +290,5 @@ metainfo-caption-recording = Trwa nagrywanie filmu
 metainfo-caption-qr = Wykrywanie kodów QR
 metainfo-caption-settings = Zaawansowane ustawienia
 insights-copy-time = Czas Opakowania Klatki
+action-toggle-ui-chrome = Przełącz interfejs
+action-toggle-preview-fit = Przełącz zmieść / wypełnij

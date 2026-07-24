@@ -317,3 +317,7 @@ metainfo-caption-filters = Filterväljare
 metainfo-caption-recording = Videoinspelning pågår
 metainfo-caption-qr = QR-kodidentifiering
 metainfo-caption-settings = Avancerade inställningar
+action-toggle-tools-menu = Växla verktygsmeny
+action-toggle-filters = Växla filterväljare
+action-toggle-ui-chrome = Växla gränssnitt
+action-toggle-preview-fit = Växla anpassning/fyllning
