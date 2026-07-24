@@ -325,3 +325,5 @@ metainfo-feature-controls = Manuální ovládání: expozice, ISO, závěrka, os
 metainfo-feature-modes = Režimy fotografie, videa a časosběru, se samospouští a kompoziční mřížkou
 action-toggle-filters = Přepnout výběr filtrů
 action-toggle-tools-menu = Přepnout nabídku nástrojů
+action-toggle-ui-chrome = Přepnout rozhraní
+action-toggle-preview-fit = Přepnout přizpůsobení / vyplnění
