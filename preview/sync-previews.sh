@@ -35,6 +35,9 @@
 #                       share of differing pixels within the worst grid cell
 #                       needed to accept a shot (default 0.25 = 25%)
 #   PREVIEW_TILES       grid resolution for the tile pass (default 16)
+#   PREVIEW_OPTIMIZE    set to 0 to commit the PNGs exactly as captured
+#   PREVIEW_OXIPNG_LEVEL
+#                       oxipng optimization level (default 4)
 
 set -euo pipefail
 
@@ -45,6 +48,7 @@ FUZZ="${PREVIEW_FUZZ:-2%}"
 THRESHOLD="${PREVIEW_THRESHOLD:-0.005}"
 TILE_THRESHOLD="${PREVIEW_TILE_THRESHOLD:-0.25}"
 TILES="${PREVIEW_TILES:-16}"
+OXIPNG_LEVEL="${PREVIEW_OXIPNG_LEVEL:-4}"
 
 command -v magick >/dev/null || command -v convert >/dev/null || {
     echo "error: ImageMagick is required" >&2
@@ -101,6 +105,73 @@ require_share() {
 
 as_pct() { awk "BEGIN { printf \"%.2f\", $1 * 100 }"; }
 
+# Losslessly recompresses the freshly captured shots, in place, before anything
+# else looks at them.
+#
+# The repository carries over a hundred of these PNGs and CI regenerates them on
+# every push to main that touches src/**, so a byte saved here is saved again in
+# every future regeneration: git keeps every generation of every blob forever.
+# oxipng re-derives the per-row filters and re-deflates the image data without
+# touching a single pixel, which is worth about 10% on these shots (measured
+# over a 14 shot sample spanning the top level, variants/ and locales/) for well
+# under a minute of wall clock across the whole set.
+#
+# Why this runs BEFORE the pixel comparison rather than after the copy:
+#
+#   * once a shot has been replaced, the committed file is itself oxipng output,
+#     so optimizing the fresh capture first keeps both sides of the comparison
+#     in the same representation instead of comparing "as captured" against
+#     "as committed"
+#   * whatever was compared is exactly what gets committed, so a shot can never
+#     be judged on one byte stream and stored as another
+#
+# Neither would be safe with a lossy optimizer, and it is worth spelling out why
+# this step is lossless. `oxipng -o4 --strip safe` was verified over that same
+# sample to decode to pixel-identical output (`magick compare -metric AE` = 0),
+# so it cannot move either share below by even one pixel.
+#
+# Quantization (pngquant --quality=70-95) was measured as well and deliberately
+# rejected despite saving far more, about 66%. It is wrong here twice over:
+#
+#   * it dithers the viewfinder photo. The smooth sky gradient picks up visible
+#     mottling and faint banding, and these shots exist to sell the app on
+#     Flathub.
+#   * it defeats the change detection this whole script is built around. The
+#     palette is chosen from the whole frame, so a change to 0.04% of the pixels
+#     (one timer digit) re-picked it and moved 2.9% of *all* pixels, past the
+#     0.5% whole-frame threshold, with a worst tile of 33% past the 25% tile
+#     threshold. Every shot would be rewritten on every run, which is precisely
+#     the churn the thresholds exist to prevent.
+#
+# oxipng is installed in the container image (see preview/Containerfile) but is
+# treated as optional: someone running this script on a host without it should
+# still get a correct sync, only larger files.
+optimize_shots() {
+    (( $# )) || return 0
+
+    if [[ "${PREVIEW_OPTIMIZE:-1}" != "1" ]]; then
+        echo "note: PREVIEW_OPTIMIZE=0, committing PNGs as captured"
+        return 0
+    fi
+
+    if ! command -v oxipng >/dev/null; then
+        echo "note: oxipng not found, committing PNGs as captured (about 10% larger)" >&2
+        return 0
+    fi
+
+    # One invocation for the whole set rather than one per shot: oxipng
+    # parallelises across the files it is given, which measured about 2.5x
+    # faster than a call per file.
+    #
+    # A failure must not fail the sync. The optimizer is a size tweak, not a
+    # correctness step, and a partially optimized set is still a set of valid,
+    # pixel-identical PNGs.
+    echo "==> Optimizing $# captured shots with oxipng -o $OXIPNG_LEVEL"
+    if ! oxipng -o "$OXIPNG_LEVEL" --strip safe --quiet "$@"; then
+        echo "warning: oxipng reported an error, continuing with the shots as they are" >&2
+    fi
+}
+
 changed=0
 unchanged=0
 added=0
@@ -111,8 +182,16 @@ shopt -s nullglob
 # locales/<lang>/. All are synced the same way, so neither the gallery in
 # preview/README.md nor the localized screenshots in metainfo.xml drift from the
 # shot they illustrate.
-for new in "$NEW_DIR"/preview-*.png "$NEW_DIR"/variants/preview-*.png \
-           "$NEW_DIR"/locales/*/preview-*.png; do
+#
+# Collected into an array first so the optimizer can be handed the whole set in
+# one go, and so it cannot possibly run over a different set of files than the
+# comparison loop below.
+shots=( "$NEW_DIR"/preview-*.png "$NEW_DIR"/variants/preview-*.png \
+        "$NEW_DIR"/locales/*/preview-*.png )
+
+optimize_shots "${shots[@]}"
+
+for new in "${shots[@]}"; do
     name="${new#"$NEW_DIR"/}"
     old="$OLD_DIR/$name"
     mkdir -p "$(dirname "$old")"

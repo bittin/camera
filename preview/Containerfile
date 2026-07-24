@@ -78,7 +78,19 @@ RUN setcap -r /usr/bin/sway
 
 # ImageMagick compares a fresh capture against the committed PNG, so shots that
 # only differ by a few antialiased pixels don't open a pull request.
-RUN dnf install -y --setopt=install_weak_deps=False ImageMagick && dnf clean all
+#
+# oxipng losslessly recompresses the shots that are about to be committed, worth
+# about 10% of their bytes. CI regenerates them on every push to main touching
+# src/**, and git keeps every generation forever, so this is paid back on every
+# future run. It is installed rather than left optional because the whole point
+# of this image is that the committed screenshots are produced the same way
+# everywhere; sync-previews.sh still runs without it, just producing fatter PNGs.
+#
+# Unpinned like everything else here, and safe to leave unpinned: a different
+# oxipng would re-encode to different bytes, but the accept/reject decision is
+# made on decoded pixels, which it cannot change.
+RUN dnf install -y --setopt=install_weak_deps=False ImageMagick oxipng \
+    && dnf clean all
 
 # Software Vulkan only: a runner that happens to expose a GPU must not render
 # these screenshots differently from one that doesn't.
