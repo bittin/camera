@@ -353,14 +353,35 @@ jobs:
             sed -i '/camera-x86_64.flatpak/a | `camera-armhf.flatpak` | Flatpak bundle for armhf (32-bit) |' release_notes_footer.md
           fi
 
+      # Reconstruct notes from the merged-PR list instead of GitHub's
+      # releases/generate-notes API. generate-notes matches PRs by merge-commit
+      # SHA, which the 2026-07 Git LFS history rewrite invalidated for every
+      # pre-rewrite PR (see create-release.yml for the full explanation). Listing
+      # merged PRs by merge date is SHA-independent and stays correct going
+      # forward.
       - name: Create GitHub Release
         run: |
-          gh api repos/${{ github.repository }}/releases/generate-notes \
-            -f tag_name="${{ github.ref_name }}" \
-            --jq '.body' > release_notes.md
+          TAG="${{ github.ref_name }}"
+          PREVIOUS_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${TAG}$" | head -1)
+
+          {
+            echo "## What's Changed"
+            if [ -n "$PREVIOUS_TAG" ]; then
+              PREV_DATE=$(git log -1 --format=%cI "$PREVIOUS_TAG")
+              gh pr list --state merged --base main --limit 1000 \
+                --json number,title,author,mergedAt \
+                --jq "[.[] | select(.mergedAt > \"$PREV_DATE\")] | sort_by(.mergedAt) | .[] | \"* \(.title) by @\(if (.author.login | startswith(\"app/\")) then (.author.login[4:] + \"[bot]\") else .author.login end) in ${{ github.server_url }}/${{ github.repository }}/pull/\(.number)\""
+              echo ""
+              echo "**Full Changelog**: ${{ github.server_url }}/${{ github.repository }}/compare/${PREVIOUS_TAG}...${TAG}"
+            else
+              gh pr list --state merged --base main --limit 1000 \
+                --json number,title,author,mergedAt \
+                --jq "sort_by(.mergedAt) | .[] | \"* \(.title) by @\(if (.author.login | startswith(\"app/\")) then (.author.login[4:] + \"[bot]\") else .author.login end) in ${{ github.server_url }}/${{ github.repository }}/pull/\(.number)\""
+            fi
+          } > release_notes.md
           cat release_notes_footer.md >> release_notes.md
-          gh release create ${{ github.ref_name }} \
-            --title "Camera ${{ github.ref_name }}" \
+          gh release create "$TAG" \
+            --title "Camera ${TAG}" \
             --notes-file release_notes.md \
             release-assets/*
         env:
