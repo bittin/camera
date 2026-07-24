@@ -263,3 +263,4 @@ settings-mirror-captures = 镜像捕获
 settings-haptic-feedback = 触觉反馈
 settings-haptic-feedback-description = 捕获、模式切换和相机切换时震动
 shortcut-category-capture = 捕获
+filter-pencil = 铅笔
