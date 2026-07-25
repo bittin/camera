@@ -19,6 +19,8 @@
 //! [`get_shared_gpu`] falls back to creating its own compute-only device.
 
 use std::sync::Arc;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info};
@@ -35,6 +37,76 @@ pub struct GpuDeviceInfo {
     pub backend: wgpu::Backend,
     /// Whether low-priority queue was successfully configured (always false now)
     pub low_priority_enabled: bool,
+    /// Driver name reported by the adapter (e.g. `NVIDIA`, `radv`).
+    pub driver: String,
+    /// Driver version string (e.g. `595.84`). The field that identifies a
+    /// driver-specific rendering bug, so it is worth carrying into bug reports.
+    pub driver_info: String,
+    /// Discrete, integrated, virtual or software.
+    pub device_type: wgpu::DeviceType,
+}
+
+/// What happened when the renderer offered its device to [`try_seed_shared_gpu_from_renderer`].
+///
+/// Recorded so a bug report can say whether compute shares the renderer's
+/// device or runs on a second one, without the reader having to infer it from
+/// debug logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RendererSeedOutcome {
+    /// No `prepare()` has run yet — the GUI never offered a device.
+    NotAttempted,
+    /// The renderer's device was adopted for compute work.
+    Shared,
+    /// Rejected: the renderer's device lacks `TEXTURE_FORMAT_16BIT_NORM`, so
+    /// compute opens its own device.
+    RejectedMissingFeature,
+    /// Offered too late — warmup had already created a compute-only device.
+    AlreadyInitialised,
+}
+
+const SEED_NOT_ATTEMPTED: u8 = 0;
+const SEED_SHARED: u8 = 1;
+const SEED_REJECTED: u8 = 2;
+const SEED_ALREADY_INIT: u8 = 3;
+
+static SEED_OUTCOME: AtomicU8 = AtomicU8::new(SEED_NOT_ATTEMPTED);
+
+/// Debug-formatted feature set of the renderer's own device, captured the first
+/// time the renderer offers it.
+static RENDERER_FEATURES: OnceLock<String> = OnceLock::new();
+
+/// How the renderer's device offer was resolved. See [`RendererSeedOutcome`].
+pub fn renderer_seed_outcome() -> RendererSeedOutcome {
+    match SEED_OUTCOME.load(Ordering::Relaxed) {
+        SEED_SHARED => RendererSeedOutcome::Shared,
+        SEED_REJECTED => RendererSeedOutcome::RejectedMissingFeature,
+        SEED_ALREADY_INIT => RendererSeedOutcome::AlreadyInitialised,
+        _ => RendererSeedOutcome::NotAttempted,
+    }
+}
+
+/// The renderer device's wgpu features, if the GUI has rendered at least once.
+pub fn renderer_features() -> Option<&'static str> {
+    RENDERER_FEATURES.get().map(String::as_str)
+}
+
+/// The shared compute context's adapter info, but only if it already exists.
+///
+/// Unlike [`get_shared_gpu`] this never creates a device, so a bug report can
+/// describe the GPU actually in use without spinning one up as a side effect.
+pub fn shared_gpu_info_if_initialised() -> Option<GpuDeviceInfo> {
+    match SHARED_GPU.get() {
+        Some(Ok(ctx)) => Some(ctx.info.clone()),
+        _ => None,
+    }
+}
+
+/// The error the shared compute device failed with, if it failed.
+pub fn shared_gpu_error_if_initialised() -> Option<String> {
+    match SHARED_GPU.get() {
+        Some(Err(e)) => Some(e.clone()),
+        _ => None,
+    }
 }
 
 /// Shared GPU context holding a single device and queue for all compute pipelines.
@@ -71,10 +143,17 @@ static SEED_NOTIFY: Notify = Notify::const_new();
 /// `get_shared_gpu` falls back to creating a dedicated compute device that
 /// explicitly requests the feature.
 pub fn try_seed_shared_gpu_from_renderer(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) {
+    // Captured once for bug reports: which features libcosmic actually asked
+    // for is what decides the branch below, and it is not otherwise visible.
+    if RENDERER_FEATURES.get().is_none() {
+        let _ = RENDERER_FEATURES.set(format!("{:?}", device.features()));
+    }
+
     if !device
         .features()
         .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
     {
+        SEED_OUTCOME.store(SEED_REJECTED, Ordering::Relaxed);
         debug!(
             "Renderer device lacks TEXTURE_FORMAT_16BIT_NORM; \
              skipping seed and letting get_shared_gpu open a dedicated compute device"
@@ -90,14 +169,28 @@ pub fn try_seed_shared_gpu_from_renderer(device: Arc<wgpu::Device>, queue: Arc<w
             adapter_name: "renderer-shared".to_string(),
             backend: wgpu::Backend::Vulkan,
             low_priority_enabled: false,
+            driver: String::new(),
+            driver_info: String::new(),
+            device_type: wgpu::DeviceType::Other,
         },
     };
     match SHARED_GPU.set(Ok(ctx)) {
         Ok(()) => {
+            SEED_OUTCOME.store(SEED_SHARED, Ordering::Relaxed);
             info!("Seeded shared GPU context from renderer device");
             SEED_NOTIFY.notify_waiters();
         }
-        Err(_) => debug!("Shared GPU context already initialised; renderer seed ignored"),
+        Err(_) => {
+            // Only downgrade from "not attempted": once seeded by us, a later
+            // redundant offer must not be reported as a lost race.
+            let _ = SEED_OUTCOME.compare_exchange(
+                SEED_NOT_ATTEMPTED,
+                SEED_ALREADY_INIT,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            debug!("Shared GPU context already initialised; renderer seed ignored");
+        }
     }
 }
 
@@ -176,6 +269,9 @@ async fn create_low_priority_compute_device(
     info!(
         adapter = %adapter_info.name,
         backend = ?adapter_info.backend,
+        driver = %adapter_info.driver,
+        driver_info = %adapter_info.driver_info,
+        device_type = ?adapter_info.device_type,
         "GPU adapter selected for compute"
     );
 
@@ -200,6 +296,9 @@ async fn create_low_priority_compute_device(
         adapter_name: adapter_info.name.clone(),
         backend: adapter_info.backend,
         low_priority_enabled: false,
+        driver: adapter_info.driver.clone(),
+        driver_info: adapter_info.driver_info.clone(),
+        device_type: adapter_info.device_type,
     };
 
     Ok((Arc::new(device), Arc::new(queue), info))
