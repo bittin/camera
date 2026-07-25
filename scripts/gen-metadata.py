@@ -80,6 +80,15 @@ PUBLISHED_VARIANT = "dark-translucent"
 # Where capture-previews.sh puts one published shot per translated language.
 LOCALES_DIR = "locales"
 
+# The screenshots are stored in Git LFS (see .gitattributes), and
+# raw.githubusercontent.com does not resolve LFS pointers: it answers 200 with
+# the pointer file itself as text/plain. Flathub's compose fetches these URLs
+# and mirrors whatever came back, so a raw host leaves the catalogue with no
+# usable screenshots and fails the appstream-missing-screenshots lint.
+# media.githubusercontent.com resolves the pointer to the real bytes.
+RAW_HOST = "https://raw.githubusercontent.com/"
+LFS_HOST = "https://media.githubusercontent.com/media/"
+
 METAINFO_SCREENSHOTS = {
     "caption": [
         "metainfo-caption-photo-tools",
@@ -231,6 +240,17 @@ def render_metainfo(translations: dict[str, dict[str, str]], text: str) -> str:
     return text
 
 
+def lfs_url(url: str) -> str:
+    """Move a screenshot URL onto the host that resolves Git LFS pointers.
+
+    Applied to the English element, whose directory the xml:lang siblings are
+    built from, so correcting it here corrects every localized URL too.
+    """
+    if url.startswith(RAW_HOST):
+        return LFS_HOST + url[len(RAW_HOST):]
+    return url
+
+
 def localized_images(image: str) -> dict[str, str]:
     """Languages that have their own capture of one screenshot, to its URL.
 
@@ -263,7 +283,7 @@ def render_screenshot_images(region: str) -> str:
     for match in pattern.finditer(region):
         if "xml:lang" not in match.group(0).split(">", 1)[0]:
             groups.append([match.start(), match.end(), match.group(1),
-                           match.group(2).strip()])
+                           lfs_url(match.group(2).strip())])
         elif groups:
             groups[-1][1] = match.end()
 
