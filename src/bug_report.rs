@@ -206,13 +206,65 @@ impl BugReportGenerator {
             info.push_str(&format!("**PipeWire Version:** {}\n", pw_version.trim()));
         }
 
+        // Session type and desktop. Wayland vs X11 changes which presentation
+        // path the renderer takes, so a rendering bug is not triageable without
+        // it — see the flicker report in cosmic-utils/camera#563.
+        info.push_str("\n### Session\n\n");
+        info.push_str(&format!(
+            "- **Session Type:** {}\n",
+            Self::env_or_unset("XDG_SESSION_TYPE")
+        ));
+        info.push_str(&format!(
+            "- **Desktop:** {}\n",
+            Self::env_or_unset("XDG_CURRENT_DESKTOP")
+        ));
+        info.push_str(&format!(
+            "- **Wayland Display:** {}\n",
+            Self::env_or_unset("WAYLAND_DISPLAY")
+        ));
+        info.push_str(&format!(
+            "- **X11 Display:** {}\n",
+            Self::env_or_unset("DISPLAY")
+        ));
+
+        // Env overrides that change renderer behaviour. Users are asked to set
+        // these while bisecting a rendering bug, and a report taken during that
+        // run is misleading unless it says so.
+        info.push_str("\n### Renderer Environment Overrides\n\n");
+        for var in [
+            "WGPU_BACKEND",
+            "WGPU_POWER_PREF",
+            "WGPU_ADAPTER_NAME",
+            "ICED_PRESENT_MODE",
+            "ICED_BACKEND",
+            "LIBGL_ALWAYS_SOFTWARE",
+            "__GLX_VENDOR_LIBRARY_NAME",
+            "__NV_PRIME_RENDER_OFFLOAD",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+        ] {
+            info.push_str(&format!("- **{}:** {}\n", var, Self::env_or_unset(var)));
+        }
+
         info.push('\n');
         info
+    }
+
+    /// An environment variable's value, or `(unset)`, for report tables.
+    fn env_or_unset(var: &str) -> String {
+        std::env::var(var).unwrap_or_else(|_| "(unset)".to_string())
     }
 
     /// Get GPU information using system commands
     async fn get_gpu_info() -> String {
         let mut info = String::from("## GPU Information\n\n");
+
+        // What wgpu actually picked, which is the part that matters for a
+        // rendering bug. `lspci` lists the hardware present; it does not say
+        // which adapter, backend or driver version the app is running on, and
+        // on a hybrid-graphics machine those differ.
+        info.push_str(&Self::format_wgpu_info());
+
+        let mut detected = String::new();
 
         // Try lspci for GPU info
         if let Ok(output) = Command::new("lspci").output()
@@ -226,10 +278,11 @@ impl BugReportGenerator {
                 .collect();
 
             if !gpu_lines.is_empty() {
+                detected.push_str("### Detected Hardware\n\n");
                 for line in gpu_lines {
-                    info.push_str(&format!("- {}\n", line));
+                    detected.push_str(&format!("- {}\n", line));
                 }
-                info.push('\n');
+                detected.push('\n');
             }
         }
 
@@ -238,10 +291,10 @@ impl BugReportGenerator {
             && output.status.success()
             && let Ok(glx_output) = String::from_utf8(output.stdout)
         {
-            info.push_str("### GLX Information\n\n");
-            info.push_str("```\n");
-            info.push_str(&glx_output);
-            info.push_str("```\n\n");
+            detected.push_str("### GLX Information\n\n");
+            detected.push_str("```\n");
+            detected.push_str(&glx_output);
+            detected.push_str("```\n\n");
         }
 
         // Try vulkaninfo (if available)
@@ -249,16 +302,75 @@ impl BugReportGenerator {
             && output.status.success()
             && let Ok(vk_output) = String::from_utf8(output.stdout)
         {
-            info.push_str("### Vulkan Information\n\n");
-            info.push_str("```\n");
-            info.push_str(&vk_output);
-            info.push_str("```\n\n");
+            detected.push_str("### Vulkan Information\n\n");
+            detected.push_str("```\n");
+            detected.push_str(&vk_output);
+            detected.push_str("```\n\n");
         }
 
-        if info == "## GPU Information\n\n" {
+        if detected.is_empty() {
             info.push_str("**Status:** Could not detect GPU information\n\n");
+        } else {
+            info.push_str(&detected);
         }
 
+        info
+    }
+
+    /// What wgpu actually resolved to at runtime.
+    ///
+    /// Reports the compute adapter (name, backend, driver version) and how the
+    /// renderer's own device was reconciled with it. A separate compute device
+    /// means two `wgpu::Instance`s are live on one GPU, which is worth knowing
+    /// when triaging driver-specific rendering bugs.
+    fn format_wgpu_info() -> String {
+        use crate::gpu::RendererSeedOutcome;
+
+        let mut info = String::from("### wgpu Runtime\n\n");
+
+        match crate::gpu::shared_gpu_info_if_initialised() {
+            Some(gpu) => {
+                info.push_str(&format!("- **Adapter:** {}\n", gpu.adapter_name));
+                info.push_str(&format!("- **Backend:** {:?}\n", gpu.backend));
+                info.push_str(&format!("- **Device Type:** {:?}\n", gpu.device_type));
+                if !gpu.driver.is_empty() {
+                    info.push_str(&format!("- **Driver:** {}\n", gpu.driver));
+                }
+                if !gpu.driver_info.is_empty() {
+                    info.push_str(&format!("- **Driver Version:** {}\n", gpu.driver_info));
+                }
+            }
+            None => match crate::gpu::shared_gpu_error_if_initialised() {
+                Some(err) => info.push_str(&format!("- **Adapter:** failed to create ({})\n", err)),
+                None => info.push_str("- **Adapter:** not initialised yet\n"),
+            },
+        }
+
+        let (device_sharing, note) = match crate::gpu::renderer_seed_outcome() {
+            RendererSeedOutcome::Shared => (
+                "shared with renderer",
+                "Compute and rendering use one device.",
+            ),
+            RendererSeedOutcome::RejectedMissingFeature => (
+                "separate compute device",
+                "The renderer's device lacks TEXTURE_FORMAT_16BIT_NORM, so compute opened its own.",
+            ),
+            RendererSeedOutcome::AlreadyInitialised => (
+                "separate compute device",
+                "Warmup created a compute device before the renderer offered one.",
+            ),
+            RendererSeedOutcome::NotAttempted => {
+                ("unknown", "The renderer has not rendered a frame yet.")
+            }
+        };
+        info.push_str(&format!("- **Device Sharing:** {}\n", device_sharing));
+        info.push_str(&format!("- **Note:** {}\n", note));
+
+        if let Some(features) = crate::gpu::renderer_features() {
+            info.push_str(&format!("- **Renderer Features:** `{}`\n", features));
+        }
+
+        info.push('\n');
         info
     }
 
@@ -431,6 +543,21 @@ impl BugReportGenerator {
             "- **Composition Guide:** {:?}\n",
             config.composition_guide
         ));
+        // Both the stored value and what this desktop resolves it to: `System`
+        // falls back to `Translucent` off COSMIC, and only the effective value
+        // says whether the blur chain runs at all.
+        let effective_overlay = config.overlay_effect.effective();
+        if effective_overlay == config.overlay_effect {
+            info.push_str(&format!(
+                "- **Overlay Effect:** {:?}\n",
+                config.overlay_effect
+            ));
+        } else {
+            info.push_str(&format!(
+                "- **Overlay Effect:** {:?} (effective: {:?})\n",
+                config.overlay_effect, effective_overlay
+            ));
+        }
         info.push_str(&format!(
             "- **Virtual Camera:** {}\n",
             config.virtual_camera_enabled
@@ -1058,5 +1185,58 @@ impl BugReportGenerator {
 
         info.push_str("**pw-dump not available or failed**\n\n");
         info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_or_unset_reports_missing_vars() {
+        assert_eq!(
+            BugReportGenerator::env_or_unset("CAMERA_BUG_REPORT_VAR_THAT_DOES_NOT_EXIST"),
+            "(unset)"
+        );
+    }
+
+    /// The wgpu section must never be the thing that creates a GPU device —
+    /// generating a bug report should describe the process, not change it.
+    #[test]
+    fn wgpu_info_does_not_initialise_the_shared_device() {
+        let before = crate::gpu::shared_gpu_info_if_initialised().is_some();
+        let _ = BugReportGenerator::format_wgpu_info();
+        let after = crate::gpu::shared_gpu_info_if_initialised().is_some();
+        assert_eq!(
+            before, after,
+            "formatting the report must not create a compute device"
+        );
+    }
+
+    /// Every field #563 needed has to survive refactors of the report layout.
+    #[test]
+    fn wgpu_info_carries_the_fields_needed_to_triage_a_render_bug() {
+        let section = BugReportGenerator::format_wgpu_info();
+        assert!(section.contains("### wgpu Runtime"), "{section}");
+        assert!(section.contains("- **Adapter:**"), "{section}");
+        assert!(section.contains("- **Device Sharing:**"), "{section}");
+    }
+
+    #[test]
+    fn system_info_reports_session_type_and_renderer_overrides() {
+        let info = futures::executor::block_on(BugReportGenerator::get_system_info());
+        assert!(info.contains("- **Session Type:**"), "{info}");
+        assert!(info.contains("- **Desktop:**"), "{info}");
+        assert!(info.contains("- **WGPU_BACKEND:**"), "{info}");
+        assert!(info.contains("- **ICED_PRESENT_MODE:**"), "{info}");
+    }
+
+    /// A stored `System` means different things on different desktops, so the
+    /// report has to state the resolved value, not just the stored one.
+    #[test]
+    fn settings_report_includes_overlay_effect() {
+        let config = Config::default();
+        let settings = BugReportGenerator::format_settings(&config, None, None, None);
+        assert!(settings.contains("- **Overlay Effect:**"), "{settings}");
     }
 }
