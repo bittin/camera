@@ -5,49 +5,49 @@ pkgver=@@VERSION@@
 pkgrel=0
 pkgdesc="Modern camera app for Linux desktops and phones"
 url="https://github.com/cosmic-utils/camera"
-arch="all"
+# armhf, armv7, x86: 32-bit is problematic for libcosmic apps
+# riscv64: blocked by cosmic-icons
+arch="all !armhf !armv7 !riscv64 !x86"
 license="GPL-3.0-only"
 depends="
 	cosmic-icons
-	gst-plugins-base
+	gst-libav
 	gst-plugins-bad
+	gst-plugins-base
+	gst-plugins-good
 "
 makedepends="
-	cargo
+	cargo-auditable
 	clang-libclang
 	cmake
-	eudev-dev
 	glib-dev
-	gst-plugins-bad-dev
 	gst-plugins-base-dev
 	gstreamer-dev
 	just
 	libcamera-dev
-	libinput-dev
-	libseat-dev
 	libxkbcommon-dev
 	nasm
-	samurai
 	pkgconf
+	samurai
 	wayland-dev
 "
-options="net !check"  # fetch dependencies, no tests
+options="net"  # fetch dependencies
 source="$pkgname-$pkgver.tar.gz::https://github.com/cosmic-utils/camera/archive/refs/tags/v$pkgver.tar.gz"
 
 prepare() {
 	default_prepare
-	cargo fetch --target="$CTARGET" --locked
+	cargo fetch --target="$CHOST" --locked
 }
 
 build() {
-	export VERGEN_GIT_COMMIT_DATE="$(date -d @"$SOURCE_DATE_EPOCH" '+%Y-%m-%d')"
-	export VERGEN_GIT_SHA="unknown"
+	# the release tarball has no git checkout for build.rs to describe
+	export CAMERA_VERSION=$pkgver
 
-	just build-release --frozen
+	cargo auditable build --release --frozen
 }
 
 check() {
-	cargo test --release --frozen
+	cargo test --frozen
 }
 
 package() {
