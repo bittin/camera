@@ -388,8 +388,21 @@ apk-build arch="":
         *)       echo "Unsupported arch: $arch"; exit 1 ;;
     esac
 
+    case "$(uname -m)" in
+        x86_64)  host_arch="amd64" ;;
+        aarch64) host_arch="arm64" ;;
+        *)       host_arch="$(uname -m)" ;;
+    esac
+
     echo "Cross-compiling for $rust_target (release-fast)..."
-    cross build --target "$rust_target" --profile release-fast
+    # Pin the toolchain image to the host platform. It and the packaging image
+    # below are both FROM alpine:edge, and the container engine keeps a single
+    # image per tag: packaging pulls the target arch, leaving a foreign-arch
+    # alpine:edge behind. Without --platform the next cross build reuses that
+    # with only a warning, silently producing an emulated same-arch toolchain
+    # instead of a cross one.
+    CROSS_BUILD_OPTS="--platform linux/$host_arch" \
+        cross build --target "$rust_target" --profile release-fast
 
     binary="target/$rust_target/release-fast/camera"
     [ -f "$binary" ] || { echo "Error: binary not found at $binary"; exit 1; }
@@ -417,7 +430,9 @@ apk-build arch="":
         chown -R builder:builder /home/builder/apkbuild
 
         cd /home/builder/apkbuild
-        sudo -Hu builder abuild -r
+        # Pin REPODEST: abuild defaults to $XDG_DATA_HOME/abuild these days,
+        # older versions used $HOME/packages
+        sudo -Hu builder env REPODEST=/home/builder/packages abuild -r
 
         mkdir -p /out
         find /home/builder/packages -name "camera-*.apk" ! -name "*-doc-*" ! -name "*-dev-*" -exec cp {} /out/ \;

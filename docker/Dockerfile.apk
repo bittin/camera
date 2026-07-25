@@ -22,8 +22,14 @@ RUN apk add --no-cache \
     samurai \
     wayland-dev
 
+# Newer abuild writes keys to ~/.config/abuild; older versions use ~/.abuild.
+# The trailing ls fails the image build here rather than midway through
+# `abuild -r` if neither location produced a key.
 RUN adduser -D builder && \
     addgroup builder abuild && \
     echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers && \
     sudo -Hu builder abuild-keygen -a -n && \
-    cp /home/builder/.abuild/*.rsa.pub /etc/apk/keys/
+    for d in /home/builder/.config/abuild /home/builder/.abuild; do \
+        [ -d "$d" ] && cp "$d"/*.rsa.pub /etc/apk/keys/ || true; \
+    done && \
+    ls /etc/apk/keys/*.rsa.pub

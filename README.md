@@ -259,6 +259,39 @@ If your kernel lacks the `tun` module (check with `modprobe tun`), pass host net
 CROSS_BUILD_OPTS="--network=host" CROSS_CONTAINER_OPTS="--network=host" cross build --target ...
 ```
 
+#### Alpine APK Packages
+
+`just apk-build [arch]` cross-compiles the binary and then packages it as an
+`.apk` in an Alpine container, leaving the result in `apk-out/`:
+
+```bash
+just apk-build aarch64
+```
+
+On an x86_64 host the packaging half runs in an emulated aarch64 container, and
+that needs `binfmt_misc` registered with the `C` (credentials) flag. Distros
+commonly register `qemu-aarch64` with `F` alone, which makes the kernel ignore
+setuid bits on emulated binaries — `abuild` then fails with:
+
+```
+abuild-apk: setuid(0) failed: Operation not permitted
+```
+
+Check the current flags, and add `C` if it is missing:
+
+```bash
+# Check — look for "flags: OCF" rather than "flags: F"
+cat /proc/sys/fs/binfmt_misc/qemu-aarch64
+
+# Override the vendor registration with C added (C implies O; keep F)
+sed 's/:F$/:OCF/' /usr/lib/binfmt.d/qemu-aarch64-static.conf \
+    | sudo tee /etc/binfmt.d/qemu-aarch64-static.conf
+sudo systemctl restart systemd-binfmt
+```
+
+Note that `C` makes setuid bits effective for *all* emulated binaries, not just
+this build.
+
 ### Distrobox (Atomic Desktops)
 
 For development on atomic/immutable desktops (Fedora Silverblue, Kinoite, Bazzite, etc.):

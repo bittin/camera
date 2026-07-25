@@ -254,19 +254,14 @@ jobs:
         run: |
           apk add --no-cache \
             alpine-sdk sudo git atools \
-            cargo \
+            cargo-auditable \
             clang-libclang \
             cmake \
-            cosmic-icons \
-            eudev-dev \
             glib-dev \
-            gst-plugins-bad-dev \
             gst-plugins-base-dev \
             gstreamer-dev \
             just \
             libcamera-dev \
-            libinput-dev \
-            libseat-dev \
             libxkbcommon-dev \
             nasm \
             pkgconf \
