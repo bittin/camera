@@ -298,10 +298,12 @@ keep_log() {
 SWAY_PID=""
 DBUS_PID=""
 APP_PID=""
+KEYBOARD_PID=""
 
 cleanup() {
     local status=$?
     [[ -n "$APP_PID" ]] && kill "$APP_PID" 2>/dev/null || true
+    [[ -n "$KEYBOARD_PID" ]] && kill "$KEYBOARD_PID" 2>/dev/null || true
     [[ -n "$SWAY_PID" ]] && kill "$SWAY_PID" 2>/dev/null || true
     [[ -n "$DBUS_PID" ]] && kill "$DBUS_PID" 2>/dev/null || true
     rm -rf "$SESSION_DIR"
@@ -338,12 +340,6 @@ for_window [app_id=".*"] floating enable
 EOF
 
 log "Starting headless compositor"
-# Give the headless backend a keyboard of its own. wtype creates a virtual
-# keyboard, sends its keys and exits immediately; on a seat with no keyboard
-# the device comes and goes faster than the client can finish the focus
-# handshake, so the app never sees the keystroke, and a screenshot of the
-# untouched UI still looks perfectly valid.
-export WLR_HEADLESS_INPUTS=1
 sway --config "$SWAY_CONFIG" >"$SESSION_DIR/sway.log" 2>&1 &
 SWAY_PID=$!
 
@@ -367,6 +363,34 @@ for socket in "$XDG_RUNTIME_DIR"/wayland-*; do
 done
 [[ -n "${WAYLAND_DISPLAY:-}" ]] || die "sway did not create a wayland socket"
 log "Compositor ready on $WAYLAND_DISPLAY"
+
+# Give the seat a keyboard that outlives a single keystroke.
+#
+# wlroots' headless backend creates no input devices (WLR_HEADLESS_INPUTS was
+# dropped in 0.17), so seat0 comes up advertising no capabilities at all. Two
+# things follow from that. wtype's virtual keyboard is then the only keyboard
+# the seat ever has, and it disappears again the moment wtype exits. And winit
+# treats wl_keyboard focus as window focus, so with no keyboard on the seat the
+# app is never told it is focused: it draws its title bar in the dimmed
+# unfocused colours, and every screenshot showed an inactive-looking window.
+#
+# `wtype -` reads the text to type from stdin. Pointed at a fifo whose write end
+# this script holds open, it types nothing and stays alive, so the seat keeps
+# its keyboard capability for the whole run and the app holds focus the way it
+# would on a real desktop.
+KEYBOARD_FIFO="$SESSION_DIR/keyboard.fifo"
+mkfifo "$KEYBOARD_FIFO" || die "could not create the keyboard fifo"
+wtype - <"$KEYBOARD_FIFO" &
+KEYBOARD_PID=$!
+# Held open for the rest of the run: closing it is what makes wtype exit.
+exec 9>"$KEYBOARD_FIFO"
+for _ in $(seq 20); do
+    [[ "$(swaymsg -t get_seats | jq -r 'map(.capabilities) | add')" != "0" ]] && break
+    sleep 0.1
+done
+if [[ "$(swaymsg -t get_seats | jq -r 'map(.capabilities) | add')" == "0" ]]; then
+    die "the virtual keyboard never attached; the app would screenshot unfocused"
+fi
 
 # ---------------------------------------------------------------------------
 # Capture
