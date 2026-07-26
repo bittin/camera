@@ -303,9 +303,25 @@ struct ViewportUniform {
     /// shaders that stop short of it stay valid against the same, larger buffer.
     /// Only `video_shader_frosted.wgsl` declares it.
     noise: f32,
-    /// Pads the struct to 128 bytes. A WGSL uniform's size must round up to a
-    /// 16-byte multiple, and `noise` alone would leave it at 116.
+    /// Pads to the 16-byte boundary `content_rect` (a vec4) has to start on. A
+    /// WGSL uniform's size must round up to a 16-byte multiple too, and `noise`
+    /// alone would leave the struct at 116.
     _pad: [f32; 3],
+    /// Final composite only: the rect the preview IMAGE occupies, as
+    /// `(min_x, min_y, max_x, max_y)` normalized over the blur chain's own rect —
+    /// the full preview — which is exactly the space the composite's
+    /// `tex_coords` spans. Everything outside it is letterbox, and the composite
+    /// paints nothing there. See [`content_rect_uv`] for why, and for the fit
+    /// math it mirrors.
+    ///
+    /// Defaults to the whole unit square, which the shader reads as "no letterbox
+    /// to cut" and skips entirely — so every pass that does not set it (the
+    /// Kawase steps, the pre-blur, the sharp preview) is bit-for-bit unaffected.
+    ///
+    /// Appended last for the same reason `noise` and `panel_rect` were: every
+    /// earlier offset is untouched, so the five shaders that stop short of it stay
+    /// valid against the same, larger buffer.
+    content_rect: [f32; 4],
 }
 
 impl Default for ViewportUniform {
@@ -334,8 +350,113 @@ impl Default for ViewportUniform {
             panel_rect: [0.0; 4],
             noise: 0.0,
             _pad: [0.0; 3],
+            content_rect: FULL_CONTENT_RECT,
         }
     }
+}
+
+/// "The image covers the whole preview rect" — no letterbox, nothing for the
+/// composite to cut. The default, and the fallback whenever the fit math has no
+/// meaningful answer (no frame yet, a degenerate window). Erring this way keeps
+/// the frosted glass painting; erring the other way would make it vanish.
+const FULL_CONTENT_RECT: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+/// The rect the preview IMAGE occupies inside the preview rect, normalized to it
+/// as `(min_x, min_y, max_x, max_y)`. Its complement is the letterbox.
+///
+/// # Why this exists
+///
+/// The blur chain fills the letterbox with an opaque `letterbox_color` (see
+/// `video_shader_blur.wgsl`), and it has to: the Kawase kernels normalize by
+/// `sum.a` and read alpha as a region mask, so a transparent letterbox would make
+/// the image bleed outward past its own edge instead of blending toward the
+/// background. That fill is correct *inside the chain* and wrong *on screen* —
+/// composited at alpha 1 over a translucent window background, it stacks a second
+/// opaque copy of the background colour over the one layer that is supposed to be
+/// see-through, and the frosted glass disappears exactly where there is no camera
+/// image to justify it (issue #569).
+///
+/// So the chain keeps its opaque fill and the composite cuts the letterbox back
+/// out, using this rect. What is left is the honest picture: blurred preview
+/// where there is preview, and the window background — the compositor's frosted
+/// glass — where there is not.
+///
+/// This is deliberately geometric rather than per-pixel. Nothing in the blurred
+/// texture distinguishes "letterbox" from "a scene that happens to be that
+/// colour": alpha comes out of the Kawase as exactly 1 or 0 (it is `sum / sum.a`),
+/// so there is no channel left to carry the distinction. The fit is the only thing
+/// that knows, and it is knowable in closed form.
+///
+/// # Why it is safe to duplicate the fit math
+///
+/// Every line below mirrors the `{}` block of `video_shader_blur.wgsl`'s
+/// `fs_main`, from the same uniform values, and the two are pinned together on
+/// the GPU by `content_rect_matches_where_the_shader_stops_drawing`: it renders
+/// pass 0 with a magenta letterbox and checks that the boundary this computes is
+/// where the magenta actually starts. A drift in either is a test failure, not a
+/// silent misalignment.
+///
+/// `tex_size` is the SOURCE texture's dimensions in sensor orientation — what
+/// `textureDimensions(texture_blur)` returns in that shader. Digital zoom is
+/// deliberately absent: pass 0 applies it *after* its letterbox early-out, so it
+/// changes which texels are sampled, never how much of the screen the image
+/// covers.
+#[allow(clippy::too_many_arguments)]
+fn content_rect_uv(
+    viewport_size: [f32; 2],
+    tex_size: (u32, u32),
+    rotation: u32,
+    crop_min: [f32; 2],
+    crop_max: [f32; 2],
+    cover_blend: f32,
+    bar_top: f32,
+    bar_bottom: f32,
+) -> [f32; 4] {
+    let [w, h] = viewport_size;
+    let content_h = h - bar_top - bar_bottom;
+    // A window with no room between its own chrome has no meaningful contain fit
+    // (the shader's `contain_zoom` goes non-positive there). Paint everything.
+    if w <= 0.0 || h <= 0.0 || content_h <= 0.0 || tex_size.0 == 0 || tex_size.1 == 0 {
+        return FULL_CONTENT_RECT;
+    }
+
+    let blend = cover_blend.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32| a + (b - a) * blend;
+    // 90/270 rotations swap the sensor's axes into display orientation. Both
+    // `tex_size` and the crop range are swapped, exactly as the shader does.
+    let rotated = rotation == 1 || rotation == 3;
+    let (tex_w, tex_h) = if rotated {
+        (tex_size.1 as f32, tex_size.0 as f32)
+    } else {
+        (tex_size.0 as f32, tex_size.1 as f32)
+    };
+    let (range_x, range_y) = {
+        let x = lerp(crop_max[0], 1.0) - lerp(crop_min[0], 0.0);
+        let y = lerp(crop_max[1], 1.0) - lerp(crop_min[1], 0.0);
+        if rotated { (y, x) } else { (x, y) }
+    };
+    let (eff_w, eff_h) = (tex_w * range_x, tex_h * range_y);
+    if eff_w <= 0.0 || eff_h <= 0.0 {
+        return FULL_CONTENT_RECT;
+    }
+
+    let contain_zoom = (w / eff_w).min(content_h / eff_h);
+    let cover_zoom = (w / eff_w).max(h / eff_h);
+    let zoom = lerp(contain_zoom, cover_zoom);
+    // Contain centres the image between the UI bars, Cover on the window.
+    let center_y = lerp((bar_top + content_h * 0.5) / h, 0.5);
+
+    // `scale = viewport / (effective_tex * zoom)` is the shader's UV scale, so
+    // the image's on-screen extent is `effective_tex * zoom` — in the same
+    // (logical px) unit as the viewport, which is all the normalization needs.
+    let half_w = eff_w * zoom * 0.5 / w;
+    let half_h = eff_h * zoom * 0.5 / h;
+    [
+        0.5 - half_w,
+        center_y - half_h,
+        0.5 + half_w,
+        center_y + half_h,
+    ]
 }
 
 /// The `(panel_rect, corner_radius)` an antialiased corner SDF is cut with, in
@@ -1439,14 +1560,40 @@ impl PrimitiveTrait for VideoPrimitive {
                         );
                     }
 
-                    // The final composite: one tap, plus dim, grain and (for the
-                    // frosted chrome) the rounded silhouette. This is the shared
-                    // binding, used by consumers with no per-panel data — i.e. the
-                    // transition blur.
+                    // Where the image ends and the letterbox begins, for the
+                    // composite to cut the latter back out (see
+                    // `content_rect_uv`). Derived from exactly the values pass 0
+                    // was configured with just above — the same viewport, blend,
+                    // bars, crop and rotation — plus the source texture's own
+                    // dimensions, which is what pass 0 reads via
+                    // `textureDimensions`. Taken from the uploaded texture rather
+                    // than from the frame, so it is literally the extent the
+                    // shader sampled.
+                    let content_rect = pipeline
+                        .textures
+                        .get(&source_texture_id(self.video_id))
+                        .map_or(FULL_CONTENT_RECT, |tex| {
+                            content_rect_uv(
+                                [width, height],
+                                (tex.width, tex.height),
+                                self.rotation,
+                                crop_min,
+                                crop_max,
+                                content_fit_mode,
+                                bar_top,
+                                bar_bottom,
+                            )
+                        });
+
+                    // The final composite: one tap, plus dim, grain, the letterbox
+                    // cut and (for the frosted chrome) the rounded silhouette. This
+                    // is the shared binding, used by consumers with no per-panel
+                    // data — i.e. the transition blur.
                     let mut composite_uniform = ViewportUniform {
                         viewport_size: [width, height],
                         dim_factor: self.dim_factor(),
                         noise: self.noise(),
+                        content_rect,
                         ..Default::default()
                     };
                     queue.write_buffer(
@@ -3412,9 +3559,10 @@ mod tests {
     /// and those declarations describing the same bytes, and a mismatch shows up
     /// as silently garbled rendering rather than a compile error — so pin them.
     ///
-    /// `panel_rect` and `noise` are deliberately LAST: only the composite shader
-    /// declares them, and the other shaders stay valid against the same (larger)
-    /// buffer precisely because every field before them keeps its offset.
+    /// `panel_rect`, `noise` and `content_rect` are deliberately LAST: only the
+    /// composite shader declares them, and the other shaders stay valid against
+    /// the same (larger) buffer precisely because every field before them keeps
+    /// its offset.
     #[test]
     fn viewport_uniform_layout_is_stable() {
         use std::mem::{align_of, offset_of, size_of};
@@ -3431,11 +3579,260 @@ mod tests {
         assert_eq!(offset_of!(ViewportUniform, letterbox_color), 80);
         // panel_rect is also a vec4, landing exactly where letterbox_color ends.
         assert_eq!(offset_of!(ViewportUniform, panel_rect), 96);
-        // `noise` is appended last, after every offset the other shaders rely on.
+        // `noise` is appended after every offset the other shaders rely on...
         assert_eq!(offset_of!(ViewportUniform, noise), 112);
-        assert_eq!(size_of::<ViewportUniform>(), 128);
+        // ...and `content_rect` after that. It is a vec4 in WGSL, so it must land
+        // on a 16-byte boundary: `_pad` is what carries it from 116 to 128, and
+        // the shader gets there on its own because a vec4 aligns to 16. Declaring
+        // a `vec3<f32>` pad in the WGSL to mirror `_pad` would align to 16 too
+        // and silently push this to 144.
+        assert_eq!(offset_of!(ViewportUniform, content_rect), 128);
+        assert_eq!(size_of::<ViewportUniform>(), 144);
         assert_eq!(size_of::<ViewportUniform>() % 16, 0);
         assert_eq!(align_of::<ViewportUniform>(), 4);
+    }
+
+    /// The unit square is the default, so every pass that never heard of
+    /// `content_rect` — the Kawase steps, the pre-blur, the sharp preview — keeps
+    /// the composite's letterbox cut switched off.
+    #[test]
+    fn the_default_content_rect_cuts_nothing() {
+        assert_eq!(ViewportUniform::default().content_rect, FULL_CONTENT_RECT);
+        assert_eq!(FULL_CONTENT_RECT, [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    /// Fill (`cover_blend` = 1) has no letterbox at all: Cover covers the window,
+    /// so the image rect IS the preview rect and the composite must paint every
+    /// pixel of every scrim bar with blurred preview.
+    ///
+    /// The `>=`/`<=` rather than exact equality is deliberate — Cover overflows on
+    /// one axis by design, so the rect legitimately runs past the unit square, and
+    /// what matters is that it never falls short and cuts live preview away.
+    #[test]
+    fn content_rect_covers_everything_in_fill() {
+        for (tw, th) in [(1280u32, 960u32), (960, 1280), (1920, 1080)] {
+            for rotation in 0..4u32 {
+                let r = content_rect_uv(
+                    [1080.0, 2340.0],
+                    (tw, th),
+                    rotation,
+                    [0.0, 0.0],
+                    [1.0, 1.0],
+                    1.0,
+                    47.0,
+                    174.0,
+                );
+                assert!(
+                    r[0] <= 0.0 && r[1] <= 0.0 && r[2] >= 1.0 && r[3] >= 1.0,
+                    "{tw}x{th} rot {rotation} in Fill gave {r:?} — Cover fills the \
+                     window, so a rect short of the unit square would cut live \
+                     preview out of the frosted bars"
+                );
+            }
+        }
+    }
+
+    /// Fit (`cover_blend` = 0) letterboxes into the area BETWEEN the UI bars — so
+    /// the bar regions come out entirely letterbox, which is what lets the window
+    /// background show through them.
+    ///
+    /// This is the geometric claim `frosted_backdrop`'s module docs make in prose
+    /// ("the bar regions are by construction exactly where the image is not"), and
+    /// the whole reason the cut is worth making: in Fit the scrim bars are pure
+    /// letterbox, and painting them opaque is exactly the bug.
+    #[test]
+    fn content_rect_in_fit_stays_between_the_ui_bars() {
+        const H: f32 = 2340.0;
+        const TOP: f32 = 47.0;
+        const BOTTOM: f32 = 174.0;
+        let r = content_rect_uv(
+            [1080.0, H],
+            (1280, 960),
+            0,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            0.0,
+            TOP,
+            BOTTOM,
+        );
+        assert!(
+            r[1] >= TOP / H - 0.001,
+            "the image must start below the top bar, got {r:?}"
+        );
+        assert!(
+            r[3] <= 1.0 - BOTTOM / H + 0.001,
+            "the image must end above the bottom bar, got {r:?}"
+        );
+        // And it is centred in the CONTENT area, not the window — the asymmetric
+        // bars are the whole reason `content_center_y` exists in the shader.
+        let centre = (r[1] + r[3]) / 2.0;
+        let content_centre = (TOP + (H - TOP - BOTTOM) / 2.0) / H;
+        assert!(
+            (centre - content_centre).abs() < 0.001,
+            "image centred at {centre:.4}, content area centres at \
+             {content_centre:.4} — centring on the window instead would slide the \
+             blurred slice against the sharp preview"
+        );
+    }
+
+    /// A 90/270 sensor rotation swaps the image's axes, so a landscape sensor
+    /// letterboxes on the SIDES of a landscape window rather than above and below.
+    ///
+    /// Easy to lose: the shader swaps both `tex_size` and the crop range, and
+    /// dropping either swap leaves a rect that looks plausible and is wrong by the
+    /// sensor's aspect ratio.
+    #[test]
+    fn content_rect_follows_the_sensor_rotation() {
+        let fit = |rotation| {
+            content_rect_uv(
+                [1920.0, 1080.0],
+                (1280, 960),
+                rotation,
+                [0.0, 0.0],
+                [1.0, 1.0],
+                0.0,
+                0.0,
+                0.0,
+            )
+        };
+        // Unrotated 4:3 into a 16:9 window: full height, pillarboxed.
+        let up = fit(0);
+        assert!(up[1] <= 0.001 && up[3] >= 0.999, "{up:?}");
+        assert!(up[0] > 0.01 && up[2] < 0.99, "{up:?}");
+        // Rotated 90 the image is 3:4 — narrower still, so more pillarbox.
+        let side = fit(1);
+        assert!(side[1] <= 0.001 && side[3] >= 0.999, "{side:?}");
+        assert!(
+            side[0] > up[0],
+            "a 90 rotation makes a 4:3 sensor 3:4 on screen, which must pillarbox \
+             MORE, got {side:?} against {up:?}"
+        );
+        assert_eq!(fit(1), fit(3), "90 and 270 differ only in which way up");
+        assert_eq!(fit(0), fit(2), "180 keeps the extent, flips the content");
+    }
+
+    /// A crop narrows the image, so it letterboxes more — and the crop is in
+    /// TEXTURE orientation, so its range is swapped by rotation alongside the
+    /// texture's own dimensions.
+    #[test]
+    fn content_rect_accounts_for_the_aspect_crop() {
+        let uncropped = content_rect_uv(
+            [1080.0, 1080.0],
+            (1280, 960),
+            0,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            0.0,
+            0.0,
+            0.0,
+        );
+        // A 1:1 crop out of a 4:3 sensor: square, so it fills a square window.
+        let cropped = content_rect_uv(
+            [1080.0, 1080.0],
+            (1280, 960),
+            0,
+            [0.125, 0.0],
+            [0.875, 1.0],
+            0.0,
+            0.0,
+            0.0,
+        );
+        assert!(
+            uncropped[1] > 0.01,
+            "4:3 in a square window must letterbox, got {uncropped:?}"
+        );
+        assert!(
+            cropped[1] <= 0.001 && cropped[3] >= 0.999,
+            "a 1:1 crop fills a square window edge to edge, got {cropped:?}"
+        );
+    }
+
+    /// The crop only applies at Fit; Cover ignores it, blending it away to the
+    /// full texture exactly as the shader's `effective_crop_*` does. A rect that
+    /// kept the crop at Fill would cut the scrim bars short of the window edge.
+    ///
+    /// Note the mid-animation value is deliberately NOT asserted to interpolate
+    /// between the ends. Two things blend at once — the crop region and the fit —
+    /// so a 1:1 crop that exactly fills a square window at Fit passes through
+    /// *wider-than-square* shapes on its way to Cover, and letterboxes slightly
+    /// in the middle even though both endpoints are flush. That is the shader's
+    /// own behaviour, faithfully reproduced; it is a transient of a ~250 ms
+    /// animation and not something to "correct" here, because correcting it would
+    /// put this function out of step with `video_shader_blur.wgsl`.
+    #[test]
+    fn content_rect_blends_the_crop_away_toward_fill() {
+        let at = |blend| {
+            content_rect_uv(
+                [1080.0, 1080.0],
+                (1280, 960),
+                0,
+                [0.125, 0.0],
+                [0.875, 1.0],
+                blend,
+                0.0,
+                0.0,
+            )
+        };
+        // Fit: the 1:1 crop fills the square window exactly.
+        let fit = at(0.0);
+        assert!(
+            fit[1] <= 0.001 && fit[3] >= 0.999,
+            "a 1:1 crop must fill a square window at Fit, got {fit:?}"
+        );
+        // Fill: the crop is gone and Cover overflows, so nothing is cut.
+        let fill = at(1.0);
+        assert!(
+            fill[0] <= 0.0 && fill[1] <= 0.0 && fill[2] >= 1.0 && fill[3] >= 1.0,
+            "Cover must reach every edge with the crop blended away, got {fill:?}"
+        );
+        // Whatever happens in between stays bounded — a rect that ran away would
+        // cut the backdrop to nothing mid-animation.
+        for i in 1..10 {
+            let r = at(i as f32 / 10.0);
+            assert!(
+                r[2] - r[0] > 0.5 && r[3] - r[1] > 0.5,
+                "at blend {:.1} the image collapsed to {r:?}",
+                i as f32 / 10.0
+            );
+        }
+    }
+
+    /// Degenerate geometry falls back to "no letterbox" rather than to an empty
+    /// rect. Erring this way leaves the frosted glass painting; the other way
+    /// makes it vanish, which is far worse than a letterbox left opaque for a
+    /// frame.
+    #[test]
+    fn content_rect_falls_back_to_full_when_the_geometry_is_degenerate() {
+        let cases = [
+            // No window yet.
+            ([0.0f32, 0.0], (1280u32, 960u32), 0.0f32, 0.0f32),
+            // No frame yet.
+            ([1080.0, 2340.0], (0, 0), 47.0, 174.0),
+            // A window smaller than its own chrome: no content area to fit into.
+            ([1080.0, 100.0], (1280, 960), 47.0, 174.0),
+        ];
+        for (viewport, tex, top, bottom) in cases {
+            assert_eq!(
+                content_rect_uv(viewport, tex, 0, [0.0, 0.0], [1.0, 1.0], 0.0, top, bottom),
+                FULL_CONTENT_RECT,
+                "{viewport:?} {tex:?} bars {top}/{bottom}"
+            );
+        }
+        // A collapsed crop is degenerate too — a zero-extent image would cut the
+        // whole backdrop away.
+        assert_eq!(
+            content_rect_uv(
+                [1080.0, 2340.0],
+                (1280, 960),
+                0,
+                [0.5, 0.5],
+                [0.5, 0.5],
+                0.0,
+                0.0,
+                0.0
+            ),
+            FULL_CONTENT_RECT
+        );
     }
 
     /// The format the blur chain's ping-pong targets ACTUALLY have on device.
@@ -6598,8 +6995,17 @@ mod tests {
     /// contained into the window MINUS the bars (`content_height =
     /// viewport_size.y - bar_top - bar_bottom`, see `video_shader_blur.wgsl`), so
     /// the bar regions are *by construction* exactly where the preview is not.
-    /// There is no preview there to blur; `letterbox_color` is the honest answer,
-    /// and it is what the sharp preview underneath paints too.
+    /// There is no preview there to blur, and the window background is the honest
+    /// answer — which is what the sharp preview underneath leaves for it too.
+    ///
+    /// What the bars are FILLED with is a separate question, and its answer has
+    /// changed: the chain still fills the letterbox with `letterbox_color` (the
+    /// Kawase kernels need alpha as a region mask), but the composite now cuts it
+    /// back out so the one window-background layer beneath — translucent under
+    /// COSMIC's window frosting — shows through. See
+    /// `the_composite_cuts_the_letterbox_where_the_fit_math_says`, which measures
+    /// that on the blue channel. This test speaks only to the GEOMETRY, and the
+    /// green channel it reads is 0 either way.
     ///
     /// So the panels and the scrim need the SAME fit, not different ones. Giving
     /// the scrim its own `video_id` and a forced Cover fit would fill the bars
@@ -6633,6 +7039,257 @@ mod tests {
                  the bars, so there is no preview under them to blur. If this now \
                  shows image content, the blur has stopped tracking the preview's \
                  fit and no longer lines up with it."
+            );
+        }
+    }
+
+    /// Render a full-window frosted backdrop at `blend` over a RED clear and
+    /// return the target's rows.
+    ///
+    /// The separation is by CHANNEL, and it is what makes the assertions below
+    /// unambiguous:
+    ///
+    /// * clear = pure RED — nothing painted here at all;
+    /// * `letterbox_color` = pure MAGENTA — the chain's letterbox fill reached the
+    ///   screen (blue is the tell, and only the letterbox has any);
+    /// * the frame = a mid-grey RAMP — real blurred preview (green is the tell,
+    ///   and only the preview has any).
+    ///
+    /// The window is square and the sensor 2:1, so at Fit the image contains to
+    /// the middle half of the window with a quarter of letterbox above and below —
+    /// large, flat regions that a boundary off by a pixel cannot fake.
+    fn frosted_letterbox_rows(blend: f32) -> Option<(Vec<[f32; 3]>, u32, [f32; 4])> {
+        const N: u32 = 256;
+        const SW: u32 = 256;
+        const SH: u32 = 128;
+
+        let (device, queue) = headless_device()?;
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut pipeline = VideoPipeline::new(&device, format);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("frosted letterbox target"),
+            size: wgpu::Extent3d {
+                width: N,
+                height: N,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // A grey ramp well clear of 0 on every channel, so "the preview painted
+        // here" is unmistakable even after the blur has averaged it.
+        let mut data = vec![0u8; (SW * SH * 4) as usize];
+        for y in 0..SH {
+            for x in 0..SW {
+                let i = ((y * SW + x) * 4) as usize;
+                let v = 80 + ((x * 120 / SW) + (y * 120 / SH)) as u8 / 2;
+                data[i..i + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+
+        let mut primitive = VideoPrimitive::new(VIDEO_ID_FROSTED);
+        primitive.letterbox_color = [1.0, 0.0, 1.0, 1.0];
+        primitive.update_frame(VideoFrame {
+            id: VIDEO_ID_FROSTED,
+            width: SW,
+            height: SH,
+            data: crate::backends::camera::types::FrameData::Copied(data.into()),
+            format: PixelFormat::RGBA,
+            stride: SW * 4,
+            yuv_planes: None,
+        });
+        primitive.update_viewport(N as f32, N as f32, blend, 0.0, 0.0);
+
+        let viewport = Viewport::with_physical_size(cosmic::iced::Size::new(N, N), 1.0);
+        let full = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: N as f32,
+            height: N as f32,
+        };
+        primitive.prepare(&mut pipeline, &device, &queue, &full, &viewport);
+
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("frosted letterbox clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::RED),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        primitive.render(
+            &pipeline,
+            &mut encoder,
+            &view,
+            &Rectangle {
+                x: 0,
+                y: 0,
+                width: N,
+                height: N,
+            },
+        );
+
+        let row_bytes = (N * 4).div_ceil(256) * 256;
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frosted letterbox readback"),
+            size: (row_bytes * N) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(N),
+                },
+            },
+            wgpu::Extent3d {
+                width: N,
+                height: N,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let pixels = readback.slice(..).get_mapped_range().to_vec();
+
+        // Row means, so a single stray texel cannot decide anything.
+        let rows: Vec<[f32; 3]> = (0..N)
+            .map(|y| {
+                let mut acc = [0f32; 3];
+                for x in 0..N {
+                    let i = (y * row_bytes + x * 4) as usize;
+                    for (c, a) in acc.iter_mut().enumerate() {
+                        *a += pixels[i + c] as f32;
+                    }
+                }
+                acc.map(|a| a / N as f32)
+            })
+            .collect();
+
+        let rect = content_rect_uv(
+            [N as f32, N as f32],
+            (SW, SH),
+            0,
+            [0.0, 0.0],
+            [1.0, 1.0],
+            blend,
+            0.0,
+            0.0,
+        );
+        Some((rows, N, rect))
+    }
+
+    /// THE test for the letterbox cut: in Fit the composite must paint NOTHING
+    /// outside the image, and `content_rect_uv` must say where that is.
+    ///
+    /// # What it separates
+    ///
+    /// The chain's own letterbox fill is magenta and nothing else on screen has
+    /// any blue, so blue in the letterbox rows means the fill was composited —
+    /// which is precisely the bug: over a translucent window background that fill
+    /// stacks a second opaque copy of the background colour and the compositor's
+    /// frosted glass disappears exactly where there is no camera image to justify
+    /// it (issue #569). Red survives instead, untouched, which is what lets the
+    /// one window-background layer beneath show through.
+    ///
+    /// # Why it also pins `content_rect_uv` itself
+    ///
+    /// That function duplicates the fit math of `video_shader_blur.wgsl` in Rust,
+    /// and duplicated geometry drifts. So this does not merely check "something
+    /// was cut" — it checks the cut lands where the SHADER's own letterbox
+    /// early-out puts it, by asserting the painted band is exactly the rows
+    /// `content_rect_uv` claims and the rows either side are untouched. A drift in
+    /// either copy moves one and not the other.
+    #[test]
+    fn the_composite_cuts_the_letterbox_where_the_fit_math_says() {
+        let Some((rows, n, rect)) = frosted_letterbox_rows(0.0) else {
+            skip_no_gpu("the_composite_cuts_the_letterbox_where_the_fit_math_says");
+            return;
+        };
+
+        // A 2:1 sensor contained into a square window: the middle half.
+        assert!(
+            (rect[1] - 0.25).abs() < 0.01 && (rect[3] - 0.75).abs() < 0.01,
+            "a 2:1 image contained in a square window occupies its middle half; \
+             content_rect_uv said {rect:?}"
+        );
+        let y0 = (rect[1] * n as f32) as u32;
+        let y1 = (rect[3] * n as f32) as u32;
+
+        // Outside the image: the red clear, untouched. One row of slack either
+        // side for the antialiased edge.
+        for y in (0..y0.saturating_sub(1)).chain(y1 + 1..n) {
+            let [r, g, b] = rows[y as usize];
+            assert!(
+                b < 4.0 && g < 4.0 && r > 250.0,
+                "row {y} is letterbox and must be left untouched (the red clear), \
+                 got rgb ({r:.1}, {g:.1}, {b:.1}). Blue means the chain's magenta \
+                 letterbox fill was composited — the very fill that hides the \
+                 window's frosted glass."
+            );
+        }
+
+        // Inside it: real blurred preview. Stay clear of the edge, where the
+        // blur legitimately mixes the letterbox fill inward.
+        for y in y0 + 12..y1 - 12 {
+            let [_, g, _] = rows[y as usize];
+            assert!(
+                g > 60.0,
+                "row {y} is inside the image and must carry blurred preview, got \
+                 green {g:.1} — the cut has eaten live preview"
+            );
+        }
+    }
+
+    /// ...and in Fill the cut must do nothing at all: Cover covers the window, so
+    /// every row is image and every row must still be painted.
+    ///
+    /// The failure this guards against is the cut going the other way — a
+    /// `content_rect` that falls short of the window would carve blurred preview
+    /// out of the scrim bars and chips in the mode the app spends most of its
+    /// time in.
+    #[test]
+    fn the_composite_cuts_nothing_in_fill() {
+        let Some((rows, n, rect)) = frosted_letterbox_rows(1.0) else {
+            skip_no_gpu("the_composite_cuts_nothing_in_fill");
+            return;
+        };
+        assert!(
+            rect[1] <= 0.0 && rect[3] >= 1.0,
+            "Cover fills the window, so there is no letterbox to cut: {rect:?}"
+        );
+        for y in 0..n {
+            let [_, g, _] = rows[y as usize];
+            assert!(
+                g > 60.0,
+                "row {y} must carry blurred preview in Fill, got green {g:.1}"
             );
         }
     }
