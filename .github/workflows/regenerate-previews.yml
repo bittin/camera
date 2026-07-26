@@ -36,6 +36,13 @@ on:
       # Localized shot text — the per-locale galleries render translated strings.
       - 'i18n/**'
   workflow_dispatch:
+    inputs:
+      force:
+        description: >-
+          Re-capture every shot that changed at all, ignoring the churn
+          thresholds. Use after a deliberate global restyle.
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -111,9 +118,26 @@ jobs:
         # committed PNGs and overwrites only what actually changed, then refreshes
         # the README/metainfo galleries that reference them. The image is already
         # built/loaded above, so NO_BUILD_IMAGE skips rebuilding it here.
+        #
+        # `force` drops both churn thresholds to 0. They are area-based shares of
+        # differing pixels, so they are blind to a change that recolours a small
+        # number of pixels completely — a theme or accent change to the symbolic
+        # glyphs in the title bar and chips moves ~0.03% of a shot with a worst
+        # tile of ~6%, an order of magnitude under either threshold, and is
+        # silently kept as "unchanged". Lowering the committed thresholds to
+        # catch that would re-admit exactly the churn they exist to reject (a
+        # timer digit ticking over is the same shape of change), so the escape
+        # hatch is a deliberate, human-triggered run instead.
+        #
+        # 0 is not "rewrite everything": the accept test is `share > threshold`,
+        # strictly, so a shot whose pixels are identical is still left alone.
+        # A forced run commits exactly the shots that differ by at least one
+        # pixel.
         env:
           CONTAINER_ENGINE: podman
           NO_BUILD_IMAGE: "1"
+          PREVIEW_THRESHOLD: ${{ inputs.force && '0' || '' }}
+          PREVIEW_TILE_THRESHOLD: ${{ inputs.force && '0' || '' }}
         run: just generate-previews
 
       - name: Open pull request if screenshots changed
