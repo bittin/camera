@@ -20,6 +20,23 @@ fn disabled_text_style(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Sty
     }
 }
 
+/// A drill-down list row: label on the left, chevron on the right.
+fn settings_nav_row<'a>(label: String, message: Message) -> widget::list::ListButton<'a, Message> {
+    widget::list::button(
+        widget::Row::new()
+            .push(widget::text::body(label))
+            .push(widget::space::horizontal().width(Length::Fill))
+            .push(
+                widget::icon::from_name("go-next-symbolic")
+                    .symbolic(true)
+                    .icon()
+                    .size(16),
+            )
+            .align_y(Alignment::Center),
+    )
+    .on_press(message)
+}
+
 /// Create a text label styled as a disabled/greyed-out control value.
 fn disabled_text(value: String) -> Element<'static, Message> {
     widget::text::body(value)
@@ -49,8 +66,8 @@ impl AppModel {
             SettingsPage::Timelapse => {
                 self.settings_subpage(fl!("settings-timelapse"), self.timelapse_sections())
             }
-            SettingsPage::Appearance => {
-                self.settings_subpage(fl!("settings-appearance"), self.appearance_sections())
+            SettingsPage::Overlay => {
+                self.settings_subpage(fl!("settings-overlay"), self.overlay_sections())
             }
             SettingsPage::VirtualCamera => {
                 self.settings_subpage(fl!("virtual-camera-title"), self.virtual_camera_sections())
@@ -72,84 +89,83 @@ impl AppModel {
             .into()
     }
 
-    /// Top-level Settings menu: a short list of categories that drill into
-    /// focused sub-pages, plus links to Insights, Shortcuts, and About.
+    /// Top-level Settings menu: the theme picker, a list of camera categories
+    /// that drill into focused sub-pages, and links to Insights, Shortcuts,
+    /// Bug reports, and About.
     fn settings_root_view(&self) -> context_drawer::ContextDrawer<'_, Message> {
-        let categories = widget::list_column()
-            .add(self.settings_nav_row(
-                "camera-photo-symbolic",
+        // Theme index (System = 0, Dark = 1, Light = 2)
+        let current_theme_index = match self.config.app_theme {
+            AppTheme::System => 0,
+            AppTheme::Dark => 1,
+            AppTheme::Light => 2,
+        };
+
+        let appearance = widget::settings::section()
+            .title(fl!("settings-appearance"))
+            .add(
+                widget::settings::item::builder(fl!("settings-theme")).control(widget::dropdown(
+                    &self.theme_dropdown_options,
+                    Some(current_theme_index),
+                    Message::SetAppTheme,
+                )),
+            );
+
+        let categories = widget::settings::section()
+            .title(fl!("camera"))
+            .add(settings_nav_row(
                 fl!("camera"),
                 Message::OpenSettingsPage(SettingsPage::Camera),
-                true,
             ))
-            .add(self.settings_nav_row(
-                "image-x-generic-symbolic",
+            .add(settings_nav_row(
                 fl!("settings-photo"),
                 Message::OpenSettingsPage(SettingsPage::Photo),
-                true,
             ))
-            .add(self.settings_nav_row(
-                "camera-video-symbolic",
+            .add(settings_nav_row(
                 fl!("settings-video"),
                 Message::OpenSettingsPage(SettingsPage::Video),
-                true,
             ))
-            .add(self.settings_nav_row(
-                "camera-video-symbolic",
+            .add(settings_nav_row(
                 fl!("settings-timelapse"),
                 Message::OpenSettingsPage(SettingsPage::Timelapse),
-                true,
             ))
-            .add(self.settings_nav_row(
-                "applications-graphics-symbolic",
-                fl!("settings-appearance"),
-                Message::OpenSettingsPage(SettingsPage::Appearance),
-                true,
+            .add(settings_nav_row(
+                fl!("settings-overlay"),
+                Message::OpenSettingsPage(SettingsPage::Overlay),
             ))
-            .add(self.settings_nav_row(
-                "camera-web-symbolic",
+            .add(settings_nav_row(
                 fl!("virtual-camera-title"),
                 Message::OpenSettingsPage(SettingsPage::VirtualCamera),
-                true,
             ));
 
-        let tools = widget::list_column()
-            .add(self.settings_nav_row(
-                "utilities-system-monitor-symbolic",
+        let other = widget::settings::section()
+            .title(fl!("settings-other"))
+            .add(settings_nav_row(
                 fl!("insights-title"),
                 Message::ToggleContextPage(ContextPage::Insights),
-                true,
             ))
-            .add(self.settings_nav_row(
-                "input-keyboard-symbolic",
+            .add(settings_nav_row(
                 fl!("keybindings-page-title"),
                 Message::ToggleContextPage(ContextPage::KeyBindings),
-                true,
             ))
-            .add(self.settings_nav_row(
-                "dialog-warning-symbolic",
+            .add(settings_nav_row(
                 fl!("settings-bug-reports"),
                 Message::OpenSettingsPage(SettingsPage::BugReports),
-                true,
-            ));
-
-        let about = widget::list_column()
-            .add(self.settings_nav_row(
-                "help-about-symbolic",
+            ))
+            .add(settings_nav_row(
                 fl!("about"),
                 Message::OpenSettingsPage(SettingsPage::About),
-                true,
-            ))
-            .add(self.settings_nav_row(
-                "edit-undo-symbolic",
-                fl!("settings-reset-all"),
-                Message::ResetAllSettings,
-                false,
             ));
 
-        let content: Element<'_, Message> =
-            widget::settings::view_column(vec![categories.into(), tools.into(), about.into()])
-                .into();
+        let reset =
+            widget::button::standard(fl!("settings-reset-all")).on_press(Message::ResetAllSettings);
+
+        let content: Element<'_, Message> = widget::settings::view_column(vec![
+            appearance.into(),
+            categories.into(),
+            other.into(),
+            reset.into(),
+        ])
+        .into();
 
         context_drawer::context_drawer(content, Message::ToggleContextPage(ContextPage::Settings))
             .title(fl!("settings-title"))
@@ -174,43 +190,6 @@ impl AppModel {
         context_drawer::context_drawer(about, Message::ToggleContextPage(ContextPage::Settings))
             .title(fl!("about"))
             .actions(self.settings_back_button())
-    }
-
-    /// A full-width menu row: leading icon, label, and (for drill-down rows) a
-    /// trailing chevron.
-    fn settings_nav_row(
-        &self,
-        icon_name: &str,
-        label: String,
-        message: Message,
-        drill: bool,
-    ) -> Element<'_, Message> {
-        let spacing = cosmic::theme::spacing();
-        let mut row = widget::Row::new()
-            .push(
-                widget::icon::from_name(icon_name)
-                    .symbolic(true)
-                    .icon()
-                    .size(16),
-            )
-            .push(widget::text::body(label))
-            .push(widget::space::horizontal().width(Length::Fill))
-            .spacing(spacing.space_s)
-            .align_y(Alignment::Center);
-        if drill {
-            row = row.push(
-                widget::icon::from_name("go-next-symbolic")
-                    .symbolic(true)
-                    .icon()
-                    .size(16),
-            );
-        }
-        widget::button::custom(row)
-            .class(cosmic::theme::Button::MenuItem)
-            .width(Length::Fill)
-            .padding([spacing.space_xs, spacing.space_s])
-            .on_press(message)
-            .into()
     }
 
     /// Camera sub-page: device selection, default mode, and mirroring.
@@ -300,7 +279,21 @@ impl AppModel {
             );
         }
 
-        vec![camera_section.into(), mirror_section.into()]
+        let mut sections = vec![camera_section.into(), mirror_section.into()];
+
+        // Haptic feedback (only where the device has haptics)
+        if crate::backends::haptic::is_available() {
+            let haptic_section = widget::settings::section().add(
+                widget::settings::item::builder(fl!("settings-haptic-feedback"))
+                    .description(fl!("settings-haptic-feedback-description"))
+                    .toggler(self.config.haptic_feedback, |_| {
+                        Message::ToggleHapticFeedback
+                    }),
+            );
+            sections.push(haptic_section.into());
+        }
+
+        sections
     }
 
     /// Photo sub-page: output format and HDR+ settings.
@@ -544,16 +537,8 @@ impl AppModel {
         vec![timelapse_section.into()]
     }
 
-    /// Appearance sub-page: theme, overlay effect, composition guide, and
-    /// (where supported) haptic feedback.
-    fn appearance_sections(&self) -> Vec<Element<'_, Message>> {
-        // Theme index (System = 0, Dark = 1, Light = 2)
-        let current_theme_index = match self.config.app_theme {
-            AppTheme::System => 0,
-            AppTheme::Dark => 1,
-            AppTheme::Light => 2,
-        };
-
+    /// Overlay sub-page: overlay effect and composition guide.
+    fn overlay_sections(&self) -> Vec<Element<'_, Message>> {
         // Overlay effect index. Indexes `available()`, which is shorter
         // off-COSMIC — hence the shared mapping rather than a literal index.
         let current_overlay_effect_index = self.config.overlay_effect.dropdown_index();
@@ -563,15 +548,7 @@ impl AppModel {
             .position(|g| *g == self.config.composition_guide)
             .unwrap_or(0);
 
-        let appearance_section = widget::settings::section()
-            .title(fl!("settings-appearance"))
-            .add(
-                widget::settings::item::builder(fl!("settings-theme")).control(widget::dropdown(
-                    &self.theme_dropdown_options,
-                    Some(current_theme_index),
-                    Message::SetAppTheme,
-                )),
-            )
+        let overlay_section = widget::settings::section()
             .add(
                 widget::settings::item::builder(fl!("settings-overlay-effect"))
                     .description(fl!("settings-overlay-effect-description"))
@@ -580,33 +557,18 @@ impl AppModel {
                         Some(current_overlay_effect_index),
                         Message::SetOverlayEffect,
                     )),
+            )
+            .add(
+                widget::settings::item::builder(fl!("settings-composition-guide"))
+                    .description(fl!("settings-composition-guide-description"))
+                    .control(widget::dropdown(
+                        &self.composition_guide_dropdown_options,
+                        Some(current_guide_index),
+                        Message::SelectCompositionGuide,
+                    )),
             );
 
-        let composition_guide_section = widget::settings::section().add(
-            widget::settings::item::builder(fl!("settings-composition-guide"))
-                .description(fl!("settings-composition-guide-description"))
-                .control(widget::dropdown(
-                    &self.composition_guide_dropdown_options,
-                    Some(current_guide_index),
-                    Message::SelectCompositionGuide,
-                )),
-        );
-
-        let mut sections = vec![appearance_section.into(), composition_guide_section.into()];
-
-        // Haptic feedback (only where the device has haptics)
-        if crate::backends::haptic::is_available() {
-            let haptic_section = widget::settings::section().add(
-                widget::settings::item::builder(fl!("settings-haptic-feedback"))
-                    .description(fl!("settings-haptic-feedback-description"))
-                    .toggler(self.config.haptic_feedback, |_| {
-                        Message::ToggleHapticFeedback
-                    }),
-            );
-            sections.push(haptic_section.into());
-        }
-
-        sections
+        vec![overlay_section.into()]
     }
 
     /// Virtual camera sub-page.

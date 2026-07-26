@@ -93,8 +93,12 @@ filter-pencil = Pencil
 
 # Title of the settings panel.
 settings-title = Settings
-# Settings row and page title for theme and overlay appearance options.
+# Section title for the theme options at the top of the settings panel.
 settings-appearance = Appearance
+# Section title for the entries that are not camera settings.
+settings-other = Other
+# Settings row and page title for the overlay effect and composition guide.
+settings-overlay = Overlay
 # Dropdown label for the light or dark theme choice.
 settings-theme = Theme
 # Theme option: follow the desktop light or dark preference.

@@ -1399,7 +1399,7 @@ pub enum SettingsPage {
     Photo,
     Video,
     Timelapse,
-    Appearance,
+    Overlay,
     VirtualCamera,
     BugReports,
     About,
