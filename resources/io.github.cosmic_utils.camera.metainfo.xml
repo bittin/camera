@@ -106,14 +106,31 @@
   <launchable type="desktop-id">io.github.cosmic_utils.camera.desktop</launchable>
   <provides>
     <id>com.system76.CosmicApplication</id>
-    <!-- Application IDs this component has been published under before. Listed
-         so AppStream keeps one history across the renames instead of treating
-         each as an unrelated application. The current ID is unchanged by the
-         rename to Klikka: only the displayed name and the binary moved. -->
-    <id>io.github.freddyfunk.camera</id>
+    <!-- Every application ID this component has been published under, oldest
+         first, so AppStream keeps one history across the renames instead of
+         treating each as an unrelated application. Taken from the commits that
+         renamed the .desktop, .metainfo.xml and flatpak manifest together, not
+         from the release notes: the 0.1.17 entry names an
+         io.github.freddyfunk.camera that was never an ID.
+         The rename to Klikka did not change the ID; only the displayed name
+         and the binary moved. -->
+    <id>io.github.freddyfunk.CosmicCamera</id>
+    <id>io.github.freddyfunk.cosmic-camera</id>
+    <id>io.github.cosmic-utils.camera</id>
     <id>io.github.cosmicutils.camera</id>
     <binary>klikka</binary>
   </provides>
+  <!-- The same IDs again, as Flathub's MetaInfo guidelines ask for on a rename:
+       `provides` is what makes a lookup of an old ID resolve to this component,
+       so ODRS reviews written under it are not lost, while `replaces` is what
+       states that this component succeeded those rather than merely offering
+       the same thing. -->
+  <replaces>
+    <id>io.github.freddyfunk.CosmicCamera</id>
+    <id>io.github.freddyfunk.cosmic-camera</id>
+    <id>io.github.cosmic-utils.camera</id>
+    <id>io.github.cosmicutils.camera</id>
+  </replaces>
   <url type="homepage">https://github.com/cosmic-utils/klikka</url>
   <url type="bugtracker">https://github.com/cosmic-utils/klikka/issues</url>
   <url type="vcs-browser">https://github.com/cosmic-utils/klikka</url>
