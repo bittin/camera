@@ -299,3 +299,4 @@ overlay-effect-translucent = Прозорий
 desktop-comment = Робіть знімки, записуйте відео й скануйте QR-коди
 metainfo-feature-filters = 14 креативних фільтрів: { filter-mono }, { filter-sepia }, { filter-vivid }, { filter-noir }, { filter-pencil } та інші
 settings-overlay-effect = Ефект перекриття
+filter-standard = Оригінал
