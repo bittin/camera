@@ -93,8 +93,12 @@ filter-pencil = Pencil
 
 # Title of the settings panel.
 settings-title = Settings
-# Settings row and page title for theme and overlay appearance options.
+# Section title for the theme options at the top of the settings panel.
 settings-appearance = Appearance
+# Section title for the entries that are not camera settings.
+settings-other = Other
+# Settings row and page title for the overlay effect and composition guide.
+settings-overlay = Overlay
 # Dropdown label for the light or dark theme choice.
 settings-theme = Theme
 # Theme option: follow the desktop light or dark preference.
@@ -152,8 +156,8 @@ settings-mirror-captures-description = Apply the same horizontal flip to saved p
 settings-haptic-feedback = Haptic feedback
 # Description under the haptic feedback toggle.
 settings-haptic-feedback-description = Vibrate on capture, mode switch, and camera switch
-# Settings row that restores every setting to its default, and the label of the
-# matching shortcut. Reused in both places.
+# Standalone button that restores every setting to its default, and the label
+# of the matching shortcut. Reused in both places.
 settings-reset-all = Reset all settings
 # Settings row, page title and section title for the bug reporting tools.
 settings-bug-reports = Bug reports

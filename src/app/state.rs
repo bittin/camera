@@ -1388,8 +1388,9 @@ pub enum ContextPage {
 
 /// Which sub-page is shown inside the Settings context drawer.
 ///
-/// The drawer is a drill-down: `Root` shows a short category menu, and each
-/// other variant is a focused sub-page reached from it with a back button.
+/// The drawer is a drill-down: `Root` shows the theme picker, a short category
+/// menu and the reset button, and each other variant is a focused sub-page
+/// reached from it with a back button.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub enum SettingsPage {
     /// Top-level category menu.
@@ -1399,7 +1400,7 @@ pub enum SettingsPage {
     Photo,
     Video,
     Timelapse,
-    Appearance,
+    Overlay,
     VirtualCamera,
     BugReports,
     About,
