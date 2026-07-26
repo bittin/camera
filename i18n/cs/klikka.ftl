@@ -327,3 +327,5 @@ action-toggle-filters = Přepnout výběr filtrů
 action-toggle-tools-menu = Přepnout nabídku nástrojů
 action-toggle-ui-chrome = Přepnout rozhraní
 action-toggle-preview-fit = Přepnout přizpůsobení / vyplnění
+settings-other = Ostatní
+settings-overlay = Překrytí
