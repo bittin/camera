@@ -137,6 +137,69 @@ pub fn overlay_surface(theme: &cosmic::Theme) -> OverlaySurface {
     )
 }
 
+/// Whether the app's own WINDOW background should be see-through, so that the
+/// compositor's frosted glass — the blurred wallpaper cosmic-comp already paints
+/// behind us — reads through the parts of the window the camera image does not
+/// cover.
+///
+/// This is a different question from [`overlay_surface`], and the two must not be
+/// conflated. That one asks how our chrome should paint itself over the *live
+/// preview*, and the blur behind it is one we render ourselves. This one asks
+/// whether there is a blur behind the *window* to reveal at all — a blur only
+/// cosmic-comp can draw, and only for a surface it has been asked to blur.
+///
+/// `Theme::transparent` is exactly that signal: libcosmic sets it to
+/// `blur_enabled && Core::frosted(theme)` (see `app/cosmic.rs`), i.e. "this
+/// window really has compositor blur attached". Nothing else will do — deciding
+/// from [`OverlayEffect`] alone would punch a see-through hole in the window on
+/// every desktop that has no blur to put behind it, showing the raw wallpaper
+/// (and whatever windows are stacked below) instead of frosted glass.
+///
+/// The one veto is [`OverlayEffect::Off`], the app's "no see-through chrome"
+/// escape hatch. A user who has turned the effect off and still gets a
+/// see-through *window* would rightly call that a bug, so `Off` keeps the whole
+/// window opaque. Every other effect leaves the window to the compositor: the
+/// window background is the desktop's business, not the overlay chrome's.
+pub fn window_is_frosted(theme: &cosmic::Theme) -> bool {
+    resolve_window_frosted(overlay_effect().effective(), theme.transparent)
+}
+
+/// [`window_is_frosted`] as a pure function of its two inputs — `theme.transparent`
+/// comes from the compositor and cannot be varied from a test.
+fn resolve_window_frosted(effect: OverlayEffect, theme_transparent: bool) -> bool {
+    theme_transparent && effect != OverlayEffect::Off
+}
+
+/// The colour of the app's own window background: the letterbox around the
+/// camera image, the placeholders before the first frame, and the root container
+/// behind everything.
+///
+/// Translucent when [`window_is_frosted`] — the theme's own transparent-container
+/// colour, whose alpha tracks COSMIC's frost-thickness `alpha_map`, so our window
+/// is exactly as see-through as every other COSMIC window at that setting.
+/// Opaque otherwise. Sourced through `Theme::background(bool)`, which is the same
+/// call libcosmic's own `ApplicationExt::view_main` makes for its content
+/// container, so we frost by joining the desktop's convention rather than by
+/// inventing an alpha.
+///
+/// This is the ONLY layer that paints the window background. Everything that
+/// used to paint its own opaque copy in the letterbox now stands aside for it —
+/// see `content_rect_uv` in `video_primitive`, which cuts the letterbox out of
+/// the frosted backdrop, and the `cover_blend` factor on the scrim tint in
+/// [`AppModel::build_crop_overlay`]. Two translucent copies of the same colour
+/// stacked would compose to nearly opaque and undo the effect.
+pub fn window_bg_color(theme: &cosmic::Theme) -> Color {
+    Color::from(theme.cosmic().background(window_is_frosted(theme)).base)
+}
+
+/// [`window_bg_color`] as a `widget::container::style` argument.
+pub fn window_bg_style(theme: &cosmic::Theme) -> widget::container::Style {
+    widget::container::Style {
+        background: Some(Background::Color(window_bg_color(theme))),
+        ..Default::default()
+    }
+}
+
 /// The [`overlay_surface`] decision as a pure function of its three inputs.
 ///
 /// Split out because `is_cosmic_desktop()` caches in a `LazyLock` and
@@ -486,7 +549,23 @@ impl AppModel {
         // that case promote `scrim_alpha` to its own `FitFrom` channel.
         let top_h = self.top_ui_height();
         let alpha_t = (top_h / TOP_BAR_HEIGHT).clamp(0.0, 1.0);
-        let overlay_color = Color::from_rgba(base.r, base.g, base.b, base.a * alpha_t);
+        // ...and fade it out with the fit blend, because in **Fit** the bars are
+        // by construction exactly the letterbox (see `frosted_backdrop`'s module
+        // docs: Contain shrinks the image into `viewport.y - bar_top -
+        // bar_bottom`, so the bar regions are precisely where the image is not).
+        // A scrim exists to separate chrome from the live preview; over the
+        // letterbox there is no preview to separate from, only the window
+        // background — and painting a second translucent copy of that colour on
+        // top of [`window_bg_color`] composes the two to nearly opaque, so the
+        // bars would read as solid slabs against frosted side letterbox.
+        //
+        // This is invisible while the window background is opaque, which is why
+        // it is unconditional: the tint and the background carry the SAME RGB
+        // (both `bg_color()`), so over an opaque background dropping the tint
+        // changes nothing at all. Pinned by
+        // `scrim_tint_over_an_opaque_window_is_a_no_op`.
+        let fit_t = self.cover_blend().clamp(0.0, 1.0);
+        let overlay_color = Color::from_rgba(base.r, base.g, base.b, base.a * alpha_t * fit_t);
 
         cosmic::widget::canvas(OverlayBackgroundProgram {
             target_ratio,
@@ -603,6 +682,105 @@ mod tests {
                 resolve_surface(effect, is_cosmic, transparent),
                 want,
                 "{effect:?} on is_cosmic={is_cosmic} transparent={transparent}"
+            );
+        }
+    }
+
+    /// The window background follows the COMPOSITOR, not the overlay effect.
+    ///
+    /// `theme.transparent` is the only signal that cosmic-comp has actually
+    /// attached blur to our surface, and it is a hard requirement: without a blur
+    /// behind the window, a see-through background is not frosted glass, it is a
+    /// hole showing the raw wallpaper and whatever is stacked below. So no effect
+    /// — not even `Frosted`, which the user can force on any desktop — may turn
+    /// the window see-through on its own.
+    ///
+    /// `Off` is the one veto in the other direction: it is the app's "no
+    /// see-through chrome" switch, and a see-through window would contradict it.
+    #[test]
+    fn the_window_frosts_only_when_the_compositor_says_so() {
+        for effect in OverlayEffect::ALL {
+            assert!(
+                !resolve_window_frosted(effect, false),
+                "{effect:?} made the window see-through with no compositor blur \
+                 behind it — that is a hole in the window, not frosted glass"
+            );
+        }
+        for effect in [
+            OverlayEffect::System,
+            OverlayEffect::Frosted,
+            OverlayEffect::Translucent,
+        ] {
+            assert!(
+                resolve_window_frosted(effect, true),
+                "{effect:?} must leave the window background to the compositor"
+            );
+        }
+        assert!(
+            !resolve_window_frosted(OverlayEffect::Off, true),
+            "'Off' is the app's no-see-through-chrome switch; it must keep the \
+             window opaque too"
+        );
+    }
+
+    /// The window background is the theme's own container colour, picked through
+    /// the same `Theme::background(bool)` call libcosmic makes for its content
+    /// container — so our frosting is the desktop's, at the desktop's own
+    /// frost-thickness alpha, rather than an alpha we invented.
+    #[test]
+    fn the_frosted_window_background_is_the_themes_transparent_container() {
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let opaque = Color::from(theme.cosmic().background(false).base);
+            let frosted = Color::from(theme.cosmic().background(true).base);
+            assert_eq!(
+                opaque.a, 1.0,
+                "the un-frosted window background must be fully opaque"
+            );
+            // The two carry the same RGB and differ only in alpha — which is what
+            // makes dropping the scrim tint over the letterbox invisible while the
+            // window is opaque (see the test below).
+            assert_eq!(
+                (opaque.r, opaque.g, opaque.b),
+                (frosted.r, frosted.g, frosted.b)
+            );
+        }
+    }
+
+    /// Fading the scrim tint out with the fit blend is a no-op while the window
+    /// background is opaque — which is why it can be unconditional.
+    ///
+    /// In Fit the scrim bars ARE the letterbox, so the tint sits on the window
+    /// background rather than on live preview. Both carry `bg_color()`'s RGB, so
+    /// over an opaque background any alpha composites to the same colour and the
+    /// fade cannot be seen. Over a *translucent* one it is the difference between
+    /// a frosted bar and a nearly solid slab, since two stacked copies of the same
+    /// translucent colour compose to `1-(1-a)^2`.
+    #[test]
+    fn scrim_tint_over_an_opaque_window_is_a_no_op() {
+        for theme in [cosmic::Theme::dark(), cosmic::Theme::light()] {
+            let window = Color::from(theme.cosmic().background(false).base);
+            for surface in [
+                OverlaySurface::Frosted,
+                OverlaySurface::Translucent,
+                OverlaySurface::Opaque,
+            ] {
+                let tint = surface.bg_color(&theme, OVERLAY_BACKGROUND_ALPHA);
+                assert_eq!(
+                    (tint.r, tint.g, tint.b),
+                    (window.r, window.g, window.b),
+                    "{surface:?}: the scrim tint and the window background must \
+                     share an RGB, or fading the tint out over the letterbox would \
+                     be a visible colour change rather than the no-op it is meant \
+                     to be"
+                );
+            }
+            // And the stacking really is the problem worth avoiding: two copies of
+            // the frosted alpha compose to nearly opaque.
+            let a = Color::from(theme.cosmic().background(true).base).a;
+            assert!(
+                1.0 - (1.0 - a).powi(2) > a + 0.1,
+                "stacking two translucent copies at alpha {a} must be materially \
+                 more opaque than one, otherwise this fade has no reason to exist"
             );
         }
     }

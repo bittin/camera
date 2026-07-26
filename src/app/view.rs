@@ -11,7 +11,7 @@
 
 use crate::app::bottom_bar::slide_h::SlideH;
 use crate::app::overlay_style::{
-    OVERLAY_CONTAINER, PICKER_PANEL, POPUP_PANEL, overlay_chip_button_class,
+    OVERLAY_CONTAINER, PICKER_PANEL, POPUP_PANEL, overlay_chip_button_class, window_bg_style,
 };
 use crate::app::preview_geometry::TOP_BAR_HEIGHT;
 use crate::app::qr_overlay::build_qr_overlay;
@@ -490,10 +490,7 @@ impl AppModel {
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|theme| widget::container::Style {
-                background: Some(Background::Color(theme.cosmic().bg_color().into())),
-                ..Default::default()
-            })
+            .style(window_bg_style)
             .into();
         }
 
@@ -507,10 +504,7 @@ impl AppModel {
             )
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|theme| widget::container::Style {
-                background: Some(Background::Color(theme.cosmic().bg_color().into())),
-                ..Default::default()
-            })
+            .style(window_bg_style)
             .into();
         }
 
@@ -805,14 +799,15 @@ impl AppModel {
             main_stack = main_stack.push(self.build_context_drawer());
         }
 
-        // Wrap everything in a themed background container
+        // Wrap everything in the window background container. This is the single
+        // layer that paints the app's window background — see [`window_bg_style`]
+        // — so with COSMIC's window frosting on it is translucent and the
+        // compositor's blurred wallpaper reads through everywhere the camera
+        // image does not cover (issue #569).
         widget::container(main_stack)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(|theme| widget::container::Style {
-                background: Some(Background::Color(theme.cosmic().bg_color().into())),
-                ..Default::default()
-            })
+            .style(window_bg_style)
             .into()
     }
 

@@ -7,7 +7,7 @@ use crate::app::video_widget::{self, VideoContentFit};
 use crate::backends::camera::types::SensorRotation;
 use crate::fl;
 use cosmic::Element;
-use cosmic::iced::{Background, Length};
+use cosmic::iced::Length;
 use cosmic::widget;
 use tracing::{debug, info};
 
@@ -116,6 +116,20 @@ impl AppModel {
         let zoom_level = transforms.zoom;
         let scroll_zoom_enabled = self.mode.supports_fit_and_zoom();
 
+        // The colour the blur chain's transform pass fills the letterbox with.
+        //
+        // RGB only: it is the colour the Kawase kernels blend *toward* at the
+        // image's edge, so it has to match the window background the letterbox
+        // actually shows — but it is never composited to screen as a fill any
+        // more. The composite cuts the letterbox out entirely (see
+        // `content_rect_uv` in `video_primitive`) and lets the one window
+        // background layer paint it, so that the frosted backdrop cannot stack a
+        // second opaque copy of this colour over a translucent window.
+        //
+        // Hence `bg_color()` rather than [`window_bg_color`]: this is the opaque
+        // RGB of the background, with no alpha to carry, and pass 0 requires an
+        // alpha of 1 regardless (the Kawase kernels read alpha as a region mask —
+        // see `video_shader_kawase.wgsl`).
         let bg = cosmic::theme::active().cosmic().bg_color();
         let letterbox_color = [bg.red, bg.green, bg.blue, 1.0];
 
@@ -156,9 +170,8 @@ impl AppModel {
             .align_x(cosmic::iced::alignment::Horizontal::Center)
             .align_y(cosmic::iced::alignment::Vertical::Center)
             .style(|theme| widget::container::Style {
-                background: Some(Background::Color(theme.cosmic().bg_color().into())),
                 text_color: Some(theme.cosmic().on_bg_color().into()),
-                ..Default::default()
+                ..crate::app::overlay_style::window_bg_style(theme)
             })
             .into();
         }
@@ -227,10 +240,7 @@ impl AppModel {
         )
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|theme: &cosmic::Theme| widget::container::Style {
-            background: Some(Background::Color(theme.cosmic().bg_color().into())),
-            ..Default::default()
-        })
+        .style(crate::app::overlay_style::window_bg_style)
         .into()
     }
 }
