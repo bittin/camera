@@ -64,6 +64,10 @@ const MOON_OFF_ICON: &[u8] = include_bytes!("../../resources/button_icons/moon-o
 /// Camera tilt/motor control icon SVG
 const CAMERA_TILT_ICON: &[u8] = include_bytes!("../../resources/button_icons/camera-tilt.svg");
 
+/// Gap left between the context drawer and the window's right/bottom edges.
+/// Matches the 8 px inset libcosmic uses for its own context-drawer overlay.
+const CONTEXT_DRAWER_INSET: u16 = 8;
+
 /// Burst mode progress bar dimensions
 const BURST_MODE_PROGRESS_BAR_WIDTH: f32 = 200.0;
 const BURST_MODE_PROGRESS_BAR_HEIGHT: f32 = 8.0;
@@ -304,6 +308,20 @@ fn overlay_icon_button<'a, M: Clone + 'static>(
     button.into()
 }
 
+/// Dim a top-bar icon that is inert while the UI is disabled mid-transition.
+///
+/// Symbolic icons read `icon_color`, not `text_color`; the top bar now publishes
+/// an ambient `icon_color` of its own (accent while focused), so the dimming has
+/// to override that channel or the disabled icons come out fully accented.
+fn disabled_top_bar_icon_style(_theme: &cosmic::Theme) -> widget::container::Style {
+    let dimmed = Color::from_rgba(1.0, 1.0, 1.0, 0.3);
+    widget::container::Style {
+        icon_color: Some(dimmed),
+        text_color: Some(dimmed),
+        ..Default::default()
+    }
+}
+
 /// Animation duration for fit/fill transition.
 pub const FIT_ANIMATION_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -311,6 +329,19 @@ pub const FIT_ANIMATION_DURATION: std::time::Duration = std::time::Duration::fro
 pub const ZOOM_ANIMATION_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
 
 impl AppModel {
+    /// Whether the main window currently holds keyboard focus.
+    ///
+    /// Mirrors the check libcosmic runs before styling its own header bar, so
+    /// our custom title bar switches between focused and unfocused colours at
+    /// the same moment a native COSMIC header bar would.
+    pub fn window_is_focused(&self) -> bool {
+        let main_window = self.core.main_window_id();
+        self.core
+            .focus_chain()
+            .iter()
+            .any(|id| Some(*id) == main_window)
+    }
+
     /// Settled cover blend: 0.0 (Contain) when fit-to-view is enabled in a
     /// mode that supports it (Photo, View), 1.0 (Cover) everywhere else.
     /// The single source of truth for the preview's geometry target.
@@ -768,6 +799,12 @@ impl AppModel {
             main_stack = main_stack.push(self.build_tools_menu());
         }
 
+        // Context drawer (Settings, Filters, Insights, Shortcuts) last, so it
+        // sits above every other overlay.
+        if self.core.window.show_context {
+            main_stack = main_stack.push(self.build_context_drawer());
+        }
+
         // Wrap everything in a themed background container
         widget::container(main_stack)
             .width(Length::Fill)
@@ -777,6 +814,73 @@ impl AppModel {
                 ..Default::default()
             })
             .into()
+    }
+
+    /// Width of the context drawer pane.
+    ///
+    /// Mirrors libcosmic's `Core::context_width`, which is crate-private: it
+    /// reserves 360 px of content (plus 8 px padding) for the main view and
+    /// clamps the drawer to 344..=480 px.
+    fn context_drawer_width(&self) -> f32 {
+        (self.screen_width - (360.0 + 8.0)).clamp(344.0, 480.0)
+    }
+
+    /// Build the context drawer (Settings, Filters, Insights, Shortcuts) as a
+    /// view-level overlay.
+    ///
+    /// libcosmic would normally render this for us from
+    /// `Application::context_drawer`, but it pins the drawer to the top of the
+    /// main view as an iced overlay. This app draws its title bar *inside* that
+    /// view, so the drawer swallowed the window controls whenever it opened
+    /// (issue #565). Building it here lets the pane start below
+    /// [`TOP_BAR_HEIGHT`], leaving the title bar visible and clickable.
+    fn build_context_drawer(&self) -> Element<'_, Message> {
+        use crate::app::state::ContextPage;
+
+        let drawer = match self.context_page {
+            ContextPage::Settings => self.settings_view(),
+            ContextPage::Filters => self.filters_view(),
+            ContextPage::Insights => self.insights_view(),
+            ContextPage::KeyBindings => crate::app::keybind::key_bindings_page::view(self),
+        };
+
+        let width = self.context_drawer_width();
+        let pane = widget::ContextDrawer::new_inner_overlay(
+            drawer.title,
+            drawer.actions,
+            drawer.header,
+            drawer.footer,
+            drawer.content,
+            drawer.on_close,
+            width,
+            // Opaque pane: it floats over the live preview, exactly as
+            // libcosmic's own overlay drawer does.
+            true,
+        );
+
+        // Swallow presses that land on the pane so they don't reach the preview
+        // underneath — the same guard the picker overlays use.
+        let pane = widget::mouse_area(
+            widget::container(pane)
+                .width(Length::Fixed(width))
+                .height(Length::Fill),
+        )
+        .on_press(Message::Noop);
+
+        widget::container(
+            widget::Row::new()
+                .push(widget::space::horizontal().width(Length::Fill))
+                .push(pane)
+                .padding([
+                    TOP_BAR_HEIGHT as u16,
+                    CONTEXT_DRAWER_INSET,
+                    CONTEXT_DRAWER_INSET,
+                    0,
+                ]),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     /// Build the top bar with recording indicator and format button
@@ -876,10 +980,7 @@ impl AppModel {
             if is_disabled {
                 row = row.push(
                     widget::container(widget::icon(flash_icon).size(20))
-                        .style(|_theme| widget::container::Style {
-                            text_color: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
-                            ..Default::default()
-                        })
+                        .style(disabled_top_bar_icon_style)
                         .padding([4, 8]),
                 );
             } else {
@@ -910,10 +1011,7 @@ impl AppModel {
                 if is_disabled {
                     row = row.push(
                         widget::container(widget::icon(moon_icon).size(20))
-                            .style(|_theme| widget::container::Style {
-                                text_color: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
-                                ..Default::default()
-                            })
+                            .style(disabled_top_bar_icon_style)
                             .padding([4, 8]),
                     );
                 } else {
@@ -939,12 +1037,7 @@ impl AppModel {
             if is_disabled {
                 let file_button =
                     widget::button::icon(icon::from_name("document-open-symbolic").symbolic(true));
-                row = row.push(widget::container(file_button).style(|_theme| {
-                    widget::container::Style {
-                        text_color: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
-                        ..Default::default()
-                    }
-                }));
+                row = row.push(widget::container(file_button).style(disabled_top_bar_icon_style));
             } else {
                 let message = if has_file {
                     Message::ClearVirtualCameraFile
@@ -974,10 +1067,7 @@ impl AppModel {
         if is_disabled {
             row = row.push(
                 widget::container(widget::icon(tools_icon).size(20))
-                    .style(|_theme| widget::container::Style {
-                        text_color: Some(Color::from_rgba(1.0, 1.0, 1.0, 0.3)),
-                        ..Default::default()
-                    })
+                    .style(disabled_top_bar_icon_style)
                     .padding([4, 8]),
             );
         } else {
@@ -1022,12 +1112,19 @@ impl AppModel {
                     .on_press(Message::WindowClose),
             );
 
+        // This row *is* the window's title bar, so it adopts the native COSMIC
+        // header bar's colours: accent icons while the window holds focus,
+        // dimmed while it doesn't, which is how a COSMIC window signals that
+        // it's the active one. `transparent: true` keeps the header bar's
+        // background off so the live preview still shows through (issue #565).
+        let focused = self.window_is_focused();
         let top_bar_widget =
             widget::container(row)
                 .width(Length::Fill)
-                .style(|_theme| widget::container::Style {
-                    background: Some(Background::Color(Color::TRANSPARENT)),
-                    ..Default::default()
+                .class(cosmic::theme::Container::HeaderBar {
+                    focused,
+                    sharp_corners: true,
+                    transparent: true,
                 });
 
         // Make the top bar draggable for window movement

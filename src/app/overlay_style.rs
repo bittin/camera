@@ -238,6 +238,12 @@ impl PanelStyle {
                 ..Default::default()
             },
             text_color: self.tinted_text.then(|| surface.on_color(theme)),
+            // Symbolic icons inside a panel read this, so every picker, chip and
+            // indicator floating over the preview gets the same accent glyphs as
+            // the title bar. Buttons that set their own `icon_color` (the accent
+            // *fill* of `Button::Suggested`, the dimmed disabled states) still
+            // win over it, so toggle states stay legible.
+            icon_color: Some(chrome_accent_color(theme)),
             ..Default::default()
         }
     }
@@ -279,32 +285,50 @@ impl PanelStyle {
     }
 }
 
+/// Foreground colour for the app's own window chrome — the custom title bar and
+/// the chips, panels and pickers that float over the preview.
+///
+/// COSMIC paints header-bar icons in the accent colour, and this app draws its
+/// entire chrome itself: the title bar row, the fit/fill and zoom chips, the
+/// tools menu and the pickers all sit on the same floating surfaces, so they all
+/// take the same colour rather than each picking its own (issue #565).
+///
+/// `accent_text_color` rather than the raw accent: the theme contrast-adjusts it
+/// for foreground use, which is what keeps it legible on the overlay scrim.
+pub fn chrome_accent_color(theme: &cosmic::Theme) -> Color {
+    Color::from(theme.cosmic().accent_text_color())
+}
+
 /// Button class for chips that sit on the translucent overlay scrim:
 /// transparent background (the surrounding [`OVERLAY_CONTAINER`] provides
-/// the colour) with `on_bg_color` text/icon. Avoids `Button::Text`, which uses
-/// the accent colour for foreground.
+/// the colour) with [`chrome_accent_color`] text/icon, matching the title bar
+/// above them. Avoids `Button::Text`, whose own background and hover tint don't
+/// match the scrim.
 pub fn overlay_chip_button_class() -> cosmic::theme::Button {
     use cosmic::widget::button::Style;
     let plain = |theme: &cosmic::Theme| -> Style {
-        let on = overlay_surface(theme).on_color(theme);
+        let accent = chrome_accent_color(theme);
         Style {
-            text_color: Some(on),
-            icon_color: Some(on),
+            text_color: Some(accent),
+            icon_color: Some(accent),
             ..Style::new()
         }
     };
     let with_overlay = |theme: &cosmic::Theme, alpha: f32| -> Style {
         let cosmic = theme.cosmic();
         // Match the scrim: source the hover/press tint from the same container
-        // variant (opaque vs. transparent) the surrounding panel uses.
+        // variant (opaque vs. transparent) the surrounding panel uses. The tint
+        // stays `on`-derived — a wash of the accent behind accent glyphs would
+        // wipe out the contrast the hover state is meant to add.
         let on = overlay_surface(theme).on_color(theme);
+        let accent = chrome_accent_color(theme);
         Style {
             background: Some(Background::Color(Color::from_rgba(on.r, on.g, on.b, alpha))),
             // Match the wrapper container's corner radius so the hover/press
             // overlay rounds with the chip instead of drawing a sharp box.
             border_radius: cosmic.corner_radii.radius_xl.into(),
-            text_color: Some(on),
-            icon_color: Some(on),
+            text_color: Some(accent),
+            icon_color: Some(accent),
             ..Style::new()
         }
     };
