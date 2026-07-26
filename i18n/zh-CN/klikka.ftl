@@ -228,7 +228,7 @@ settings-timelapse-interval-description = 连续照片拍摄之间的时间间�
 # Insights - Capture
 insights-capture = 捕捉
 insights-capture-burst = 连拍捕捉
-desktop-keywords = 相机;摄像头;照片;视频;
+desktop-keywords = klikka;相机;摄像头;照片;视频;
 metainfo-summary = 拍摄照片和视频
 metainfo-description-usage = 只需打开应用程序即可开始捕捉精彩瞬间。 为照片添加有趣的滤镜，扫描二维码打开链接或连接 WiFi， 或使用虚拟相机模式在视频通话中应用您喜爱的滤镜，展现最佳状态。
 metainfo-description-features-title = 主要功能：

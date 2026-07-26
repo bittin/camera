@@ -502,7 +502,7 @@ impl Default for Config {
             photo_settings: HashMap::new(),
             last_video_encoder_index: None,
             bug_report_url:
-                "https://github.com/cosmic-utils/camera/issues/new?template=bug_report_from_app.yml"
+                "https://github.com/cosmic-utils/klikka/issues/new?template=bug_report_from_app.yml"
                     .to_string(),
             mirror_preview: true,   // Default to mirrored (selfie mode)
             mirror_captures: false, // Captured media unmirrored by default

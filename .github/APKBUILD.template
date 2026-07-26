@@ -1,10 +1,10 @@
 # Contributor: Frederic Laing <dev@fredfunk.tech>
 # Maintainer: Frederic Laing <dev@fredfunk.tech>
-pkgname=camera
+pkgname=klikka
 pkgver=@@VERSION@@
 pkgrel=0
 pkgdesc="Modern camera app for Linux desktops and phones"
-url="https://github.com/cosmic-utils/camera"
+url="https://github.com/cosmic-utils/klikka"
 # armhf, armv7, x86: 32-bit is problematic for libcosmic apps
 # riscv64: blocked by cosmic-icons
 arch="all !armhf !armv7 !riscv64 !x86"
@@ -32,7 +32,7 @@ makedepends="
 	wayland-dev
 "
 options="net"  # fetch dependencies
-source="$pkgname-$pkgver.tar.gz::https://github.com/cosmic-utils/camera/archive/refs/tags/v$pkgver.tar.gz"
+source="$pkgname-$pkgver.tar.gz::https://github.com/cosmic-utils/klikka/archive/refs/tags/v$pkgver.tar.gz"
 
 prepare() {
 	default_prepare
@@ -41,7 +41,7 @@ prepare() {
 
 build() {
 	# the release tarball has no git checkout for build.rs to describe
-	export CAMERA_VERSION=$pkgver
+	export KLIKKA_VERSION=$pkgver
 
 	cargo auditable build --release --frozen
 }
@@ -55,5 +55,5 @@ package() {
 }
 
 sha512sums="
-@@CHECKSUM@@  camera-@@VERSION@@.tar.gz
+@@CHECKSUM@@  klikka-@@VERSION@@.tar.gz
 "

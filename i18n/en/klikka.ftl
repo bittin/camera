@@ -1,17 +1,21 @@
-### Camera, a camera application for Linux desktops and phones.
+### Klikka, a camera application for Linux desktops and phones.
 ###
 ### Notes for translators:
 ### Screen space is tight in this app. Most strings sit in overlays drawn on top
 ### of the live camera preview, or in fixed-width rows. Where a length limit
 ### matters it is stated in the comment above the string.
-### Product names (COSMIC, PipeWire, GStreamer, libcamera, V4L2, DNG, JPEG, PNG,
-### HDR+, Opus, AAC, MJPEG, NV12) are not translated.
+### Product names (Klikka, COSMIC, PipeWire, GStreamer, libcamera, V4L2, DNG,
+### JPEG, PNG, HDR+, Opus, AAC, MJPEG, NV12) are not translated.
 
-# The word "Camera", used for every place the app names itself or a camera
-# device: the window title and About page header, the launcher and software
-# centre entry, the camera settings page, and the camera shortcut category. It
-# is also referenced inside longer strings as { camera }, so keep it a single
-# noun that reads correctly at the start of a sentence.
+# The name of the application. A made up word, so leave it exactly as it is in
+# every language. Shown as the About page header, the launcher entry and the
+# software centre listing, and referenced inside longer strings as { app-name }.
+app-name = Klikka
+# The word "Camera", the generic noun rather than the product: the camera
+# settings page, the camera shortcut category, and the subtitle the launcher
+# and the desktop search index show beside { app-name }. It is also referenced
+# inside longer strings as { camera }, so keep it a single noun that reads
+# correctly at the start of a sentence.
 camera = Camera
 # Row that opens the About page, and the label of the F1 shortcut. Reused in
 # both places, so it has to work as a navigation row and as an action name.
@@ -739,16 +743,18 @@ desktop-comment = Take photos, record video, and scan QR codes
 # Translate the terms, and feel free to add extra words people in your language
 # would search for. Keeping the English words as well is useful, since many
 # users type them regardless.
-desktop-keywords = camera;webcam;photo;video;
+desktop-keywords = klikka;camera;webcam;photo;video;
 
 ## Software centre listing, shown by GNOME Software, KDE Discover and Flathub.
 ## The release notes in the metainfo file are deliberately not translated.
 
 # One line summary shown under the name in a software centre. Keep it under
-# about 60 characters, as listings truncate it.
-metainfo-summary = Capture photos and videos
+# about 60 characters, as listings truncate it. Software centres have no
+# equivalent of the launcher's generic name, so this line carries the word
+# "camera" for people searching the catalogue for one.
+metainfo-summary = Camera for photos, videos and QR codes
 # First paragraph of the long description.
-metainfo-description-intro = { camera } is a modern camera application for Linux, built for desktops and phones alike. Whether you need to snap a quick photo, record a video, or scan a QR code, { camera } provides a clean and intuitive interface that stays out of your way.
+metainfo-description-intro = { app-name } is a modern camera application for Linux, built for desktops and phones alike. Whether you need to snap a quick photo, record a video, or scan a QR code, { app-name } provides a clean and intuitive interface that stays out of your way.
 # Second paragraph of the long description.
 metainfo-description-usage = Just open the app and start capturing moments. Add fun filters to your photos, scan QR codes to open links or connect to WiFi, or use virtual camera mode to look great in video calls with your favorite filter applied.
 # Heading introducing the feature list below. Ends with a colon.

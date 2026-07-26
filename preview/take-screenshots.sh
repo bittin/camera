@@ -2,7 +2,7 @@
 # Launch the camera app with preview source images for taking Flathub screenshots.
 #
 # Usage:
-#   ./preview/take-screenshots.sh [path-to-camera-binary]
+#   ./preview/take-screenshots.sh [path-to-klikka-binary]
 #
 # The script launches the camera app once per source image so you can manually
 # set up the required UI state and take a screenshot (e.g. with COSMIC Screenshot).
@@ -16,11 +16,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SOURCE_DIR="$SCRIPT_DIR/source"
-CAMERA="${1:-$SCRIPT_DIR/../target/release/camera}"
+CAMERA="${1:-$SCRIPT_DIR/../target/release/klikka}"
 
 if [[ ! -x "$CAMERA" ]]; then
     echo "Camera binary not found at: $CAMERA"
-    echo "Usage: $0 [path-to-camera-binary]"
+    echo "Usage: $0 [path-to-klikka-binary]"
     echo "       Build first with: cargo build --release"
     exit 1
 fi

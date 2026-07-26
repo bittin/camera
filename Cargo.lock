@@ -952,51 +952,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "camera"
-version = "1.0.2"
-dependencies = [
- "ashpd 0.13.13",
- "async-stream",
- "bytemuck",
- "chrono",
- "clap",
- "crossterm",
- "ctrlc",
- "dirs",
- "dng",
- "drm-fourcc",
- "futures",
- "gstreamer",
- "gstreamer-app",
- "gstreamer-video",
- "i18n-embed",
- "i18n-embed-fl",
- "iced_core",
- "iced_futures",
- "iced_wgpu",
- "image",
- "libc",
- "libcamera",
- "libcosmic",
- "naga 30.0.0",
- "open",
- "pollster 1.0.1",
- "pulseaudio",
- "ratatui",
- "rfd 0.17.2",
- "rqrr",
- "rust-embed",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "turbojpeg",
- "uuid",
- "zbus",
-]
-
-[[package]]
 name = "castaway"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3738,6 +3693,51 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "klikka"
+version = "1.0.2"
+dependencies = [
+ "ashpd 0.13.13",
+ "async-stream",
+ "bytemuck",
+ "chrono",
+ "clap",
+ "crossterm",
+ "ctrlc",
+ "dirs",
+ "dng",
+ "drm-fourcc",
+ "futures",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-video",
+ "i18n-embed",
+ "i18n-embed-fl",
+ "iced_core",
+ "iced_futures",
+ "iced_wgpu",
+ "image",
+ "libc",
+ "libcamera",
+ "libcosmic",
+ "naga 30.0.0",
+ "open",
+ "pollster 1.0.1",
+ "pulseaudio",
+ "ratatui",
+ "rfd 0.17.2",
+ "rqrr",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "turbojpeg",
+ "uuid",
+ "zbus",
+]
 
 [[package]]
 name = "known-folders"
