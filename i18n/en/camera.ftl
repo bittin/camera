@@ -156,8 +156,8 @@ settings-mirror-captures-description = Apply the same horizontal flip to saved p
 settings-haptic-feedback = Haptic feedback
 # Description under the haptic feedback toggle.
 settings-haptic-feedback-description = Vibrate on capture, mode switch, and camera switch
-# Settings row that restores every setting to its default, and the label of the
-# matching shortcut. Reused in both places.
+# Standalone button that restores every setting to its default, and the label
+# of the matching shortcut. Reused in both places.
 settings-reset-all = Reset all settings
 # Settings row, page title and section title for the bug reporting tools.
 settings-bug-reports = Bug reports

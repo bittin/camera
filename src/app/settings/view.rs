@@ -24,8 +24,7 @@ fn disabled_text_style(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Sty
 fn settings_nav_row<'a>(label: String, message: Message) -> widget::list::ListButton<'a, Message> {
     widget::list::button(
         widget::Row::new()
-            .push(widget::text::body(label))
-            .push(widget::space::horizontal().width(Length::Fill))
+            .push(widget::text::body(label).width(Length::Fill))
             .push(
                 widget::icon::from_name("go-next-symbolic")
                     .symbolic(true)
@@ -49,10 +48,11 @@ fn disabled_text(value: String) -> Element<'static, Message> {
 impl AppModel {
     /// Build the Settings context drawer for the current sub-page.
     ///
-    /// The drawer is a drill-down: [`SettingsPage::Root`] shows a short category
-    /// menu, and every other page is a focused list reached from it with a back
-    /// button. Keeping the root short avoids the single long scroll that used to
-    /// make About/Insights inherit its scroll position.
+    /// The drawer is a drill-down: [`SettingsPage::Root`] shows the theme
+    /// picker, a short category menu and the reset button, and every other page
+    /// is a focused list reached from it with a back button. Keeping the root
+    /// short avoids the single long scroll that used to make About/Insights
+    /// inherit its scroll position.
     pub fn settings_view(&self) -> context_drawer::ContextDrawer<'_, Message> {
         match self.settings_page {
             SettingsPage::Root => self.settings_root_view(),
@@ -549,6 +549,7 @@ impl AppModel {
             .unwrap_or(0);
 
         let overlay_section = widget::settings::section()
+            .title(fl!("settings-overlay"))
             .add(
                 widget::settings::item::builder(fl!("settings-overlay-effect"))
                     .description(fl!("settings-overlay-effect-description"))
