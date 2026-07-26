@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use camera::app::keybind::{Action, ActionCategory};
 use cosmic::widget::menu::key_bind::KeyBind;
+use klikka::app::keybind::{Action, ActionCategory};
 use std::collections::{HashMap, HashSet};
 
 #[test]
@@ -87,14 +87,14 @@ fn chrome_and_fit_defaults_are_unmodified_letters() {
 
 #[test]
 fn space_renders_as_word_not_glyph() {
-    use camera::app::keybind::format_keybind;
+    use klikka::app::keybind::format_keybind;
     let space_kb = Action::Capture.default_keybind().unwrap();
     assert_eq!(format_keybind(&space_kb), "Space");
 }
 
 #[test]
 fn every_default_keybind_round_trips_through_serde() {
-    use camera::app::keybind::SerializedKeyBind;
+    use klikka::app::keybind::SerializedKeyBind;
     // If a new default uses a Named variant that parse_named doesn't know
     // about, the round-trip silently produces None — making the binding
     // un-persistable. This test catches that early.

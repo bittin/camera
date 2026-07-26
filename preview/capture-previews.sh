@@ -23,7 +23,7 @@
 #   preview/capture-previews.sh [output-dir]
 #
 # Environment:
-#   CAMERA_BIN   camera binary to use (default: build with cargo)
+#   CAMERA_BIN   klikka binary to use (default: build with cargo)
 #   SHOTS            comma-separated shot numbers to capture (default: all)
 #   VARIANTS_FILTER  comma-separated variant names (default: all)
 #   LOCALES_FILTER   comma-separated languages, or `none` for English only
@@ -97,13 +97,13 @@ done
 
 CAMERA="${CAMERA_BIN:-}"
 if [[ -z "$CAMERA" ]]; then
-    log "Building camera (release-fast)"
+    log "Building klikka (release-fast)"
     ( cd "$REPO_DIR" && cargo build --profile release-fast )
     # Honour CARGO_TARGET_DIR: generate-previews.sh points it at the mounted
     # cache (/target), so the binary lands there, not under $REPO_DIR/target.
-    CAMERA="${CARGO_TARGET_DIR:-$REPO_DIR/target}/release-fast/camera"
+    CAMERA="${CARGO_TARGET_DIR:-$REPO_DIR/target}/release-fast/klikka"
 fi
-[[ -x "$CAMERA" ]] || die "camera binary not found or not executable: $CAMERA"
+[[ -x "$CAMERA" ]] || die "klikka binary not found or not executable: $CAMERA"
 
 mkdir -p "$OUT_DIR"
 
@@ -632,7 +632,7 @@ discover_locales() {
     local dir locale
     for dir in "$REPO_DIR"/i18n/*/; do
         locale="$(basename "$dir")"
-        [[ -f "$dir/camera.ftl" ]] || continue
+        [[ -f "$dir/klikka.ftl" ]] || continue
         [[ "$locale" == "$BASE_LOCALE" ]] && continue
         printf '%s\n' "$locale"
     done

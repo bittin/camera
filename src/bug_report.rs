@@ -140,7 +140,7 @@ impl BugReportGenerator {
     /// Reports are saved in the same directory as photos/videos: ~/Pictures/Camera/
     fn get_report_path(save_folder_name: &str) -> PathBuf {
         let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-        let filename = format!("camera-bug-report-{}.md", timestamp);
+        let filename = format!("klikka-bug-report-{}.md", timestamp);
 
         // Use the same directory as photos/videos
         let report_dir = crate::app::get_photo_directory(save_folder_name);
@@ -208,7 +208,7 @@ impl BugReportGenerator {
 
         // Session type and desktop. Wayland vs X11 changes which presentation
         // path the renderer takes, so a rendering bug is not triageable without
-        // it — see the flicker report in cosmic-utils/camera#563.
+        // it — see the flicker report in cosmic-utils/klikka#563.
         info.push_str("\n### Session\n\n");
         info.push_str(&format!(
             "- **Session Type:** {}\n",

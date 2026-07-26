@@ -212,7 +212,7 @@ fn pick_startup_camera_index(
     0
 }
 
-const REPOSITORY: &str = "https://github.com/cosmic-utils/camera";
+const REPOSITORY: &str = "https://github.com/cosmic-utils/klikka";
 
 /// App icon for the about page (pre-rendered PNG avoids SVG parsing lag on first open)
 const APP_ICON: &[u8] =
@@ -253,7 +253,7 @@ impl cosmic::Application for AppModel {
 
         // Create the about widget
         let about = About::default()
-            .name(fl!("camera"))
+            .name(fl!("app-name"))
             .icon(widget::icon::from_raster_bytes(APP_ICON))
             .version(env!("GIT_VERSION"))
             .author("Frederic Laing")
@@ -264,7 +264,7 @@ impl cosmic::Application for AppModel {
                 (fl!("repository"), REPOSITORY),
                 (
                     fl!("about-support"),
-                    "https://github.com/cosmic-utils/camera/issues",
+                    "https://github.com/cosmic-utils/klikka/issues",
                 ),
             ])
             .comments(

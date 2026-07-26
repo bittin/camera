@@ -292,13 +292,13 @@ jobs:
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
           # Create source tarball matching GitHub's archive format
-          git archive --format=tar.gz --prefix=camera-$VERSION/ HEAD > /tmp/camera-$VERSION.tar.gz
-          CHECKSUM=$(sha512sum /tmp/camera-$VERSION.tar.gz | awk '{print $1}')
+          git archive --format=tar.gz --prefix=klikka-$VERSION/ HEAD > /tmp/klikka-$VERSION.tar.gz
+          CHECKSUM=$(sha512sum /tmp/klikka-$VERSION.tar.gz | awk '{print $1}')
 
           # Place tarball in distfiles cache where abuild expects it
           mkdir -p /var/cache/distfiles
-          cp /tmp/camera-$VERSION.tar.gz /var/cache/distfiles/camera-$VERSION.tar.gz
-          chmod 644 /var/cache/distfiles/camera-$VERSION.tar.gz
+          cp /tmp/klikka-$VERSION.tar.gz /var/cache/distfiles/klikka-$VERSION.tar.gz
+          chmod 644 /var/cache/distfiles/klikka-$VERSION.tar.gz
 
           # Generate APKBUILD from template
           mkdir -p /home/builder/apkbuild
@@ -364,8 +364,8 @@ jobs:
       - name: Upload Flatpak bundle
         uses: actions/upload-artifact@v7
         with:
-          name: camera-x86_64.flatpak
-          path: camera-x86_64.flatpak
+          name: klikka-x86_64.flatpak
+          path: klikka-x86_64.flatpak
           if-no-files-found: error
           retention-days: 7
 
@@ -417,8 +417,8 @@ jobs:
       - name: Upload Flatpak bundle
         uses: actions/upload-artifact@v7
         with:
-          name: camera-aarch64.flatpak
-          path: camera-aarch64.flatpak
+          name: klikka-aarch64.flatpak
+          path: klikka-aarch64.flatpak
           if-no-files-found: error
           retention-days: 7
 
@@ -465,12 +465,15 @@ jobs:
         run: just flatpak-deps arm
 
       - name: Build Flatpak bundle
-        run: just flatpak-bundle arm
+        run: |
+          just flatpak-bundle arm
+          # Flatpak calls the architecture arm, the release assets call it armhf
+          mv klikka-arm.flatpak klikka-armhf.flatpak
 
       - name: Upload Flatpak bundle
         uses: actions/upload-artifact@v7
         with:
-          name: camera-armhf.flatpak
-          path: camera-armhf.flatpak
+          name: klikka-armhf.flatpak
+          path: klikka-armhf.flatpak
           if-no-files-found: error
           retention-days: 7

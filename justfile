@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
-name := 'camera'
+name := 'klikka'
 export APPID := 'io.github.cosmic_utils.camera'
 
 rootdir := ''
@@ -87,11 +87,11 @@ dev *args:
 
 # Run with debug logs
 run *args:
-    env RUST_LOG=camera=info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
+    env RUST_LOG=klikka=info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
 
 # Run with verbose debug logs
 run-debug *args:
-    env RUST_LOG=camera=debug,info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
+    env RUST_LOG=klikka=debug,info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
 
 # ============================================================================
 # Resource generation
@@ -104,7 +104,7 @@ run-debug *args:
 # it; generate-previews is a separate, explicitly invoked recipe.
 generate: generate-metadata flatpak-cargo-sources
 
-# Write translations from i18n/*/camera.ftl into the desktop and metainfo files
+# Write translations from i18n/*/klikka.ftl into the desktop and metainfo files
 generate-metadata:
     python3 scripts/gen-metadata.py
 
@@ -404,13 +404,13 @@ apk-build arch="":
     CROSS_BUILD_OPTS="--platform linux/$host_arch" \
         cross build --target "$rust_target" --profile release-fast
 
-    binary="target/$rust_target/release-fast/camera"
+    binary="target/$rust_target/release-fast/{{name}}"
     [ -f "$binary" ] || { echo "Error: binary not found at $binary"; exit 1; }
 
     echo "Packaging APK for $arch..."
     platform="linux/$arch"
     [ "$arch" = "x86_64" ] && platform="linux/amd64"
-    image_tag="camera-apk-$arch"
+    image_tag="{{name}}-apk-$arch"
     VERSION=$(grep "^version" Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
     mkdir -p apk-out
@@ -419,7 +419,7 @@ apk-build arch="":
     podman run --rm --platform "$platform" \
         -v "$(pwd)":/src:ro \
         -v "$(pwd)/apk-out":/out \
-        -v "$(pwd)/$binary":/prebuilt/camera:ro \
+        -v "$(pwd)/$binary":/prebuilt/{{name}}:ro \
         "$image_tag" sh -c '
         set -e
         VERSION="'"$VERSION"'"
@@ -435,7 +435,7 @@ apk-build arch="":
         sudo -Hu builder env REPODEST=/home/builder/packages abuild -r
 
         mkdir -p /out
-        find /home/builder/packages -name "camera-*.apk" ! -name "*-doc-*" ! -name "*-dev-*" -exec cp {} /out/ \;
+        find /home/builder/packages -name "{{name}}-*.apk" ! -name "*-doc-*" ! -name "*-dev-*" -exec cp {} /out/ \;
         echo "APK built successfully:"
         ls -la /out/
     '

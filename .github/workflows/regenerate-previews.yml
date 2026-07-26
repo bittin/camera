@@ -99,8 +99,8 @@ jobs:
             podman load -i ~/preview-image.tar
           else
             echo "Building image"
-            podman build -t camera-previews -f preview/Containerfile .
-            podman save -o ~/preview-image.tar camera-previews
+            podman build -t klikka-previews -f preview/Containerfile .
+            podman save -o ~/preview-image.tar klikka-previews
           fi
 
       - name: Install just

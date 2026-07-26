@@ -7,14 +7,14 @@
 //! - Taking photos
 //! - Recording videos
 
-use camera::backends::camera::CameraBackend;
-use camera::backends::camera::libcamera::{LibcameraBackend, create_pipeline};
-use camera::backends::camera::types::{CameraFormat, CameraFrame};
-use camera::pipelines::photo::PhotoPipeline;
-use camera::pipelines::video::{
+use chrono::Local;
+use klikka::backends::camera::CameraBackend;
+use klikka::backends::camera::libcamera::{LibcameraBackend, create_pipeline};
+use klikka::backends::camera::types::{CameraFormat, CameraFrame};
+use klikka::pipelines::photo::PhotoPipeline;
+use klikka::pipelines::video::{
     AppsrcRecorderConfig, EncoderConfig, RecorderConfig, VideoRecorder,
 };
-use chrono::Local;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -408,7 +408,7 @@ fn select_video_format(formats: &[CameraFormat]) -> CameraFormat {
         .unwrap_or_else(|| formats[0].clone())
 }
 
-use camera::constants::DEFAULT_SAVE_FOLDER;
+use klikka::constants::DEFAULT_SAVE_FOLDER;
 
 /// Get default photo directory
 fn get_default_photo_dir() -> PathBuf {
@@ -429,11 +429,11 @@ pub fn process_burst_mode(
     input: Vec<PathBuf>,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use camera::backends::camera::types::SensorRotation;
-    use camera::pipelines::photo::burst_mode::{
+    use klikka::backends::camera::types::SensorRotation;
+    use klikka::pipelines::photo::burst_mode::{
         BurstModeConfig, SaveOutputParams, process_burst_mode as run_burst_mode, save_output,
     };
-    use camera::pipelines::photo::{CameraMetadata, EncodingFormat};
+    use klikka::pipelines::photo::{CameraMetadata, EncodingFormat};
 
     // Collect all image paths from input (can be files or directories)
     let image_paths = collect_image_paths(&input)?;
@@ -568,8 +568,8 @@ fn is_supported_image(path: &Path) -> bool {
 
 /// Load a DNG file and convert to RGBA CameraFrame
 fn load_dng_frame(path: &Path) -> Result<CameraFrame, Box<dyn std::error::Error>> {
-    use camera::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
     use image::GenericImageView;
+    use klikka::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
     use std::fs::File;
     use std::io::BufReader;
 
@@ -601,8 +601,8 @@ fn load_dng_frame(path: &Path) -> Result<CameraFrame, Box<dyn std::error::Error>
 fn load_burst_mode_frames(
     paths: &[PathBuf],
 ) -> Result<Vec<Arc<CameraFrame>>, Box<dyn std::error::Error>> {
-    use camera::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
     use image::GenericImageView;
+    use klikka::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
 
     let mut frames = Vec::new();
 

@@ -8,7 +8,7 @@
 # Everything that ends up in the image is therefore installed here rather than
 # inherited from the host or the runner image.
 #
-# Build:  podman build -t camera-previews -f preview/Containerfile .
+# Build:  podman build -t klikka-previews -f preview/Containerfile .
 # Run:    see preview/generate-previews.sh
 FROM registry.fedoraproject.org/fedora:44
 

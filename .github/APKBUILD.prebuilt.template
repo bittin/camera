@@ -1,9 +1,9 @@
 # Packaging-only APKBUILD for pre-built binary (used by `just apk-build`)
-pkgname=camera
+pkgname=klikka
 pkgver=@@VERSION@@
 pkgrel=0
 pkgdesc="Modern camera app for Linux desktops and phones"
-url="https://github.com/cosmic-utils/camera"
+url="https://github.com/cosmic-utils/klikka"
 arch="all"
 license="GPL-3.0-only"
 depends="
@@ -17,7 +17,7 @@ depends="
 build() { :; }
 
 package() {
-	install -Dm0755 /prebuilt/camera "$pkgdir/usr/bin/camera"
+	install -Dm0755 /prebuilt/klikka "$pkgdir/usr/bin/klikka"
 	cd /src
 	install -Dm0644 resources/io.github.cosmic_utils.camera.desktop "$pkgdir/usr/share/applications/io.github.cosmic_utils.camera.desktop"
 	install -Dm0644 resources/io.github.cosmic_utils.camera.metainfo.xml "$pkgdir/usr/share/metainfo/io.github.cosmic_utils.camera.metainfo.xml"

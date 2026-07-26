@@ -2,7 +2,7 @@
 
 //! Integration tests for constants module
 
-use camera::constants::BitratePreset;
+use klikka::constants::BitratePreset;
 
 #[test]
 fn test_bitrate_preset_values() {
