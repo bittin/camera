@@ -308,6 +308,27 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.1.0" date="2026-07-26">
+      <description>
+        <p>Release 1.1.0 includes the following changes:</p>
+        <ul>
+          <li>packaging: align APKBUILD with aports submission</li>
+          <li>bug-report: record wgpu adapter, session type and overlay effect</li>
+          <li>settings: simplify drawer to COSMIC section layout</li>
+          <li>ui: accent-colour the title bar and keep it visible under the drawer</li>
+          <li>ui: let the compositor's frosted glass show through the window background</li>
+          <li>chore(l10n): update translations</li>
+          <li>preview: keep a keyboard on the seat so shots capture a focused window</li>
+          <li>rename app to Klikka</li>
+          <li>i18n: keep the app name out of the translation catalogue</li>
+          <li>chore(l10n): update translations</li>
+          <li>metainfo: declare every previous app ID under provides and replaces</li>
+          <li>docs: drop the stale terminal demo and correct the README after the rename</li>
+          <li>ci: add a force input to regenerate every changed preview</li>
+          <li>chore: regenerate preview screenshots</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.0.2" date="2026-07-25">
       <description>
         <p>Release 1.0.2 includes the following changes:</p>
