@@ -41,7 +41,7 @@ This is a personal project by [Frederic Laing](https://github.com/FreddyFunk). I
 flatpak install flathub io.github.cosmic_utils.camera
 
 # Or install from a downloaded .flatpak bundle
-flatpak install camera-x86_64.flatpak
+flatpak install klikka-x86_64.flatpak
 ```
 
 ### From Source
@@ -82,6 +82,7 @@ klikka --help       # Show help
 klikka list         # List available cameras
 klikka photo        # Take a photo
 klikka video        # Record a video
+klikka process      # Run a computational photography pipeline
 klikka terminal     # Terminal mode viewer
 ```
 
@@ -152,7 +153,7 @@ klikka process <MODE> [OPTIONS] <INPUT>...
 Multi-frame denoising and HDR+ pipeline for low-light photography.
 
 ```bash
-klikka process night-mode [OPTIONS] <INPUT>...
+klikka process burst-mode [OPTIONS] <INPUT>...
 ```
 
 **Arguments:**
@@ -163,9 +164,9 @@ klikka process night-mode [OPTIONS] <INPUT>...
 
 **Examples:**
 ```bash
-klikka process night-mode /path/to/burst/               # Process all images in directory
-klikka process night-mode img1.png img2.png img3.png    # Process specific files
-klikka process night-mode /path/to/burst/ -o /output/   # Custom output directory
+klikka process burst-mode /path/to/burst/               # Process all images in directory
+klikka process burst-mode img1.png img2.png img3.png    # Process specific files
+klikka process burst-mode /path/to/burst/ -o /output/   # Custom output directory
 ```
 
 The pipeline automatically:
@@ -182,8 +183,6 @@ Ever wanted to see your face rendered in glorious Unicode? Wonder what you'd loo
 ```bash
 klikka terminal
 ```
-
-![Terminal Mode Demo](preview/preview-terminal-demo.gif)
 
 **Controls:**
 - `s` - Switch camera (cycle through available cameras)
