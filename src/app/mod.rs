@@ -56,6 +56,7 @@ mod view;
 
 // Re-export public API
 use crate::config::Config;
+use crate::constants::APP_NAME;
 use crate::fl;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::Subscription;
@@ -253,7 +254,7 @@ impl cosmic::Application for AppModel {
 
         // Create the about widget
         let about = About::default()
-            .name(fl!("app-name"))
+            .name(APP_NAME)
             .icon(widget::icon::from_raster_bytes(APP_ICON))
             .version(env!("GIT_VERSION"))
             .author("Frederic Laing")

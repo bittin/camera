@@ -7,10 +7,11 @@
 ### Product names (Klikka, COSMIC, PipeWire, GStreamer, libcamera, V4L2, DNG,
 ### JPEG, PNG, HDR+, Opus, AAC, MJPEG, NV12) are not translated.
 
-# The name of the application. A made up word, so leave it exactly as it is in
-# every language. Shown as the About page header, the launcher entry and the
-# software centre listing, and referenced inside longer strings as { app-name }.
-app-name = Klikka
+# The application is called Klikka. The name is a made up word that reads the
+# same in every language, so it is not part of this catalogue and cannot be
+# translated: it lives in src/constants.rs and scripts/gen-metadata.py. Strings
+# below still refer to it as { app-name }, which always renders as "Klikka".
+#
 # The word "Camera", the generic noun rather than the product: the camera
 # settings page, the camera shortcut category, and the subtitle the launcher
 # and the desktop search index show beside { app-name }. It is also referenced
