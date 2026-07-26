@@ -57,7 +57,6 @@ mod view;
 // Re-export public API
 use crate::config::Config;
 use crate::fl;
-use cosmic::app::context_drawer;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::Subscription;
 use cosmic::widget::{self, about::About};
@@ -826,13 +825,20 @@ impl cosmic::Application for AppModel {
     /// title bar keep their foreground color when maximized. libcosmic's
     /// default `style()` swaps `icon_color` to `bg_color` for maximized
     /// windows, which `widget::button::icon` inherits as its ambient color.
+    ///
+    /// The ambient icon color is the accent, so every symbolic icon that doesn't
+    /// name a color of its own — the gallery button, the picker glyphs, the
+    /// indicators — matches the title bar and the camera switcher instead of
+    /// being the odd plain-white one out (issue #565). Content surfaces are
+    /// unaffected: the context drawer's own container publishes `primary.on`,
+    /// which wins over this for everything nested inside it.
     fn style(&self) -> Option<cosmic::iced::theme::Style> {
         let theme = cosmic::theme::active();
         let cosmic = theme.cosmic();
         Some(cosmic::iced::theme::Style {
             background_color: cosmic::iced::Color::TRANSPARENT,
             text_color: cosmic.on_bg_color().into(),
-            icon_color: cosmic.on_bg_color().into(),
+            icon_color: crate::app::overlay_style::chrome_accent_color(&theme),
         })
     }
 
@@ -844,19 +850,11 @@ impl cosmic::Application for AppModel {
         self.screen_height = height;
     }
 
-    /// Display a context drawer if the context page is requested.
-    fn context_drawer(&self) -> Option<context_drawer::ContextDrawer<'_, Self::Message>> {
-        if !self.core.window.show_context {
-            return None;
-        }
-
-        Some(match self.context_page {
-            ContextPage::Settings => self.settings_view(),
-            ContextPage::Filters => self.filters_view(),
-            ContextPage::Insights => self.insights_view(),
-            ContextPage::KeyBindings => keybind::key_bindings_page::view(self),
-        })
-    }
+    // NOTE: `context_drawer` is deliberately not implemented. libcosmic renders
+    // that drawer as an iced overlay pinned to the top of the main view, which
+    // for this app — whose title bar is drawn *inside* the view — hid the window
+    // controls whenever the drawer opened (issue #565). `AppModel::view` builds
+    // the drawer itself instead, offset below the title bar.
 
     /// Handle escape key - close any open drawers or pickers
     fn on_escape(&mut self) -> Task<cosmic::Action<Self::Message>> {
