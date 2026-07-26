@@ -292,3 +292,5 @@ metainfo-caption-filters = Seletor de filtros
 metainfo-caption-recording = Gravação de vídeo em andamento
 metainfo-caption-qr = Detecção de código QR
 metainfo-caption-settings = Configurações avançadas
+settings-other = Outros
+settings-overlay = Sobreposição
