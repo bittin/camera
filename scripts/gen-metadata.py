@@ -42,9 +42,11 @@ FTL = "klikka.ftl"
 
 # The application's name, kept out of the Fluent catalogue so it cannot be
 # translated or transliterated. Mirrors APP_NAME in src/constants.rs. Injected
-# under APP_NAME_KEY below for the source language only, which is what keeps the
-# generated files free of translated <name> elements and Name[xx] entries while
-# still resolving the { app-name } references inside translated strings.
+# under APP_NAME_KEY below for the source language only, so the { app-name }
+# references inside translated strings resolve to the one spelling everywhere.
+# Nothing maps to it directly: the launcher and the stores are named for what
+# the app is, so the brand reaches the generated files only through the strings
+# that mention it.
 APP_NAME = "Klikka"
 APP_NAME_KEY = "app-name"
 
@@ -54,21 +56,26 @@ KEY_PREFIXES = ("desktop-", "metainfo-")
 
 # Desktop entry key -> Fluent key.
 #
-# Name is the product and is the same word everywhere; GenericName is the
-# generic noun and is translated. Launchers show the pair together and desktop
-# search indexes both, so the app stays findable under "camera" in the user's
-# own language without the brand being translated away.
+# Name is the generic noun rather than the product, and is translated, so the
+# launcher lists the app the way GNOME's Snapshot lists itself: as "Camera" in
+# the user's own language. GenericName would have carried that word instead, but
+# no current launcher displays it. The brand stays in the app ID, the metainfo
+# <name> the stores show, and the Keywords, which is what keeps a search for
+# "klikka" finding it.
 DESKTOP_KEYS = {
-    "Name": APP_NAME_KEY,
-    "GenericName": "camera",
+    "Name": "camera",
     "Comment": "desktop-comment",
     "Keywords": "desktop-keywords",
 }
 
 # Metainfo elements, in document order within their region, mapped to Fluent
 # keys. The nth English (untagged) element of each kind takes the nth key.
+#
+# <name> takes the same generic noun the desktop entry's Name does, so the
+# stores and the launcher agree on what the app is called. The brand survives in
+# the app ID, in the description, and in the desktop entry's Keywords.
 METAINFO_HEAD = {
-    "name": [APP_NAME_KEY],
+    "name": ["camera"],
     "summary": ["metainfo-summary"],
 }
 METAINFO_DESCRIPTION = {
@@ -122,9 +129,8 @@ def read_translations() -> dict[str, dict[str, str]]:
     """Return {fluent_key: {lang: value}} for every string of every language.
 
     In-app keys are read too, not just the metadata ones: the metadata maps
-    some of them directly (`camera` becomes the launcher's generic name) and
-    references others inside its own strings, so they all have to be
-    resolvable.
+    some of them directly (`camera` becomes the launcher's name) and references
+    others inside its own strings, so they all have to be resolvable.
 
     The application's name is not one of them. It is injected from APP_NAME
     afterwards, so a catalogue that acquired an `app-name` message is an error
@@ -408,7 +414,7 @@ def render_locale_gallery(images: list[str], keys: list[str],
         return []
 
     def entry(lang: str) -> str:
-        # The generic name in that language doubles as a preview of the
+        # The launcher name in that language doubles as a preview of the
         # translation, so the list shows what the reader is clicking into. The
         # product name is the same word in every language and would say nothing
         # here.
@@ -564,7 +570,10 @@ def main() -> int:
     if not translations:
         sys.exit(f"error: no metadata strings found in {I18N.relative_to(ROOT)}/*/{FTL}")
 
-    expected = set(DESKTOP_KEYS.values())
+    # The name is not mapped to an element of its own any more, but the
+    # description still refers to it as { app-name }, so it counts as expected
+    # rather than as a stray key.
+    expected = {APP_NAME_KEY} | set(DESKTOP_KEYS.values())
     for mapping in (METAINFO_HEAD, METAINFO_DESCRIPTION, METAINFO_SCREENSHOTS):
         expected.update(k for keys in mapping.values() for k in keys)
     # Only the prefixed keys and the mapped ones are this script's business;
