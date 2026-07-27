@@ -321,6 +321,14 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.1.1" date="2026-07-27">
+      <description>
+        <p>Release 1.1.1 includes the following changes:</p>
+        <ul>
+          <li>metadata: name the app Camera in the launcher and the stores</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-07-26">
       <description>
         <p>Release 1.1.0 includes the following changes:</p>
