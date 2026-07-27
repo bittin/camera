@@ -13,10 +13,11 @@
 # below still refer to it as { app-name }, which always renders as "Klikka".
 #
 # The word "Camera", the generic noun rather than the product: the camera
-# settings page, the camera shortcut category, and the subtitle the launcher
-# and the desktop search index show beside { app-name }. It is also referenced
-# inside longer strings as { camera }, so keep it a single noun that reads
-# correctly at the start of a sentence.
+# settings page, the camera shortcut category, and the name the launcher and
+# the software stores list the application under, which is why this one is
+# translated while { app-name } is not. It is also referenced inside longer
+# strings as { camera }, so keep it a single noun that reads correctly at the
+# start of a sentence.
 camera = Camera
 # Row that opens the About page, and the label of the F1 shortcut. Reused in
 # both places, so it has to work as a navigation row and as an action name.
