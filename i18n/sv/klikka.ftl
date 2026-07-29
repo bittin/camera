@@ -321,3 +321,5 @@ action-toggle-tools-menu = Växla verktygsmeny
 action-toggle-filters = Växla filterväljare
 action-toggle-ui-chrome = Växla gränssnitt
 action-toggle-preview-fit = Växla anpassning/fyllning
+settings-other = Andra
+settings-overlay = Överlägg
