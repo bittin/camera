@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
-name := 'klikka'
+name := 'camera'
+# Alpine package name. Differs from the binary: the distro package is
+# namespaced under the cosmic-ext- prefix, while the binary it installs
+# stays `camera`. Must match pkgname in .github/APKBUILD*.template.
+apk-pkgname := 'cosmic-ext-camera'
 export APPID := 'io.github.cosmic_utils.camera'
 
 rootdir := ''
@@ -87,11 +91,11 @@ dev *args:
 
 # Run with debug logs
 run *args:
-    env RUST_LOG=klikka=info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
+    env RUST_LOG=camera=info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
 
 # Run with verbose debug logs
 run-debug *args:
-    env RUST_LOG=klikka=debug,info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
+    env RUST_LOG=camera=debug,info RUST_BACKTRACE=full cargo run --profile release-fast {{args}}
 
 # ============================================================================
 # Resource generation
@@ -104,7 +108,7 @@ run-debug *args:
 # it; generate-previews is a separate, explicitly invoked recipe.
 generate: generate-metadata flatpak-cargo-sources
 
-# Write translations from i18n/*/klikka.ftl into the desktop and metainfo files
+# Write translations from i18n/*/camera.ftl into the desktop and metainfo files
 generate-metadata:
     python3 scripts/gen-metadata.py
 
@@ -435,7 +439,7 @@ apk-build arch="":
         sudo -Hu builder env REPODEST=/home/builder/packages abuild -r
 
         mkdir -p /out
-        find /home/builder/packages -name "{{name}}-*.apk" ! -name "*-doc-*" ! -name "*-dev-*" -exec cp {} /out/ \;
+        find /home/builder/packages -name "{{apk-pkgname}}-*.apk" ! -name "*-doc-*" ! -name "*-dev-*" -exec cp {} /out/ \;
         echo "APK built successfully:"
         ls -la /out/
     '
