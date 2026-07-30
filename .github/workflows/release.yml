@@ -101,17 +101,40 @@ jobs:
         if: ${{ matrix.use_cross }}
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Install podman
+      - name: Install and verify podman
         if: ${{ matrix.use_cross }}
-        # See the matching step in ci.yml: installing Ubuntu's podman on top of
-        # the newer one the runner image now ships breaks every cross build.
+        # See the matching step in ci.yml: podman on the current runner image
+        # cannot start a container with its own crun, which breaks every cross
+        # build. Smoke test the runtime and fall back to runc when it is broken.
         run: |
-          if command -v podman >/dev/null 2>&1; then
-            echo "Using preinstalled $(podman --version)"
-          else
-            sudo apt-get update && sudo apt-get install -y podman
-            echo "Installed $(podman --version)"
+          set -euo pipefail
+          command -v podman >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y podman; }
+          echo "podman: $(podman --version)"
+          echo "crun:   $(crun --version 2>/dev/null | head -1 || echo 'not installed')"
+          echo "runc:   $(runc --version 2>/dev/null | head -1 || echo 'not installed')"
+
+          # A pull failure (Docker Hub rate limits) must not be mistaken for a
+          # broken runtime, so only the `run` result decides anything.
+          probe=docker.io/library/busybox:latest
+          if ! podman pull -q "$probe" >/dev/null 2>&1; then
+            echo "::warning::could not pull $probe; skipping OCI runtime check"
+            exit 0
           fi
+
+          if podman run --rm "$probe" true; then
+            echo "Default OCI runtime works"
+            exit 0
+          fi
+
+          echo "Default OCI runtime cannot start a container; falling back to runc"
+          if ! command -v runc >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y runc
+          fi
+          mkdir -p ~/.config/containers
+          printf '[engine]\nruntime = "runc"\n' > ~/.config/containers/containers.conf
+          # Fail here rather than 10 minutes into the build if runc is no better.
+          podman run --rm "$probe" true
+          echo "Using runc"
 
       - name: Install just
         uses: extractions/setup-just@v4
