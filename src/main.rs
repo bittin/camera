@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use camera::app::AppModel;
+use camera::i18n;
 use clap::{Parser, Subcommand};
-use klikka::app::AppModel;
-use klikka::i18n;
 use std::path::PathBuf;
 
 mod cli;
 
 #[derive(Parser)]
-#[command(name = "klikka")]
+#[command(name = "camera")]
 #[command(about = "Modern camera app for Linux desktops and phones")]
 #[command(version)]
 #[command(subcommand_required = false)]
@@ -75,7 +75,7 @@ enum Commands {
 
     /// Take a photo
     Photo {
-        /// Camera index to use (from 'klikka list')
+        /// Camera index to use (from 'camera list')
         #[arg(short, long, default_value = "0")]
         camera: usize,
 
@@ -86,7 +86,7 @@ enum Commands {
 
     /// Record a video
     Video {
-        /// Camera index to use (from 'klikka list')
+        /// Camera index to use (from 'camera list')
         #[arg(short, long, default_value = "0")]
         camera: usize,
 
@@ -131,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initialize logging
     // Set RUST_LOG environment variable to control log level
-    // Examples: RUST_LOG=debug, RUST_LOG=klikka=debug, RUST_LOG=info
+    // Examples: RUST_LOG=debug, RUST_LOG=camera=debug, RUST_LOG=info
     //
     // In terminal mode, suppress all log output — stderr writes would corrupt
     // the ratatui TUI since the alternate screen only covers stdout.
@@ -151,10 +151,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
-    tracing::info!("klikka app starting");
+    tracing::info!("camera app starting");
 
     match cli.command {
-        Some(Commands::Terminal) => klikka::terminal::run(),
+        Some(Commands::Terminal) => camera::terminal::run(),
         Some(Commands::List) => cli::list_cameras(),
         Some(Commands::Photo { camera, output }) => cli::take_photo(camera, output),
         Some(Commands::Video {
@@ -191,13 +191,13 @@ fn run_gui(
     //   3. Main prewarm: GStreamer init + video encoders, then collects 1 & 2
     let audio_handle = std::thread::spawn(|| {
         tracing::info!("prewarm: enumerating audio devices");
-        let devices = klikka::backends::audio::enumerate_audio_devices();
+        let devices = camera::backends::audio::enumerate_audio_devices();
         tracing::info!(count = devices.len(), "prewarm: audio devices ready");
         devices
     });
     let camera_handle = std::thread::spawn(|| {
         tracing::info!("prewarm: enumerating cameras");
-        let backend = klikka::backends::camera::create_backend();
+        let backend = camera::backends::camera::create_backend();
         let cameras = backend.enumerate_cameras();
         tracing::info!(count = cameras.len(), "prewarm: cameras enumerated");
         let formats = if let Some(cam) = cameras.first() {
@@ -220,7 +220,7 @@ fn run_gui(
         if let Err(e) = gstreamer::init() {
             tracing::error!(error = %e, "prewarm: failed to initialize GStreamer");
         }
-        let video_encoders = klikka::media::encoders::video::enumerate_video_encoders();
+        let video_encoders = camera::media::encoders::video::enumerate_video_encoders();
         tracing::info!(
             count = video_encoders.len(),
             "prewarm: GStreamer + video encoders ready"
@@ -233,7 +233,7 @@ fn run_gui(
 
         // Don't join camera_handle here — it takes ~170ms and would block init().
         // Pass it through so init() can wrap it in an async Task instead.
-        klikka::app::PrewarmResults {
+        camera::app::PrewarmResults {
             audio_devices,
             video_encoders,
             camera_enum: Some(camera_handle),
@@ -262,7 +262,7 @@ fn run_gui(
     }
 
     // Create app flags with pre-warm handle
-    let flags = klikka::app::AppFlags {
+    let flags = camera::app::AppFlags {
         preview_source,
         preview_spoof_recording,
         preview_fake_camera,

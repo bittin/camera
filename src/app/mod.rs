@@ -213,7 +213,7 @@ fn pick_startup_camera_index(
     0
 }
 
-const REPOSITORY: &str = "https://github.com/cosmic-utils/klikka";
+const REPOSITORY: &str = "https://github.com/cosmic-utils/cosmic-ext-camera";
 
 /// App icon for the about page (pre-rendered PNG avoids SVG parsing lag on first open)
 const APP_ICON: &[u8] =
@@ -265,7 +265,7 @@ impl cosmic::Application for AppModel {
                 (fl!("repository"), REPOSITORY),
                 (
                     fl!("about-support"),
-                    "https://github.com/cosmic-utils/klikka/issues",
+                    "https://github.com/cosmic-utils/cosmic-ext-camera/issues",
                 ),
             ])
             .comments(
