@@ -21,6 +21,51 @@ use pulseaudio::protocol::{
     SourceInfoList, TagStructRead, Volume,
 };
 
+/// Length of a PulseAudio auth cookie, in bytes.
+///
+/// Both PulseAudio and PipeWire's `module-protocol-pulse` reject an AUTH
+/// command whose cookie field is not exactly this long — PipeWire answers
+/// `ERROR command:8 (AUTH) tag:0 error:3 (Invalid argument)` — *before* they
+/// get as far as deciding whether the cookie matters. For a local Unix-socket
+/// connection it does not: both servers authorise the peer from its socket
+/// credentials, so any 256 bytes get in. See [`auth_cookie`].
+const PA_COOKIE_LEN: usize = 256;
+
+/// The cookie to send in the AUTH command, always exactly [`PA_COOKIE_LEN`] bytes.
+///
+/// Inside flatpak `~/.config/pulse/cookie` is not in the sandbox, so there is
+/// nothing to read and we used to send a zero-length cookie. That is a protocol
+/// error rather than an auth failure: the server rejected the handshake before
+/// looking at socket credentials, so *every* PulseAudio query failed in flatpak
+/// and every attempt logged an error to the system journal (issue #563). The
+/// app then fell back to forking `pw-dump` and parsing the entire PipeWire
+/// graph — every two seconds, from the hotplug poll.
+///
+/// Padding to the required length lets the local-peer credential check do its
+/// job. A real cookie is still preferred and sent verbatim when readable, for
+/// the remote/TCP case where the contents genuinely are the credential.
+fn auth_cookie() -> Vec<u8> {
+    let cookie = pulseaudio::cookie_path_from_env()
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_default();
+
+    if cookie.len() != PA_COOKIE_LEN {
+        debug!(
+            found = cookie.len(),
+            "No usable PulseAudio cookie; padding to the protocol length so the \
+             server falls back to Unix-socket credentials"
+        );
+    }
+
+    fit_cookie(cookie)
+}
+
+/// Pad or truncate a cookie to exactly [`PA_COOKIE_LEN`] bytes.
+fn fit_cookie(mut cookie: Vec<u8>) -> Vec<u8> {
+    cookie.resize(PA_COOKIE_LEN, 0);
+    cookie
+}
+
 /// Minimal blocking PulseAudio protocol client. Owns a single socket; one
 /// instance per logical operation is fine — connection setup is ~1ms over a
 /// Unix socket and we don't do these in hot paths (recording start/stop,
@@ -46,21 +91,24 @@ impl PulseClient {
         let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
         let mut sock = std::io::BufReader::new(stream);
 
-        let cookie = pulseaudio::cookie_path_from_env()
-            .and_then(|p| std::fs::read(p).ok())
-            .unwrap_or_default();
-
         let auth = AuthParams {
             version: MAX_VERSION,
             supports_shm: false,
             supports_memfd: false,
-            cookie,
+            cookie: auth_cookie(),
         };
 
         protocol::write_command_message(sock.get_mut(), 0, &PaCommand::Auth(auth), MAX_VERSION)
             .ok()?;
-        let (_, auth_reply) =
-            protocol::read_reply_message::<AuthReply>(&mut sock, MAX_VERSION).ok()?;
+        let auth_reply = match protocol::read_reply_message::<AuthReply>(&mut sock, MAX_VERSION) {
+            Ok((_, reply)) => reply,
+            Err(e) => {
+                // Worth a log line: a failed handshake here is invisible
+                // otherwise, and the caller only reports "PA unavailable".
+                warn!(error = %e, path = %path.display(), "PulseAudio AUTH failed");
+                return None;
+            }
+        };
         let protocol_version = std::cmp::min(MAX_VERSION, auth_reply.version);
 
         let mut props = Props::new();
@@ -392,11 +440,16 @@ fn enumerate_via_pw_dump() -> Vec<AudioDevice> {
                 .unwrap_or("Unknown Audio Device")
                 .to_string();
 
+            // `object.serial` comes back as a JSON number, so reading it as a
+            // string handed every device the same "0" and made the hotplug
+            // comparison fall back to matching on name alone.
             let serial = props
                 .get("object.serial")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0")
-                .to_string();
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .unwrap_or_else(|| "0".to_string());
 
             let node_name = props
                 .get("node.name")
@@ -608,4 +661,51 @@ fn channel_info_from_pa(src: &SourceInfo) -> Vec<AudioChannelInfo> {
         });
     }
     channels
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_cookie_is_padded_to_the_protocol_length() {
+        // The flatpak case: nothing readable at ~/.config/pulse/cookie.
+        // A zero-length cookie is what made every AUTH fail with
+        // "Invalid argument" (issue #563).
+        assert_eq!(fit_cookie(Vec::new()).len(), PA_COOKIE_LEN);
+    }
+
+    #[test]
+    fn a_short_cookie_is_padded_and_a_long_one_truncated() {
+        assert_eq!(fit_cookie(vec![7u8; 10]).len(), PA_COOKIE_LEN);
+        assert_eq!(fit_cookie(vec![7u8; 1000]).len(), PA_COOKIE_LEN);
+    }
+
+    #[test]
+    fn a_real_cookie_is_sent_verbatim() {
+        let real: Vec<u8> = (0..PA_COOKIE_LEN).map(|i| (i % 251) as u8).collect();
+        assert_eq!(fit_cookie(real.clone()), real);
+    }
+
+    #[test]
+    fn the_cookie_we_would_send_is_always_well_formed() {
+        assert_eq!(auth_cookie().len(), PA_COOKIE_LEN);
+    }
+
+    /// Live check against whatever PulseAudio/PipeWire-Pulse is running.
+    /// Ignored by default because it needs a session bus and an audio server.
+    ///
+    /// Run with: `cargo test --lib -- --ignored pa_handshake`
+    #[test]
+    #[ignore = "requires a running PulseAudio or PipeWire-Pulse server"]
+    fn pa_handshake_succeeds_against_the_local_server() {
+        let mut client = PulseClient::connect().expect("PA handshake failed");
+        let info = client.server_info().expect("GetServerInfo failed");
+        println!(
+            "connected to {:?} {:?}",
+            info.server_name, info.server_version
+        );
+        let sources = client.list_sources().expect("GetSourceInfoList failed");
+        println!("{} source(s)", sources.len());
+    }
 }
