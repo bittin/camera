@@ -139,17 +139,6 @@ pub fn format_bitrate(kbps: u32) -> String {
     }
 }
 
-/// The application's name, as shown on the About page.
-///
-/// Deliberately a constant rather than a Fluent message: it is a made-up word
-/// and reads the same in every language, so it is kept out of the translation
-/// catalogue where it could be translated or transliterated.
-/// `scripts/gen-metadata.py` holds the same literal for the AppStream metainfo.
-/// The launcher is the exception: its desktop entry is named for what the app
-/// is rather than what it is called, so it reads "Camera" in the user's own
-/// language and the brand lives in the entry's Keywords.
-pub const APP_NAME: &str = "Klikka";
-
 /// Default folder name for saving photos and videos
 pub const DEFAULT_SAVE_FOLDER: &str = "Camera";
 

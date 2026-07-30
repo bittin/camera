@@ -228,7 +228,7 @@ settings-timelapse-interval-description = 连续照片拍摄之间的时间间�
 # Insights - Capture
 insights-capture = 捕获
 insights-capture-burst = 连拍捕获
-desktop-keywords = klikka;相机;摄像头;照片;视频;
+desktop-keywords = 相机;摄像头;照片;视频;
 metainfo-summary = 拍摄照片和视频
 metainfo-description-usage = 只需打开应用程序即可开始捕捉精彩瞬间。 为照片添加有趣的滤镜，扫描二维码打开链接或连接 WiFi， 或使用虚拟相机模式在视频通话中应用您喜爱的滤镜，展现最佳状态。
 metainfo-description-features-title = 主要功能：
@@ -316,7 +316,7 @@ metainfo-caption-phone = Linux 手机的拍照模式
 action-cycle-photo-aspect-ratio = 循环照片宽高比
 keybindings-record-conflict = 此快捷键已被“{ $other }” 使用。要替换吗？
 action-toggle-preview-fit = 切换适应/填充
-metainfo-description-intro = { app-name } 是个现代 Linux 相机应用程序。专为电脑与手机设计。无论您需要快速拍照、录制视频还是扫描二维码，{ app-name } 能提供简洁直观的界面，不妨碍您的操作。
+metainfo-description-intro = { camera } 是个现代 Linux 相机应用程序。专为电脑与手机设计。无论您需要快速拍照、录制视频还是扫描二维码，{ camera } 能提供简洁直观的界面，不妨碍您的操作。
 metainfo-feature-modes = 照片、视频与延时摄影模式，并带有自拍定时气器和构图指南
 metainfo-feature-controls = 手动控制：曝光、ISO、快门、聚焦和白平衡
 metainfo-feature-filters = 14 种创意滤镜：{ filter-mono }、{ filter-sepia }、{ filter-vivid }、{ filter-noir }、{ filter-pencil }等
