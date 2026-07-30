@@ -328,6 +328,22 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.2.0" date="2026-07-30">
+      <description>
+        <p>Release 1.2.0 includes the following changes:</p>
+        <ul>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>chore(l10n): update translations</li>
+          <li>rename app back to "Camera"</li>
+          <li>chore: regenerate preview screenshots</li>
+          <li>feat(turbojpeg): improve photo and thumbnail paths performance</li>
+          <li>fix(audio): pad PulseAudio auth cookie so the handshake works in flatpak</li>
+          <li>ci: keep the runner's own podman instead of installing Ubuntu's over it</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.1.1" date="2026-07-27">
       <description>
         <p>Release 1.1.1 includes the following changes:</p>
