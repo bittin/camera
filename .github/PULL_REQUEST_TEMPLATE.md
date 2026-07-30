@@ -32,9 +32,9 @@ Delete this section if not applicable.
 If you don't want to show real camera footage in your screenshots, use the `--preview-source` flag:
 
 ```bash
-klikka --preview-source /path/to/image.png
+camera --preview-source /path/to/image.png
 # or with a video
-klikka --preview-source /path/to/video.mp4
+camera --preview-source /path/to/video.mp4
 ```
 
 This launches the app with your test file displayed instead of real camera footage. The window automatically sizes to 900x700, which is optimal for Flathub screenshots.

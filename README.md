@@ -1,14 +1,14 @@
-# Klikka
+# Camera
 
 [![Sponsor](https://img.shields.io/badge/sponsor-FreddyFunk-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/FreddyFunk)
 [![Flathub](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fflathub.org%2Fapi%2Fv2%2Fappstream%2Fio.github.cosmic_utils.camera&query=%24.releases%5B0%5D.version&prefix=v&label=flathub&logo=flathub&logoColor=white&color=blue)](https://flathub.org/apps/io.github.cosmic_utils.camera)
-[![CI](https://github.com/cosmic-utils/klikka/actions/workflows/ci.yml/badge.svg)](https://github.com/cosmic-utils/klikka/actions/workflows/ci.yml)
-[![Release](https://github.com/cosmic-utils/klikka/actions/workflows/release.yml/badge.svg)](https://github.com/cosmic-utils/klikka/actions/workflows/release.yml)
+[![CI](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/ci.yml/badge.svg)](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/ci.yml)
+[![Release](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/release.yml/badge.svg)](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/release.yml)
 [![Translation status](https://hosted.weblate.org/widget/cosmic-utils/camera/svg-badge.svg)](https://hosted.weblate.org/engage/cosmic-utils/)
 
 A modern camera application for Linux, built for desktops and phones alike.
 
-![Klikka Preview](preview/preview-001.png)
+![Camera Preview](preview/preview-001.png)
 
 [View more screenshots](preview/README.md)
 
@@ -41,7 +41,7 @@ This is a personal project by [Frederic Laing](https://github.com/FreddyFunk). I
 flatpak install flathub io.github.cosmic_utils.camera
 
 # Or install from a downloaded .flatpak bundle
-flatpak install klikka-x86_64.flatpak
+flatpak install camera-x86_64.flatpak
 ```
 
 ### From Source
@@ -74,22 +74,22 @@ sudo just install
 
 ## CLI Usage
 
-Klikka supports several command-line modes for headless operation:
+Camera supports several command-line modes for headless operation:
 
 ```bash
-klikka              # Launch GUI (default)
-klikka --help       # Show help
-klikka list         # List available cameras
-klikka photo        # Take a photo
-klikka video        # Record a video
-klikka process      # Run a computational photography pipeline
-klikka terminal     # Terminal mode viewer
+camera              # Launch GUI (default)
+camera --help       # Show help
+camera list         # List available cameras
+camera photo        # Take a photo
+camera video        # Record a video
+camera process      # Run a computational photography pipeline
+camera terminal     # Terminal mode viewer
 ```
 
 ### List Cameras
 
 ```bash
-klikka list
+camera list
 ```
 
 Shows available cameras with their supported formats:
@@ -104,38 +104,38 @@ Available cameras:
 ### Take a Photo
 
 ```bash
-klikka photo [OPTIONS]
+camera photo [OPTIONS]
 ```
 
 **Options:**
-- `-c, --camera <INDEX>` - Camera index from `klikka list` (default: 0)
+- `-c, --camera <INDEX>` - Camera index from `camera list` (default: 0)
 - `-o, --output <PATH>` - Output file path (default: ~/Pictures/Camera/IMG_TIMESTAMP.jpg)
 
 **Examples:**
 ```bash
-klikka photo                         # Quick photo with defaults
-klikka photo -o ~/snapshot.jpg       # Custom output path
-klikka photo -c 1                    # Use second camera
+camera photo                         # Quick photo with defaults
+camera photo -o ~/snapshot.jpg       # Custom output path
+camera photo -c 1                    # Use second camera
 ```
 
 ### Record a Video
 
 ```bash
-klikka video [OPTIONS]
+camera video [OPTIONS]
 ```
 
 **Options:**
-- `-c, --camera <INDEX>` - Camera index from `klikka list` (default: 0)
+- `-c, --camera <INDEX>` - Camera index from `camera list` (default: 0)
 - `-d, --duration <SECONDS>` - Recording duration (default: 10)
 - `-o, --output <PATH>` - Output file path (default: ~/Videos/Camera/video_TIMESTAMP.mp4)
 - `-a, --audio` - Enable audio recording
 
 **Examples:**
 ```bash
-klikka video                         # 10 second video
-klikka video -d 30                   # 30 second video
-klikka video -d 60 -a                # 1 minute with audio
-klikka video -c 1 -d 30 -o out.mp4   # Camera 1, custom output
+camera video                         # 10 second video
+camera video -d 30                   # 30 second video
+camera video -d 60 -a                # 1 minute with audio
+camera video -c 1 -d 30 -o out.mp4   # Camera 1, custom output
 ```
 
 Press `Ctrl+C` to stop recording early.
@@ -145,7 +145,7 @@ Press `Ctrl+C` to stop recording early.
 Process images through computational photography pipelines.
 
 ```bash
-klikka process <MODE> [OPTIONS] <INPUT>...
+camera process <MODE> [OPTIONS] <INPUT>...
 ```
 
 #### Night Mode
@@ -153,7 +153,7 @@ klikka process <MODE> [OPTIONS] <INPUT>...
 Multi-frame denoising and HDR+ pipeline for low-light photography.
 
 ```bash
-klikka process burst-mode [OPTIONS] <INPUT>...
+camera process burst-mode [OPTIONS] <INPUT>...
 ```
 
 **Arguments:**
@@ -164,9 +164,9 @@ klikka process burst-mode [OPTIONS] <INPUT>...
 
 **Examples:**
 ```bash
-klikka process burst-mode /path/to/burst/               # Process all images in directory
-klikka process burst-mode img1.png img2.png img3.png    # Process specific files
-klikka process burst-mode /path/to/burst/ -o /output/   # Custom output directory
+camera process burst-mode /path/to/burst/               # Process all images in directory
+camera process burst-mode img1.png img2.png img3.png    # Process specific files
+camera process burst-mode /path/to/burst/ -o /output/   # Custom output directory
 ```
 
 The pipeline automatically:
@@ -181,7 +181,7 @@ The pipeline automatically:
 Ever wanted to see your face rendered in glorious Unicode? Wonder what you'd look like as a half-block character? Well, wonder no more!
 
 ```bash
-klikka terminal
+camera terminal
 ```
 
 **Controls:**
@@ -300,17 +300,17 @@ For development on atomic/immutable desktops (Fedora Silverblue, Kinoite, Bazzit
 distrobox assemble create
 
 # Enter the container
-distrobox enter klikka-dev
+distrobox enter camera-dev
 
 # Build inside the container
 just build-release
 
 # Run the binary on the host (not inside distrobox)
 # Camera access via PipeWire requires running on the host
-./target/release/klikka
+./target/release/camera
 
 # Remove when no longer needed
-distrobox rm klikka-dev
+distrobox rm camera-dev
 ```
 
 To run GUI apps from inside the container, allow local display access on your host:
@@ -385,13 +385,13 @@ Any contribution intentionally submitted for inclusion in the work by you shall 
 
 The easiest way to report a bug is to use the **"Report a Bug"** button in the app settings. This generates a detailed system report that helps with debugging.
 
-1. Open Klikka → Settings → "Report a Bug"
+1. Open Camera → Settings → "Report a Bug"
 2. A bug report file will be saved to `~/Pictures/Camera/`
-3. Your browser will open the [bug report form](https://github.com/cosmic-utils/klikka/issues/new?template=bug_report_from_app.yml)
+3. Your browser will open the [bug report form](https://github.com/cosmic-utils/cosmic-ext-camera/issues/new?template=bug_report_from_app.yml)
 4. Attach the generated report file and describe the issue
 
-You can also [report bugs manually](https://github.com/cosmic-utils/klikka/issues/new?template=bug_report.yml) if you prefer.
+You can also [report bugs manually](https://github.com/cosmic-utils/cosmic-ext-camera/issues/new?template=bug_report.yml) if you prefer.
 
 ### Feature Requests
 
-Have an idea for a new feature? [Submit a feature request](https://github.com/cosmic-utils/klikka/issues/new?template=feature_request.yml)!
+Have an idea for a new feature? [Submit a feature request](https://github.com/cosmic-utils/cosmic-ext-camera/issues/new?template=feature_request.yml)!

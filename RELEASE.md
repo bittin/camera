@@ -111,13 +111,13 @@ Each release includes:
 
 | Artifact | Description |
 |----------|-------------|
-| `klikka-x86_64-linux.tar.gz` | Linux binary for x86_64 |
-| `klikka-aarch64-linux.tar.gz` | Linux binary for ARM64 |
-| `klikka-armhf-linux.tar.gz` | Linux binary for armhf (32-bit) |
-| `klikka-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
-| `klikka-x86_64-musl-linux.tar.gz` | Linux binary for x86_64 (musl/static) |
-| `klikka-aarch64-musl-linux.tar.gz` | Linux binary for ARM64 (musl/static) |
-| `klikka-x86_64.flatpak` | Flatpak bundle for x86_64 |
-| `klikka-aarch64.flatpak` | Flatpak bundle for ARM64 |
-| `klikka-vX.Y.Z-source.zip` | Source code archive |
+| `camera-x86_64-linux.tar.gz` | Linux binary for x86_64 |
+| `camera-aarch64-linux.tar.gz` | Linux binary for ARM64 |
+| `camera-armhf-linux.tar.gz` | Linux binary for armhf (32-bit) |
+| `camera-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
+| `camera-x86_64-musl-linux.tar.gz` | Linux binary for x86_64 (musl/static) |
+| `camera-aarch64-musl-linux.tar.gz` | Linux binary for ARM64 (musl/static) |
+| `camera-x86_64.flatpak` | Flatpak bundle for x86_64 |
+| `camera-aarch64.flatpak` | Flatpak bundle for ARM64 |
+| `camera-vX.Y.Z-source.zip` | Source code archive |
 | `APKBUILD` | Alpine Linux package build recipe |

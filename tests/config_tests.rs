@@ -2,7 +2,7 @@
 
 //! Integration tests for configuration module
 
-use klikka::Config;
+use camera::Config;
 
 #[test]
 fn test_config_default() {

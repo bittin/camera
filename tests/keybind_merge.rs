@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use camera::app::keybind::{Action, Bindings, SerializedKeyBind};
 use cosmic::iced::keyboard::Key;
 use cosmic::widget::menu::key_bind::{KeyBind, Modifier};
-use klikka::app::keybind::{Action, Bindings, SerializedKeyBind};
 use std::collections::HashMap;
 
 fn kb_char(c: &str, modifiers: Vec<Modifier>) -> KeyBind {

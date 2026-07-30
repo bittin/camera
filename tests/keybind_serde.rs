@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use camera::app::keybind::SerializedKeyBind;
 use cosmic::iced::keyboard::Key;
 use cosmic::iced::keyboard::key::Named;
 use cosmic::widget::menu::key_bind::{KeyBind, Modifier};
-use klikka::app::keybind::SerializedKeyBind;
 
 fn kb(modifiers: Vec<Modifier>, key: Key) -> KeyBind {
     KeyBind { modifiers, key }

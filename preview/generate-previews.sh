@@ -13,7 +13,7 @@
 #
 # Environment:
 #   CONTAINER_ENGINE  podman (default) or docker
-#   PREVIEW_IMAGE     image tag to build and run (default klikka-previews)
+#   PREVIEW_IMAGE     image tag to build and run (default camera-previews)
 #   NO_BUILD_IMAGE    set to 1 to reuse an already-built image
 #   SHOTS             comma-separated shot numbers, passed through
 #   PREVIEW_FUZZ / PREVIEW_THRESHOLD / PREVIEW_TILE_THRESHOLD / PREVIEW_TILES
@@ -41,7 +41,7 @@ if [[ -z "$ENGINE" ]]; then
     fi
 fi
 
-IMAGE="${PREVIEW_IMAGE:-klikka-previews}"
+IMAGE="${PREVIEW_IMAGE:-camera-previews}"
 
 # The app fakes its own camera in CPU memory (--preview-fake-camera plus
 # --preview-source), so no dma-buf provider (/dev/udmabuf or a dma_heap) and no

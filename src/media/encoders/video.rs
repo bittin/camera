@@ -12,7 +12,7 @@ use gstreamer::prelude::*;
 use tracing::{debug, info, warn};
 
 /// Blacklisted software AV1 encoders that cause issues in Flatpak environments
-/// See: https://github.com/cosmic-utils/klikka/issues/171
+/// See: https://github.com/cosmic-utils/cosmic-ext-camera/issues/171
 /// - svtav1enc (SVT-AV1): No file is created when recording
 /// - av1enc (AOM AV1): Recording terminates immediately with unplayable output
 const BLACKLISTED_ENCODERS: &[&str] = &["svtav1enc", "av1enc"];

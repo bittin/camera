@@ -29,14 +29,14 @@
   <summary xml:lang="uk">Знімайте фото та відео</summary>
   <summary xml:lang="zh-CN">拍摄照片和视频</summary>
   <description>
-    <p>Klikka is a modern camera application for Linux, built for desktops and phones alike. Whether you need to snap a quick photo, record a video, or scan a QR code, Klikka provides a clean and intuitive interface that stays out of your way.</p>
-    <p xml:lang="cs">Klikka je moderní aplikace kamery pro Linux, navržená pro stolní počítače i mobilní zařízení. Ať už potřebujete rychle vyfotit snímek, natočit video nebo naskenovat QR kód, Klikka nabízí čisté a intuitivní rozhraní, které vás při používání neruší.</p>
-    <p xml:lang="de">Klikka ist eine moderne Kamera-App für Linux, für den Desktop genauso wie fürs Smartphone. Ob du schnell ein Foto machst, ein Video aufnimmst oder einen QR-Code scannst, Klikka bleibt schlicht und übersichtlich und kommt dir dabei nicht in die Quere.</p>
-    <p xml:lang="hu">A Klikka egy modern kameraalkalmazás Linuxra, amely asztali számítógépekre és telefonokra egyaránt készült. Akár gyorsan szeretnél fotót készíteni, videót rögzíteni vagy QR-kódot beolvasni, a Klikka letisztult és könnyen használható felületet biztosít, amely nem vonja el a figyelmet.</p>
-    <p xml:lang="pl">Klikka jest nowoczesną aplikacją aparatu dla Linuxa, zbudowaną zarówno dla komputerów i telefonów. Jeśli masz ochotę zrobić szybkie zdjęcie, nagrać film lub zeskanować kod QR, Klikka dostarcza przejrzystego i intuicyjnego interfejsu który Ci w tym nie przeszkadza.</p>
-    <p xml:lang="pt-BR">O Klikka é um aplicativo de câmera moderno para Linux, desenvolvido para desktops e celulares. Seja para tirar uma foto rápida, gravar um vídeo ou escanear um código QR, o Klikka oferece uma interface limpa e intuitiva que não interfere na sua experiência.</p>
-    <p xml:lang="sv">Klikka är ett modernt kamera program för Linux, byggt för både stationära datorer och telefoner. Oavsett om du behöver ta ett snabbt foto, spela in en video eller skanna en QR-kod, så gerKlikka dig ett rent och intuitivt gränssnitt som håller sig ur vägen.</p>
-    <p xml:lang="zh-CN">Klikka 是个现代 Linux 相机应用程序。专为电脑与手机设计。无论您需要快速拍照、录制视频还是扫描二维码，Klikka 能提供简洁直观的界面，不妨碍您的操作。</p>
+    <p>Camera is a modern camera application for Linux, built for desktops and phones alike. Whether you need to snap a quick photo, record a video, or scan a QR code, Camera provides a clean and intuitive interface that stays out of your way.</p>
+    <p xml:lang="cs">Kamera je moderní aplikace kamery pro Linux, navržená pro stolní počítače i mobilní zařízení. Ať už potřebujete rychle vyfotit snímek, natočit video nebo naskenovat QR kód, Kamera nabízí čisté a intuitivní rozhraní, které vás při používání neruší.</p>
+    <p xml:lang="de">Kamera ist eine moderne Kamera-App für Linux, für den Desktop genauso wie fürs Smartphone. Ob du schnell ein Foto machst, ein Video aufnimmst oder einen QR-Code scannst, Kamera bleibt schlicht und übersichtlich und kommt dir dabei nicht in die Quere.</p>
+    <p xml:lang="hu">A Kamera egy modern kameraalkalmazás Linuxra, amely asztali számítógépekre és telefonokra egyaránt készült. Akár gyorsan szeretnél fotót készíteni, videót rögzíteni vagy QR-kódot beolvasni, a Kamera letisztult és könnyen használható felületet biztosít, amely nem vonja el a figyelmet.</p>
+    <p xml:lang="pl">Aparat jest nowoczesną aplikacją aparatu dla Linuxa, zbudowaną zarówno dla komputerów i telefonów. Jeśli masz ochotę zrobić szybkie zdjęcie, nagrać film lub zeskanować kod QR, Aparat dostarcza przejrzystego i intuicyjnego interfejsu który Ci w tym nie przeszkadza.</p>
+    <p xml:lang="pt-BR">O Câmera é um aplicativo de câmera moderno para Linux, desenvolvido para desktops e celulares. Seja para tirar uma foto rápida, gravar um vídeo ou escanear um código QR, o Câmera oferece uma interface limpa e intuitiva que não interfere na sua experiência.</p>
+    <p xml:lang="sv">Kamera är ett modernt kamera program för Linux, byggt för både stationära datorer och telefoner. Oavsett om du behöver ta ett snabbt foto, spela in en video eller skanna en QR-kod, så gerKamera dig ett rent och intuitivt gränssnitt som håller sig ur vägen.</p>
+    <p xml:lang="zh-CN">相机 是个现代 Linux 相机应用程序。专为电脑与手机设计。无论您需要快速拍照、录制视频还是扫描二维码，相机 能提供简洁直观的界面，不妨碍您的操作。</p>
     <p>Just open the app and start capturing moments. Add fun filters to your photos, scan QR codes to open links or connect to WiFi, or use virtual camera mode to look great in video calls with your favorite filter applied.</p>
     <p xml:lang="cs">Otevřete aplikaci a začněte zachycovat okamžiky. Přidejte zábavné filtry ke svým fotografiím, skenujte QR kódy pro otevření odkazů nebo připojení k Wi-Fi, případně použijte režim virtuální kamery, abyste při videohovorech vypadali skvěle s aplikovaným oblíbeným filtrem.</p>
     <p xml:lang="de">Einfach die App öffnen und den Moment festhalten. Leg witzige Filter über deine Fotos, scanne QR-Codes, um Links zu öffnen oder dich mit WiFi zu verbinden, oder nutze die virtuelle Kamera, um in Videoanrufen mit deinem Lieblingsfilter gut auszusehen.</p>
@@ -130,13 +130,13 @@
          renamed the .desktop, .metainfo.xml and flatpak manifest together, not
          from the release notes: the 0.1.17 entry names an
          io.github.freddyfunk.camera that was never an ID.
-         The rename to Klikka did not change the ID; only the displayed name
-         and the binary moved. -->
+         Neither the rename to Klikka nor the rename back to Camera changed
+         the ID; only the displayed name and the binary moved. -->
     <id>io.github.freddyfunk.CosmicCamera</id>
     <id>io.github.freddyfunk.cosmic-camera</id>
     <id>io.github.cosmic-utils.camera</id>
     <id>io.github.cosmicutils.camera</id>
-    <binary>klikka</binary>
+    <binary>camera</binary>
   </provides>
   <!-- The same IDs again, as Flathub's MetaInfo guidelines ask for on a rename:
        `provides` is what makes a lookup of an old ID resolve to this component,
@@ -149,9 +149,9 @@
     <id>io.github.cosmic-utils.camera</id>
     <id>io.github.cosmicutils.camera</id>
   </replaces>
-  <url type="homepage">https://github.com/cosmic-utils/klikka</url>
-  <url type="bugtracker">https://github.com/cosmic-utils/klikka/issues</url>
-  <url type="vcs-browser">https://github.com/cosmic-utils/klikka</url>
+  <url type="homepage">https://github.com/cosmic-utils/cosmic-ext-camera</url>
+  <url type="bugtracker">https://github.com/cosmic-utils/cosmic-ext-camera/issues</url>
+  <url type="vcs-browser">https://github.com/cosmic-utils/cosmic-ext-camera</url>
   <developer id="io.github.cosmic_utils">
     <name>Frederic Laing</name>
   </developer>
@@ -187,20 +187,20 @@
       <caption xml:lang="pt-BR">Modo foto com menu de ferramentas</caption>
       <caption xml:lang="sv">Fotoläge med verktygsmeny</caption>
       <caption xml:lang="zh-CN">带有工具菜单的拍照模式</caption>
-      <image>https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/preview-001.png</image>
-      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/ar/preview-001.png</image>
-      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/bg/preview-001.png</image>
-      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/cs/preview-001.png</image>
-      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/de/preview-001.png</image>
-      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/es/preview-001.png</image>
-      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/fr/preview-001.png</image>
-      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/hu/preview-001.png</image>
-      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/kmr/preview-001.png</image>
-      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pl/preview-001.png</image>
-      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pt-BR/preview-001.png</image>
-      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/sv/preview-001.png</image>
-      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/uk/preview-001.png</image>
-      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/zh-CN/preview-001.png</image>
+      <image>https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/preview-001.png</image>
+      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/ar/preview-001.png</image>
+      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/bg/preview-001.png</image>
+      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/cs/preview-001.png</image>
+      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/de/preview-001.png</image>
+      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/es/preview-001.png</image>
+      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/fr/preview-001.png</image>
+      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/hu/preview-001.png</image>
+      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/kmr/preview-001.png</image>
+      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pl/preview-001.png</image>
+      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pt-BR/preview-001.png</image>
+      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/sv/preview-001.png</image>
+      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/uk/preview-001.png</image>
+      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/zh-CN/preview-001.png</image>
     </screenshot>
     <screenshot>
       <caption>Photo mode on a Linux phone</caption>
@@ -211,20 +211,20 @@
       <caption xml:lang="pt-BR">Modo foto em um telefone Linux</caption>
       <caption xml:lang="sv">Fotoläge med en Linux telefon</caption>
       <caption xml:lang="zh-CN">Linux 手机的拍照模式</caption>
-      <image>https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/preview-002.png</image>
-      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/ar/preview-002.png</image>
-      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/bg/preview-002.png</image>
-      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/cs/preview-002.png</image>
-      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/de/preview-002.png</image>
-      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/es/preview-002.png</image>
-      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/fr/preview-002.png</image>
-      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/hu/preview-002.png</image>
-      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/kmr/preview-002.png</image>
-      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pl/preview-002.png</image>
-      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pt-BR/preview-002.png</image>
-      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/sv/preview-002.png</image>
-      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/uk/preview-002.png</image>
-      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/zh-CN/preview-002.png</image>
+      <image>https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/preview-002.png</image>
+      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/ar/preview-002.png</image>
+      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/bg/preview-002.png</image>
+      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/cs/preview-002.png</image>
+      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/de/preview-002.png</image>
+      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/es/preview-002.png</image>
+      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/fr/preview-002.png</image>
+      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/hu/preview-002.png</image>
+      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/kmr/preview-002.png</image>
+      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pl/preview-002.png</image>
+      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pt-BR/preview-002.png</image>
+      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/sv/preview-002.png</image>
+      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/uk/preview-002.png</image>
+      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/zh-CN/preview-002.png</image>
     </screenshot>
     <screenshot>
       <caption>Filter picker</caption>
@@ -236,20 +236,20 @@
       <caption xml:lang="sv">Filterväljare</caption>
       <caption xml:lang="uk">Вибір фільтрів</caption>
       <caption xml:lang="zh-CN">滤镜选择器</caption>
-      <image>https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/preview-003.png</image>
-      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/ar/preview-003.png</image>
-      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/bg/preview-003.png</image>
-      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/cs/preview-003.png</image>
-      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/de/preview-003.png</image>
-      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/es/preview-003.png</image>
-      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/fr/preview-003.png</image>
-      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/hu/preview-003.png</image>
-      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/kmr/preview-003.png</image>
-      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pl/preview-003.png</image>
-      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pt-BR/preview-003.png</image>
-      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/sv/preview-003.png</image>
-      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/uk/preview-003.png</image>
-      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/zh-CN/preview-003.png</image>
+      <image>https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/preview-003.png</image>
+      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/ar/preview-003.png</image>
+      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/bg/preview-003.png</image>
+      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/cs/preview-003.png</image>
+      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/de/preview-003.png</image>
+      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/es/preview-003.png</image>
+      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/fr/preview-003.png</image>
+      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/hu/preview-003.png</image>
+      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/kmr/preview-003.png</image>
+      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pl/preview-003.png</image>
+      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pt-BR/preview-003.png</image>
+      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/sv/preview-003.png</image>
+      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/uk/preview-003.png</image>
+      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/zh-CN/preview-003.png</image>
     </screenshot>
     <screenshot>
       <caption>Video recording in progress</caption>
@@ -261,20 +261,20 @@
       <caption xml:lang="sv">Videoinspelning pågår</caption>
       <caption xml:lang="uk">Запис відео триває</caption>
       <caption xml:lang="zh-CN">视频录制中</caption>
-      <image>https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/preview-004.png</image>
-      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/ar/preview-004.png</image>
-      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/bg/preview-004.png</image>
-      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/cs/preview-004.png</image>
-      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/de/preview-004.png</image>
-      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/es/preview-004.png</image>
-      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/fr/preview-004.png</image>
-      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/hu/preview-004.png</image>
-      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/kmr/preview-004.png</image>
-      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pl/preview-004.png</image>
-      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pt-BR/preview-004.png</image>
-      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/sv/preview-004.png</image>
-      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/uk/preview-004.png</image>
-      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/zh-CN/preview-004.png</image>
+      <image>https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/preview-004.png</image>
+      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/ar/preview-004.png</image>
+      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/bg/preview-004.png</image>
+      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/cs/preview-004.png</image>
+      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/de/preview-004.png</image>
+      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/es/preview-004.png</image>
+      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/fr/preview-004.png</image>
+      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/hu/preview-004.png</image>
+      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/kmr/preview-004.png</image>
+      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pl/preview-004.png</image>
+      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pt-BR/preview-004.png</image>
+      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/sv/preview-004.png</image>
+      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/uk/preview-004.png</image>
+      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/zh-CN/preview-004.png</image>
     </screenshot>
     <screenshot>
       <caption>QR code detection</caption>
@@ -286,20 +286,20 @@
       <caption xml:lang="sv">QR-kodidentifiering</caption>
       <caption xml:lang="uk">Виявлення QR-коду</caption>
       <caption xml:lang="zh-CN">二维码检测</caption>
-      <image>https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/preview-005.png</image>
-      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/ar/preview-005.png</image>
-      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/bg/preview-005.png</image>
-      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/cs/preview-005.png</image>
-      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/de/preview-005.png</image>
-      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/es/preview-005.png</image>
-      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/fr/preview-005.png</image>
-      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/hu/preview-005.png</image>
-      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/kmr/preview-005.png</image>
-      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pl/preview-005.png</image>
-      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pt-BR/preview-005.png</image>
-      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/sv/preview-005.png</image>
-      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/uk/preview-005.png</image>
-      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/zh-CN/preview-005.png</image>
+      <image>https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/preview-005.png</image>
+      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/ar/preview-005.png</image>
+      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/bg/preview-005.png</image>
+      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/cs/preview-005.png</image>
+      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/de/preview-005.png</image>
+      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/es/preview-005.png</image>
+      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/fr/preview-005.png</image>
+      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/hu/preview-005.png</image>
+      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/kmr/preview-005.png</image>
+      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pl/preview-005.png</image>
+      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pt-BR/preview-005.png</image>
+      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/sv/preview-005.png</image>
+      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/uk/preview-005.png</image>
+      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/zh-CN/preview-005.png</image>
     </screenshot>
     <screenshot>
       <caption>Advanced settings</caption>
@@ -311,20 +311,20 @@
       <caption xml:lang="sv">Avancerade inställningar</caption>
       <caption xml:lang="uk">Розширені налаштування</caption>
       <caption xml:lang="zh-CN">高级设置</caption>
-      <image>https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/preview-006.png</image>
-      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/ar/preview-006.png</image>
-      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/bg/preview-006.png</image>
-      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/cs/preview-006.png</image>
-      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/de/preview-006.png</image>
-      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/es/preview-006.png</image>
-      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/fr/preview-006.png</image>
-      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/hu/preview-006.png</image>
-      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/kmr/preview-006.png</image>
-      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pl/preview-006.png</image>
-      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/pt-BR/preview-006.png</image>
-      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/sv/preview-006.png</image>
-      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/uk/preview-006.png</image>
-      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/klikka/main/preview/locales/zh-CN/preview-006.png</image>
+      <image>https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/preview-006.png</image>
+      <image xml:lang="ar">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/ar/preview-006.png</image>
+      <image xml:lang="bg">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/bg/preview-006.png</image>
+      <image xml:lang="cs">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/cs/preview-006.png</image>
+      <image xml:lang="de">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/de/preview-006.png</image>
+      <image xml:lang="es">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/es/preview-006.png</image>
+      <image xml:lang="fr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/fr/preview-006.png</image>
+      <image xml:lang="hu">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/hu/preview-006.png</image>
+      <image xml:lang="kmr">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/kmr/preview-006.png</image>
+      <image xml:lang="pl">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pl/preview-006.png</image>
+      <image xml:lang="pt-BR">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/pt-BR/preview-006.png</image>
+      <image xml:lang="sv">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/sv/preview-006.png</image>
+      <image xml:lang="uk">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/uk/preview-006.png</image>
+      <image xml:lang="zh-CN">https://media.githubusercontent.com/media/cosmic-utils/cosmic-ext-camera/main/preview/locales/zh-CN/preview-006.png</image>
     </screenshot>
   </screenshots>
   <releases>
@@ -943,7 +943,6 @@
     <category>Photography</category>
   </categories>
   <keywords>
-    <keyword>klikka</keyword>
     <keyword>camera</keyword>
     <keyword>webcam</keyword>
     <keyword>photo</keyword>
@@ -951,7 +950,6 @@
     <keyword>recording</keyword>
     <keyword>capture</keyword>
     <keyword>cosmic</keyword>
-    <keyword xml:lang="cs">klikka</keyword>
     <keyword xml:lang="cs">kamera</keyword>
     <keyword xml:lang="cs">fotoaparát</keyword>
     <keyword xml:lang="cs">webkamera</keyword>
@@ -960,7 +958,6 @@
     <keyword xml:lang="cs">nahrávka</keyword>
     <keyword xml:lang="cs">záznam</keyword>
     <keyword xml:lang="cs">cosmic</keyword>
-    <keyword xml:lang="uk">klikka</keyword>
     <keyword xml:lang="uk">камера</keyword>
     <keyword xml:lang="uk">вебкамера</keyword>
     <keyword xml:lang="uk">знімок</keyword>
@@ -969,7 +966,6 @@
     <keyword xml:lang="uk">відео</keyword>
     <keyword xml:lang="uk">запис</keyword>
     <keyword xml:lang="uk">космік</keyword>
-    <keyword xml:lang="zh-CN">klikka</keyword>
     <keyword xml:lang="zh-CN">相机</keyword>
     <keyword xml:lang="zh-CN">摄像头</keyword>
     <keyword xml:lang="zh-CN">照片</keyword>

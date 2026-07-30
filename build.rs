@@ -8,12 +8,7 @@ fn main() {
     println!("cargo::rerun-if-changed=.git/refs/tags");
 
     // Check if version is already set (e.g., in flatpak builds).
-    // CAMERA_VERSION is the pre-rename spelling, still honoured so an older
-    // downstream packaging recipe keeps stamping the version instead of
-    // silently falling back to a git describe that a release tarball cannot do.
-    let version = if let Ok(v) =
-        std::env::var("KLIKKA_VERSION").or_else(|_| std::env::var("CAMERA_VERSION"))
-    {
+    let version = if let Ok(v) = std::env::var("CAMERA_VERSION") {
         v
     } else {
         get_git_version()

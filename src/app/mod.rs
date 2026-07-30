@@ -56,7 +56,6 @@ mod view;
 
 // Re-export public API
 use crate::config::Config;
-use crate::constants::APP_NAME;
 use crate::fl;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
 use cosmic::iced::Subscription;
@@ -213,7 +212,7 @@ fn pick_startup_camera_index(
     0
 }
 
-const REPOSITORY: &str = "https://github.com/cosmic-utils/klikka";
+const REPOSITORY: &str = "https://github.com/cosmic-utils/cosmic-ext-camera";
 
 /// App icon for the about page (pre-rendered PNG avoids SVG parsing lag on first open)
 const APP_ICON: &[u8] =
@@ -254,7 +253,7 @@ impl cosmic::Application for AppModel {
 
         // Create the about widget
         let about = About::default()
-            .name(APP_NAME)
+            .name(fl!("camera"))
             .icon(widget::icon::from_raster_bytes(APP_ICON))
             .version(env!("GIT_VERSION"))
             .author("Frederic Laing")
@@ -265,7 +264,7 @@ impl cosmic::Application for AppModel {
                 (fl!("repository"), REPOSITORY),
                 (
                     fl!("about-support"),
-                    "https://github.com/cosmic-utils/klikka/issues",
+                    "https://github.com/cosmic-utils/cosmic-ext-camera/issues",
                 ),
             ])
             .comments(
