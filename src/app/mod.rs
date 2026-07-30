@@ -1417,7 +1417,19 @@ impl cosmic::Application for AppModel {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                    let new_devices = crate::backends::audio::enumerate_audio_devices();
+                    // Enumeration is blocking: a Unix-socket handshake with
+                    // PulseAudio, and on the fallback path a `pw-dump` fork plus
+                    // a parse of the whole PipeWire graph. Off the async worker
+                    // threads it goes, so a slow audio server can never stall
+                    // whatever else the runtime is driving.
+                    let Ok(new_devices) = tokio::task::spawn_blocking(
+                        crate::backends::audio::enumerate_audio_devices,
+                    )
+                    .await
+                    else {
+                        warn!("Audio enumeration task failed - stopping hotplug monitoring");
+                        break;
+                    };
 
                     let devices_changed = last_devices.len() != new_devices.len()
                         || !last_devices.iter().all(|d| {
