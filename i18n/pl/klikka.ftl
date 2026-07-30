@@ -292,3 +292,5 @@ metainfo-caption-settings = Zaawansowane ustawienia
 insights-copy-time = Czas Opakowania Klatki
 action-toggle-ui-chrome = Przełącz interfejs
 action-toggle-preview-fit = Przełącz zmieść / wypełnij
+settings-other = Inne
+settings-overlay = Nakładka
