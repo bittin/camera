@@ -227,7 +227,19 @@ jobs:
 
       - name: Install podman
         if: ${{ matrix.use_cross }}
-        run: sudo apt-get update && sudo apt-get install -y podman
+        # Runner images from ubuntu24/20260726.254 on ship podman 5.8.4 outside
+        # dpkg, so `apt-get install podman` no longer no-ops: it drops Ubuntu's
+        # podman 4.9.3 and its /etc/containers config next to the newer binary,
+        # and every `cross` build then dies with
+        #   error running container: from /usr/bin/crun ...: unknown version specified
+        # Only reach for apt when the image has no podman of its own.
+        run: |
+          if command -v podman >/dev/null 2>&1; then
+            echo "Using preinstalled $(podman --version)"
+          else
+            sudo apt-get update && sudo apt-get install -y podman
+            echo "Installed $(podman --version)"
+          fi
 
       - name: Install just
         uses: extractions/setup-just@v4

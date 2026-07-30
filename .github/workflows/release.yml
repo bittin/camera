@@ -103,7 +103,15 @@ jobs:
 
       - name: Install podman
         if: ${{ matrix.use_cross }}
-        run: sudo apt-get update && sudo apt-get install -y podman
+        # See the matching step in ci.yml: installing Ubuntu's podman on top of
+        # the newer one the runner image now ships breaks every cross build.
+        run: |
+          if command -v podman >/dev/null 2>&1; then
+            echo "Using preinstalled $(podman --version)"
+          else
+            sudo apt-get update && sudo apt-get install -y podman
+            echo "Installed $(podman --version)"
+          fi
 
       - name: Install just
         uses: extractions/setup-just@v4
