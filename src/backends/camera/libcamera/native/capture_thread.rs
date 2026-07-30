@@ -342,6 +342,11 @@ pub(crate) fn capture_thread_main(
 /// How often to emit per-frame diagnostic log messages (every Nth frame).
 const LOG_EVERY_N_FRAMES: u64 = 30;
 
+/// Maximum number of progressive scans accepted in a single MJPEG frame.
+/// Baseline MJPEG has one scan; the limit only exists to bound decode time on
+/// malformed or hostile input.
+const MJPEG_SCAN_LIMIT: u32 = 500;
+
 /// Stream format metadata read back after configure.
 struct StreamFormats {
     vf_size: libcamera::geometry::Size,
@@ -513,8 +518,15 @@ fn capture_thread_setup_and_run(
     // Create MJPEG decompressor if needed — BEFORE reporting success so that
     // init failures are propagated to the caller via init_tx.
     let mut jpeg_decompressor = if formats.vf_is_mjpeg {
-        let decompressor = turbojpeg::Decompressor::new()
+        let mut decompressor = turbojpeg::Decompressor::new()
             .map_err(|e| BackendError::Other(format!("turbojpeg init: {e}")))?;
+        // Bound the work a single frame can cost us. A camera emitting a
+        // progressive JPEG with a pathological scan count would otherwise stall
+        // the capture thread frame after frame; MJPEG in practice is baseline,
+        // so a generous limit never fires for well-behaved hardware.
+        if let Err(e) = decompressor.set_scan_limit(MJPEG_SCAN_LIMIT) {
+            debug!(error = %e, "Could not set MJPEG scan limit");
+        }
         if let Ok(mut d) = DIAGNOSTICS.write() {
             d.mjpeg_decoder_name = Some("turbojpeg (libjpeg-turbo)".to_string());
         }
@@ -1227,6 +1239,15 @@ fn decode_mjpeg_frame(
 
     // Update decoded format and stream info on first frame
     if frame_num == 0 {
+        // Baseline Huffman is what UVC cameras emit; anything else costs
+        // noticeably more CPU per frame, so record it for the insights panel.
+        let entropy_note = match (header.is_progressive, header.is_arithmetic) {
+            (true, true) => Some("progressive, arithmetic"),
+            (true, false) => Some("progressive"),
+            (false, true) => Some("arithmetic"),
+            (false, false) => None,
+        };
+
         info!(
             subsamp = ?header.subsamp,
             format_name,
@@ -1236,11 +1257,20 @@ fn decode_mjpeg_frame(
             height,
             uv_w,
             uv_h,
+            entropy = entropy_note.unwrap_or("baseline"),
             "First MJPEG frame decoded to {format_name} via turbojpeg"
         );
 
+        if let Some(note) = entropy_note {
+            warn!(
+                entropy = note,
+                "Camera emits non-baseline MJPEG — decoding will be slower than usual"
+            );
+        }
+
         if let Ok(mut d) = DIAGNOSTICS.write() {
             d.mjpeg_decoded_format = Some(format_name.to_string());
+            d.mjpeg_entropy_note = entropy_note.map(str::to_string);
             // Update stream info pixel format to show actual decoded format
             if let Some(ref mut info) = d.preview_stream_info {
                 info.1 = format!("{} (MJPEG)", format_name);

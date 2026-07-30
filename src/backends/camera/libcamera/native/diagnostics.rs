@@ -27,6 +27,11 @@ pub(crate) struct PipelineDiagnostics {
     pub(crate) capture_stream_info: Option<(String, String, u32, u32)>,
     pub(crate) mjpeg_decoder_name: Option<String>,
     pub(crate) mjpeg_decoded_format: Option<String>,
+    /// Entropy coding of the incoming MJPEG when it is not plain baseline
+    /// Huffman (e.g. "progressive"). Both progressive and arithmetic coding
+    /// decode much slower, so surfacing it explains an otherwise puzzling
+    /// CPU decode time in the insights panel.
+    pub(crate) mjpeg_entropy_note: Option<String>,
     pub(crate) preview_role: Option<String>,
     pub(crate) capture_role: Option<String>,
 }
@@ -43,6 +48,7 @@ pub(crate) static DIAGNOSTICS: RwLock<PipelineDiagnostics> = RwLock::new(Pipelin
     capture_stream_info: None,
     mjpeg_decoder_name: None,
     mjpeg_decoded_format: None,
+    mjpeg_entropy_note: None,
     preview_role: None,
     capture_role: None,
 });
@@ -84,6 +90,10 @@ pub(crate) fn get_mjpeg_decode_time_us() -> u64 {
 
 pub(crate) fn get_mjpeg_decoded_format() -> Option<String> {
     DIAGNOSTICS.read().ok()?.mjpeg_decoded_format.clone()
+}
+
+pub(crate) fn get_mjpeg_entropy_note() -> Option<String> {
+    DIAGNOSTICS.read().ok()?.mjpeg_entropy_note.clone()
 }
 
 pub(crate) fn get_capture_stream_info() -> Option<(String, String, String, u64, u32, u32)> {

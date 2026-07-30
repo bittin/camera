@@ -918,8 +918,16 @@ impl AppModel {
                 "Y800" => "Grayscale",
                 other => other,
             };
-            self.insights.cpu_processing =
-                Some(format!("MJPEG \u{2192} {} (turbojpeg)", yuv_label));
+            // Non-baseline entropy coding is the usual explanation for a high
+            // CPU decode time, so name it right next to the decode step.
+            let mjpeg_label = match diag::get_mjpeg_entropy_note() {
+                Some(note) => format!("MJPEG ({note})"),
+                None => "MJPEG".to_string(),
+            };
+            self.insights.cpu_processing = Some(format!(
+                "{} \u{2192} {} (turbojpeg)",
+                mjpeg_label, yuv_label
+            ));
         } else if mjpeg_decoder.is_some() {
             self.insights.cpu_processing = Some("MJPEG \u{2192} YUV (turbojpeg)".to_string());
         } else {
