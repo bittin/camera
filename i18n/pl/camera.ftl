@@ -1,5 +1,5 @@
 camera = Aparat
-about = O Aparacie
+about = O aplikacji
 repository = Repozytorium
 mode-video = Film
 mode-photo = Zdjęcie
