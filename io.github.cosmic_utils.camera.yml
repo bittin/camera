@@ -1,10 +1,10 @@
 app-id: io.github.cosmic_utils.camera
 runtime: org.freedesktop.Platform
-runtime-version: '25.08'
+runtime-version: '26.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-  - org.freedesktop.Sdk.Extension.llvm21
+  - org.freedesktop.Sdk.Extension.llvm22
 base: com.system76.Cosmic.BaseApp
 base-version: stable
 command: camera
@@ -84,6 +84,16 @@ modules:
         url: https://files.pythonhosted.org/packages/e5/69/882ee5c9d017149285cab114ebeab373308ef0f874fcdac9beb90e0ac4da/ply-3.11.tar.gz
         sha256: 00c7c1aaa88358b9c765b6d3000c6eec0ba42abca5351b095321aef446081da3
 
+  # libyaml was removed from Freedesktop SDK 26.08, but libcamera requires it.
+  - name: libyaml
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+    sources:
+      - type: archive
+        url: https://github.com/yaml/libyaml/releases/download/0.2.5/yaml-0.2.5.tar.gz
+        sha256: c642ae9b75fee120b2d96c712538bd2cf283228d2337df2cf2988e3c02678ef4
+
   # nlohmann/json header-only library, needed by libpisp
   - name: nlohmann-json
     buildsystem: cmake-ninja
@@ -141,8 +151,8 @@ modules:
       env:
         CARGO_HOME: /run/build/camera/cargo
         CARGO_TARGET_DIR: /run/build/camera/target
-        LIBCLANG_PATH: /usr/lib/sdk/llvm21/lib
-        BINDGEN_EXTRA_CLANG_ARGS: -I/usr/lib/sdk/llvm21/lib/clang/21/include
+        LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
+        BINDGEN_EXTRA_CLANG_ARGS: -I/usr/lib/sdk/llvm22/lib/clang/22/include
         # libcamera installs to lib64 on x86_64, but flatpak's default
         # PKG_CONFIG_PATH only includes lib/pkgconfig
         PKG_CONFIG_PATH: /app/lib64/pkgconfig:/app/lib/pkgconfig:/app/share/pkgconfig:/usr/lib/pkgconfig:/usr/share/pkgconfig
