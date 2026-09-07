@@ -641,6 +641,10 @@ impl cosmic::Application for AppModel {
         app.core.window.content_container = false;
         // Always hide headerbar — custom window controls are in the top bar overlay
         app.core.window.show_headerbar = false;
+        // libcosmic's template paints a rounded border but only clips the surface
+        // through COSMIC's corner-radius protocol. On other compositors our
+        // full-bleed preview remains rectangular and protrudes below that border.
+        app.core.window.use_template = crate::config::is_cosmic_desktop();
 
         // Warm launches often finish camera enumeration before AppModel construction.
         // Install those results immediately so capture can start on the first loop.
