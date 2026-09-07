@@ -283,6 +283,9 @@ impl AppModel {
 
             // ===== Gallery =====
             Message::OpenGallery => self.handle_open_gallery(),
+            Message::GalleryPortalOpenCompleted(path, result) => {
+                self.handle_gallery_portal_open_completed(path, result)
+            }
             Message::RefreshGalleryThumbnail => self.handle_refresh_gallery_thumbnail(),
             Message::GalleryThumbnailLoaded(data) => self.handle_gallery_thumbnail_loaded(data),
 

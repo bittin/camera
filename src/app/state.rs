@@ -1726,6 +1726,8 @@ pub enum Message {
     // ===== Gallery =====
     /// Open gallery in file manager
     OpenGallery,
+    /// XDG portal finished opening the directory containing the latest media
+    GalleryPortalOpenCompleted(std::path::PathBuf, Result<(), String>),
     /// Refresh the gallery thumbnail
     RefreshGalleryThumbnail,
     /// Gallery thumbnail loaded

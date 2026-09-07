@@ -10,13 +10,68 @@ use cosmic::Task;
 use cosmic::cosmic_config::CosmicConfigEntry;
 use tracing::{error, info};
 
+fn file_manager_dbus_args(file_uri: &str) -> Vec<String> {
+    [
+        "--session".to_string(),
+        "--print-reply".to_string(),
+        "--reply-timeout=5000".to_string(),
+        "--dest=org.freedesktop.FileManager1".to_string(),
+        "--type=method_call".to_string(),
+        "/org/freedesktop/FileManager1".to_string(),
+        "org.freedesktop.FileManager1.ShowItems".to_string(),
+        format!("array:string:{file_uri}"),
+        "string:".to_string(),
+    ]
+    .into()
+}
+
+fn portal_gallery_item(running_in_flatpak: bool, last_media_path: Option<&str>) -> Option<&str> {
+    running_in_flatpak.then_some(last_media_path).flatten()
+}
+
+async fn open_gallery_item_via_portal(path: &std::path::Path) -> Result<(), String> {
+    use ashpd::desktop::open_uri::OpenDirectoryRequest;
+    use std::os::fd::AsFd;
+
+    let file = std::fs::File::open(path)
+        .map_err(|err| format!("Failed to open media file for portal request: {err}"))?;
+    let request = OpenDirectoryRequest::default()
+        .send(&file.as_fd())
+        .await
+        .map_err(|err| format!("OpenDirectory portal request failed: {err}"))?;
+    request
+        .response()
+        .map_err(|err| format!("OpenDirectory portal rejected request: {err}"))
+}
+
 impl AppModel {
     // =========================================================================
     // Gallery Handlers
     // =========================================================================
 
     pub(crate) fn handle_open_gallery(&self) -> Task<cosmic::Action<Message>> {
-        // If we have a last media path, open the file manager with that file pre-selected
+        let running_in_flatpak = std::env::var_os("FLATPAK_ID").is_some();
+
+        // OpenDirectory accepts the latest media file itself, then opens its
+        // containing directory and asks the file manager to select it. Unlike a
+        // direct FileManager1 call, the portal reliably crosses the sandbox.
+        if let Some(path) = portal_gallery_item(running_in_flatpak, self.last_media_path.as_deref())
+        {
+            let path = std::path::PathBuf::from(path);
+            let task_path = path.clone();
+            info!(path = %path.display(), "Opening gallery item through XDG portal");
+            return Task::perform(
+                async move {
+                    let result = open_gallery_item_via_portal(&task_path).await;
+                    (task_path, result)
+                },
+                |(path, result)| {
+                    cosmic::Action::App(Message::GalleryPortalOpenCompleted(path, result))
+                },
+            );
+        }
+
+        // Native builds retain file pre-selection through FileManager1.
         if let Some(ref path) = self.last_media_path {
             info!(path = %path, "Opening gallery with file pre-selected");
             if Self::show_in_file_manager(path).is_ok() {
@@ -32,6 +87,28 @@ impl AppModel {
             error!(error = %e, path = %photo_dir.display(), "Failed to open gallery directory");
         } else {
             info!("Gallery opened successfully");
+        }
+        Task::none()
+    }
+
+    pub(crate) fn handle_gallery_portal_open_completed(
+        &self,
+        path: std::path::PathBuf,
+        result: Result<(), String>,
+    ) -> Task<cosmic::Action<Message>> {
+        if let Err(err) = result {
+            error!(error = %err, path = %path.display(), "Failed to open gallery item through XDG portal");
+            if let Some(parent) = path.parent()
+                && let Err(fallback_err) = open::that(parent)
+            {
+                error!(
+                    error = %fallback_err,
+                    path = %parent.display(),
+                    "Failed to open gallery item's parent directory"
+                );
+            }
+        } else {
+            info!(path = %path.display(), "Gallery item opened through XDG portal");
         }
         Task::none()
     }
@@ -623,15 +700,7 @@ impl AppModel {
 
         // Method 1: Try D-Bus FileManager1.ShowItems
         let dbus_result = Command::new("dbus-send")
-            .args([
-                "--session",
-                "--dest=org.freedesktop.FileManager1",
-                "--type=method_call",
-                "/org/freedesktop/FileManager1",
-                "org.freedesktop.FileManager1.ShowItems",
-                &format!("array:string:{}", file_uri),
-                "string:",
-            ])
+            .args(file_manager_dbus_args(&file_uri))
             .output();
 
         if let Ok(output) = dbus_result
@@ -1370,4 +1439,38 @@ fn frame_metadata_to_json(
     }
 
     serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{file_manager_dbus_args, portal_gallery_item};
+
+    #[test]
+    fn flatpak_gallery_routes_the_latest_video_to_the_portal() {
+        let video = "/home/test/Videos/Camera/latest.mp4";
+
+        assert_eq!(portal_gallery_item(true, Some(video)), Some(video));
+        assert_eq!(portal_gallery_item(true, None), None);
+        assert_eq!(portal_gallery_item(false, Some(video)), None);
+    }
+
+    #[test]
+    fn file_manager_dbus_call_waits_for_the_method_reply() {
+        let args = file_manager_dbus_args("file:///tmp/photo.jpg");
+
+        assert_eq!(
+            args,
+            [
+                "--session",
+                "--print-reply",
+                "--reply-timeout=5000",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+                "array:string:file:///tmp/photo.jpg",
+                "string:",
+            ]
+        );
+    }
 }
