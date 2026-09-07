@@ -11,6 +11,7 @@ jobs:
     name: Check for Flatpak Runtime Updates
     runs-on: ubuntu-latest
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     steps:
@@ -20,7 +21,7 @@ jobs:
       - name: Install Flatpak
         run: |
           sudo apt-get update
-          sudo apt-get install -y flatpak
+          sudo apt-get install -y flatpak flatpak-builder
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
 
       - name: Check for runtime updates
@@ -28,8 +29,11 @@ jobs:
         run: |
           # Get current runtime version from manifest
           CURRENT_VERSION=$(grep -oP "runtime-version:\s*'\K[^']+" io.github.cosmic_utils.camera.yml)
+          CURRENT_LLVM=$(grep -oP 'org\.freedesktop\.Sdk\.Extension\.llvm\K[0-9]+' io.github.cosmic_utils.camera.yml)
           echo "Current runtime version: $CURRENT_VERSION"
+          echo "Current LLVM extension: $CURRENT_LLVM"
           echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "current_llvm=$CURRENT_LLVM" >> $GITHUB_OUTPUT
 
           # Query Flathub for available Freedesktop Platform versions
           # Get list of available runtime versions
@@ -49,9 +53,25 @@ jobs:
           echo "Latest runtime version: $LATEST_VERSION"
           echo "latest=$LATEST_VERSION" >> $GITHUB_OUTPUT
 
-          # Compare versions
-          if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
-            echo "Update available: $CURRENT_VERSION -> $LATEST_VERSION"
+          # Select the newest LLVM SDK extension published for that runtime.
+          LATEST_LLVM=$(flatpak remote-ls --user flathub --runtime --columns=application,branch \
+            | awk -v version="$LATEST_VERSION" \
+                '$2 == version && $1 ~ /^org\.freedesktop\.Sdk\.Extension\.llvm[0-9]+$/ { print $1 }' \
+            | sed 's/.*llvm//' \
+            | sort -nu \
+            | tail -1)
+          if [ -z "$LATEST_LLVM" ]; then
+            echo "No LLVM SDK extension is available for runtime $LATEST_VERSION" >&2
+            exit 1
+          fi
+          flatpak remote-info --user flathub \
+            org.freedesktop.Sdk.Extension.rust-stable//$LATEST_VERSION >/dev/null
+          echo "Latest LLVM extension: $LATEST_LLVM"
+          echo "latest_llvm=$LATEST_LLVM" >> $GITHUB_OUTPUT
+
+          # Compare the runtime and its coupled LLVM extension.
+          if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ] || [ "$CURRENT_LLVM" != "$LATEST_LLVM" ]; then
+            echo "Update available: runtime $CURRENT_VERSION -> $LATEST_VERSION, LLVM $CURRENT_LLVM -> $LATEST_LLVM"
             echo "update_available=true" >> $GITHUB_OUTPUT
           else
             echo "Already on latest version"
@@ -63,14 +83,36 @@ jobs:
         run: |
           CURRENT="${{ steps.check.outputs.current }}"
           LATEST="${{ steps.check.outputs.latest }}"
+          CURRENT_LLVM="${{ steps.check.outputs.current_llvm }}"
+          LATEST_LLVM="${{ steps.check.outputs.latest_llvm }}"
 
-          # Update runtime-version in the manifest
+          # Update the runtime and every coupled LLVM extension/path reference.
           sed -i "s/runtime-version: '$CURRENT'/runtime-version: '$LATEST'/" io.github.cosmic_utils.camera.yml
+          sed -i "s/llvm${CURRENT_LLVM}/llvm${LATEST_LLVM}/g" io.github.cosmic_utils.camera.yml justfile
+          sed -i "s#/clang/${CURRENT_LLVM}/#/clang/${LATEST_LLVM}/#g" io.github.cosmic_utils.camera.yml
 
-          echo "Updated manifest:"
-          grep "runtime-version" io.github.cosmic_utils.camera.yml
+          grep "runtime-version\|Sdk.Extension.llvm\|LIBCLANG_PATH\|BINDGEN_EXTRA_CLANG_ARGS" \
+            io.github.cosmic_utils.camera.yml
+          if [ "$CURRENT_LLVM" != "$LATEST_LLVM" ] && \
+            grep -q "llvm${CURRENT_LLVM}\|/clang/${CURRENT_LLVM}/" \
+              io.github.cosmic_utils.camera.yml justfile; then
+            echo "Stale LLVM ${CURRENT_LLVM} reference remains" >&2
+            exit 1
+          fi
+
+      - name: Install just
+        if: steps.check.outputs.update_available == 'true'
+        uses: extractions/setup-just@v4
+
+      - name: Build updated Flatpak
+        if: steps.check.outputs.update_available == 'true'
+        run: |
+          just flatpak-deps x86_64
+          just flatpak-bundle x86_64
+          rm -rf build-dir .flatpak-builder repo camera-x86_64.flatpak .flatpak-version
 
       - name: Create Pull Request
+        id: cpr
         if: steps.check.outputs.update_available == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
@@ -84,9 +126,10 @@ jobs:
 
             ### Changes
             - Updated `runtime-version` in `io.github.cosmic_utils.camera.yml`
+            - Updated the LLVM SDK extension and paths where required
 
             ### Testing
-            - [ ] Build Flatpak locally with `just flatpak-install`
+            - [x] Built the x86_64 Flatpak in the update workflow
             - [ ] Verify app runs correctly
 
             ---
@@ -94,3 +137,9 @@ jobs:
           branch: deps/flatpak-runtime-${{ steps.check.outputs.latest }}
           delete-branch: true
           labels: dependencies
+
+      - name: Run CI on pull request branch
+        if: ${{ steps.cpr.outputs.pull-request-operation == 'created' || steps.cpr.outputs.pull-request-operation == 'updated' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run ci.yml --ref "${{ steps.cpr.outputs.pull-request-branch }}"

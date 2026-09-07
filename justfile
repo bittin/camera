@@ -285,10 +285,11 @@ flatpak-cargo-sources:
 # Build and install Flatpak locally
 flatpak-build: flatpak-cargo-sources
     #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'rm -f .flatpak-version' EXIT
     echo "Building Flatpak..."
     just get-version > .flatpak-version
     flatpak-builder --user --install --force-clean build-dir {{APPID}}.yml
-    rm -f .flatpak-version
     echo "Flatpak built and installed!"
 
 # Deliberately does not regenerate cargo-sources.json first. Flathub builds from
@@ -303,8 +304,8 @@ flatpak-bundle arch="":
     arch="{{arch}}"
     if [ -z "$arch" ]; then
         arch=$(uname -m)
-        [ "$arch" = "x86_64" ] || [ "$arch" = "aarch64" ] || { echo "Unknown arch: $arch"; exit 1; }
     fi
+    [ "$arch" = "x86_64" ] || [ "$arch" = "aarch64" ] || { echo "Unsupported Flatpak architecture: $arch"; exit 1; }
     echo "Building Flatpak bundle for $arch..."
     just get-version > .flatpak-version
     flatpak-builder --repo=repo --force-clean --arch=$arch build-dir {{APPID}}.yml
@@ -338,7 +339,7 @@ flatpak-install:
     flatpak info org.freedesktop.Sdk//${RUNTIME_VERSION} &>/dev/null || DEPS_MISSING=true
     flatpak info org.freedesktop.Platform//${RUNTIME_VERSION} &>/dev/null || DEPS_MISSING=true
     flatpak info org.freedesktop.Sdk.Extension.rust-stable//${RUNTIME_VERSION} &>/dev/null || DEPS_MISSING=true
-    flatpak info org.freedesktop.Sdk.Extension.llvm21//${RUNTIME_VERSION} &>/dev/null || DEPS_MISSING=true
+    flatpak info org.freedesktop.Sdk.Extension.llvm22//${RUNTIME_VERSION} &>/dev/null || DEPS_MISSING=true
     flatpak info com.system76.Cosmic.BaseApp//stable &>/dev/null || DEPS_MISSING=true
     if [ "$DEPS_MISSING" = true ]; then
         echo "Flatpak dependencies missing, installing..."
@@ -357,17 +358,22 @@ flatpak-clean:
 # Install Flatpak dependencies (runtime and SDK)
 flatpak-deps arch="":
     #!/usr/bin/env bash
+    set -euo pipefail
     echo "Installing Flatpak dependencies..."
     command -v flatpak &> /dev/null || { echo "Error: flatpak not found!"; exit 1; }
     RUNTIME_VERSION=$(just flatpak-runtime-version)
-    ARCH_FLAG=""
-    [ -n "{{arch}}" ] && ARCH_FLAG="--arch={{arch}}"
+    arch="{{arch}}"
+    if [ -z "$arch" ]; then
+        arch=$(uname -m)
+    fi
+    [ "$arch" = "x86_64" ] || [ "$arch" = "aarch64" ] || { echo "Unsupported Flatpak architecture: $arch"; exit 1; }
+    ARCH_FLAG="--arch=$arch"
     echo "Runtime version: $RUNTIME_VERSION"
-    flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
     sudo flatpak install -y --noninteractive flathub org.freedesktop.Platform//${RUNTIME_VERSION} $ARCH_FLAG
     sudo flatpak install -y --noninteractive flathub org.freedesktop.Sdk//${RUNTIME_VERSION} $ARCH_FLAG
     sudo flatpak install -y --noninteractive flathub org.freedesktop.Sdk.Extension.rust-stable//${RUNTIME_VERSION} $ARCH_FLAG
-    sudo flatpak install -y --noninteractive flathub org.freedesktop.Sdk.Extension.llvm21//${RUNTIME_VERSION} $ARCH_FLAG
+    sudo flatpak install -y --noninteractive flathub org.freedesktop.Sdk.Extension.llvm22//${RUNTIME_VERSION} $ARCH_FLAG
     sudo flatpak install -y --noninteractive flathub com.system76.Cosmic.BaseApp//stable $ARCH_FLAG
     echo "Flatpak dependencies installed!"
 
