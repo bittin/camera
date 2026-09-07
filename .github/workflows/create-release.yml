@@ -209,7 +209,9 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.0
 
       - name: Update Cargo.lock
         run: |
