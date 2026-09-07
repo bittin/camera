@@ -285,10 +285,11 @@ flatpak-cargo-sources:
 # Build and install Flatpak locally
 flatpak-build: flatpak-cargo-sources
     #!/usr/bin/env bash
+    set -euo pipefail
+    trap 'rm -f .flatpak-version' EXIT
     echo "Building Flatpak..."
     just get-version > .flatpak-version
     flatpak-builder --user --install --force-clean build-dir {{APPID}}.yml
-    rm -f .flatpak-version
     echo "Flatpak built and installed!"
 
 # Deliberately does not regenerate cargo-sources.json first. Flathub builds from
