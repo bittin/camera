@@ -379,6 +379,29 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.3.5" date="2026-09-10">
+      <description>
+        <p>Release 1.3.5 includes the following changes:</p>
+        <ul>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump uuid from 1.25.0 to 1.26.0 in the rust-dependencies group</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>chore(l10n): update translations</li>
+          <li>fix: correct window edges outside COSMIC</li>
+          <li>chore: regenerate preview screenshots</li>
+          <li>fix(flatpak): support runtime 26.08</li>
+          <li>build: pin Rust 1.98.0</li>
+          <li>fix: reveal latest media from Flatpak</li>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>deps(cargo): bump open from 5.4.2 to 5.4.3 in the rust-dependencies group</li>
+          <li>deps(cargo): bump rqrr from 0.10.1 to 0.11.0</li>
+          <li>deps(cargo): bump dirs from 6.0.0 to 7.0.0</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.3.4" date="2026-08-29">
       <description>
         <p>Release 1.3.4 includes the following changes:</p>
