@@ -9,6 +9,11 @@
 
 A modern camera application for Linux, built for desktops and phones alike.
 
+<p>
+  <img src="resources/icons/hicolor/scalable/apps/io.github.cosmic_utils.camera.svg" alt="Camera app icon" width="80">
+  <a href="https://flathub.org/apps/io.github.cosmic_utils.camera"><img src="https://flathub.org/api/badge?svg&locale=en" alt="Get it on Flathub" width="240"></a>
+</p>
+
 ![Camera Preview](preview/preview-001.png)
 
 [View more screenshots](preview/README.md)
@@ -34,8 +39,6 @@ This is a personal project by [Frederic Laing](https://github.com/FreddyFunk). I
 ## Installation
 
 ### Flatpak (Recommended)
-
-<a href='https://flathub.org/apps/io.github.cosmic_utils.camera'><img width='240' alt='Get it on Flathub' src='https://flathub.org/api/badge?svg&locale=en'/></a>
 
 ```bash
 # Install from Flathub
