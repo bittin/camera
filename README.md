@@ -2,7 +2,7 @@
 
 [![Sponsor](https://img.shields.io/badge/sponsor-FreddyFunk-ea4aaa?logo=github-sponsors)](https://github.com/sponsors/FreddyFunk)
 [![Flathub](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fflathub.org%2Fapi%2Fv2%2Fappstream%2Fio.github.cosmic_utils.camera&query=%24.releases%5B0%5D.version&prefix=v&label=flathub&logo=flathub&logoColor=white&color=blue)](https://flathub.org/apps/io.github.cosmic_utils.camera)
-[![Alpine Linux Edge package](https://img.shields.io/badge/Alpine_Edge-1.3.2--r0-0D597F?logo=alpinelinux&logoColor=white)](https://pkgs.alpinelinux.org/packages?name=cosmic-ext-camera&branch=edge)
+[![Alpine Linux Edge package](https://img.shields.io/badge/dynamic/xml?url=https%3A%2F%2Fpkgs.alpinelinux.org%2Fpackages%3Fname%3Dcosmic-ext-camera%26branch%3Dedge%26repo%3Dcommunity%26arch%3Dx86_64&query=%2F%2Ftd%5B%40class%3D%22version%22%5D%2Fstrong%2Ftext%28%29&label=Alpine%20Edge&logo=alpinelinux&logoColor=white&color=0D597F&cacheSeconds=3600)](https://pkgs.alpinelinux.org/packages?name=cosmic-ext-camera&branch=edge&repo=community&arch=)
 [![CI](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/ci.yml/badge.svg)](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/ci.yml)
 [![Release](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/release.yml/badge.svg)](https://github.com/cosmic-utils/cosmic-ext-camera/actions/workflows/release.yml)
 [![Translation status](https://hosted.weblate.org/widget/cosmic-utils/camera/svg-badge.svg)](https://hosted.weblate.org/engage/cosmic-utils/)
