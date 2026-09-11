@@ -36,6 +36,8 @@ use tracing::{debug, info, warn};
 /// Linux evdev key codes (`linux/input-event-codes.h`).
 const KEY_VOLUMEDOWN: u16 = 114;
 const KEY_VOLUMEUP: u16 = 115;
+const KEY_Q: u16 = 16;
+const KEY_P: u16 = 25;
 
 /// `EV_KEY` event type.
 const EV_KEY: u16 = 0x01;
@@ -82,18 +84,31 @@ const fn eviocgbit(ev: u32, len: u32) -> libc::c_ulong {
     ((IOC_READ << 30) | (len << 16) | (ty << 8) | nr) as libc::c_ulong
 }
 
-/// Query whether a given input-device fd reports either of the volume
-/// key codes among its `EV_KEY` capabilities.
-fn device_has_volume_key(fd: i32) -> bool {
+/// Query the `EV_KEY` capabilities of an input-device fd.
+fn key_capabilities(fd: i32) -> Option<[u8; KEY_BITMAP_BYTES]> {
     let mut buf = [0u8; KEY_BITMAP_BYTES];
     let req = eviocgbit(EV_KEY as u32, buf.len() as u32);
     // SAFETY: ioctl with a writable byte buffer of the size encoded in the
     // request number. EVIOCGBIT writes the supported-codes bitmap.
     let ret = unsafe { libc::ioctl(fd, req as _, buf.as_mut_ptr()) };
     if ret < 0 {
-        return false;
+        return None;
     }
-    bit_set(&buf, KEY_VOLUMEUP as usize) || bit_set(&buf, KEY_VOLUMEDOWN as usize)
+    Some(buf)
+}
+
+/// Whether an `EV_KEY` capability bitmap represents a dedicated button
+/// device that is safe to grab exclusively.
+///
+/// libinput identifies a full keyboard by requiring the complete Q-to-P
+/// key row. Use the same conservative signal here: a keyboard may also expose
+/// volume keys, but grabbing it would prevent the compositor from receiving
+/// every key event from that device.
+fn is_volume_button_device(buf: &[u8]) -> bool {
+    let has_volume_key =
+        bit_set(buf, KEY_VOLUMEUP as usize) || bit_set(buf, KEY_VOLUMEDOWN as usize);
+    let is_full_keyboard = (KEY_Q..=KEY_P).all(|key| bit_set(buf, key as usize));
+    has_volume_key && !is_full_keyboard
 }
 
 fn bit_set(buf: &[u8], bit: usize) -> bool {
@@ -127,9 +142,15 @@ fn detect_volume_devices() -> Vec<PathBuf> {
                 continue;
             }
         };
-        if device_has_volume_key(file.as_raw_fd()) {
-            info!(device = %path.display(), "Volume-key device detected");
-            out.push(path);
+        if let Some(capabilities) = key_capabilities(file.as_raw_fd()) {
+            if is_volume_button_device(&capabilities) {
+                info!(device = %path.display(), "Dedicated volume-key device detected");
+                out.push(path);
+            } else if bit_set(&capabilities, KEY_VOLUMEUP as usize)
+                || bit_set(&capabilities, KEY_VOLUMEDOWN as usize)
+            {
+                info!(device = %path.display(), "Skipping keyboard with volume keys");
+            }
         }
     }
     out
@@ -307,6 +328,41 @@ fn run_read_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set_key(buf: &mut [u8], key: u16) {
+        buf[key as usize / 8] |= 1 << (key as usize % 8);
+    }
+
+    #[test]
+    fn full_keyboard_with_volume_keys_is_not_grabbed() {
+        let mut buf = [0u8; KEY_BITMAP_BYTES];
+        set_key(&mut buf, KEY_VOLUMEUP);
+        set_key(&mut buf, KEY_VOLUMEDOWN);
+        for key in KEY_Q..=KEY_P {
+            set_key(&mut buf, key);
+        }
+
+        assert!(!is_volume_button_device(&buf));
+    }
+
+    #[test]
+    fn dedicated_volume_button_device_is_grabbed() {
+        let mut buf = [0u8; KEY_BITMAP_BYTES];
+        set_key(&mut buf, KEY_VOLUMEUP);
+        set_key(&mut buf, KEY_VOLUMEDOWN);
+
+        assert!(is_volume_button_device(&buf));
+    }
+
+    #[test]
+    fn device_without_volume_keys_is_not_grabbed() {
+        let mut buf = [0u8; KEY_BITMAP_BYTES];
+        for key in KEY_Q..=KEY_P {
+            set_key(&mut buf, key);
+        }
+
+        assert!(!is_volume_button_device(&buf));
+    }
 
     #[test]
     fn bit_set_handles_volume_codes() {
