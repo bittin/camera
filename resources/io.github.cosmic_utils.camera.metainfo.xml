@@ -379,6 +379,18 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="1.3.6" date="2026-09-11">
+      <description>
+        <p>Release 1.3.6 includes the following changes:</p>
+        <ul>
+          <li>deps(cargo): bump the libcosmic group with 4 updates</li>
+          <li>docs: add app icon to README</li>
+          <li>docs: update Alpine badge dynamically</li>
+          <li>fix: mark Camera as mobile friendly</li>
+          <li>fix: avoid grabbing full keyboards</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.3.5" date="2026-09-10">
       <description>
         <p>Release 1.3.5 includes the following changes:</p>
