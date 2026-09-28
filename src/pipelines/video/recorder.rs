@@ -33,6 +33,11 @@ use tracing::{debug, error, info, warn};
 /// How often to emit periodic progress log messages (every Nth frame).
 const LOG_EVERY_N_FRAMES: u64 = 60;
 
+/// Maximum number of frames retained by appsrc while the encoder is slower
+/// than capture. Live recording must prefer a recent frame over unbounded
+/// latency and memory growth.
+const APPSRC_MAX_BUFFERS: u64 = 3;
+
 pub use crate::pipelines::audio_level::{AudioLevels, SharedAudioLevels};
 
 /// Common recording configuration.
@@ -327,6 +332,36 @@ fn add_audio_branch_to_pipeline(
     Ok(())
 }
 
+/// Bound the appsrc queue used by live recording.
+///
+/// `push_buffer` does not automatically stop accepting data after appsrc emits
+/// `enough-data`. Without an explicit leaky limit, a slow encoder can therefore
+/// retain every full-resolution frame until the process is killed by the OOM
+/// killer. Dropping the oldest queued frame keeps latency and memory bounded.
+fn configure_live_appsrc(appsrc: &gst_app::AppSrc) {
+    appsrc.set_max_buffers(APPSRC_MAX_BUFFERS);
+    appsrc.set_max_bytes(0);
+    appsrc.set_block(false);
+    appsrc.set_leaky_type(gst_app::AppLeakyType::Downstream);
+}
+
+/// Return whether appsrc has reached its configured live-frame limit.
+///
+/// Checking before format conversion avoids spending CPU/GPU time on a frame
+/// that cannot enter the encoding pipeline yet. The next captured frame gets
+/// another chance as soon as downstream frees a slot.
+fn appsrc_queue_is_full(appsrc: &gst_app::AppSrc) -> bool {
+    queue_at_capacity(appsrc.current_level_buffers(), appsrc.max_buffers())
+}
+
+fn queue_at_capacity(current_buffers: u64, max_buffers: u64) -> bool {
+    max_buffers > 0 && current_buffers >= max_buffers
+}
+
+fn fallback_pts(capture_index: u64, frame_duration_ns: u64) -> u64 {
+    capture_index * frame_duration_ns
+}
+
 /// Parse a GStreamer pipeline description and perform common configuration.
 ///
 /// Returns the pipeline and appsrc element after:
@@ -354,6 +389,7 @@ fn build_recorder_pipeline(
         .ok_or("Failed to find camera-appsrc in pipeline")?
         .dynamic_cast::<gst_app::AppSrc>()
         .map_err(|_| "Failed to cast to AppSrc")?;
+    configure_live_appsrc(&appsrc);
 
     if let Some(enc_element) = pipeline.by_name("recording-encoder") {
         crate::media::encoders::video::configure_video_encoder(
@@ -390,13 +426,13 @@ enum PtsResult {
 fn compute_pts(
     appsrc: &gst_app::AppSrc,
     sensor_ts: Option<u64>,
-    frame_count: u64,
+    capture_index: u64,
     frame_duration_ns: u64,
     pipeline_playing: &mut bool,
     ts_offset: &mut Option<(u64, u64)>,
 ) -> PtsResult {
     let Some(ts) = sensor_ts else {
-        return PtsResult::Pts(frame_count * frame_duration_ns);
+        return PtsResult::Pts(fallback_pts(capture_index, frame_duration_ns));
     };
 
     // Skip frames until pipeline is PLAYING.
@@ -589,6 +625,7 @@ where
             .store(start_epoch_ns, Ordering::Relaxed);
 
         let mut frame_count: u64 = 0;
+        let mut capture_frame_count: u64 = 0;
         let start_time = std::time::Instant::now();
         let frame_duration_ns = 1_000_000_000u64 / framerate as u64;
         let mut pipeline_playing = false;
@@ -604,10 +641,19 @@ where
                 continue;
             };
 
+            let capture_index = capture_frame_count;
+            capture_frame_count += 1;
+            if appsrc_queue_is_full(&appsrc) {
+                RECORDING_STATS
+                    .pusher_skipped
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
             let pts_ns = match compute_pts(
                 &appsrc,
                 sensor_ts,
-                frame_count,
+                capture_index,
                 frame_duration_ns,
                 &mut pipeline_playing,
                 &mut ts_offset,
@@ -874,6 +920,7 @@ impl VideoRecorder {
                 .store(start_epoch_ns, Ordering::Relaxed);
 
             let mut frame_count: u64 = 0;
+            let mut capture_frame_count: u64 = 0;
             let start_time = std::time::Instant::now();
             let frame_duration_ns = 1_000_000_000u64 / framerate as u64;
             let mut pipeline_playing = false;
@@ -884,6 +931,15 @@ impl VideoRecorder {
                     RecordingFrame::Decoded(f) => f,
                     RecordingFrame::Jpeg { .. } => continue,
                 };
+
+                let capture_index = capture_frame_count;
+                capture_frame_count += 1;
+                if appsrc_queue_is_full(&appsrc) {
+                    RECORDING_STATS
+                        .pusher_skipped
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
 
                 let sensor_ts = frame.sensor_timestamp_ns;
                 let sequence = frame.libcamera_metadata.as_ref().and_then(|m| m.sequence);
@@ -929,7 +985,7 @@ impl VideoRecorder {
                 let pts_ns = match compute_pts(
                     &appsrc,
                     sensor_ts,
-                    frame_count,
+                    capture_index,
                     frame_duration_ns,
                     &mut pipeline_playing,
                     &mut ts_offset,
@@ -1550,4 +1606,62 @@ struct AudioBranch {
 /// Check which video encoders are available (backward compatibility)
 pub fn check_available_encoders() {
     crate::media::encoders::log_available_encoders();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_appsrc_queue_stays_bounded_when_downstream_is_slow() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "appsrc name=test-appsrc is-live=true format=time \
+             ! identity sleep-time=250000 \
+             ! fakesink sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let appsrc = pipeline
+            .by_name("test-appsrc")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+
+        configure_live_appsrc(&appsrc);
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        for _ in 0..32 {
+            appsrc
+                .push_buffer(gst::Buffer::with_size(1024).unwrap())
+                .unwrap();
+        }
+
+        assert_eq!(appsrc.max_buffers(), APPSRC_MAX_BUFFERS);
+        assert_eq!(appsrc.max_bytes(), 0);
+        assert!(!appsrc.is_block());
+        assert_eq!(appsrc.leaky_type(), gst_app::AppLeakyType::Downstream);
+        assert!(appsrc.current_level_buffers() <= APPSRC_MAX_BUFFERS);
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    #[test]
+    fn queue_capacity_treats_zero_as_unlimited() {
+        assert!(!queue_at_capacity(100, 0));
+        assert!(!queue_at_capacity(
+            APPSRC_MAX_BUFFERS - 1,
+            APPSRC_MAX_BUFFERS
+        ));
+        assert!(queue_at_capacity(APPSRC_MAX_BUFFERS, APPSRC_MAX_BUFFERS));
+    }
+
+    #[test]
+    fn fallback_timestamps_preserve_time_across_dropped_frames() {
+        let frame_duration_ns = 40_000_000;
+
+        assert_eq!(fallback_pts(0, frame_duration_ns), 0);
+        // Capture index 1 represents a frame discarded under backpressure.
+        assert_eq!(fallback_pts(2, frame_duration_ns), 80_000_000);
+    }
 }
