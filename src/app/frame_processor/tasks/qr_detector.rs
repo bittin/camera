@@ -9,7 +9,61 @@
 use crate::app::frame_processor::types::{FrameRegion, QrDetection};
 use crate::backends::camera::types::{CameraFrame, PixelFormat};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
+
+pub(crate) const DETECTION_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) fn minimum_overlay_time_elapsed(shown_at: Option<Instant>, now: Instant) -> bool {
+    shown_at.is_none_or(|shown_at| now.duration_since(shown_at) >= DETECTION_INTERVAL)
+}
+
+/// Prevents CPU-bound QR scans from overlapping while preserving the intended
+/// one-second delay between completed scans.
+#[derive(Debug, Default)]
+pub(crate) struct QrDetectionScheduler {
+    active_generation: Option<u64>,
+    last_completed_at: Option<Instant>,
+    generation: u64,
+}
+
+impl QrDetectionScheduler {
+    pub(crate) fn try_start(&mut self, enabled: bool, now: Instant) -> Option<u64> {
+        if !enabled
+            || self.active_generation.is_some()
+            || self
+                .last_completed_at
+                .is_some_and(|completed_at| now.duration_since(completed_at) < DETECTION_INTERVAL)
+        {
+            return None;
+        }
+
+        self.active_generation = Some(self.generation);
+        Some(self.generation)
+    }
+
+    pub(crate) fn finish(&mut self, generation: u64, now: Instant) -> bool {
+        if self.active_generation != Some(generation) {
+            return false;
+        }
+        self.active_generation = None;
+        let is_current = generation == self.generation;
+        if is_current {
+            self.last_completed_at = Some(now);
+        }
+        is_current
+    }
+
+    pub(crate) fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.last_completed_at = None;
+    }
+
+    pub(crate) fn has_stale_detection_in_progress(&self) -> bool {
+        self.active_generation
+            .is_some_and(|active| active != self.generation)
+    }
+}
 
 /// QR code detector
 ///
@@ -446,6 +500,83 @@ mod tests {
     use crate::backends::camera::types::{FrameData, PixelFormat};
 
     #[test]
+    fn scheduler_allows_only_one_detection_at_a_time() {
+        let started_at = std::time::Instant::now();
+        let mut scheduler = QrDetectionScheduler::default();
+
+        assert!(scheduler.try_start(true, started_at).is_some());
+        assert!(
+            scheduler
+                .try_start(true, started_at + std::time::Duration::from_secs(1))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scheduler_waits_one_second_after_detection_finishes() {
+        let started_at = std::time::Instant::now();
+        let finished_at = started_at + std::time::Duration::from_millis(200);
+        let mut scheduler = QrDetectionScheduler::default();
+
+        let generation = scheduler
+            .try_start(true, started_at)
+            .expect("first detection should start");
+        assert!(scheduler.finish(generation, finished_at));
+        assert!(
+            scheduler
+                .try_start(true, finished_at + std::time::Duration::from_millis(999))
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .try_start(true, finished_at + std::time::Duration::from_secs(1))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn scheduler_does_not_start_when_detection_is_disabled() {
+        let mut scheduler = QrDetectionScheduler::default();
+
+        assert!(
+            scheduler
+                .try_start(false, std::time::Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn scheduler_rejects_results_invalidated_while_in_flight() {
+        let started_at = std::time::Instant::now();
+        let mut scheduler = QrDetectionScheduler::default();
+        let generation = scheduler
+            .try_start(true, started_at)
+            .expect("first detection should start");
+
+        scheduler.invalidate();
+
+        assert!(!scheduler.finish(
+            generation,
+            started_at + std::time::Duration::from_millis(200)
+        ));
+    }
+
+    #[test]
+    fn invalidation_clears_the_previous_sources_cooldown() {
+        let started_at = std::time::Instant::now();
+        let finished_at = started_at + std::time::Duration::from_millis(200);
+        let mut scheduler = QrDetectionScheduler::default();
+        let generation = scheduler
+            .try_start(true, started_at)
+            .expect("first detection should start");
+        assert!(scheduler.finish(generation, finished_at));
+
+        scheduler.invalidate();
+
+        assert!(scheduler.try_start(true, finished_at).is_some());
+    }
+
+    #[test]
     fn test_rgba_to_gray() {
         // Create a simple 2x2 RGBA frame
         let data: Vec<u8> = vec![
@@ -490,5 +621,23 @@ mod tests {
         // First pixel samples around (0,0), second around (2,0)
         assert!(result[0] < 100); // Near start of gradient
         assert!(result[1] > 150); // Near end of gradient
+    }
+
+    #[test]
+    fn empty_scan_keeps_overlay_until_minimum_display_time() {
+        let shown_at = Instant::now();
+        assert!(!minimum_overlay_time_elapsed(
+            Some(shown_at),
+            shown_at + DETECTION_INTERVAL / 2
+        ));
+    }
+
+    #[test]
+    fn empty_scan_may_clear_overlay_after_minimum_display_time() {
+        let shown_at = Instant::now();
+        assert!(minimum_overlay_time_elapsed(
+            Some(shown_at),
+            shown_at + DETECTION_INTERVAL
+        ));
     }
 }

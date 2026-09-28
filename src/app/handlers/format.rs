@@ -156,6 +156,7 @@ impl AppModel {
         // Skip blur transition and camera restart when a file source is active
         // (no camera stream to restart, blur would never resolve)
         let file_source_active = self.virtual_camera_file_source.is_some();
+        self.invalidate_qr_detection();
 
         // Reset filter when switching to Virtual mode (filters supported in Photo and Video)
         if mode == CameraMode::Virtual
@@ -230,7 +231,6 @@ impl AppModel {
                 is_video,
                 seek_position, "Restoring file source preview after mode switch"
             );
-
             let preview_task = Task::perform(
                 async move {
                     use crate::backends::virtual_camera::{

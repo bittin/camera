@@ -5,7 +5,7 @@
 use crate::app::exposure_picker::{
     AvailableExposureControls, ColorSettings, ExposureMode, ExposureSettings, MeteringMode,
 };
-use crate::app::frame_processor::QrDetection;
+use crate::app::frame_processor::{QrDetection, tasks::QrDetectionScheduler};
 use crate::backends::audio::AudioDevice;
 use crate::backends::camera::CameraBackendManager;
 use crate::backends::camera::types::{CameraDevice, CameraFormat, CameraFrame};
@@ -872,8 +872,13 @@ pub struct AppModel {
     pub qr_detection_enabled: bool,
     /// Current QR code detections (updated at 1 FPS)
     pub qr_detections: Vec<QrDetection>,
-    /// Last time QR detection was processed
-    pub last_qr_detection_time: Option<Instant>,
+    /// When the currently displayed QR overlay was first shown. Empty scan
+    /// results may clear it only after the minimum display interval.
+    pub(crate) qr_detections_shown_at: Option<Instant>,
+    /// Ensures CPU-bound QR scans never overlap.
+    pub(crate) qr_detection_scheduler: QrDetectionScheduler,
+    /// Latest frame waiting for an invalidated in-flight scan to finish.
+    pub(crate) pending_qr_frame: Option<Arc<CameraFrame>>,
 
     // ===== Privacy Cover Detection =====
     /// Whether the camera privacy cover is closed (blocking the camera)
@@ -1812,7 +1817,10 @@ pub enum Message {
     /// Toggle QR code detection on/off
     ToggleQrDetection,
     /// QR detection results updated
-    QrDetectionsUpdated(Vec<QrDetection>),
+    QrDetectionsUpdated {
+        generation: u64,
+        detections: Vec<QrDetection>,
+    },
     /// Open URL from QR code
     QrOpenUrl(String),
     /// Connect to WiFi network from QR code
