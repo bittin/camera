@@ -28,7 +28,7 @@ pub const VIDEO_ID_FILTER_PREVIEW: u64 = 99;
 use iced_wgpu::graphics::Viewport;
 use iced_wgpu::primitive::{Pipeline as PipelineTrait, Primitive as PrimitiveTrait};
 use iced_wgpu::wgpu;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 // ---------------------------------------------------------------------------
@@ -882,14 +882,102 @@ struct VideoTexture {
     /// Pointer to last uploaded frame data (for deduplication)
     /// Multiple widgets with same video_id share an Arc, so same pointer = same frame
     last_frame_ptr: usize,
-    /// How long this source's last upload took, for the "GPU is behind" skip in
-    /// [`VideoPipeline::upload`].
-    ///
-    /// Per SOURCE, not per pipeline: the sources on screen at once (the frozen
-    /// transition frame and the live preview) are different sizes and different
-    /// formats, so one pipeline-wide figure had one consumer's cost decide the
-    /// other's skip — they took turns being skipped, each dropping to half rate.
-    last_upload_duration: std::time::Duration,
+}
+
+const UPLOAD_RING_SIZE: usize = 3;
+const UPLOAD_SLOT_READY: u8 = 0;
+const UPLOAD_SLOT_STAGED: u8 = 1;
+const UPLOAD_SLOT_IN_FLIGHT: u8 = 2;
+const UPLOAD_SLOT_FAILED: u8 = 3;
+
+struct UploadSlot {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    state: Arc<AtomicU8>,
+}
+
+struct UploadRing {
+    slots: Vec<UploadSlot>,
+    next: usize,
+}
+
+struct PendingTextureCopy {
+    texture: wgpu::Texture,
+    buffer_offset: u64,
+    bytes_per_row: u32,
+    extent: wgpu::Extent3d,
+}
+
+struct UploadPlane {
+    texture: wgpu::Texture,
+    source_offset: usize,
+    source_stride: usize,
+    row_bytes: usize,
+    rows: usize,
+    extent: wgpu::Extent3d,
+}
+
+struct PendingUpload {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    state: Arc<AtomicU8>,
+    copies: Vec<PendingTextureCopy>,
+    yuv_conversion: Option<(u64, u32, u32)>,
+}
+
+struct UploadRecycle {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    state: Arc<AtomicU8>,
+}
+
+fn padded_copy_bytes_per_row(row_bytes: usize) -> usize {
+    row_bytes.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+        * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_rows_to_upload(
+    source: &[u8],
+    source_offset: usize,
+    source_stride: usize,
+    row_bytes: usize,
+    rows: usize,
+    destination: &mut [u8],
+    destination_offset: usize,
+    destination_stride: usize,
+) -> Option<()> {
+    if row_bytes > source_stride || row_bytes > destination_stride {
+        return None;
+    }
+
+    let source_bytes = if rows == 0 {
+        0
+    } else {
+        source_stride
+            .checked_mul(rows - 1)?
+            .checked_add(row_bytes)?
+    };
+    let destination_bytes = if rows == 0 {
+        0
+    } else {
+        destination_stride
+            .checked_mul(rows - 1)?
+            .checked_add(row_bytes)?
+    };
+    let source_end = source_offset.checked_add(source_bytes)?;
+    let destination_end = destination_offset.checked_add(destination_bytes)?;
+    if source_end > source.len() || destination_end > destination.len() {
+        return None;
+    }
+
+    for row in 0..rows {
+        let source_start = source_offset + row * source_stride;
+        let destination_start = destination_offset + row * destination_stride;
+        destination[destination_start..destination_start + row_bytes]
+            .copy_from_slice(&source[source_start..source_start + row_bytes]);
+    }
+    Some(())
 }
 
 /// Filter-specific binding (viewport buffer + bind group)
@@ -929,6 +1017,7 @@ struct YuvTextures {
     /// Cached bind group for the YUV→RGBA compute shader.
     /// Invalidated when textures are recreated (dimension/format change).
     convert_bind_group: Option<wgpu::BindGroup>,
+    uniform_buffer: wgpu::Buffer,
 }
 
 /// Custom pipeline for efficient video rendering
@@ -957,13 +1046,15 @@ pub struct VideoPipeline {
     // Filter pre-blur intermediate texture for multi-pass filters (e.g. Pencil)
     // Full resolution — used to store the pre-blurred frame for spatial filters
     filter_preblur_intermediate: std::sync::RwLock<Option<PreblurIntermediate>>,
-    // GPU timing tracking to detect and handle stalls (per source: see
-    // `VideoTexture::last_upload_duration`)
+    // Ring exhaustion tracking: a full ring is direct evidence that GPU upload
+    // work has not completed, unlike the old CPU-side write_texture duration.
     frames_skipped: std::sync::atomic::AtomicU32,
+    upload_rings: std::collections::HashMap<u64, UploadRing>,
+    pending_uploads: Mutex<Vec<PendingUpload>>,
     // YUV→RGBA conversion compute pipeline
     yuv_compute_pipeline: Option<wgpu::ComputePipeline>,
     yuv_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    yuv_uniform_buffer: Option<wgpu::Buffer>,
+
     // YUV textures per video_id
     yuv_textures: std::collections::HashMap<u64, YuvTextures>,
     // Store the texture format for use in prepare
@@ -2180,13 +2271,6 @@ impl VideoPipeline {
                 cache: None,
             });
 
-        let yuv_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("yuv_convert_uniform_buffer"),
-            size: std::mem::size_of::<YuvConvertParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         Self {
             pipeline_rgba,
             pipeline_rgb_blur,
@@ -2202,9 +2286,10 @@ impl VideoPipeline {
             blur_targets: std::sync::RwLock::new(std::collections::HashMap::new()),
             filter_preblur_intermediate: std::sync::RwLock::new(None),
             frames_skipped: std::sync::atomic::AtomicU32::new(0),
+            upload_rings: std::collections::HashMap::new(),
+            pending_uploads: Mutex::new(Vec::new()),
             yuv_compute_pipeline: Some(yuv_compute_pipeline),
             yuv_bind_group_layout: Some(yuv_bind_group_layout),
-            yuv_uniform_buffer: Some(yuv_uniform_buffer),
             yuv_textures: std::collections::HashMap::new(),
             output_format: format,
         }
@@ -2258,34 +2343,6 @@ impl VideoPipeline {
             return;
         }
 
-        // Skip frame if GPU is behind (last upload took > 32ms = 2 frame periods at 60fps)
-        // This prevents the GPU command queue from backing up and causing UI hangs
-        if let Some(tex) = self.textures.get_mut(&tex_id)
-            && tex.last_upload_duration.as_millis() > 32
-        {
-            let last_upload_ms = tex.last_upload_duration.as_millis();
-            // Reset timing to allow next frame through
-            tex.last_upload_duration = std::time::Duration::ZERO;
-            // Skipping a frame means skipping it for every consumer of this
-            // source, not just the one that happened to ask first: record it as
-            // handled so the dedup above turns the rest of this frame's asks into
-            // no-ops. Otherwise the preview's skip merely handed the upload to the
-            // frosted backdrop, and the frame was never actually skipped.
-            tex.last_frame_ptr = frame_data_ptr;
-            let skipped = self
-                .frames_skipped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                + 1;
-            if skipped % 10 == 1 {
-                tracing::warn!(
-                    skipped_count = skipped,
-                    last_upload_ms,
-                    "Skipping frame - GPU behind, preventing UI hang"
-                );
-            }
-            return;
-        }
-
         let upload_start = Instant::now();
 
         // Create or resize texture if needed (invalidates all bindings for the
@@ -2315,56 +2372,68 @@ impl VideoPipeline {
         // Handle non-RGBA (YUV, ABGR, BGRA, etc.) or direct RGBA upload
         let gpu_copy_start = Instant::now();
 
-        if frame.needs_gpu_conversion() {
-            // GPU conversion path: Update last frame pointer, then run compute shader
-            {
-                let tex = self
-                    .textures
-                    .get_mut(&tex_id)
-                    .expect("Texture should exist");
-                tex.last_frame_ptr = frame_data_ptr;
-            }
-            // Now self.textures borrow is released, we can call upload_yuv_and_convert
-            self.upload_yuv_and_convert(device, queue, tex_id, &frame);
+        let staged = if frame.needs_gpu_conversion() {
+            self.stage_yuv_upload(device, queue, tex_id, &frame)
         } else {
-            // Direct RGBA texture upload (CPU to GPU copy)
-            let tex = self
+            let texture = self
                 .textures
-                .get_mut(&tex_id)
-                .expect("Texture should exist");
-            tex.last_frame_ptr = frame_data_ptr;
-
-            queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &tex.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
+                .get(&tex_id)
+                .expect("Texture should exist")
+                .texture
+                .clone();
+            self.stage_upload_planes(
+                device,
+                tex_id,
                 frame.rgba_data(),
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(frame.stride),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
-                    depth_or_array_layers: 1,
-                },
-            );
+                vec![UploadPlane {
+                    texture,
+                    source_offset: 0,
+                    source_stride: frame.stride as usize,
+                    row_bytes: frame.width as usize * 4,
+                    rows: frame.height as usize,
+                    extent: wgpu::Extent3d {
+                        width: frame.width,
+                        height: frame.height,
+                        depth_or_array_layers: 1,
+                    },
+                }],
+                None,
+            )
+        };
+
+        if !staged {
+            let skipped = self.frames_skipped.fetch_add(1, Ordering::Relaxed) + 1;
+            if skipped % 10 == 1 {
+                tracing::warn!(
+                    skipped_count = skipped,
+                    "Skipping frame - GPU upload ring is full"
+                );
+            }
+            return;
         }
+
+        // Submit immediately from prepare rather than deferring until a
+        // primitive's render call. iced may prepare an individually clipped
+        // primitive without rendering it; deferring would strand an unmapped
+        // ring slot and could eventually exhaust the ring while the GPU is idle.
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("camera texture upload encoder"),
+        });
+        let recycle = self.encode_pending_uploads(&mut encoder);
+        queue.submit([encoder.finish()]);
+        Self::remap_uploads(recycle);
+
+        self.textures
+            .get_mut(&tex_id)
+            .expect("Texture should exist")
+            .last_frame_ptr = frame_data_ptr;
         let gpu_copy_time = gpu_copy_start.elapsed();
 
         // Store GPU upload metrics for insights
         GPU_UPLOAD_TIME_US.store(gpu_copy_time.as_micros() as u64, Ordering::Relaxed);
         GPU_FRAME_SIZE.store(frame.data_slice().len() as u64, Ordering::Relaxed);
 
-        // Track upload duration for frame skipping decisions
         let upload_duration = upload_start.elapsed();
-        if let Some(tex) = self.textures.get_mut(&tex_id) {
-            tex.last_upload_duration = upload_duration;
-        }
 
         // Log GPU upload performance periodically (every ~30 frames based on frame.id)
         if frame.id.is_multiple_of(30) {
@@ -2423,390 +2492,396 @@ impl VideoPipeline {
             width,
             height,
             last_frame_ptr: 0, // Will be set on first upload
-            last_upload_duration: std::time::Duration::ZERO,
         }
     }
 
-    /// Upload YUV frame data and convert to RGBA using GPU compute shader
-    ///
-    /// This method:
-    /// 1. Uploads YUV plane data to GPU textures
-    /// 2. Runs compute shader to convert YUV→RGBA
-    /// 3. Outputs directly to the RGBA texture used for rendering
-    ///
-    /// All processing stays on GPU - no CPU round-trip between YUV conversion and rendering.
-    fn upload_yuv_and_convert(
+    fn create_upload_slot(device: &wgpu::Device, capacity: u64) -> UploadSlot {
+        let capacity = capacity.max(4).div_ceil(4) * 4;
+        UploadSlot {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("camera reusable texture upload buffer"),
+                size: capacity,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            }),
+            capacity,
+            state: Arc::new(AtomicU8::new(UPLOAD_SLOT_READY)),
+        }
+    }
+
+    fn stage_upload_planes(
+        &mut self,
+        device: &wgpu::Device,
+        tex_id: u64,
+        source: &[u8],
+        planes: Vec<UploadPlane>,
+        yuv_conversion: Option<(u64, u32, u32)>,
+    ) -> bool {
+        let mut offsets = Vec::with_capacity(planes.len());
+        let mut required = 0usize;
+        for plane in &planes {
+            required = required.div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize)
+                * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
+            let bytes_per_row = padded_copy_bytes_per_row(plane.row_bytes);
+            offsets.push((required, bytes_per_row));
+            let Some(plane_bytes) = bytes_per_row.checked_mul(plane.rows) else {
+                return false;
+            };
+            let Some(next_required) = required.checked_add(plane_bytes) else {
+                return false;
+            };
+            required = next_required;
+        }
+        let capacity = required.max(4).div_ceil(4) as u64 * 4;
+
+        let ring = self
+            .upload_rings
+            .entry(tex_id)
+            .or_insert_with(|| UploadRing {
+                slots: (0..UPLOAD_RING_SIZE)
+                    .map(|_| Self::create_upload_slot(device, capacity))
+                    .collect(),
+                next: 0,
+            });
+
+        let mut acquired = None;
+        for _ in 0..ring.slots.len() {
+            let index = ring.next;
+            ring.next = (ring.next + 1) % ring.slots.len();
+            let slot = &mut ring.slots[index];
+            let state = slot.state.load(Ordering::Acquire);
+            if state == UPLOAD_SLOT_FAILED
+                || (state == UPLOAD_SLOT_READY && slot.capacity < capacity)
+            {
+                *slot = Self::create_upload_slot(device, capacity);
+            }
+            if slot
+                .state
+                .compare_exchange(
+                    UPLOAD_SLOT_READY,
+                    UPLOAD_SLOT_STAGED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                acquired = Some(index);
+                break;
+            }
+        }
+
+        let Some(index) = acquired else {
+            return false;
+        };
+        let slot = &ring.slots[index];
+        let mut mapped = slot.buffer.get_mapped_range_mut(0..capacity);
+        let mut copies = Vec::with_capacity(planes.len());
+        for (plane, (offset, bytes_per_row)) in planes.into_iter().zip(offsets) {
+            if copy_rows_to_upload(
+                source,
+                plane.source_offset,
+                plane.source_stride,
+                plane.row_bytes,
+                plane.rows,
+                &mut mapped,
+                offset,
+                bytes_per_row,
+            )
+            .is_none()
+            {
+                drop(mapped);
+                slot.state.store(UPLOAD_SLOT_READY, Ordering::Release);
+                return false;
+            }
+            copies.push(PendingTextureCopy {
+                texture: plane.texture,
+                buffer_offset: offset as u64,
+                bytes_per_row: bytes_per_row as u32,
+                extent: plane.extent,
+            });
+        }
+        drop(mapped);
+        slot.buffer.unmap();
+
+        let pending = PendingUpload {
+            buffer: slot.buffer.clone(),
+            capacity: slot.capacity,
+            state: Arc::clone(&slot.state),
+            copies,
+            yuv_conversion,
+        };
+        match self.pending_uploads.lock() {
+            Ok(mut uploads) => uploads.push(pending),
+            Err(_) => {
+                slot.state.store(UPLOAD_SLOT_FAILED, Ordering::Release);
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Stage YUV planes in a reusable mapped buffer. The copies and conversion
+    /// are submitted immediately so clipped primitives cannot strand ring slots.
+    fn stage_yuv_upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tex_id: u64,
         frame: &VideoFrame,
-    ) {
-        use std::time::Instant;
-        let convert_start = Instant::now();
-
-        // Ensure YUV textures exist (UV dimensions from yuv_planes if available)
-        let (uv_w, uv_h) = frame
+    ) -> bool {
+        let (uv_width, uv_height) = frame
             .yuv_planes
             .as_ref()
-            .map(|p| (p.uv_width, p.uv_height))
+            .map(|planes| (planes.uv_width, planes.uv_height))
             .unwrap_or_else(|| default_uv_size(frame.format, frame.width, frame.height));
         self.ensure_yuv_textures(
             device,
             tex_id,
             frame.width,
             frame.height,
-            (uv_w, uv_h),
+            (uv_width, uv_height),
             frame.format,
         );
 
-        // Get output texture view (already cached in VideoTexture)
         let output_view = match self.textures.get(&tex_id) {
-            Some(tex) => &tex.view,
-            None => {
-                tracing::error!("Output texture not found for YUV conversion");
-                return;
-            }
+            Some(texture) => &texture.view,
+            None => return false,
         };
-
-        let yuv_textures = match self.yuv_textures.get_mut(&tex_id) {
-            Some(t) => t,
-            None => {
-                tracing::error!("YUV textures not found after ensure_yuv_textures");
-                return;
-            }
+        let bind_group_layout = match &self.yuv_bind_group_layout {
+            Some(layout) => layout,
+            None => return false,
         };
-
-        // Get the full buffer data (zero-copy from GStreamer)
-        let buffer_data = frame.data_slice();
-
-        // Upload planes using offsets (zero-copy: we slice from the mapped buffer)
-        match frame.format {
-            // Packed 4:2:2 formats: YUYV, UYVY, YVYU, VYUY
-            // All packed as RGBA8 where each texel encodes 2 pixels
-            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
-                let packed_width = frame.width / 2;
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &yuv_textures.tex_y,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    buffer_data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(frame.stride),
-                        rows_per_image: None,
-                    },
-                    wgpu::Extent3d {
-                        width: packed_width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-            // Semi-planar 4:2:0 formats: NV12, NV21
-            PixelFormat::NV12 | PixelFormat::NV21 => {
-                // NV12: Use offsets to slice Y and UV planes from buffer
-                if let Some(ref yuv_planes) = frame.yuv_planes {
-                    let uv_width = frame.width / 2;
-                    let uv_height = frame.height / 2;
-
-                    // Y plane: full resolution, R8 format
-                    let y_end = yuv_planes.y_offset + yuv_planes.y_size;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &yuv_textures.tex_y,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &buffer_data[yuv_planes.y_offset..y_end],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(frame.stride),
-                            rows_per_image: None,
-                        },
-                        wgpu::Extent3d {
-                            width: frame.width,
-                            height: frame.height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-
-                    // UV plane: interleaved UV as RG8
-                    let uv_end = yuv_planes.uv_offset + yuv_planes.uv_size;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &yuv_textures.tex_uv,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &buffer_data[yuv_planes.uv_offset..uv_end],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(yuv_planes.uv_stride),
-                            rows_per_image: None,
-                        },
-                        wgpu::Extent3d {
-                            width: uv_width,
-                            height: uv_height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                }
-            }
-            PixelFormat::I420 => {
-                // Planar YUV: Use offsets to slice Y, U, V planes from buffer
-                // UV dimensions come from yuv_planes (supports 4:2:0, 4:2:2, 4:4:4)
-                if let Some(ref yuv_planes) = frame.yuv_planes {
-                    let uv_width = yuv_planes.uv_width;
-                    let uv_height = yuv_planes.uv_height;
-
-                    // Y plane: full resolution, R8 format
-                    let y_end = yuv_planes.y_offset + yuv_planes.y_size;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &yuv_textures.tex_y,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &buffer_data[yuv_planes.y_offset..y_end],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(frame.stride),
-                            rows_per_image: None,
-                        },
-                        wgpu::Extent3d {
-                            width: frame.width,
-                            height: frame.height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-
-                    // U plane: R8 format
-                    let u_end = yuv_planes.uv_offset + yuv_planes.uv_size;
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &yuv_textures.tex_uv,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        &buffer_data[yuv_planes.uv_offset..u_end],
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(yuv_planes.uv_stride),
-                            rows_per_image: None,
-                        },
-                        wgpu::Extent3d {
-                            width: uv_width,
-                            height: uv_height,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-
-                    // V plane: R8 format
-                    if yuv_planes.v_size > 0 {
-                        let v_end = yuv_planes.v_offset + yuv_planes.v_size;
-                        queue.write_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &yuv_textures.tex_v,
-                                mip_level: 0,
-                                origin: wgpu::Origin3d::ZERO,
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            &buffer_data[yuv_planes.v_offset..v_end],
-                            wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(yuv_planes.v_stride),
-                                rows_per_image: None,
-                            },
-                            wgpu::Extent3d {
-                                width: uv_width,
-                                height: uv_height,
-                                depth_or_array_layers: 1,
-                            },
-                        );
-                    }
-                }
-            }
-            // Grayscale: single channel R8 format
-            PixelFormat::Gray8 => {
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &yuv_textures.tex_y,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    buffer_data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(frame.stride),
-                        rows_per_image: None,
-                    },
-                    wgpu::Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-            // RGB24: Should have been converted to RGBA by GStreamer pipeline
-            // If it arrives here, treat similarly to RGBA but with 3 bytes per pixel
-            PixelFormat::RGB24 => {
-                tracing::warn!(
-                    "RGB24 format received - should have been converted to RGBA by pipeline"
-                );
-                return;
-            }
-            // ABGR/BGRA: Upload as RGBA8, shader will swizzle channels
-            PixelFormat::ABGR | PixelFormat::BGRA => {
-                queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &yuv_textures.tex_y,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    buffer_data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(frame.stride),
-                        rows_per_image: None,
-                    },
-                    wgpu::Extent3d {
-                        width: frame.width,
-                        height: frame.height,
-                        depth_or_array_layers: 1,
-                    },
-                );
-            }
-            PixelFormat::RGBA => {
-                // Should not reach here - RGBA is handled by direct upload path
-                tracing::warn!("upload_yuv_and_convert called for RGBA frame");
-                return;
-            }
-            // Bayer formats: Raw sensor data that requires debayering
-            // This YUV convert path is not suitable - use dedicated debayer pipeline
-            PixelFormat::BayerRGGB
-            | PixelFormat::BayerBGGR
-            | PixelFormat::BayerGRBG
-            | PixelFormat::BayerGBRG => {
-                tracing::warn!(
-                    "Bayer format received in YUV pipeline - requires debayering, not supported here"
-                );
-                return;
-            }
-        }
-
-        // Update uniform buffer with conversion parameters
-        // Use the PixelFormat method to get format code
-        let format_code = frame.format.gpu_format_code();
+        let yuv = match self.yuv_textures.get_mut(&tex_id) {
+            Some(textures) => textures,
+            None => return false,
+        };
 
         let params = YuvConvertParams {
             width: frame.width,
             height: frame.height,
-            format: format_code,
+            format: frame.format.gpu_format_code(),
             y_stride: frame.stride,
             uv_stride: frame.yuv_planes.as_ref().map(|p| p.uv_stride).unwrap_or(0),
             v_stride: frame.yuv_planes.as_ref().map(|p| p.v_stride).unwrap_or(0),
             _pad: [0, 0],
         };
+        queue.write_buffer(&yuv.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
 
-        if let Some(ref uniform_buffer) = self.yuv_uniform_buffer {
-            queue.write_buffer(uniform_buffer, 0, bytemuck::cast_slice(&[params]));
+        if yuv.convert_bind_group.is_none() {
+            yuv.convert_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yuv_convert_bind_group"),
+                layout: bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&yuv.tex_y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&yuv.tex_uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&yuv.tex_v_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(output_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: yuv.uniform_buffer.as_entire_binding(),
+                    },
+                ],
+            }));
         }
 
-        // Create bind group lazily (reused across frames — only recreated when textures change)
-        if yuv_textures.convert_bind_group.is_none() {
-            let bind_group_layout = match &self.yuv_bind_group_layout {
-                Some(layout) => layout,
-                None => {
-                    tracing::error!("YUV bind group layout not initialized");
-                    return;
-                }
-            };
-
-            yuv_textures.convert_bind_group = Some(
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("yuv_convert_bind_group"),
-                    layout: bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&yuv_textures.tex_y_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&yuv_textures.tex_uv_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(&yuv_textures.tex_v_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: wgpu::BindingResource::TextureView(output_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 4,
-                            resource: self
-                                .yuv_uniform_buffer
-                                .as_ref()
-                                .unwrap()
-                                .as_entire_binding(),
-                        },
-                    ],
-                }),
-            );
-        }
-
-        let bind_group = yuv_textures.convert_bind_group.as_ref().unwrap();
-
-        // Dispatch compute shader
-        let compute_pipeline = match &self.yuv_compute_pipeline {
-            Some(pipeline) => pipeline,
-            None => {
-                tracing::error!("YUV compute pipeline not initialized");
-                return;
-            }
+        let data = frame.data_slice();
+        let extent = |width, height| wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
         };
+        let planes = match frame.format {
+            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                vec![UploadPlane {
+                    texture: yuv.tex_y.clone(),
+                    source_offset: 0,
+                    source_stride: frame.stride as usize,
+                    row_bytes: frame.width as usize * 2,
+                    rows: frame.height as usize,
+                    extent: extent(frame.width / 2, frame.height),
+                }]
+            }
+            PixelFormat::NV12 | PixelFormat::NV21 => {
+                let Some(layout) = frame.yuv_planes.as_ref() else {
+                    return false;
+                };
+                vec![
+                    UploadPlane {
+                        texture: yuv.tex_y.clone(),
+                        source_offset: layout.y_offset,
+                        source_stride: frame.stride as usize,
+                        row_bytes: frame.width as usize,
+                        rows: frame.height as usize,
+                        extent: extent(frame.width, frame.height),
+                    },
+                    UploadPlane {
+                        texture: yuv.tex_uv.clone(),
+                        source_offset: layout.uv_offset,
+                        source_stride: layout.uv_stride as usize,
+                        row_bytes: layout.uv_width as usize * 2,
+                        rows: layout.uv_height as usize,
+                        extent: extent(layout.uv_width, layout.uv_height),
+                    },
+                ]
+            }
+            PixelFormat::I420 => {
+                let Some(layout) = frame.yuv_planes.as_ref() else {
+                    return false;
+                };
+                let mut planes = vec![
+                    UploadPlane {
+                        texture: yuv.tex_y.clone(),
+                        source_offset: layout.y_offset,
+                        source_stride: frame.stride as usize,
+                        row_bytes: frame.width as usize,
+                        rows: frame.height as usize,
+                        extent: extent(frame.width, frame.height),
+                    },
+                    UploadPlane {
+                        texture: yuv.tex_uv.clone(),
+                        source_offset: layout.uv_offset,
+                        source_stride: layout.uv_stride as usize,
+                        row_bytes: layout.uv_width as usize,
+                        rows: layout.uv_height as usize,
+                        extent: extent(layout.uv_width, layout.uv_height),
+                    },
+                ];
+                if layout.v_size > 0 {
+                    planes.push(UploadPlane {
+                        texture: yuv.tex_v.clone(),
+                        source_offset: layout.v_offset,
+                        source_stride: layout.v_stride as usize,
+                        row_bytes: layout.uv_width as usize,
+                        rows: layout.uv_height as usize,
+                        extent: extent(layout.uv_width, layout.uv_height),
+                    });
+                }
+                planes
+            }
+            PixelFormat::Gray8 => vec![UploadPlane {
+                texture: yuv.tex_y.clone(),
+                source_offset: 0,
+                source_stride: frame.stride as usize,
+                row_bytes: frame.width as usize,
+                rows: frame.height as usize,
+                extent: extent(frame.width, frame.height),
+            }],
+            PixelFormat::ABGR | PixelFormat::BGRA => vec![UploadPlane {
+                texture: yuv.tex_y.clone(),
+                source_offset: 0,
+                source_stride: frame.stride as usize,
+                row_bytes: frame.width as usize * 4,
+                rows: frame.height as usize,
+                extent: extent(frame.width, frame.height),
+            }],
+            PixelFormat::RGB24
+            | PixelFormat::RGBA
+            | PixelFormat::BayerRGGB
+            | PixelFormat::BayerBGGR
+            | PixelFormat::BayerGRBG
+            | PixelFormat::BayerGBRG => return false,
+        };
+        self.stage_upload_planes(
+            device,
+            tex_id,
+            data,
+            planes,
+            Some((tex_id, frame.width, frame.height)),
+        )
+    }
 
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("yuv_convert_encoder"),
-        });
+    fn encode_pending_uploads(&self, encoder: &mut wgpu::CommandEncoder) -> Vec<UploadRecycle> {
+        let uploads = match self.pending_uploads.lock() {
+            Ok(mut pending) => std::mem::take(&mut *pending),
+            Err(_) => return Vec::new(),
+        };
+        let mut recycle = Vec::with_capacity(uploads.len());
 
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("yuv_convert_pass"),
-                timestamp_writes: None,
+        for upload in uploads {
+            if upload
+                .state
+                .compare_exchange(
+                    UPLOAD_SLOT_STAGED,
+                    UPLOAD_SLOT_IN_FLIGHT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            for copy in &upload.copies {
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &upload.buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: copy.buffer_offset,
+                            bytes_per_row: Some(copy.bytes_per_row),
+                            rows_per_image: None,
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &copy.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    copy.extent,
+                );
+            }
+
+            if let Some((tex_id, width, height)) = upload.yuv_conversion
+                && let (Some(pipeline), Some(textures)) = (
+                    self.yuv_compute_pipeline.as_ref(),
+                    self.yuv_textures.get(&tex_id),
+                )
+                && let Some(bind_group) = textures.convert_bind_group.as_ref()
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("yuv_convert_pass"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, Some(bind_group), &[]);
+                pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+            }
+
+            recycle.push(UploadRecycle {
+                buffer: upload.buffer,
+                capacity: upload.capacity,
+                state: upload.state,
             });
-
-            compute_pass.set_pipeline(compute_pipeline);
-            compute_pass.set_bind_group(0, Some(bind_group), &[]);
-
-            // Dispatch: workgroup size is 16x16, so divide and round up
-            let workgroup_x = frame.width.div_ceil(16);
-            let workgroup_y = frame.height.div_ceil(16);
-            compute_pass.dispatch_workgroups(workgroup_x, workgroup_y, 1);
         }
+        recycle
+    }
 
-        queue.submit(std::iter::once(encoder.finish()));
-
-        let convert_time = convert_start.elapsed();
-        if frame.id.is_multiple_of(60) {
-            tracing::debug!(
-                format = ?frame.format,
-                width = frame.width,
-                height = frame.height,
-                convert_us = convert_time.as_micros(),
-                "YUV→RGBA GPU conversion"
-            );
+    fn remap_uploads(uploads: Vec<UploadRecycle>) {
+        for upload in uploads {
+            upload
+                .buffer
+                .map_async(wgpu::MapMode::Write, 0..upload.capacity, move |result| {
+                    upload.state.store(
+                        if result.is_ok() {
+                            UPLOAD_SLOT_READY
+                        } else {
+                            UPLOAD_SLOT_FAILED
+                        },
+                        Ordering::Release,
+                    );
+                });
         }
     }
 
@@ -2913,6 +2988,12 @@ impl VideoPipeline {
             view_formats: &[],
         });
         let tex_v_view = tex_v.create_view(&wgpu::TextureViewDescriptor::default());
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("yuv_convert_uniform_buffer"),
+            size: std::mem::size_of::<YuvConvertParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         self.yuv_textures.insert(
             video_id,
@@ -2929,6 +3010,7 @@ impl VideoPipeline {
                 uv_height,
                 format,
                 convert_bind_group: None, // Created lazily on first use
+                uniform_buffer,
             },
         );
 
@@ -3604,6 +3686,186 @@ impl VideoPipeline {
 mod tests {
     use super::*;
     use crate::test_gpu::{headless_device, skip_no_gpu};
+
+    #[test]
+    fn upload_rows_are_padded_without_copying_source_padding() {
+        let source = [
+            1, 2, 3, 4, 5, 6, 99, 99, // row 0: six bytes plus source padding
+            7, 8, 9, 10, 11, 12, 99, 99, // row 1
+        ];
+        let destination_stride = padded_copy_bytes_per_row(6);
+        let mut destination = vec![0xaa; destination_stride * 2];
+
+        copy_rows_to_upload(&source, 0, 8, 6, 2, &mut destination, 0, destination_stride).unwrap();
+
+        assert_eq!(&destination[..6], &[1, 2, 3, 4, 5, 6]);
+        assert!(
+            destination[6..destination_stride]
+                .iter()
+                .all(|byte| *byte == 0xaa)
+        );
+        assert_eq!(
+            &destination[destination_stride..destination_stride + 6],
+            &[7, 8, 9, 10, 11, 12]
+        );
+        assert!(
+            destination[destination_stride + 6..]
+                .iter()
+                .all(|byte| *byte == 0xaa)
+        );
+    }
+
+    #[test]
+    fn upload_rows_do_not_require_padding_after_the_final_source_row() {
+        let source = [1, 2, 3, 4, 5, 6, 99, 99, 7, 8, 9, 10, 11, 12];
+        let destination_stride = padded_copy_bytes_per_row(6);
+        let mut destination = vec![0; destination_stride * 2];
+
+        assert!(
+            copy_rows_to_upload(&source, 0, 8, 6, 2, &mut destination, 0, destination_stride,)
+                .is_some()
+        );
+        assert_eq!(
+            &destination[destination_stride..destination_stride + 6],
+            &[7, 8, 9, 10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn reusable_upload_buffer_copies_texture_and_remaps_after_submission() {
+        let Some((_gpu_test, device, queue)) = headless_device() else {
+            skip_no_gpu("reusable_upload_buffer_copies_texture_and_remaps_after_submission");
+            return;
+        };
+        const WIDTH: u32 = 3;
+        const HEIGHT: u32 = 2;
+        const SOURCE_STRIDE: usize = 16;
+        const READBACK_STRIDE: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+        let mut pipeline = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("reusable upload test texture"),
+            size: wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let source = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 99, 99, 99, 99, // row 0
+            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, // row 1
+        ];
+
+        assert!(pipeline.stage_upload_planes(
+            &device,
+            VIDEO_ID_NORMAL,
+            &source,
+            vec![UploadPlane {
+                texture: texture.clone(),
+                source_offset: 0,
+                source_stride: SOURCE_STRIDE,
+                row_bytes: WIDTH as usize * 4,
+                rows: HEIGHT as usize,
+                extent: wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+            }],
+            None,
+        ));
+
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("reusable upload test readback"),
+            size: u64::from(READBACK_STRIDE * HEIGHT),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("reusable upload test encoder"),
+        });
+        let recycle = pipeline.encode_pending_uploads(&mut encoder);
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(READBACK_STRIDE),
+                    rows_per_image: Some(HEIGHT),
+                },
+            },
+            wgpu::Extent3d {
+                width: WIDTH,
+                height: HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit([encoder.finish()]);
+        VideoPipeline::remap_uploads(recycle);
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = slice.get_mapped_range();
+        assert_eq!(&data[..12], &source[..12]);
+        assert_eq!(
+            &data[READBACK_STRIDE as usize..READBACK_STRIDE as usize + 12],
+            &source[SOURCE_STRIDE..]
+        );
+        drop(data);
+        readback.unmap();
+
+        assert!(
+            pipeline.upload_rings[&VIDEO_ID_NORMAL]
+                .slots
+                .iter()
+                .any(|slot| slot.state.load(Ordering::Acquire) == UPLOAD_SLOT_READY)
+        );
+    }
+
+    #[test]
+    fn upload_submission_does_not_depend_on_a_render_call() {
+        let Some((_gpu_test, device, queue)) = headless_device() else {
+            skip_no_gpu("upload_submission_does_not_depend_on_a_render_call");
+            return;
+        };
+        let mut pipeline = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+
+        pipeline.upload(
+            &device,
+            &queue,
+            VideoFrame {
+                id: VIDEO_ID_NORMAL,
+                width: 2,
+                height: 2,
+                data: FrameData::from_owned_vec(vec![255; 16]),
+                format: PixelFormat::RGBA,
+                stride: 8,
+                yuv_planes: None,
+            },
+        );
+
+        assert!(pipeline.pending_uploads.lock().unwrap().is_empty());
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(
+            pipeline.upload_rings[&VIDEO_ID_NORMAL]
+                .slots
+                .iter()
+                .any(|slot| slot.state.load(Ordering::Acquire) == UPLOAD_SLOT_READY)
+        );
+    }
 
     /// `ViewportUniform` is mirrored by hand in six WGSL files
     /// (`video_shader.wgsl`, `video_shader_blur.wgsl`, `video_shader_kawase.wgsl`,
