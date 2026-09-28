@@ -5,56 +5,243 @@
 
 use gstreamer::buffer::{MappedBuffer, Readable};
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
-/// Frame data storage - either pre-copied bytes or zero-copy GStreamer buffer
-///
-/// This enum allows frames to be passed around without copying the underlying
-/// pixel data when coming from GStreamer pipelines. The `Mapped` variant keeps
-/// the GStreamer buffer mapped and alive until all references are dropped.
+static NEXT_FRAME_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameIdentity {
+    pub(crate) pointer: usize,
+    pub(crate) generation: u64,
+}
+
+struct FrameDataPoolInner {
+    free: Mutex<Vec<Vec<u8>>>,
+    max_cached: usize,
+}
+
+impl FrameDataPoolInner {
+    fn return_buffer(&self, mut data: Vec<u8>) {
+        data.clear();
+        let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
+        if free.len() < self.max_cached {
+            free.push(data);
+        }
+    }
+}
+
 #[derive(Clone)]
-pub enum FrameData {
-    /// Pre-copied bytes (used for photo capture, file sources, tests, etc.)
+pub(crate) struct FrameDataPool {
+    inner: Arc<FrameDataPoolInner>,
+}
+
+impl FrameDataPool {
+    pub(crate) fn new(max_cached: usize) -> Self {
+        Self {
+            inner: Arc::new(FrameDataPoolInner {
+                free: Mutex::new(Vec::with_capacity(max_cached)),
+                max_cached,
+            }),
+        }
+    }
+
+    pub(crate) fn acquire(&self, minimum_capacity: usize) -> FrameDataLease {
+        let mut data = self
+            .inner
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(minimum_capacity));
+        if data.capacity() < minimum_capacity {
+            data.reserve(minimum_capacity);
+        }
+        data.clear();
+        FrameDataLease {
+            data: Some(data),
+            pool: Arc::clone(&self.inner),
+            generation: NEXT_FRAME_GENERATION.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(test)]
+    fn cached_count(&self) -> usize {
+        self.inner
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+pub(crate) struct FrameDataLease {
+    data: Option<Vec<u8>>,
+    pool: Arc<FrameDataPoolInner>,
+    generation: u64,
+}
+
+impl FrameDataLease {
+    pub(crate) fn resize(&mut self, new_len: usize, value: u8) {
+        self.data
+            .as_mut()
+            .expect("frame lease is live")
+            .resize(new_len, value);
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.data
+            .as_mut()
+            .expect("frame lease is live")
+            .as_mut_slice()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_ptr(&self) -> *const u8 {
+        self.data.as_ref().expect("frame lease is live").as_ptr()
+    }
+
+    pub(crate) fn freeze(mut self) -> FrameData {
+        let data = self.data.take().expect("frame lease is live");
+        FrameData::from_pooled(PooledFrameData {
+            data: Some(data),
+            pool: Arc::clone(&self.pool),
+            generation: self.generation,
+        })
+    }
+}
+
+impl Drop for FrameDataLease {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            self.pool.return_buffer(data);
+        }
+    }
+}
+
+struct PooledFrameData {
+    data: Option<Vec<u8>>,
+    pool: Arc<FrameDataPoolInner>,
+    generation: u64,
+}
+
+impl PooledFrameData {
+    fn as_slice(&self) -> &[u8] {
+        self.data.as_deref().unwrap_or_default()
+    }
+}
+
+impl Drop for PooledFrameData {
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            self.pool.return_buffer(data);
+        }
+    }
+}
+
+/// Shared frame bytes with an opaque storage representation.
+///
+/// Callers can clone and read frame data without depending on whether the bytes
+/// are copied, Vec-backed, pooled, or mapped from GStreamer.
+#[derive(Clone)]
+pub struct FrameData {
+    storage: FrameDataStorage,
+}
+
+#[derive(Clone)]
+enum FrameDataStorage {
     Copied(Arc<[u8]>),
-    /// Zero-copy mapped GStreamer buffer - no data copy, just reference counting
+    Owned(Arc<Vec<u8>>),
+    Pooled(Arc<PooledFrameData>),
     Mapped(Arc<MappedBuffer<Readable>>),
 }
 
 impl FrameData {
-    /// Create FrameData from a mapped GStreamer buffer (zero-copy)
-    pub fn from_mapped_buffer(buffer: MappedBuffer<Readable>) -> Self {
-        FrameData::Mapped(Arc::new(buffer))
-    }
-
-    /// Get the length of the frame data in bytes
-    pub fn len(&self) -> usize {
-        match self {
-            FrameData::Copied(data) => data.len(),
-            FrameData::Mapped(buf) => buf.len(),
+    /// Store already-shared bytes.
+    pub fn from_copied(data: Arc<[u8]>) -> Self {
+        Self {
+            storage: FrameDataStorage::Copied(data),
         }
     }
 
-    /// Check if the frame data is empty
+    /// Take ownership of a pixel buffer without moving its contents.
+    pub fn from_owned_vec(data: Vec<u8>) -> Self {
+        Self {
+            storage: FrameDataStorage::Owned(Arc::new(data)),
+        }
+    }
+
+    /// Create FrameData from a mapped GStreamer buffer (zero-copy).
+    pub fn from_mapped_buffer(buffer: MappedBuffer<Readable>) -> Self {
+        Self {
+            storage: FrameDataStorage::Mapped(Arc::new(buffer)),
+        }
+    }
+
+    fn from_pooled(data: PooledFrameData) -> Self {
+        Self {
+            storage: FrameDataStorage::Pooled(Arc::new(data)),
+        }
+    }
+
+    pub(crate) fn upload_identity(&self) -> FrameIdentity {
+        FrameIdentity {
+            pointer: self.as_ptr() as usize,
+            generation: match &self.storage {
+                FrameDataStorage::Pooled(data) => data.generation,
+                FrameDataStorage::Copied(_)
+                | FrameDataStorage::Owned(_)
+                | FrameDataStorage::Mapped(_) => 0,
+            },
+        }
+    }
+
+    /// Get the length of the frame data in bytes.
+    pub fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    /// Check if the frame data is empty.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    fn clone_for_background(&self) -> Self {
+        match &self.storage {
+            FrameDataStorage::Copied(data) => Self::from_copied(Arc::clone(data)),
+            FrameDataStorage::Owned(data) => Self {
+                storage: FrameDataStorage::Owned(Arc::clone(data)),
+            },
+            FrameDataStorage::Pooled(data) => Self {
+                storage: FrameDataStorage::Pooled(Arc::clone(data)),
+            },
+            FrameDataStorage::Mapped(buffer) => {
+                Self::from_copied(Arc::from(buffer.as_ref() as &[u8]))
+            }
+        }
     }
 }
 
 impl std::fmt::Debug for FrameData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameData::Copied(data) => write!(f, "FrameData::Copied({} bytes)", data.len()),
-            FrameData::Mapped(buf) => write!(f, "FrameData::Mapped({} bytes)", buf.len()),
-        }
+        let kind = match &self.storage {
+            FrameDataStorage::Copied(_) => "Copied",
+            FrameDataStorage::Owned(_) => "Owned",
+            FrameDataStorage::Pooled(_) => "Pooled",
+            FrameDataStorage::Mapped(_) => "Mapped",
+        };
+        write!(f, "FrameData::{kind}({} bytes)", self.len())
     }
 }
 
 impl AsRef<[u8]> for FrameData {
     fn as_ref(&self) -> &[u8] {
-        match self {
-            FrameData::Copied(data) => data.as_ref(),
-            FrameData::Mapped(buf) => buf.as_slice(),
+        match &self.storage {
+            FrameDataStorage::Copied(data) => data.as_ref(),
+            FrameDataStorage::Owned(data) => data.as_slice(),
+            FrameDataStorage::Pooled(data) => data.as_slice(),
+            FrameDataStorage::Mapped(buffer) => buffer.as_slice(),
         }
     }
 }
@@ -624,15 +811,7 @@ impl CameraFrame {
     /// Use this method before sending frames to background tasks that may outlive
     /// the pipeline.
     pub fn to_copied(&self) -> Self {
-        let copied_data = match &self.data {
-            FrameData::Copied(data) => FrameData::Copied(Arc::clone(data)),
-            FrameData::Mapped(buffer) => {
-                // Copy the mapped buffer data to owned memory
-                let slice: &[u8] = buffer.as_ref();
-                let bytes: Arc<[u8]> = Arc::from(slice);
-                FrameData::Copied(bytes)
-            }
-        };
+        let copied_data = self.data.clone_for_background();
 
         Self {
             width: self.width,
@@ -709,3 +888,74 @@ impl std::fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{FrameData, FrameDataPool};
+
+    #[test]
+    fn owned_vec_keeps_its_pixel_allocation() {
+        let pixels = vec![1, 2, 3, 4];
+        let original_ptr = pixels.as_ptr();
+
+        let data = FrameData::from_owned_vec(pixels);
+
+        assert_eq!(data.as_ptr(), original_ptr);
+        assert_eq!(data.as_ref(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn pooled_frame_reuses_storage_only_after_the_last_owner_drops() {
+        let pool = FrameDataPool::new(1);
+        let mut lease = pool.acquire(4);
+        lease.resize(4, 0);
+        lease.as_mut_slice().copy_from_slice(&[1, 2, 3, 4]);
+        let original_ptr = lease.as_ptr();
+        let data = lease.freeze();
+        let clone = data.clone();
+
+        assert_eq!(data.as_ptr(), original_ptr);
+        assert_eq!(pool.cached_count(), 0);
+        drop(data);
+        assert_eq!(pool.cached_count(), 0);
+        drop(clone);
+        assert_eq!(pool.cached_count(), 1);
+
+        let reused = pool.acquire(4);
+        assert_eq!(reused.as_ptr(), original_ptr);
+    }
+
+    #[test]
+    fn pooled_frame_identity_changes_when_storage_is_reused() {
+        let pool = FrameDataPool::new(1);
+        let first = pool.acquire(4).freeze();
+        let first_identity = first.upload_identity();
+        drop(first);
+
+        let second = pool.acquire(4).freeze();
+        assert_eq!(second.as_ptr(), first_identity.pointer as *const u8);
+        assert_ne!(second.upload_identity(), first_identity);
+    }
+
+    #[test]
+    fn pooled_frame_generations_do_not_repeat_across_pools() {
+        let first = FrameDataPool::new(1).acquire(4).freeze();
+        let second = FrameDataPool::new(1).acquire(4).freeze();
+
+        assert_ne!(
+            first.upload_identity().generation,
+            second.upload_identity().generation
+        );
+    }
+
+    #[test]
+    fn frame_pool_does_not_cache_more_than_its_limit() {
+        let pool = FrameDataPool::new(1);
+        let first = pool.acquire(4).freeze();
+        let second = pool.acquire(4).freeze();
+        drop(first);
+        drop(second);
+
+        assert_eq!(pool.cached_count(), 1);
+    }
+}

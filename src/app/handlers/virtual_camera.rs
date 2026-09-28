@@ -194,7 +194,7 @@ impl AppModel {
                                 let rgba_frame = CameraFrame {
                                     width: latest_frame.width,
                                     height: latest_frame.height,
-                                    data: FrameData::Copied(rgba_arc),
+                                    data: FrameData::from_copied(rgba_arc),
                                     format: PixelFormat::RGBA,
                                     stride: latest_frame.width * 4,
                                     yuv_planes: None,

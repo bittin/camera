@@ -300,7 +300,7 @@ mod tests {
             current_frame: Some(Arc::new(CameraFrame {
                 width: 1280,
                 height: 960,
-                data: FrameData::Copied(vec![0u8; 1280 * 960 * 4].into()),
+                data: FrameData::from_copied(vec![0u8; 1280 * 960 * 4].into()),
                 format: PixelFormat::RGBA,
                 stride: 1280 * 4,
                 yuv_planes: None,
