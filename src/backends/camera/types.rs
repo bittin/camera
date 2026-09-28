@@ -17,11 +17,18 @@ use std::time::Instant;
 pub enum FrameData {
     /// Pre-copied bytes (used for photo capture, file sources, tests, etc.)
     Copied(Arc<[u8]>),
+    /// Owned pixel storage whose allocation can be moved in without copying.
+    Owned(Arc<Vec<u8>>),
     /// Zero-copy mapped GStreamer buffer - no data copy, just reference counting
     Mapped(Arc<MappedBuffer<Readable>>),
 }
 
 impl FrameData {
+    /// Take ownership of a pixel buffer without moving its contents.
+    pub fn from_owned_vec(data: Vec<u8>) -> Self {
+        FrameData::Owned(Arc::new(data))
+    }
+
     /// Create FrameData from a mapped GStreamer buffer (zero-copy)
     pub fn from_mapped_buffer(buffer: MappedBuffer<Readable>) -> Self {
         FrameData::Mapped(Arc::new(buffer))
@@ -31,6 +38,7 @@ impl FrameData {
     pub fn len(&self) -> usize {
         match self {
             FrameData::Copied(data) => data.len(),
+            FrameData::Owned(data) => data.len(),
             FrameData::Mapped(buf) => buf.len(),
         }
     }
@@ -45,6 +53,7 @@ impl std::fmt::Debug for FrameData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameData::Copied(data) => write!(f, "FrameData::Copied({} bytes)", data.len()),
+            FrameData::Owned(data) => write!(f, "FrameData::Owned({} bytes)", data.len()),
             FrameData::Mapped(buf) => write!(f, "FrameData::Mapped({} bytes)", buf.len()),
         }
     }
@@ -54,6 +63,7 @@ impl AsRef<[u8]> for FrameData {
     fn as_ref(&self) -> &[u8] {
         match self {
             FrameData::Copied(data) => data.as_ref(),
+            FrameData::Owned(data) => data.as_slice(),
             FrameData::Mapped(buf) => buf.as_slice(),
         }
     }
@@ -626,6 +636,7 @@ impl CameraFrame {
     pub fn to_copied(&self) -> Self {
         let copied_data = match &self.data {
             FrameData::Copied(data) => FrameData::Copied(Arc::clone(data)),
+            FrameData::Owned(data) => FrameData::Owned(Arc::clone(data)),
             FrameData::Mapped(buffer) => {
                 // Copy the mapped buffer data to owned memory
                 let slice: &[u8] = buffer.as_ref();
@@ -709,3 +720,19 @@ impl std::fmt::Display for BackendError {
 }
 
 impl std::error::Error for BackendError {}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameData;
+
+    #[test]
+    fn owned_vec_keeps_its_pixel_allocation() {
+        let pixels = vec![1, 2, 3, 4];
+        let original_ptr = pixels.as_ptr();
+
+        let data = FrameData::from_owned_vec(pixels);
+
+        assert_eq!(data.as_ptr(), original_ptr);
+        assert_eq!(data.as_ref(), &[1, 2, 3, 4]);
+    }
+}

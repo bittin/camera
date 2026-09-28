@@ -172,7 +172,7 @@ struct FrameLayout {
 /// stride and dimensions so that consumers (terminal preview, QR detector,
 /// burst mode) don't need format-specific fallback calculations.
 fn build_camera_frame(
-    data: Arc<[u8]>,
+    data: FrameData,
     layout: FrameLayout,
     captured_at: Instant,
     sensor_timestamp_ns: Option<u64>,
@@ -183,7 +183,7 @@ fn build_camera_frame(
     CameraFrame {
         width: layout.width,
         height: layout.height,
-        data: FrameData::Copied(data),
+        data,
         format: layout.format,
         stride: layout.stride,
         yuv_planes,
@@ -278,16 +278,16 @@ fn process_buffer(
         return None;
     }
 
-    let data: Arc<[u8]> = if planes.len() == 1 {
+    let data = if planes.len() == 1 {
         let bytes = used[0].min(planes[0].len());
-        Arc::from(&planes[0][..bytes])
+        planes[0][..bytes].to_vec()
     } else {
         let mut combined = Vec::with_capacity(total_bytes);
         for (plane, &bytes) in planes.iter().zip(used.iter()) {
             let bytes = bytes.min(plane.len());
             combined.extend_from_slice(&plane[..bytes]);
         }
-        Arc::from(combined)
+        combined
     };
 
     let stride = if config_stride > 0 {
@@ -298,7 +298,7 @@ fn process_buffer(
 
     let sensor_timestamp_ns = buf.metadata().map(|m| m.timestamp());
     Some(build_camera_frame(
-        data,
+        FrameData::from_owned_vec(data),
         FrameLayout {
             width: size.width,
             height: size.height,
@@ -935,7 +935,7 @@ fn run_capture_loop(
                         }
                     }
                 } else {
-                    let data: Arc<[u8]> = Arc::from(data_slice);
+                    let data = FrameData::from_owned_vec(combined_data);
 
                     let stride = if formats.vf_stride > 0 {
                         formats.vf_stride
