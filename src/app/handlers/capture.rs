@@ -1157,7 +1157,6 @@ impl AppModel {
     }
 
     pub(crate) fn handle_clear_capture_animation(&mut self) -> Task<cosmic::Action<Message>> {
-        self.is_capturing = false;
         if self.recording.is_recording() {
             self.animate_photo_btn_scale(1.0);
         } else {

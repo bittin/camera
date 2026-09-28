@@ -745,11 +745,19 @@ impl AppModel {
 
     pub(crate) fn handle_toggle_qr_detection(&mut self) -> Task<cosmic::Action<Message>> {
         self.qr_detection_enabled = !self.qr_detection_enabled;
+        self.invalidate_qr_detection();
         info!(enabled = self.qr_detection_enabled, "QR detection toggled");
 
         // Clear detections when disabling
         if !self.qr_detection_enabled {
             self.qr_detections.clear();
+            self.qr_detections_shown_at = None;
+        }
+
+        if self.qr_detection_enabled
+            && let Some(frame) = self.current_frame.clone()
+        {
+            return self.start_qr_detection(&frame);
         }
 
         Task::none()
@@ -757,14 +765,35 @@ impl AppModel {
 
     pub(crate) fn handle_qr_detections_updated(
         &mut self,
+        generation: u64,
         detections: Vec<crate::app::frame_processor::QrDetection>,
     ) -> Task<cosmic::Action<Message>> {
         let count = detections.len();
-        self.qr_detections = detections;
-        self.last_qr_detection_time = Some(std::time::Instant::now());
+        let is_current = self
+            .qr_detection_scheduler
+            .finish(generation, std::time::Instant::now());
 
-        if count > 0 {
-            info!(count, "QR detections updated");
+        if is_current && self.qr_detection_enabled && self.qr_detection_allowed() {
+            self.pending_qr_frame = None;
+            let now = std::time::Instant::now();
+            if count > 0 {
+                self.qr_detections = detections;
+                self.qr_detections_shown_at = Some(now);
+                info!(count, "QR detections updated");
+            } else if self.qr_detections.is_empty()
+                || crate::app::frame_processor::tasks::qr_detector::minimum_overlay_time_elapsed(
+                    self.qr_detections_shown_at,
+                    now,
+                )
+            {
+                self.qr_detections.clear();
+                self.qr_detections_shown_at = None;
+            }
+        } else if self.qr_detection_enabled
+            && self.qr_detection_allowed()
+            && let Some(frame) = self.pending_qr_frame.take()
+        {
+            return self.start_qr_detection(&frame);
         }
 
         Task::none()

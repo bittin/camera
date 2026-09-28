@@ -332,9 +332,10 @@ impl AppModel {
 
             // ===== QR Code Detection =====
             Message::ToggleQrDetection => self.handle_toggle_qr_detection(),
-            Message::QrDetectionsUpdated(detections) => {
-                self.handle_qr_detections_updated(detections)
-            }
+            Message::QrDetectionsUpdated {
+                generation,
+                detections,
+            } => self.handle_qr_detections_updated(generation, detections),
             Message::QrOpenUrl(url) => self.handle_qr_open_url(url),
             Message::QrConnectWifi {
                 ssid,

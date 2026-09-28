@@ -7,4 +7,5 @@
 
 pub mod qr_detector;
 
+pub(crate) use qr_detector::QrDetectionScheduler;
 pub use qr_detector::QrDetector;

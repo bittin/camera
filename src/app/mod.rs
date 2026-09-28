@@ -627,7 +627,9 @@ impl cosmic::Application for AppModel {
             // QR detection enabled by default
             qr_detection_enabled: true,
             qr_detections: Vec::new(),
-            last_qr_detection_time: None,
+            qr_detections_shown_at: None,
+            qr_detection_scheduler: Default::default(),
+            pending_qr_frame: None,
             // Privacy cover detection
             privacy_cover_closed: false,
             idle_inhibit: None,
@@ -1537,29 +1539,6 @@ impl cosmic::Application for AppModel {
             }),
         );
 
-        // QR detection subscription (samples frames at 1 FPS)
-        let should_detect_qr = self.qr_detection_enabled
-            && self
-                .last_qr_detection_time
-                .map(|t| t.elapsed() >= std::time::Duration::from_secs(1))
-                .unwrap_or(true);
-
-        let qr_detection_sub = match (should_detect_qr, &self.current_frame) {
-            (true, Some(frame)) => {
-                // Copy frame for background task - mapped buffers become invalid when pipeline stops
-                let frame = Arc::new(frame.to_copied());
-                subscription_with_id(
-                    ("qr_detection", frame.captured_at),
-                    cosmic::iced::stream::channel(1, async move |mut output| {
-                        let detector = frame_processor::tasks::QrDetector::new();
-                        let detections = detector.detect(frame).await;
-                        let _ = output.send(Message::QrDetectionsUpdated(detections)).await;
-                    }),
-                )
-            }
-            _ => Subscription::none(),
-        };
-
         // File source preview subscription - receives frames from file streaming thread
         let file_source_preview_sub = if let Some(ref receiver) = self.file_source_preview_receiver
         {
@@ -1819,7 +1798,6 @@ impl cosmic::Application for AppModel {
             camera_sub,
             hotplug_sub,
             audio_hotplug_sub,
-            qr_detection_sub,
             file_source_preview_sub,
             timer_animation_sub,
             privacy_polling_sub,

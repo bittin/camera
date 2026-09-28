@@ -54,6 +54,7 @@ impl AppModel {
             // but don't send VirtualCameraStopped - the streaming thread will send it
             // when it actually stops. This avoids duplicate messages.
             self.virtual_camera = VirtualCameraState::Idle;
+            self.invalidate_qr_detection();
 
             // Clear current frame to avoid accessing invalid mapped buffers
             // The frame might contain a GStreamer mapped buffer that becomes invalid
@@ -820,6 +821,7 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         if let Some(ref source) = file_source {
             info!(?source, "Virtual camera file source selected");
+            self.invalidate_qr_detection();
 
             // Get the path to load preview from
             let path = match source {
@@ -878,6 +880,7 @@ impl AppModel {
         frame: Option<Arc<crate::backends::camera::types::CameraFrame>>,
         duration: Option<f64>,
     ) -> Task<cosmic::Action<Message>> {
+        let mut qr_task = Task::none();
         if let Some(frame) = frame {
             info!(
                 width = frame.width,
@@ -885,6 +888,8 @@ impl AppModel {
                 ?duration,
                 "File source preview loaded"
             );
+            self.invalidate_qr_detection();
+            qr_task = self.start_qr_detection(&frame);
             self.current_frame = Some(frame);
             self.current_frame_is_file_source = true;
             // Reset aspect ratio to Native so the file source displays uncropped
@@ -911,11 +916,11 @@ impl AppModel {
             // the existing pipeline instead of spinning a new one per scrub
             // via `load_video_frame_at_position`.
             if matches!(self.virtual_camera_file_source, Some(FileSource::Video(_))) {
-                return self.start_video_preview_playback();
+                return Task::batch([qr_task, self.start_video_preview_playback()]);
             }
         }
 
-        Task::none()
+        qr_task
     }
 
     pub(crate) fn handle_clear_virtual_camera_file(&mut self) -> Task<cosmic::Action<Message>> {
@@ -927,6 +932,7 @@ impl AppModel {
         self.video_file_progress = None;
         self.video_preview_seek_position = 0.0;
         self.video_file_paused = false;
+        self.invalidate_qr_detection();
         // Clear current frame so camera subscription can update it with camera feed
         self.current_frame = None;
         Task::none()
@@ -946,6 +952,7 @@ impl AppModel {
         &mut self,
         position: f64,
     ) -> Task<cosmic::Action<Message>> {
+        self.invalidate_qr_detection();
         // Always store the seek position for when streaming starts
         self.video_preview_seek_position = position;
 
@@ -1007,8 +1014,10 @@ impl AppModel {
                 height = frame.height,
                 "Seek preview frame loaded"
             );
+            let qr_task = self.start_qr_detection(&frame);
             self.current_frame = Some(frame);
             self.current_frame_is_file_source = true;
+            return qr_task;
         }
         Task::none()
     }
@@ -1042,11 +1051,12 @@ impl AppModel {
         duration: f64,
         progress: f64,
     ) -> Task<cosmic::Action<Message>> {
+        let qr_task = self.start_qr_detection(&frame);
         self.current_frame = Some(frame);
         self.current_frame_is_file_source = true;
         self.video_file_progress = Some((position, duration, progress));
         self.video_preview_seek_position = position;
-        Task::none()
+        qr_task
     }
 
     pub(crate) fn handle_video_preview_playback_stopped(

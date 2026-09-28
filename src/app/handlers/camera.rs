@@ -12,6 +12,60 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 impl AppModel {
+    pub(crate) fn qr_detection_allowed(&self) -> bool {
+        !self.is_capturing
+            && !self.recording.is_recording()
+            && !self.timelapse.is_active()
+            && !self.burst_mode.is_collecting_frames()
+            && self.burst_mode.stage != crate::app::state::BurstModeStage::Processing
+    }
+
+    pub(crate) fn invalidate_qr_detection(&mut self) {
+        self.qr_detection_scheduler.invalidate();
+        self.pending_qr_frame = None;
+        self.qr_detections.clear();
+        self.qr_detections_shown_at = None;
+    }
+
+    pub(crate) fn start_qr_detection(
+        &mut self,
+        frame: &Arc<crate::backends::camera::types::CameraFrame>,
+    ) -> Task<cosmic::Action<Message>> {
+        if !self.qr_detection_enabled || !self.qr_detection_allowed() {
+            return Task::none();
+        }
+
+        let Some(generation) = self
+            .qr_detection_scheduler
+            .try_start(true, std::time::Instant::now())
+        else {
+            if self
+                .qr_detection_scheduler
+                .has_stale_detection_in_progress()
+            {
+                self.pending_qr_frame = Some(Arc::new(frame.to_copied()));
+            }
+            return Task::none();
+        };
+
+        self.pending_qr_frame = None;
+        // Mapped camera buffers may be reused while detection is running.
+        let frame = Arc::new(frame.to_copied());
+        Task::perform(
+            async move {
+                crate::app::frame_processor::tasks::QrDetector::new()
+                    .detect(frame)
+                    .await
+            },
+            move |detections| {
+                cosmic::Action::App(Message::QrDetectionsUpdated {
+                    generation,
+                    detections,
+                })
+            },
+        )
+    }
+
     /// Trigger haptic feedback if enabled and available.
     pub(crate) fn haptic_tap(&self) {
         if self.config.haptic_feedback {
@@ -90,6 +144,7 @@ impl AppModel {
     /// won't restart prematurely), and after a brief delay calls
     /// `enumerate_cameras()` which delivers its result via `CameraListChanged`.
     fn stop_and_reenumerate(&mut self) -> Task<cosmic::Action<Message>> {
+        self.invalidate_qr_detection();
         self.camera_cancel_flag
             .store(true, std::sync::atomic::Ordering::Release);
         self.camera_cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -117,6 +172,7 @@ impl AppModel {
     /// If the target camera was added via hotplug and has no libcamera path yet,
     /// a full re-enumeration is performed first to discover the correct path.
     fn do_camera_switch(&mut self, new_index: usize) -> Task<cosmic::Action<Message>> {
+        self.invalidate_qr_detection();
         // If the target camera has no libcamera path (hotplug placeholder),
         // we need a full re-enumeration first.
         let needs_enumeration = self
@@ -322,7 +378,9 @@ impl AppModel {
             self.current_frame = Some(Arc::clone(&frame));
             self.current_frame_is_file_source = is_file_source;
             self.current_frame_rotation = frame_rotation;
-            return Task::batch([task.map(cosmic::Action::App), exposure_task]);
+            self.invalidate_qr_detection();
+            let qr_task = self.start_qr_detection(&frame);
+            return Task::batch([task.map(cosmic::Action::App), exposure_task, qr_task]);
         }
 
         // During HDR+ processing, the camera stream is stopped.
@@ -343,17 +401,22 @@ impl AppModel {
             );
 
             if collection_complete {
+                let qr_task = self.start_qr_detection(&frame);
                 self.current_frame = Some(frame);
                 self.current_frame_is_file_source = is_file_source;
                 self.current_frame_rotation = frame_rotation;
-                return Task::done(cosmic::Action::App(Message::BurstModeFramesCollected));
+                return Task::batch([
+                    Task::done(cosmic::Action::App(Message::BurstModeFramesCollected)),
+                    qr_task,
+                ]);
             }
         }
 
+        let qr_task = self.start_qr_detection(&frame);
         self.current_frame = Some(frame);
         self.current_frame_is_file_source = is_file_source;
         self.current_frame_rotation = frame_rotation;
-        exposure_task
+        Task::batch([exposure_task, qr_task])
     }
 
     pub(crate) fn handle_cameras_initialized(
@@ -739,6 +802,7 @@ impl AppModel {
         // snaps.
         let mut fit_anim_task = Task::none();
         if !self.config.virtual_camera_enabled && self.mode == CameraMode::Virtual {
+            self.invalidate_qr_detection();
             // Stop virtual camera if streaming
             if self.virtual_camera.is_streaming() {
                 if let Some(sender) = self.virtual_camera.take_stop_sender() {
