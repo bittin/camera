@@ -10,8 +10,8 @@
 
 use super::encoder_selection::{EncoderConfig, select_encoders, select_encoders_with_video};
 use super::muxer::{create_muxer, link_muxer_to_sink, link_video_to_muxer};
-use super::recorder::convert_frame_to_rgba;
-use crate::backends::camera::types::{CameraFrame, SensorRotation};
+use super::recorder::{apply_video_tags_to_muxer, convert_frame_to_rgba};
+use crate::backends::camera::types::CameraFrame;
 use crate::media::encoders::video::EncoderInfo;
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -23,6 +23,10 @@ use tracing::{error, info, warn};
 
 /// Target framerate for the output timelapse video.
 const TIMELAPSE_FPS: u32 = 30;
+
+fn timelapse_output_dimensions(width: u32, height: u32) -> (u32, u32) {
+    (width, height)
+}
 
 /// Run the timelapse encoding loop.
 ///
@@ -38,8 +42,7 @@ pub async fn run_timelapse_encoder(
     encoder_info: Option<EncoderInfo>,
     bitrate_kbps: Option<u32>,
     live_filter_code: Arc<AtomicU32>,
-    rotation: SensorRotation,
-    mirror_horizontal: bool,
+    capture_metadata: crate::pipelines::capture_metadata::CaptureMetadata,
 ) -> Result<String, String> {
     // Wait for the first frame so we know the dimensions.
     let first_frame = frame_rx
@@ -58,20 +61,7 @@ pub async fn run_timelapse_encoder(
         "Starting timelapse encoder"
     );
 
-    // --- rotation handling -----------------------------------------------------
-    let flip_direction = match rotation {
-        SensorRotation::Rotate90 => Some("90l"),
-        SensorRotation::Rotate180 => Some("180"),
-        SensorRotation::Rotate270 => Some("90r"),
-        SensorRotation::None => None,
-    };
-
-    // Swap output dimensions for 90°/270° rotations
-    let (out_width, out_height) = if rotation.swaps_dimensions() {
-        (height, width)
-    } else {
-        (width, height)
-    };
+    let (out_width, out_height) = timelapse_output_dimensions(width, height);
 
     // --- encoder selection ---------------------------------------------------
     let encoder_config = EncoderConfig {
@@ -123,46 +113,11 @@ pub async fn run_timelapse_encoder(
         .build()
         .map_err(|e| format!("videoconvert: {e}"))?;
 
-    // Optional videoflip for sensor rotation correction. If we also need to
-    // mirror horizontally, chain a second videoflip after rotation.
-    let videoflip = if let Some(direction) = flip_direction {
-        let flip = gst::ElementFactory::make("videoflip")
-            .property_from_str("video-direction", direction)
-            .build()
-            .map_err(|e| format!("videoflip: {e}"))?;
-
-        // Capsfilter after flip to enforce rotated dimensions
-        let capsfilter = gst::ElementFactory::make("capsfilter")
-            .property(
-                "caps",
-                gst::Caps::builder("video/x-raw")
-                    .field("width", out_width as i32)
-                    .field("height", out_height as i32)
-                    .build(),
-            )
-            .build()
-            .map_err(|e| format!("capsfilter: {e}"))?;
-
-        Some((flip, capsfilter))
-    } else {
-        None
-    };
-
-    let mirror_flip = if mirror_horizontal {
-        Some(
-            gst::ElementFactory::make("videoflip")
-                .property_from_str("video-direction", "horiz")
-                .build()
-                .map_err(|e| format!("videoflip(mirror): {e}"))?,
-        )
-    } else {
-        None
-    };
-
     let encoder_elem = video_enc.encoder;
     let parser = video_enc.parser;
     let muxer_elem = video_enc.muxer;
     let muxer_cfg = create_muxer(muxer_elem, final_output.clone())?;
+    apply_video_tags_to_muxer(&muxer_cfg.muxer, &capture_metadata);
 
     // Add elements
     pipeline
@@ -175,55 +130,24 @@ pub async fn run_timelapse_encoder(
         ])
         .map_err(|e| format!("pipeline add: {e}"))?;
 
-    if let Some((ref flip, ref capsfilter)) = videoflip {
-        pipeline
-            .add_many([flip, capsfilter])
-            .map_err(|e| format!("pipeline add flip/capsfilter: {e}"))?;
-    }
-    if let Some(ref mirror) = mirror_flip {
-        pipeline
-            .add_many([mirror])
-            .map_err(|e| format!("pipeline add mirror: {e}"))?;
-    }
-
     // Link
     appsrc
         .link(&videoconvert)
         .map_err(|_| "link appsrc→videoconvert")?;
 
-    // Chain: videoconvert → [videoflip → capsfilter →] [mirror →] encoder
-    let after_rotation: &gst::Element = if let Some((ref flip, ref capsfilter)) = videoflip {
-        videoconvert
-            .link(flip)
-            .map_err(|_| "link videoconvert→videoflip")?;
-        flip.link(capsfilter)
-            .map_err(|_| "link videoflip→capsfilter")?;
-        capsfilter
-    } else {
-        &videoconvert
-    };
-    let pre_encoder: &gst::Element = if let Some(ref mirror) = mirror_flip {
-        after_rotation
-            .link(mirror)
-            .map_err(|_| "link rotation→mirror")?;
-        mirror
-    } else {
-        after_rotation
-    };
-
     if let Some(ref p) = parser {
         pipeline
             .add(p)
             .map_err(|e| format!("pipeline add parser: {e}"))?;
-        pre_encoder
+        videoconvert
             .link(&encoder_elem)
-            .map_err(|_| "link pre_encoder→encoder")?;
+            .map_err(|_| "link videoconvert→encoder")?;
         encoder_elem.link(p).map_err(|_| "link encoder→parser")?;
         link_video_to_muxer(p, &muxer_cfg.muxer)?;
     } else {
-        pre_encoder
+        videoconvert
             .link(&encoder_elem)
-            .map_err(|_| "link pre_encoder→encoder")?;
+            .map_err(|_| "link videoconvert→encoder")?;
         link_video_to_muxer(&encoder_elem, &muxer_cfg.muxer)?;
     }
     link_muxer_to_sink(&muxer_cfg.muxer, &muxer_cfg.filesink)?;
@@ -361,4 +285,14 @@ fn push_rgba(
         .push_buffer(buffer)
         .map(|_| ())
         .map_err(|e| format!("push_buffer: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orientation_metadata_preserves_timelapse_pixel_dimensions() {
+        assert_eq!(timelapse_output_dimensions(1920, 1080), (1920, 1080));
+    }
 }

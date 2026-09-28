@@ -9,7 +9,8 @@
 
 use camera::backends::camera::CameraBackend;
 use camera::backends::camera::libcamera::{LibcameraBackend, create_pipeline};
-use camera::backends::camera::types::{CameraFormat, CameraFrame};
+use camera::backends::camera::types::{CameraFormat, CameraFrame, SensorRotation};
+use camera::pipelines::capture_metadata::{CaptureMetadata, CaptureOrientation};
 use camera::pipelines::photo::PhotoPipeline;
 use camera::pipelines::video::{
     AppsrcRecorderConfig, EncoderConfig, RecorderConfig, VideoRecorder,
@@ -18,6 +19,25 @@ use chrono::Local;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+fn capture_metadata_for_rotation(rotation: SensorRotation) -> CaptureMetadata {
+    CaptureMetadata {
+        captured_at: Some(Local::now().fixed_offset()),
+        orientation: CaptureOrientation::from_capture(rotation, false),
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_metadata_preserves_sensor_orientation() {
+        let metadata = capture_metadata_for_rotation(SensorRotation::Rotate90);
+        assert_eq!(metadata.orientation, CaptureOrientation::Rotate270);
+    }
+}
 
 /// List all available cameras
 pub fn list_cameras() -> Result<(), Box<dyn std::error::Error>> {
@@ -169,7 +189,8 @@ pub fn take_photo(
     let frame = frame.ok_or("Failed to capture frame from camera")?;
 
     // Use photo pipeline to save the image
-    let photo_pipeline = PhotoPipeline::new();
+    let mut photo_pipeline = PhotoPipeline::new();
+    photo_pipeline.set_camera_metadata(capture_metadata_for_rotation(camera.rotation));
 
     // Create async runtime for the pipeline
     let rt = tokio::runtime::Runtime::new()?;
@@ -294,7 +315,7 @@ pub fn record_video(
 
     // Create encoder config and video recorder
     let encoder_config = EncoderConfig::default();
-    let rotation = camera.rotation;
+    let capture_metadata = capture_metadata_for_rotation(camera.rotation);
 
     let rt = tokio::runtime::Runtime::new()?;
     let recorder = rt.block_on(async {
@@ -313,8 +334,7 @@ pub fn record_video(
                         audio_device: None,
                         audio_source_rate_hz: 0,
                         encoder_info: None,
-                        rotation,
-                        mirror_horizontal: false,
+                        capture_metadata,
                         audio_levels: Default::default(),
                     },
                     pixel_format,
@@ -429,7 +449,6 @@ pub fn process_burst_mode(
     input: Vec<PathBuf>,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use camera::backends::camera::types::SensorRotation;
     use camera::pipelines::photo::burst_mode::{
         BurstModeConfig, SaveOutputParams, process_burst_mode as run_burst_mode, save_output,
     };
@@ -501,6 +520,7 @@ pub fn process_burst_mode(
         exposure_time: None,
         iso: None,
         gain: None,
+        ..Default::default()
     };
 
     let output_path = rt.block_on(async {
@@ -512,9 +532,7 @@ pub fn process_burst_mode(
                 encoding_format: EncodingFormat::Jpeg,
                 camera_metadata,
                 filter: None,
-                rotation: SensorRotation::None,
                 filename_suffix: Some("_HDR+"),
-                mirror_horizontal: false,
             },
         )
         .await

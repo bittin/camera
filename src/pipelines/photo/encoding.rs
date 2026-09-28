@@ -10,7 +10,12 @@
 
 use super::processing::ProcessedImage;
 use crate::backends::camera::types::PixelFormat;
+use crate::pipelines::capture_metadata::CaptureMetadata;
+use chrono::{DateTime, FixedOffset};
 use image::RgbImage;
+use little_exif::exif_tag::ExifTag;
+use little_exif::filetype::FileExtension;
+use little_exif::metadata::Metadata;
 use std::path::PathBuf;
 use tracing::{debug, error, info, warn};
 
@@ -92,6 +97,7 @@ pub struct EncodedImage {
     pub format: EncodingFormat,
     pub width: u32,
     pub height: u32,
+    pub captured_at: Option<DateTime<FixedOffset>>,
 }
 
 /// Raw Bayer data for DNG encoding (bypasses post-processing)
@@ -106,26 +112,20 @@ pub struct RawBayerData {
     pub format: PixelFormat,
 }
 
-/// Camera metadata for DNG encoding
-#[derive(Debug, Clone, Default)]
-pub struct CameraMetadata {
-    /// Camera name (e.g., "Logitech C920")
-    pub camera_name: Option<String>,
-    /// Camera driver (e.g., "uvcvideo")
-    pub camera_driver: Option<String>,
-    /// Exposure time in seconds (e.g., 0.033 for 1/30s)
-    pub exposure_time: Option<f64>,
-    /// ISO sensitivity (e.g., 100, 400, 800)
-    pub iso: Option<u32>,
-    /// Gain value (camera-specific units)
-    pub gain: Option<i32>,
-}
+/// Backwards-compatible name used by the photo pipeline API.
+pub type CameraMetadata = CaptureMetadata;
 
 /// Photo encoder
 pub struct PhotoEncoder {
     format: EncodingFormat,
     quality: EncodingQuality,
     camera_metadata: CameraMetadata,
+}
+
+struct MetadataFallback<'a> {
+    image: &'a RgbImage,
+    format: EncodingFormat,
+    quality: EncodingQuality,
 }
 
 impl PhotoEncoder {
@@ -183,6 +183,7 @@ impl PhotoEncoder {
                 format: EncodingFormat::Dng,
                 width,
                 height,
+                captured_at: camera_metadata.captured_at,
             })
         })
         .await
@@ -213,15 +214,43 @@ impl PhotoEncoder {
 
         // Run encoding in background task (CPU-bound)
         tokio::task::spawn_blocking(move || {
+            let image = processed.image;
             let data = match format {
-                EncodingFormat::Jpeg => Self::encode_jpeg(processed.image, quality)?,
-                EncodingFormat::Png => Self::encode_png(processed.image)?,
-                EncodingFormat::Dng => Self::encode_dng(
-                    &processed.image,
-                    processed.width,
-                    processed.height,
-                    &camera_metadata,
-                )?,
+                EncodingFormat::Jpeg => {
+                    let data = Self::encode_jpeg(&image, quality)?;
+                    Self::embed_standard_metadata(
+                        data,
+                        FileExtension::JPEG,
+                        processed.width,
+                        processed.height,
+                        &camera_metadata,
+                        MetadataFallback {
+                            image: &image,
+                            format,
+                            quality,
+                        },
+                    )
+                }
+                EncodingFormat::Png => {
+                    let data = Self::encode_png(&image)?;
+                    Self::embed_standard_metadata(
+                        data,
+                        FileExtension::PNG {
+                            as_zTXt_chunk: false,
+                        },
+                        processed.width,
+                        processed.height,
+                        &camera_metadata,
+                        MetadataFallback {
+                            image: &image,
+                            format,
+                            quality,
+                        },
+                    )
+                }
+                EncodingFormat::Dng => {
+                    Self::encode_dng(&image, processed.width, processed.height, &camera_metadata)?
+                }
             };
 
             debug!(size = data.len(), "Encoding complete");
@@ -231,6 +260,7 @@ impl PhotoEncoder {
                 format,
                 width: processed.width,
                 height: processed.height,
+                captured_at: camera_metadata.captured_at,
             })
         })
         .await
@@ -275,7 +305,10 @@ impl PhotoEncoder {
         }
 
         // Generate filename with timestamp (millisecond precision so two rapid captures don't collide).
-        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
+        let timestamp = encoded
+            .captured_at
+            .unwrap_or_else(|| chrono::Local::now().fixed_offset())
+            .format("%Y%m%d_%H%M%S_%3f");
         let filename = format!("IMG_{}.{}", timestamp, encoded.format.extension());
         let filepath = output_dir.join(&filename);
 
@@ -323,14 +356,14 @@ impl PhotoEncoder {
     /// that is ~117 ms instead of ~269 ms, and the 4:2:0 chroma subsampling used
     /// for everything below the Maximum preset also cuts the file roughly a third
     /// (3.4 MB vs 5.2 MB) — `image` always writes 4:4:4.
-    fn encode_jpeg(image: RgbImage, quality: EncodingQuality) -> Result<Vec<u8>, String> {
-        match Self::encode_jpeg_turbo(&image, quality) {
+    fn encode_jpeg(image: &RgbImage, quality: EncodingQuality) -> Result<Vec<u8>, String> {
+        match Self::encode_jpeg_turbo(image, quality) {
             Ok(data) => Ok(data),
             Err(e) => {
                 // Keep the pure-Rust encoder as a safety net so a turbojpeg
                 // failure never costs the user a capture.
                 warn!(error = %e, "libjpeg-turbo encoding failed, falling back to image crate");
-                Self::encode_jpeg_image_crate(&image, quality)
+                Self::encode_jpeg_image_crate(image, quality)
             }
         }
     }
@@ -383,7 +416,7 @@ impl PhotoEncoder {
     }
 
     /// Encode image as PNG
-    fn encode_png(image: RgbImage) -> Result<Vec<u8>, String> {
+    fn encode_png(image: &RgbImage) -> Result<Vec<u8>, String> {
         let mut buffer = Vec::new();
 
         image
@@ -394,6 +427,109 @@ impl PhotoEncoder {
             .map_err(|e| format!("PNG encoding failed: {}", e))?;
 
         Ok(buffer)
+    }
+
+    /// Embed standard EXIF fields in an encoded JPEG or PNG.
+    ///
+    /// Metadata is written into a copy so a metadata-writer failure can never
+    /// corrupt or discard the successfully encoded image.
+    fn embed_standard_metadata(
+        data: Vec<u8>,
+        file_type: FileExtension,
+        width: u32,
+        height: u32,
+        camera_metadata: &CameraMetadata,
+        fallback: MetadataFallback<'_>,
+    ) -> Vec<u8> {
+        let metadata = build_standard_exif(width, height, camera_metadata);
+        let mut tagged = data.clone();
+        let write_result = match file_type {
+            FileExtension::PNG { .. } => Self::write_png_exif_chunk(&mut tagged, &metadata),
+            other => metadata.write_to_vec(&mut tagged, other),
+        };
+        match write_result {
+            Ok(()) => tagged,
+            Err(error) => {
+                warn!(%error, "Failed to embed photo metadata; baking orientation into pixels");
+                match Self::encode_oriented_fallback(
+                    fallback.image,
+                    fallback.format,
+                    fallback.quality,
+                    camera_metadata.orientation,
+                ) {
+                    Ok(oriented) => oriented,
+                    Err(fallback_error) => {
+                        warn!(
+                            error = %fallback_error,
+                            "Failed to bake fallback orientation; keeping encoded image"
+                        );
+                        data
+                    }
+                }
+            }
+        }
+    }
+
+    fn write_png_exif_chunk(data: &mut Vec<u8>, metadata: &Metadata) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+
+        const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+        const EXIF_HEADER_LEN: usize = 10;
+
+        if data.len() < 24 || !data.starts_with(PNG_SIGNATURE) || &data[12..16] != b"IHDR" {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid PNG structure"));
+        }
+
+        let app1 = metadata.as_u8_vec(FileExtension::JPEG)?;
+        if app1.len() <= EXIF_HEADER_LEN
+            || !app1.starts_with(&[0xff, 0xe1])
+            || &app1[4..10] != b"Exif\0\0"
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid encoded EXIF payload",
+            ));
+        }
+        let tiff = &app1[EXIF_HEADER_LEN..];
+        let length = u32::try_from(tiff.len())
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "EXIF payload too large"))?;
+
+        let mut chunk = Vec::with_capacity(12 + tiff.len());
+        chunk.extend_from_slice(&length.to_be_bytes());
+        chunk.extend_from_slice(b"eXIf");
+        chunk.extend_from_slice(tiff);
+        let mut crc = crc32fast::Hasher::new();
+        crc.update(b"eXIf");
+        crc.update(tiff);
+        chunk.extend_from_slice(&crc.finalize().to_be_bytes());
+
+        let ihdr_len = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
+        let insert_at = 8usize
+            .checked_add(12)
+            .and_then(|value| value.checked_add(ihdr_len))
+            .filter(|&value| value <= data.len())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid PNG IHDR length"))?;
+        data.splice(insert_at..insert_at, chunk);
+        Ok(())
+    }
+
+    fn encode_oriented_fallback(
+        image: &RgbImage,
+        format: EncodingFormat,
+        quality: EncodingQuality,
+        orientation: crate::pipelines::capture_metadata::CaptureOrientation,
+    ) -> Result<Vec<u8>, String> {
+        let mut oriented = image::DynamicImage::ImageRgb8(image.clone());
+        let orientation = image::metadata::Orientation::from_exif(orientation.exif_value() as u8)
+            .ok_or_else(|| "Invalid capture orientation".to_string())?;
+        oriented.apply_orientation(orientation);
+        let oriented = oriented.into_rgb8();
+
+        match format {
+            EncodingFormat::Jpeg => Self::encode_jpeg(&oriented, quality),
+            EncodingFormat::Png => Self::encode_png(&oriented),
+            EncodingFormat::Dng => Err("DNG metadata is written during encoding".into()),
+        }
     }
 
     /// Encode image as DNG (Digital Negative raw format)
@@ -597,6 +733,57 @@ impl Default for PhotoEncoder {
     }
 }
 
+fn build_standard_exif(width: u32, height: u32, camera_metadata: &CameraMetadata) -> Metadata {
+    let mut metadata = Metadata::new();
+
+    metadata.set_tag(ExifTag::ExifImageWidth(vec![width]));
+    metadata.set_tag(ExifTag::ExifImageHeight(vec![height]));
+    metadata.set_tag(ExifTag::Orientation(vec![
+        camera_metadata.orientation.exif_value(),
+    ]));
+
+    metadata.set_tag(ExifTag::Software(camera_metadata.software()));
+
+    if let Some(captured_at) = camera_metadata.captured_at {
+        let timestamp = captured_at.format("%Y:%m:%d %H:%M:%S").to_string();
+        let offset = captured_at.format("%:z").to_string();
+        let subseconds = captured_at.format("%3f").to_string();
+
+        metadata.set_tag(ExifTag::ModifyDate(timestamp.clone()));
+        metadata.set_tag(ExifTag::DateTimeOriginal(timestamp.clone()));
+        metadata.set_tag(ExifTag::CreateDate(timestamp));
+        metadata.set_tag(ExifTag::OffsetTime(offset.clone()));
+        metadata.set_tag(ExifTag::OffsetTimeOriginal(offset.clone()));
+        metadata.set_tag(ExifTag::OffsetTimeDigitized(offset));
+        metadata.set_tag(ExifTag::SubSecTime(subseconds.clone()));
+        metadata.set_tag(ExifTag::SubSecTimeOriginal(subseconds.clone()));
+        metadata.set_tag(ExifTag::SubSecTimeDigitized(subseconds));
+    }
+
+    if let Some(make) = &camera_metadata.device_make {
+        metadata.set_tag(ExifTag::Make(make.clone()));
+    }
+    if let Some(model) = &camera_metadata.device_model {
+        metadata.set_tag(ExifTag::Model(model.clone()));
+    }
+
+    if let Some(exposure_time) = camera_metadata.exposure_time
+        && exposure_time.is_finite()
+        && exposure_time > 0.0
+    {
+        metadata.set_tag(ExifTag::ExposureTime(vec![exposure_time.into()]));
+    }
+    if let Some(iso) = camera_metadata.iso {
+        metadata.set_tag(ExifTag::ISO(vec![iso.min(u16::MAX as u32) as u16]));
+    }
+
+    if let Some(description) = camera_metadata.description() {
+        metadata.set_tag(ExifTag::ImageDescription(description));
+    }
+
+    metadata
+}
+
 /// Strip data offsets for DNG encoding (used for both RGB and raw CFA data)
 struct DngOffsets {
     data: Vec<u8>,
@@ -620,7 +807,7 @@ fn set_common_dng_tags(
     width: u32,
     height: u32,
     camera_metadata: &CameraMetadata,
-    version: &str,
+    _version: &str,
 ) -> dng::ifd::Ifd {
     use dng::ifd::{Ifd, IfdValue};
     use dng::tags::ifd as tiff_tags;
@@ -633,25 +820,35 @@ fn set_common_dng_tags(
     ifd.insert(tiff_tags::Compression, IfdValue::Short(1)); // No compression
     ifd.insert(tiff_tags::RowsPerStrip, IfdValue::Long(height)); // One strip
     ifd.insert(tiff_tags::PlanarConfiguration, IfdValue::Short(1)); // Chunky
+    ifd.insert(
+        tiff_tags::Orientation,
+        IfdValue::Short(camera_metadata.orientation.exif_value()),
+    );
 
-    // Software tag: include gain if available
-    let software = match camera_metadata.gain {
-        Some(gain) => format!("Camera v{} (Gain: {})", version, gain),
-        None => format!("Camera v{}", version),
-    };
-    ifd.insert(tiff_tags::Software, IfdValue::Ascii(software));
+    ifd.insert(
+        tiff_tags::Software,
+        IfdValue::Ascii(camera_metadata.software()),
+    );
 
-    // Camera make/model tags
-    if let Some(camera_name) = &camera_metadata.camera_name {
-        ifd.insert(tiff_tags::Make, IfdValue::Ascii(camera_name.clone()));
-        if let Some(driver) = &camera_metadata.camera_driver {
-            ifd.insert(
-                tiff_tags::Model,
-                IfdValue::Ascii(format!("{} ({})", camera_name, driver)),
-            );
-        } else {
-            ifd.insert(tiff_tags::Model, IfdValue::Ascii(camera_name.clone()));
-        }
+    if let Some(make) = &camera_metadata.device_make {
+        ifd.insert(tiff_tags::Make, IfdValue::Ascii(make.clone()));
+    }
+    if let Some(model) = &camera_metadata.device_model {
+        ifd.insert(tiff_tags::Model, IfdValue::Ascii(model.clone()));
+    }
+    if let Some(sensor) = camera_metadata.sensor_identity() {
+        ifd.insert(
+            tiff_tags::UniqueCameraModel,
+            IfdValue::Ascii(sensor.to_string()),
+        );
+    }
+    if let Some(description) = camera_metadata.description() {
+        ifd.insert(tiff_tags::ImageDescription, IfdValue::Ascii(description));
+    }
+    if let Some(captured_at) = camera_metadata.captured_at.as_ref() {
+        let timestamp = captured_at.format("%Y:%m:%d %H:%M:%S").to_string();
+        ifd.insert(tiff_tags::DateTime, IfdValue::Ascii(timestamp.clone()));
+        ifd.insert(tiff_tags::DateTimeOriginal, IfdValue::Ascii(timestamp));
     }
 
     // Exposure metadata (EXIF tags)
@@ -742,6 +939,7 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Timelike};
 
     #[test]
     fn test_format_extensions() {
@@ -773,7 +971,7 @@ mod tests {
             EncodingQuality::Maximum,
         ] {
             let source = test_image(65, 33);
-            let data = PhotoEncoder::encode_jpeg(source, quality).expect("encoding failed");
+            let data = PhotoEncoder::encode_jpeg(&source, quality).expect("encoding failed");
 
             assert_eq!(&data[..2], &[0xFF, 0xD8], "missing JPEG SOI marker");
 
@@ -802,7 +1000,8 @@ mod tests {
             turbojpeg::Subsamp::Sub2x2
         );
 
-        let data = PhotoEncoder::encode_jpeg(test_image(64, 64), EncodingQuality::Maximum).unwrap();
+        let source = test_image(64, 64);
+        let data = PhotoEncoder::encode_jpeg(&source, EncodingQuality::Maximum).unwrap();
         let header = turbojpeg::read_header(&data).unwrap();
         assert_eq!(header.subsamp, turbojpeg::Subsamp::None);
     }
@@ -814,8 +1013,8 @@ mod tests {
             image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
         });
 
-        let high = PhotoEncoder::encode_jpeg(source.clone(), EncodingQuality::High).unwrap();
-        let maximum = PhotoEncoder::encode_jpeg(source, EncodingQuality::Maximum).unwrap();
+        let high = PhotoEncoder::encode_jpeg(&source, EncodingQuality::High).unwrap();
+        let maximum = PhotoEncoder::encode_jpeg(&source, EncodingQuality::Maximum).unwrap();
 
         assert!(
             high.len() < maximum.len(),
@@ -823,5 +1022,149 @@ mod tests {
             high.len(),
             maximum.len()
         );
+    }
+
+    fn tag_string(metadata: &Metadata, prototype: ExifTag) -> String {
+        let tag = metadata
+            .get_tag(&prototype)
+            .next()
+            .expect("expected EXIF tag");
+        match tag {
+            ExifTag::DateTimeOriginal(value)
+            | ExifTag::OffsetTimeOriginal(value)
+            | ExifTag::SubSecTimeOriginal(value)
+            | ExifTag::Software(value)
+            | ExifTag::Make(value)
+            | ExifTag::Model(value)
+            | ExifTag::LensModel(value)
+            | ExifTag::ImageDescription(value) => value.clone(),
+            other => panic!("unexpected EXIF tag: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jpeg_metadata_uses_standard_capture_fields() {
+        let captured_at = FixedOffset::east_opt(2 * 60 * 60)
+            .unwrap()
+            .with_ymd_and_hms(2026, 9, 28, 14, 5, 6)
+            .unwrap()
+            .with_nanosecond(123_000_000)
+            .unwrap();
+        let camera_metadata = CameraMetadata {
+            camera_name: Some("Back Camera".into()),
+            camera_driver: Some("libcamera".into()),
+            sensor_model: Some("sony,imx363".into()),
+            camera_location: Some("back".into()),
+            pipeline_handler: Some("simple".into()),
+            libcamera_version: Some("0.5.2".into()),
+            device_make: Some("Google".into()),
+            device_model: Some("Pixel 3a".into()),
+            captured_at: Some(captured_at),
+            orientation: crate::pipelines::capture_metadata::CaptureOrientation::Rotate270,
+            exposure_time: Some(1.0 / 30.0),
+            iso: Some(200),
+            gain: Some(4),
+        };
+
+        let source = test_image(65, 33);
+        let encoded =
+            PhotoEncoder::encode_jpeg(&source, EncodingQuality::High).expect("encoding failed");
+        let encoded = PhotoEncoder::embed_standard_metadata(
+            encoded,
+            FileExtension::JPEG,
+            65,
+            33,
+            &camera_metadata,
+            MetadataFallback {
+                image: &source,
+                format: EncodingFormat::Jpeg,
+                quality: EncodingQuality::High,
+            },
+        );
+        let metadata = Metadata::new_from_vec(&encoded, FileExtension::JPEG)
+            .expect("metadata should be readable");
+
+        assert_eq!(
+            tag_string(&metadata, ExifTag::DateTimeOriginal(String::new())),
+            "2026:09:28 14:05:06"
+        );
+        assert_eq!(
+            tag_string(&metadata, ExifTag::OffsetTimeOriginal(String::new())),
+            "+02:00"
+        );
+        assert_eq!(
+            tag_string(&metadata, ExifTag::SubSecTimeOriginal(String::new())),
+            "123"
+        );
+        assert_eq!(
+            tag_string(&metadata, ExifTag::Make(String::new())),
+            "Google"
+        );
+        assert_eq!(
+            tag_string(&metadata, ExifTag::Model(String::new())),
+            "Pixel 3a"
+        );
+        assert!(
+            metadata
+                .get_tag(&ExifTag::LensModel(String::new()))
+                .next()
+                .is_none(),
+            "sensor identity must not be mislabeled as a lens"
+        );
+        assert_eq!(
+            tag_string(&metadata, ExifTag::Software(String::new())),
+            format!("Camera {}; libcamera 0.5.2", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(matches!(
+            metadata
+                .get_tag(&ExifTag::Orientation(Vec::new()))
+                .next(),
+            Some(ExifTag::Orientation(value)) if value == &vec![8]
+        ));
+        assert!(
+            tag_string(&metadata, ExifTag::ImageDescription(String::new()))
+                .contains("libcamera pipeline: simple")
+        );
+    }
+
+    #[test]
+    fn metadata_failure_fallback_bakes_orientation_into_pixels() {
+        let source = test_image(65, 33);
+        let encoded = PhotoEncoder::encode_oriented_fallback(
+            &source,
+            EncodingFormat::Jpeg,
+            EncodingQuality::High,
+            crate::pipelines::capture_metadata::CaptureOrientation::Rotate270,
+        )
+        .expect("fallback encoding failed");
+        let decoded = image::load_from_memory(&encoded).expect("fallback image should decode");
+        assert_eq!((decoded.width(), decoded.height()), (33, 65));
+    }
+
+    #[test]
+    fn png_metadata_uses_standard_exif_chunk() {
+        let source = test_image(65, 33);
+        let camera_metadata = CameraMetadata {
+            orientation: crate::pipelines::capture_metadata::CaptureOrientation::Rotate270,
+            ..Default::default()
+        };
+        let encoded = PhotoEncoder::encode_png(&source).expect("encoding failed");
+        let encoded = PhotoEncoder::embed_standard_metadata(
+            encoded,
+            FileExtension::PNG {
+                as_zTXt_chunk: true,
+            },
+            65,
+            33,
+            &camera_metadata,
+            MetadataFallback {
+                image: &source,
+                format: EncodingFormat::Png,
+                quality: EncodingQuality::High,
+            },
+        );
+
+        assert!(encoded.windows(4).any(|chunk| chunk == b"eXIf"));
+        assert!(!encoded.windows(4).any(|chunk| chunk == b"zTXt"));
     }
 }
