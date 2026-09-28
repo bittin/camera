@@ -14,10 +14,11 @@ use super::stats::{
     RECORDING_STATS, RecordingDiagnostics, clear_recording_diagnostics,
     publish_recording_diagnostics,
 };
-use crate::backends::camera::types::{CameraFrame, PixelFormat, RecordingFrame, SensorRotation};
+use crate::backends::camera::types::{CameraFrame, PixelFormat, RecordingFrame};
 use crate::media::encoders::video::SelectedVideoEncoder;
 use crate::pipelines::audio_level::PULSESRC_SLAVE_METHOD;
 use crate::pipelines::audio_level::install_level_sync_handler as install_shared_level_sync_handler;
+use chrono::{Datelike, Timelike, Utc};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
@@ -63,10 +64,8 @@ pub struct RecorderConfig<'a> {
     pub audio_source_rate_hz: u32,
     /// Specific encoder info (if None, auto-select)
     pub encoder_info: Option<&'a crate::media::encoders::video::EncoderInfo>,
-    /// Sensor rotation to correct video orientation
-    pub rotation: SensorRotation,
-    /// Mirror the recorded video horizontally (selfie / front-camera mode).
-    pub mirror_horizontal: bool,
+    /// Immutable metadata captured at recording start.
+    pub capture_metadata: crate::pipelines::capture_metadata::CaptureMetadata,
     /// Pre-created shared audio levels handle (UI reads this for live meters)
     pub audio_levels: SharedAudioLevels,
 }
@@ -102,15 +101,77 @@ pub struct VideoRecorder {
     pusher_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Map sensor rotation to the GStreamer videoflip `video-direction` value.
-/// Returns None for SensorRotation::None (no rotation needed).
-fn rotation_to_flip_direction(rotation: SensorRotation) -> Option<&'static str> {
-    match rotation {
-        SensorRotation::Rotate90 => Some("90l"),
-        SensorRotation::Rotate180 => Some("180"),
-        SensorRotation::Rotate270 => Some("90r"),
-        SensorRotation::None => None,
+fn decoded_video_processing_chain(width: u32, height: u32) -> String {
+    format!(
+        "! videoconvert ! videoscale \
+         ! capsfilter caps=video/x-raw,format=I420,width={width},height={height} \
+         ! videoconvert"
+    )
+}
+
+fn video_tags(metadata: &crate::pipelines::capture_metadata::CaptureMetadata) -> gst::TagList {
+    let mut tags = gst::TagList::new();
+    let tags = tags.get_mut().expect("new tag list must be writable");
+    let replace = gst::TagMergeMode::ReplaceAll;
+    let application_name = crate::pipelines::capture_metadata::CaptureMetadata::application_name();
+
+    tags.add::<gst::tags::ApplicationName>(&application_name.as_str(), replace);
+    if let Some(version) = metadata.libcamera_version.as_deref() {
+        let encoder = format!("libcamera {version}");
+        tags.add::<gst::tags::Encoder>(&encoder.as_str(), replace);
     }
+    tags.add::<gst::tags::ImageOrientation>(&metadata.orientation.gstreamer_tag(), replace);
+
+    if let Some(make) = metadata.device_make.as_deref() {
+        tags.add::<gst::tags::DeviceManufacturer>(&make, replace);
+    }
+    if let Some(model) = metadata.device_model.as_deref() {
+        tags.add::<gst::tags::DeviceModel>(&model, replace);
+    }
+    if let Some(description) = metadata.description() {
+        tags.add::<gst::tags::Description>(&description.as_str(), replace);
+    }
+    if let Some(captured_at) = metadata.captured_at.as_ref() {
+        let captured_at = captured_at.with_timezone(&Utc);
+        let seconds =
+            captured_at.second() as f64 + f64::from(captured_at.nanosecond()) / 1_000_000_000.0;
+        if let Ok(date_time) = gst::DateTime::new(
+            0.0f32,
+            captured_at.year(),
+            captured_at.month() as i32,
+            captured_at.day() as i32,
+            captured_at.hour() as i32,
+            captured_at.minute() as i32,
+            seconds,
+        ) {
+            tags.add::<gst::tags::DateTime>(&date_time, replace);
+        }
+    }
+
+    tags.to_owned()
+}
+
+fn apply_video_tags(
+    pipeline: &gst::Pipeline,
+    metadata: &crate::pipelines::capture_metadata::CaptureMetadata,
+) {
+    let Some(muxer) = pipeline.by_name("recording-muxer") else {
+        warn!("Recording muxer not found; video metadata was not applied");
+        return;
+    };
+    apply_video_tags_to_muxer(&muxer, metadata);
+}
+
+pub(super) fn apply_video_tags_to_muxer(
+    muxer: &gst::Element,
+    metadata: &crate::pipelines::capture_metadata::CaptureMetadata,
+) {
+    let Ok(tag_setter) = muxer.clone().dynamic_cast::<gst::TagSetter>() else {
+        warn!("Recording muxer does not implement TagSetter; video metadata was not applied");
+        return;
+    };
+
+    tag_setter.merge_tags(&video_tags(metadata), gst::TagMergeMode::ReplaceAll);
 }
 
 /// OpenH264 maximum pixel count (roughly 3072x3072).
@@ -730,8 +791,7 @@ impl VideoRecorder {
                     audio_device,
                     audio_source_rate_hz,
                     encoder_info,
-                    rotation,
-                    mirror_horizontal,
+                    capture_metadata,
                     audio_levels,
                 },
             pixel_format,
@@ -751,8 +811,7 @@ impl VideoRecorder {
             output = %output_path.display(),
             audio = enable_audio,
             audio_device = ?audio_device,
-            rotation = %rotation,
-            mirror_horizontal,
+            orientation = capture_metadata.orientation.gstreamer_tag(),
             "Creating appsrc-based video recorder (libcamera backend)"
         );
 
@@ -772,32 +831,15 @@ impl VideoRecorder {
             framerate,
         )?;
 
-        let (base_width, base_height) = if rotation.swaps_dimensions() {
-            (height, width)
-        } else {
-            (width, height)
-        };
-
-        // Inverse rotation: sensor mounting angle → correction direction.
-        // Optionally chained with a horizontal mirror flip for front-camera mode.
-        let rotation_flip = rotation_to_flip_direction(rotation)
-            .map(|dir| format!("! videoflip video-direction={dir}"))
-            .unwrap_or_default();
-        let mirror_flip = if mirror_horizontal {
-            "! videoflip video-direction=horiz"
-        } else {
-            ""
-        };
-        let flip_str = format!("{rotation_flip} {mirror_flip}").trim().to_string();
+        let (base_width, base_height) = (width, height);
 
         // OpenH264 has a maximum resolution limit — downscale if exceeded
         let (final_width, final_height) =
             openh264_downscale(base_width, base_height, &setup.encoder_name);
 
-        // Only insert videoconvert/videoscale/capsfilter when actually needed.
-        // Skipping these for the common case (no rotation, no scaling, I420 input)
-        // eliminates ~3 software passthrough elements at 12MP+ resolutions.
-        let needs_rotation = !flip_str.is_empty();
+        // Only insert videoscale/capsfilter when downscaling is needed.
+        // Capture orientation is stored as container metadata, so recording never
+        // rotates or mirrors full video frames in software.
         let needs_scaling = final_width != base_width || final_height != base_height;
 
         // Always use RGBA input: the filtered pusher converts each frame to RGBA
@@ -805,16 +847,8 @@ impl VideoRecorder {
         // This lets the user toggle filters mid-recording.
         let initial_gst_format = "RGBA";
 
-        let processing_chain = if needs_rotation || needs_scaling {
-            format!(
-                "! videoconvert {flip} ! videoscale \
-                 ! capsfilter caps=video/x-raw,format=I420,width={fw},height={fh},framerate={fps}/1 \
-                 ! videoconvert",
-                flip = flip_str,
-                fw = final_width,
-                fh = final_height,
-                fps = framerate,
-            )
+        let processing_chain = if needs_scaling {
+            decoded_video_processing_chain(final_width, final_height)
         } else {
             "! videoconvert".to_string()
         };
@@ -853,6 +887,7 @@ impl VideoRecorder {
             setup.audio_elements.as_ref(),
             &audio_levels,
         )?;
+        apply_video_tags(&pipeline, &capture_metadata);
 
         info!(
             initial_filter = initial_filter_code,
@@ -862,8 +897,8 @@ impl VideoRecorder {
             Self::spawn_filtered_pusher(appsrc, frame_rx, framerate, live_filter_code);
 
         // Publish diagnostics for the insights drawer
-        let mode = if needs_rotation || needs_scaling {
-            "Filtered RGBA (videoconvert + rotation/scale)"
+        let mode = if needs_scaling {
+            "Filtered RGBA (videoconvert + scale)"
         } else {
             "Filtered RGBA (videoconvert)"
         };
@@ -1062,8 +1097,7 @@ impl VideoRecorder {
                     audio_device,
                     audio_source_rate_hz,
                     encoder_info,
-                    rotation: _,
-                    mirror_horizontal,
+                    capture_metadata,
                     audio_levels,
                 },
             pixel_format: _,
@@ -1083,7 +1117,6 @@ impl VideoRecorder {
             va_jpeg_dec,
             output = %output_path.display(),
             audio = enable_audio,
-            mirror_horizontal,
             "Creating VA-API JPEG zero-copy recording pipeline"
         );
 
@@ -1136,15 +1169,6 @@ impl VideoRecorder {
             }
         }
 
-        // Insert a horizontal flip between videoconvert and the encoder when
-        // mirroring is requested. This forces a software pass on the flip but
-        // keeps the rest of the zero-copy pipeline intact.
-        let mirror_str = if mirror_horizontal {
-            "! videoflip video-direction=horiz "
-        } else {
-            ""
-        };
-
         let pipeline_desc = format!(
             "appsrc name=camera-appsrc \
                caps=image/jpeg,width={w},height={h},framerate={fps}/1 \
@@ -1153,7 +1177,6 @@ impl VideoRecorder {
              ! queue max-size-buffers=60 max-size-time=3000000000 \
              ! {decoder} name=jpeg-decoder \
              ! videoconvert \
-             {mirror}\
              ! {encoder} name=recording-encoder \
              {parser} \
              ! {muxer} name=recording-muxer \
@@ -1163,7 +1186,6 @@ impl VideoRecorder {
             fps = framerate,
             lat = setup.frame_duration_ns,
             decoder = va_jpeg_dec,
-            mirror = mirror_str,
             encoder = setup.encoder_name,
             parser = setup.parser_str,
             muxer = setup.muxer_name,
@@ -1185,6 +1207,7 @@ impl VideoRecorder {
             setup.audio_elements.as_ref(),
             &audio_levels,
         )?;
+        apply_video_tags(&pipeline, &capture_metadata);
 
         // JPEG-specific PTS verification probes
         if let Some(decoder) = pipeline.by_name("jpeg-decoder") {
@@ -1611,6 +1634,45 @@ pub fn check_available_encoders() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_recording_orientation_does_not_transform_pixels() {
+        let processing = decoded_video_processing_chain(1080, 1920);
+
+        assert!(!processing.contains("videoflip"));
+        assert!(processing.contains("width=1080,height=1920"));
+    }
+
+    #[test]
+    fn video_tags_include_standard_orientation_and_device_fields() {
+        gst::init().unwrap();
+        let metadata = crate::pipelines::capture_metadata::CaptureMetadata {
+            device_make: Some("Example".to_string()),
+            device_model: Some("Phone".to_string()),
+            captured_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-28T12:34:56.789+02:00").unwrap(),
+            ),
+            orientation: crate::pipelines::capture_metadata::CaptureOrientation::FlipRotate90,
+            ..Default::default()
+        };
+
+        let tags = video_tags(&metadata);
+
+        assert_eq!(
+            tags.get::<gst::tags::ImageOrientation>().unwrap().get(),
+            "flip-rotate-90"
+        );
+        assert_eq!(
+            tags.get::<gst::tags::DeviceManufacturer>().unwrap().get(),
+            "Example"
+        );
+        assert_eq!(tags.get::<gst::tags::DeviceModel>().unwrap().get(), "Phone");
+        assert_eq!(
+            tags.get::<gst::tags::ApplicationName>().unwrap().get(),
+            crate::pipelines::capture_metadata::CaptureMetadata::application_name()
+        );
+        assert!(tags.get::<gst::tags::DateTime>().is_some());
+    }
 
     #[test]
     fn live_appsrc_queue_stays_bounded_when_downstream_is_slow() {

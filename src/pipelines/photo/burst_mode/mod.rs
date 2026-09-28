@@ -42,7 +42,7 @@ pub mod fft_gpu;
 mod gpu_helpers;
 pub mod params;
 
-use crate::backends::camera::types::{CameraFrame, PixelFormat, SensorRotation};
+use crate::backends::camera::types::{CameraFrame, PixelFormat};
 use crate::gpu::{self, wgpu};
 use crate::shaders::{GpuFrameInput, get_gpu_convert_pipeline};
 use bayer_planes::{BayerPlanes, extract_bayer_planes};
@@ -185,10 +185,6 @@ pub struct BurstModeConfig {
     pub encoding_format: super::EncodingFormat,
     /// Camera metadata for DNG encoding
     pub camera_metadata: super::CameraMetadata,
-    /// Sensor rotation to correct the image orientation
-    pub rotation: SensorRotation,
-    /// Mirror the final HDR+ output horizontally (selfie / front-camera).
-    pub mirror_horizontal: bool,
 }
 
 impl Default for BurstModeConfig {
@@ -204,8 +200,6 @@ impl Default for BurstModeConfig {
             save_burst_raw_dng: false, // Don't save raw DNG frames by default
             encoding_format: super::EncodingFormat::Jpeg, // Default to JPEG
             camera_metadata: super::CameraMetadata::default(),
-            rotation: SensorRotation::None, // No rotation by default
-            mirror_horizontal: false,
         }
     }
 }
@@ -3017,13 +3011,10 @@ pub struct SaveOutputParams<'a> {
     pub encoding_format: super::EncodingFormat,
     pub camera_metadata: super::CameraMetadata,
     pub filter: Option<crate::app::FilterType>,
-    pub rotation: SensorRotation,
     pub filename_suffix: Option<&'a str>,
-    /// Mirror the final image horizontally (selfie / front-camera mode).
-    pub mirror_horizontal: bool,
 }
 
-/// Save output image to disk with optional filter, rotation, and aspect ratio cropping
+/// Save output image to disk with optional filter and aspect ratio cropping.
 pub async fn save_output(
     frame: &MergedFrame,
     params: SaveOutputParams<'_>,
@@ -3039,9 +3030,7 @@ pub async fn save_output(
         encoding_format,
         camera_metadata,
         filter,
-        rotation,
         filename_suffix,
-        mirror_horizontal,
     } = params;
 
     let timestamp = SystemTime::now()
@@ -3102,36 +3091,7 @@ pub async fn save_output(
 
     let rgb_img = cropped_img.to_rgb8();
 
-    // Apply rotation correction if needed
-    let (rgb_img, width, height) = if rotation != SensorRotation::None {
-        use image::imageops;
-        debug!(rotation = ?rotation, "Applying rotation correction to burst mode output");
-        let rotated = match rotation {
-            SensorRotation::None => rgb_img,
-            // 90 CW sensor -> rotate 90 CCW to correct
-            SensorRotation::Rotate90 => imageops::rotate270(&rgb_img),
-            // 180 sensor -> rotate 180 to correct
-            SensorRotation::Rotate180 => imageops::rotate180(&rgb_img),
-            // 270 CW sensor -> rotate 90 CW to correct
-            SensorRotation::Rotate270 => imageops::rotate90(&rgb_img),
-        };
-        let (w, h) = rotated.dimensions();
-        (rotated, w, h)
-    } else {
-        let (w, h) = rgb_img.dimensions();
-        (rgb_img, w, h)
-    };
-
-    // Mirror horizontally if requested (front-camera selfie mode). Done after
-    // rotation so the user-visible orientation is upright before flipping.
-    let rgb_img = if mirror_horizontal {
-        debug!("Mirroring burst output horizontally");
-        let mut img = rgb_img;
-        image::imageops::flip_horizontal_in_place(&mut img);
-        img
-    } else {
-        rgb_img
-    };
+    let (width, height) = rgb_img.dimensions();
 
     // Create a PhotoEncoder for the selected format
     let mut encoder = PhotoEncoder::new();

@@ -106,7 +106,8 @@ pub async fn load_latest_thumbnail(
             return Some(scaled);
         }
 
-        let img = image::load_from_memory(&bytes_clone).ok()?;
+        let mut img = image::load_from_memory(&bytes_clone).ok()?;
+        img.apply_orientation(embedded_orientation(&bytes_clone));
         let rgba = img.to_rgba8();
         let (width, height) = img.dimensions();
 
@@ -191,7 +192,57 @@ fn decode_jpeg_thumbnail(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         "Decoded gallery thumbnail with scaled JPEG decode"
     );
 
-    Some((pixels, scaled.width as u32, scaled.height as u32))
+    orient_thumbnail(
+        pixels,
+        scaled.width as u32,
+        scaled.height as u32,
+        embedded_orientation(bytes),
+    )
+}
+
+fn embedded_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::filetype::FileExtension;
+    use little_exif::metadata::Metadata;
+
+    let file_type = if bytes.starts_with(&[0xff, 0xd8]) {
+        FileExtension::JPEG
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        FileExtension::PNG {
+            as_zTXt_chunk: true,
+        }
+    } else {
+        return image::metadata::Orientation::NoTransforms;
+    };
+
+    let bytes = bytes.to_vec();
+    Metadata::new_from_vec(&bytes, file_type)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get_tag(&ExifTag::Orientation(Vec::new()))
+                .next()
+                .and_then(|tag| match tag {
+                    ExifTag::Orientation(values) => values.first().copied(),
+                    _ => None,
+                })
+        })
+        .and_then(|value| image::metadata::Orientation::from_exif(value as u8))
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
+fn orient_thumbnail(
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    orientation: image::metadata::Orientation,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let image = image::RgbaImage::from_raw(width, height, pixels)?;
+    let mut image = image::DynamicImage::ImageRgba8(image);
+    image.apply_orientation(orientation);
+    let width = image.width();
+    let height = image.height();
+    Some((image.into_rgba8().into_raw(), width, height))
 }
 
 /// Load a thumbnail from a video file by extracting the first frame
@@ -309,5 +360,22 @@ mod tests {
         assert!(rgba[centre + 1].abs_diff(160) < 10);
         assert!(rgba[centre + 2].abs_diff(220) < 10);
         assert_eq!(rgba[centre + 3], 255, "alpha channel must be opaque");
+    }
+
+    #[test]
+    fn jpeg_thumbnail_applies_embedded_orientation() {
+        use little_exif::exif_tag::ExifTag;
+        use little_exif::filetype::FileExtension;
+        use little_exif::metadata::Metadata;
+
+        let mut encoded = jpeg(320, 240);
+        let mut metadata = Metadata::new();
+        metadata.set_tag(ExifTag::Orientation(vec![6]));
+        metadata
+            .write_to_vec(&mut encoded, FileExtension::JPEG)
+            .unwrap();
+
+        let (_, width, height) = decode_jpeg_thumbnail(&encoded).expect("decode failed");
+        assert_eq!((width, height), (240, 320));
     }
 }

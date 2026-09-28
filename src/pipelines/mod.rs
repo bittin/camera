@@ -38,5 +38,6 @@
 
 pub mod audio_level;
 pub mod audio_probe;
+pub mod capture_metadata;
 pub mod photo;
 pub mod video;

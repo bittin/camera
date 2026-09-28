@@ -235,12 +235,7 @@ fn create_frame_extraction_pipeline(
     gstreamer::init().map_err(|e| BackendError::Other(format!("GStreamer init failed: {}", e)))?;
 
     let path_str = escape_gst_string(&path.to_string_lossy());
-    let pipeline_str = format!(
-        "filesrc location=\"{}\" ! decodebin3 ! \
-         videoconvert ! video/x-raw,format=RGBA ! \
-         appsink name=sink max-buffers=1 drop=true sync=false",
-        path_str
-    );
+    let pipeline_str = frame_extraction_pipeline_description(&path_str);
 
     let pipeline = gstreamer::parse::launch(&pipeline_str)
         .map_err(|e| BackendError::Other(format!("Failed to create pipeline: {}", e)))?
@@ -254,6 +249,70 @@ fn create_frame_extraction_pipeline(
         .map_err(|_| BackendError::Other("Failed to downcast to AppSink".into()))?;
 
     Ok((pipeline, appsink))
+}
+
+fn frame_extraction_pipeline_description(path: &str) -> String {
+    format!(
+        "filesrc location=\"{}\" ! decodebin3 ! \
+         videoflip video-direction=auto ! videoconvert ! video/x-raw,format=RGBA ! \
+         appsink name=sink max-buffers=1 drop=true sync=false",
+        path
+    )
+}
+
+fn video_playback_pipeline_description(path: &str) -> String {
+    format!(
+        "filesrc location=\"{}\" ! decodebin3 name=decode ! \
+         queue ! videoflip video-direction=auto ! videoconvert ! video/x-raw,format=RGBA ! \
+         appsink name=videosink emit-signals=true sync=true",
+        path
+    )
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+
+    #[test]
+    fn video_frame_extraction_applies_container_orientation() {
+        let pipeline = frame_extraction_pipeline_description("/tmp/video.mp4");
+        assert!(pipeline.contains("videoflip video-direction=auto"));
+    }
+
+    #[test]
+    fn video_playback_applies_container_orientation() {
+        let pipeline = video_playback_pipeline_description("/tmp/video.mp4");
+        assert!(pipeline.contains("videoflip video-direction=auto"));
+    }
+
+    #[test]
+    fn image_file_source_applies_embedded_orientation() {
+        use little_exif::exif_tag::ExifTag;
+        use little_exif::filetype::FileExtension;
+        use little_exif::metadata::Metadata;
+
+        let image = image::RgbImage::from_pixel(4, 2, image::Rgb([10, 20, 30]));
+        let mut encoded = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut encoded)
+            .encode(image.as_raw(), 4, 2, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let mut metadata = Metadata::new();
+        metadata.set_tag(ExifTag::Orientation(vec![6]));
+        metadata
+            .write_to_vec(&mut encoded, FileExtension::JPEG)
+            .unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "camera-oriented-source-{}-{}.jpg",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, encoded).unwrap();
+        let frame = load_image_as_frame(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!((frame.width, frame.height), (2, 4));
+    }
 }
 
 /// Load the first frame from a video file
@@ -291,11 +350,31 @@ fn load_video_first_frame(path: &Path) -> BackendResult<CameraFrame> {
 ///
 /// Supports common image formats: PNG, JPEG, GIF, BMP, WebP
 pub fn load_image_as_frame(path: &Path) -> BackendResult<CameraFrame> {
+    use image::ImageDecoder;
+
     info!(path = %path.display(), "Loading image file");
 
-    let img = image::open(path).map_err(|e| {
+    let reader = image::ImageReader::open(path).map_err(|e| {
         BackendError::Other(format!("Failed to load image '{}': {}", path.display(), e))
     })?;
+    let mut decoder = reader.into_decoder().map_err(|e| {
+        BackendError::Other(format!(
+            "Failed to decode image '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let orientation = decoder.orientation().map_err(|e| {
+        BackendError::Other(format!(
+            "Failed to read image orientation '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
+        BackendError::Other(format!("Failed to load image '{}': {}", path.display(), e))
+    })?;
+    img.apply_orientation(orientation);
 
     let rgba = img.to_rgba8();
     let width = rgba.width();
@@ -353,11 +432,7 @@ impl VideoDecoder {
 
         // Create video pipeline: filesrc → decodebin3 → videoconvert → appsink
         // Note: sync=true is important to play video at correct speed (matches video's native framerate)
-        let video_pipeline_str = format!(
-            "filesrc location=\"{}\" ! decodebin3 name=decode ! \
-             queue ! videoconvert ! video/x-raw,format=RGBA ! appsink name=videosink emit-signals=true sync=true",
-            path_str
-        );
+        let video_pipeline_str = video_playback_pipeline_description(&path_str);
 
         let video_pipeline = gstreamer::parse::launch(&video_pipeline_str)
             .map_err(|e| BackendError::Other(format!("Failed to create video pipeline: {}", e)))?

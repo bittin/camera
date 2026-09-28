@@ -164,12 +164,20 @@ impl AppModel {
 
     /// Build camera metadata (name, driver, exposure info) for photo encoding.
     fn build_camera_metadata(&self) -> crate::pipelines::photo::CameraMetadata {
+        let host = crate::pipelines::capture_metadata::host_device_metadata();
         self.available_cameras
             .get(self.current_camera_index)
             .map(|cam| {
                 let mut metadata = crate::pipelines::photo::CameraMetadata {
                     camera_name: Some(cam.name.clone()),
                     camera_driver: cam.device_info.as_ref().map(|info| info.driver.clone()),
+                    sensor_model: cam.sensor_model.clone(),
+                    camera_location: cam.camera_location.clone(),
+                    pipeline_handler: cam.pipeline_handler.clone(),
+                    libcamera_version: cam.libcamera_version.clone(),
+                    device_make: host.make.clone(),
+                    device_model: host.model.clone(),
+                    captured_at: Some(chrono::Local::now().fixed_offset()),
                     ..Default::default()
                 };
                 if let Some(device_info) = &cam.device_info {
@@ -180,7 +188,12 @@ impl AppModel {
                 }
                 metadata
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| crate::pipelines::photo::CameraMetadata {
+                device_make: host.make.clone(),
+                device_model: host.model.clone(),
+                captured_at: Some(chrono::Local::now().fixed_offset()),
+                ..Default::default()
+            })
     }
 
     /// Capture the current frame as a photo with the selected filter and zoom
@@ -273,7 +286,12 @@ impl AppModel {
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
 
-        let camera_metadata = self.build_camera_metadata();
+        let mut camera_metadata = self.build_camera_metadata();
+        camera_metadata.orientation =
+            crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
+                media_rotation,
+                mirror_horizontal,
+            );
 
         let save_task = Task::perform(
             async move {
@@ -284,8 +302,6 @@ impl AppModel {
                     filter_type,
                     crop_rect,
                     zoom_level,
-                    rotation: media_rotation,
-                    mirror_horizontal,
                     ..Default::default()
                 };
                 let mut pipeline =
@@ -343,7 +359,12 @@ impl AppModel {
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
 
-        let camera_metadata = self.build_camera_metadata();
+        let mut camera_metadata = self.build_camera_metadata();
+        camera_metadata.orientation =
+            crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
+                media_rotation,
+                mirror_horizontal,
+            );
 
         let raw_save_dir = save_dir.clone();
         let raw_camera_metadata = camera_metadata.clone();
@@ -404,8 +425,6 @@ impl AppModel {
                         filter_type,
                         crop_rect,
                         zoom_level,
-                        rotation: media_rotation,
-                        mirror_horizontal,
                         ..Default::default()
                     };
                     let mut pipeline =
@@ -465,8 +484,6 @@ impl AppModel {
                         filter_type,
                         crop_rect,
                         zoom_level,
-                        rotation: media_rotation,
-                        mirror_horizontal,
                         ..Default::default()
                     };
                     let mut pipeline =
@@ -674,10 +691,15 @@ impl AppModel {
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
 
-        let camera_metadata = self.build_camera_metadata();
+        let mut camera_metadata = self.build_camera_metadata();
 
         let geometry_rotation = self.capture_geometry_rotation();
         let media_rotation = self.capture_media_rotation();
+        camera_metadata.orientation =
+            crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
+                media_rotation,
+                self.should_mirror_captures(),
+            );
 
         // Calculate crop rectangle based on preview mode and aspect ratio.
         // Cover-mode crop is computed by inverse-mapping the on-screen
@@ -722,8 +744,6 @@ impl AppModel {
         config.encoding_format = encoding_format;
         config.camera_metadata = camera_metadata;
         config.save_burst_raw_dng = self.config.save_burst_raw;
-        config.rotation = media_rotation;
-        config.mirror_horizontal = self.should_mirror_captures();
 
         // Calculate adaptive processing parameters based on scene brightness
         // estimate_scene_brightness assumes RGBA data, so skip for raw Bayer frames
@@ -1644,6 +1664,12 @@ impl AppModel {
             bitrate_kbps,
         } = config;
         let mirror_horizontal = self.should_mirror_captures();
+        let mut capture_metadata = self.build_camera_metadata();
+        capture_metadata.orientation =
+            crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
+                sensor_rotation,
+                mirror_horizontal,
+            );
 
         // Determine pixel format for the appsrc pipeline
         let pixel_format = self
@@ -1671,9 +1697,7 @@ impl AppModel {
         } else {
             None
         };
-        let use_jpeg_pipeline = is_mjpeg
-            && va_jpeg_dec.is_some()
-            && sensor_rotation == crate::backends::camera::types::SensorRotation::None;
+        let use_jpeg_pipeline = is_mjpeg && va_jpeg_dec.is_some();
 
         if use_jpeg_pipeline {
             info!(
@@ -1797,8 +1821,7 @@ impl AppModel {
                                     audio_device: audio_device.as_deref(),
                                     audio_source_rate_hz,
                                     encoder_info: selected_encoder.as_ref(),
-                                    rotation: sensor_rotation,
-                                    mirror_horizontal,
+                                    capture_metadata: capture_metadata.clone(),
                                     audio_levels,
                                 },
                                 pixel_format,
@@ -2039,8 +2062,12 @@ impl AppModel {
             .unwrap_or((1920, 1080));
         let bitrate_kbps = Some(self.config.bitrate_preset.bitrate_kbps(w, h));
         let live_filter_code = Arc::clone(&self.recording_filter_code);
-        let rotation = self.capture_media_rotation();
-        let mirror_horizontal = self.should_mirror_captures();
+        let mut capture_metadata = self.build_camera_metadata();
+        capture_metadata.orientation =
+            crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
+                self.capture_media_rotation(),
+                self.should_mirror_captures(),
+            );
 
         // Spawn the encoder task — it runs until the channel is closed
         let encoder_task = Task::perform(
@@ -2059,8 +2086,7 @@ impl AppModel {
                     encoder_info,
                     bitrate_kbps,
                     live_filter_code,
-                    rotation,
-                    mirror_horizontal,
+                    capture_metadata,
                 )
                 .await
             },
@@ -2245,8 +2271,6 @@ async fn process_burst_mode_frames_with_atomic(
     let encoding_format = config.encoding_format;
     let camera_metadata = config.camera_metadata.clone();
     let save_burst_raw_dng = config.save_burst_raw_dng;
-    let rotation = config.rotation;
-    let mirror_horizontal = config.mirror_horizontal;
 
     // Export raw burst frames as DNG if enabled (before processing)
     if save_burst_raw_dng {
@@ -2270,8 +2294,6 @@ async fn process_burst_mode_frames_with_atomic(
             encoding_format,
             &camera_metadata,
             filter,
-            rotation,
-            mirror_horizontal,
         )
         .await
     {
@@ -2288,7 +2310,7 @@ async fn process_burst_mode_frames_with_atomic(
     // Process using the unified GPU pipeline with progress reporting
     let merged = process_burst_mode(frames, config, Some(progress_callback)).await?;
 
-    // Save output with optional crop, filter, rotation, and selected encoding format
+    // Save output with optional crop, filter, and selected encoding format.
     let output_path = save_output(
         &merged,
         SaveOutputParams {
@@ -2297,9 +2319,7 @@ async fn process_burst_mode_frames_with_atomic(
             encoding_format,
             camera_metadata,
             filter: Some(filter),
-            rotation,
             filename_suffix: Some("_HDR+"),
-            mirror_horizontal,
         },
     )
     .await?;
@@ -2317,8 +2337,6 @@ async fn save_first_burst_frame(
     encoding_format: crate::pipelines::photo::EncodingFormat,
     camera_metadata: &crate::pipelines::photo::CameraMetadata,
     filter: crate::app::FilterType,
-    rotation: crate::backends::camera::types::SensorRotation,
-    mirror_horizontal: bool,
 ) -> Result<PathBuf, String> {
     use crate::pipelines::photo::burst_mode::{MergedFrame, SaveOutputParams, save_output};
 
@@ -2359,9 +2377,7 @@ async fn save_first_burst_frame(
             encoding_format,
             camera_metadata: camera_metadata.clone(),
             filter: Some(filter),
-            rotation,
             filename_suffix: None, // No suffix for first frame
-            mirror_horizontal,
         },
     )
     .await?;
