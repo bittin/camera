@@ -935,6 +935,45 @@ fn padded_copy_bytes_per_row(row_bytes: usize) -> usize {
         * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
 }
 
+fn yuv_plane_layout_is_valid(
+    data_len: usize,
+    offset: usize,
+    declared_size: usize,
+    stride: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> bool {
+    if row_bytes > stride {
+        return false;
+    }
+    let required_size = if rows == 0 {
+        Some(0)
+    } else {
+        stride
+            .checked_mul(rows - 1)
+            .and_then(|size| size.checked_add(row_bytes))
+    };
+    let Some(required_size) = required_size else {
+        return false;
+    };
+    required_size <= declared_size
+        && offset
+            .checked_add(declared_size)
+            .is_some_and(|end| end <= data_len)
+}
+
+fn i420_v_plane_is_valid(data_len: usize, layout: &YuvPlanes) -> bool {
+    layout.v_size > 0
+        && yuv_plane_layout_is_valid(
+            data_len,
+            layout.v_offset,
+            layout.v_size,
+            layout.v_stride as usize,
+            layout.uv_width as usize,
+            layout.uv_height as usize,
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn copy_rows_to_upload(
     source: &[u8],
@@ -2711,6 +2750,23 @@ impl VideoPipeline {
                 let Some(layout) = frame.yuv_planes.as_ref() else {
                     return false;
                 };
+                if !yuv_plane_layout_is_valid(
+                    data.len(),
+                    layout.y_offset,
+                    layout.y_size,
+                    frame.stride as usize,
+                    frame.width as usize,
+                    frame.height as usize,
+                ) || !yuv_plane_layout_is_valid(
+                    data.len(),
+                    layout.uv_offset,
+                    layout.uv_size,
+                    layout.uv_stride as usize,
+                    layout.uv_width as usize * 2,
+                    layout.uv_height as usize,
+                ) {
+                    return false;
+                }
                 vec![
                     UploadPlane {
                         texture: yuv.tex_y.clone(),
@@ -2734,6 +2790,24 @@ impl VideoPipeline {
                 let Some(layout) = frame.yuv_planes.as_ref() else {
                     return false;
                 };
+                if !yuv_plane_layout_is_valid(
+                    data.len(),
+                    layout.y_offset,
+                    layout.y_size,
+                    frame.stride as usize,
+                    frame.width as usize,
+                    frame.height as usize,
+                ) || !yuv_plane_layout_is_valid(
+                    data.len(),
+                    layout.uv_offset,
+                    layout.uv_size,
+                    layout.uv_stride as usize,
+                    layout.uv_width as usize,
+                    layout.uv_height as usize,
+                ) || !i420_v_plane_is_valid(data.len(), layout)
+                {
+                    return false;
+                }
                 let mut planes = vec![
                     UploadPlane {
                         texture: yuv.tex_y.clone(),
@@ -2752,16 +2826,14 @@ impl VideoPipeline {
                         extent: extent(layout.uv_width, layout.uv_height),
                     },
                 ];
-                if layout.v_size > 0 {
-                    planes.push(UploadPlane {
-                        texture: yuv.tex_v.clone(),
-                        source_offset: layout.v_offset,
-                        source_stride: layout.v_stride as usize,
-                        row_bytes: layout.uv_width as usize,
-                        rows: layout.uv_height as usize,
-                        extent: extent(layout.uv_width, layout.uv_height),
-                    });
-                }
+                planes.push(UploadPlane {
+                    texture: yuv.tex_v.clone(),
+                    source_offset: layout.v_offset,
+                    source_stride: layout.v_stride as usize,
+                    row_bytes: layout.uv_width as usize,
+                    rows: layout.uv_height as usize,
+                    extent: extent(layout.uv_width, layout.uv_height),
+                });
                 planes
             }
             PixelFormat::Gray8 => vec![UploadPlane {
@@ -3723,6 +3795,36 @@ mod tests {
             &destination[destination_stride..destination_stride + 6],
             &[7, 8, 9, 10, 11, 12]
         );
+    }
+
+    #[test]
+    fn yuv_plane_layout_requires_declared_and_backing_bounds() {
+        assert!(yuv_plane_layout_is_valid(32, 4, 16, 8, 6, 2));
+        assert!(!yuv_plane_layout_is_valid(32, 4, 13, 8, 6, 2));
+        assert!(!yuv_plane_layout_is_valid(16, 4, 16, 8, 6, 2));
+        assert!(!yuv_plane_layout_is_valid(32, 4, 16, 5, 6, 2));
+    }
+
+    #[test]
+    fn i420_requires_a_complete_v_plane() {
+        let mut layout = YuvPlanes {
+            y_offset: 0,
+            y_size: 16,
+            uv_offset: 16,
+            uv_size: 4,
+            uv_stride: 2,
+            v_offset: 20,
+            v_size: 0,
+            v_stride: 2,
+            uv_width: 2,
+            uv_height: 2,
+        };
+
+        assert!(!i420_v_plane_is_valid(24, &layout));
+        layout.v_size = 3;
+        assert!(!i420_v_plane_is_valid(24, &layout));
+        layout.v_size = 4;
+        assert!(i420_v_plane_is_valid(24, &layout));
     }
 
     #[test]
