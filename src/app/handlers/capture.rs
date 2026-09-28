@@ -36,6 +36,24 @@ const BURST_MODE_SUCCESS_DISPLAY_MS: u64 = 2000;
 /// Delay in ms before resetting burst mode state after an error
 const BURST_MODE_ERROR_DISPLAY_MS: u64 = 3000;
 
+/// Decide whether the zero-copy JPEG recorder can be used.
+///
+/// The JPEG path bypasses the decoded-frame pusher, so it cannot apply a
+/// filter selected after recording starts. Keep the live-filter requirement in
+/// this decision so that a future JPEG filter implementation can re-enable the
+/// fast path deliberately rather than silently regressing recording behavior.
+fn should_use_jpeg_recording_pipeline(
+    is_mjpeg: bool,
+    has_jpeg_decoder: bool,
+    sensor_rotation: crate::backends::camera::types::SensorRotation,
+    live_filters_required: bool,
+) -> bool {
+    is_mjpeg
+        && has_jpeg_decoder
+        && sensor_rotation == crate::backends::camera::types::SensorRotation::None
+        && !live_filters_required
+}
+
 impl AppModel {
     // =========================================================================
     // Flash Hardware Helpers
@@ -1697,7 +1715,12 @@ impl AppModel {
         } else {
             None
         };
-        let use_jpeg_pipeline = is_mjpeg && va_jpeg_dec.is_some();
+        let use_jpeg_pipeline = should_use_jpeg_recording_pipeline(
+            is_mjpeg,
+            va_jpeg_dec.is_some(),
+            sensor_rotation,
+            true,
+        );
 
         if use_jpeg_pipeline {
             info!(
@@ -2450,7 +2473,8 @@ pub(super) async fn wait_for_still_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::capture_with_preview_fallback;
+    use super::{capture_with_preview_fallback, should_use_jpeg_recording_pipeline};
+    use crate::backends::camera::types::SensorRotation;
     use std::cell::Cell;
 
     #[tokio::test]
@@ -2485,5 +2509,15 @@ mod tests {
 
         assert_eq!(result, Ok("raw.jpg"));
         assert!(!fallback_called.get());
+    }
+
+    #[test]
+    fn jpeg_recording_pipeline_is_not_selected_when_live_filters_are_required() {
+        assert!(!should_use_jpeg_recording_pipeline(
+            true,
+            true,
+            SensorRotation::None,
+            true,
+        ));
     }
 }
