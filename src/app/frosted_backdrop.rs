@@ -473,7 +473,7 @@ mod tests {
         Arc::new(CameraFrame {
             width: 64,
             height: 48,
-            data: FrameData::Copied(vec![7u8; 64 * 48 * 4].into()),
+            data: FrameData::from_copied(vec![7u8; 64 * 48 * 4].into()),
             format,
             stride,
             captured_at: std::time::Instant::now(),

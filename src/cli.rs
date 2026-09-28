@@ -582,7 +582,7 @@ fn load_dng_frame(path: &Path) -> Result<CameraFrame, Box<dyn std::error::Error>
 
     let (width, height) = img.dimensions();
     let rgba = img.to_rgba8();
-    let data = FrameData::Copied(Arc::from(rgba.into_raw().into_boxed_slice()));
+    let data = FrameData::from_copied(Arc::from(rgba.into_raw().into_boxed_slice()));
 
     Ok(CameraFrame {
         width,
@@ -618,7 +618,7 @@ fn load_burst_mode_frames(
             let img = image::open(path)?;
             let (width, height) = img.dimensions();
             let rgba = img.to_rgba8();
-            let data = FrameData::Copied(Arc::from(rgba.into_raw().into_boxed_slice()));
+            let data = FrameData::from_copied(Arc::from(rgba.into_raw().into_boxed_slice()));
 
             CameraFrame {
                 width,

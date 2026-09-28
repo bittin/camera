@@ -589,7 +589,7 @@ mod tests {
         let frame = CameraFrame {
             width: 2,
             height: 2,
-            data: FrameData::Copied(Arc::from(data.as_slice())),
+            data: FrameData::from_copied(Arc::from(data.as_slice())),
             format: PixelFormat::RGBA,
             stride: 8, // 2 pixels * 4 bytes = 8 bytes per row
             yuv_planes: None,

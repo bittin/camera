@@ -793,9 +793,9 @@ fn run_capture_loop(
 
     info!("Entering capture loop");
 
-    // Reusable buffer for MJPEG→YUV decompression.
-    // Avoids allocating + zeroing several MB per frame.
-    let mut jpeg_yuv_buf: Vec<u8> = Vec::new();
+    // Decoded frames return their allocation here after the last preview,
+    // recording, QR, or still-capture owner drops it.
+    let jpeg_yuv_pool = FrameDataPool::new(3);
 
     type MmapFB = MemoryMappedFrameBuffer<libcamera::framebuffer_allocator::FrameBuffer>;
 
@@ -921,7 +921,7 @@ fn run_capture_loop(
                         sensor_timestamp_ns,
                         &metadata,
                         frame_num,
-                        &mut jpeg_yuv_buf,
+                        &jpeg_yuv_pool,
                     );
                     MJPEG_DECODE_TIME_US
                         .store(decode_start.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -1153,7 +1153,8 @@ fn extract_metadata(req: &libcamera::request::Request) -> FrameMetadata {
 ///
 /// The GPU shader handles all subsampling types via `textureDimensions()`.
 ///
-/// `yuv_buf` is a reusable buffer to avoid allocating on every frame.
+/// Decoded storage comes from a refcount-aware pool and is returned only after
+/// every consumer has dropped the frame.
 /// Returns `None` if decoding fails (caller should skip the frame).
 fn decode_mjpeg_frame(
     decompressor: &mut turbojpeg::Decompressor,
@@ -1162,7 +1163,7 @@ fn decode_mjpeg_frame(
     sensor_timestamp_ns: Option<u64>,
     metadata: &FrameMetadata,
     frame_num: u64,
-    yuv_buf: &mut Vec<u8>,
+    yuv_pool: &FrameDataPool,
 ) -> Option<CameraFrame> {
     // Read JPEG header to get dimensions and subsampling
     let header = match decompressor.read_header(jpeg_data) {
@@ -1188,11 +1189,11 @@ fn decode_mjpeg_frame(
         }
     };
 
-    // Resize reusable buffer (free if same size, which it will be after first frame)
+    let mut yuv_buf = yuv_pool.acquire(buf_len);
     yuv_buf.resize(buf_len, 0);
 
     let yuv_image = turbojpeg::YuvImage {
-        pixels: &mut yuv_buf[..],
+        pixels: yuv_buf.as_mut_slice(),
         width,
         align,
         height,
@@ -1301,14 +1302,12 @@ fn decode_mjpeg_frame(
         uv_height: uv_h as u32,
     };
 
-    // Copy into Arc<[u8]> for shared ownership across preview/still/channel.
-    // The Vec buffer itself is reused across frames (no alloc after first frame).
-    let data: Arc<[u8]> = Arc::from(&yuv_buf[..]);
+    let data = yuv_buf.freeze();
 
     Some(CameraFrame {
         width: width as u32,
         height: height as u32,
-        data: FrameData::Copied(data),
+        data,
         format: match header.subsamp {
             turbojpeg::Subsamp::Sub2x2 => PixelFormat::I420,
             // No PixelFormat::I422 variant yet; treat 4:2:2 as I420 for now

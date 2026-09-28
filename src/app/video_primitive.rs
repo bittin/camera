@@ -8,7 +8,7 @@
 //! - Persistent textures across frames
 
 use crate::app::state::FilterType;
-use crate::backends::camera::types::{FrameData, PixelFormat, YuvPlanes};
+use crate::backends::camera::types::{FrameData, FrameIdentity, PixelFormat, YuvPlanes};
 use cosmic::iced::Rectangle;
 
 /// Video ID for the normal camera preview (no blur).
@@ -773,7 +773,7 @@ impl Clone for VideoPrimitive {
     /// Cloning is cheap and stays cheap: `VideoFrame` holds its pixels behind a
     /// `FrameData` (an `Arc`), so this copies a refcount, and the duplicate
     /// upload each clone would otherwise drive is deduplicated by
-    /// `last_frame_ptr` — the same mechanism that already absorbs the filter
+    /// `last_frame_identity` — the same mechanism that already absorbs the filter
     /// picker's fifteen widgets.
     ///
     /// `frosted_final_binding` and `preblur_binding` are deliberately not carried
@@ -847,8 +847,7 @@ impl VideoPrimitive {
 /// `video_id` meant uploading that `Arc` two or three times per frame — ~20 MB of
 /// bus traffic per extra copy, and an extra full-res texture each, on the target
 /// phone's 2592x1940 back camera, for identical texels. The per-texture
-/// `last_frame_ptr` dedup could not catch it: three keys, three
-/// `last_frame_ptr`s.
+/// identity dedup could not catch it: three keys, three identities.
 ///
 /// The mapping is sound ONLY while the mapped ids genuinely carry the same
 /// `Arc`. Feeding one of them a *different* frame would leave whichever consumer
@@ -879,9 +878,9 @@ struct VideoTexture {
     view: wgpu::TextureView,
     width: u32,
     height: u32,
-    /// Pointer to last uploaded frame data (for deduplication)
-    /// Multiple widgets with same video_id share an Arc, so same pointer = same frame
-    last_frame_ptr: usize,
+    /// Identity of the last uploaded frame. Pooled storage includes a generation
+    /// so recycling the same allocation cannot suppress a newer frame.
+    last_frame_identity: Option<FrameIdentity>,
 }
 
 const UPLOAD_RING_SIZE: usize = 3;
@@ -2312,14 +2311,9 @@ impl VideoPipeline {
         // `source_texture_id`).
         let tex_id = source_texture_id(frame.id);
 
-        // Get data pointer for deduplication (all filter picker widgets share the same Arc)
-        //
-        // Sound only because `AppModel::current_frame` keeps frame N's Arc alive
-        // while frame N+1 is allocated, so the two can never share an address. If
-        // a caller ever drops a frame before minting its successor, the allocator
-        // may hand back the same block and this dedup will freeze the preview on
-        // the stale texture.
-        let frame_data_ptr = frame.data.as_ptr() as usize;
+        // All consumers of one frame share this identity. Pooled allocations add
+        // a generation because their pointer is intentionally reused later.
+        let frame_identity = frame.data.upload_identity();
 
         // Check if texture exists and needs resizing
         let needs_creation = match self.textures.get(&tex_id) {
@@ -2337,7 +2331,7 @@ impl VideoPipeline {
         // a genuinely slow source was never actually throttled.
         if !needs_creation
             && let Some(tex) = self.textures.get(&tex_id)
-            && tex.last_frame_ptr == frame_data_ptr
+            && tex.last_frame_identity == Some(frame_identity)
         {
             // Same frame data already uploaded, skip
             return;
@@ -2426,7 +2420,7 @@ impl VideoPipeline {
         self.textures
             .get_mut(&tex_id)
             .expect("Texture should exist")
-            .last_frame_ptr = frame_data_ptr;
+            .last_frame_identity = Some(frame_identity);
         let gpu_copy_time = gpu_copy_start.elapsed();
 
         // Store GPU upload metrics for insights
@@ -2491,7 +2485,7 @@ impl VideoPipeline {
             view,
             width,
             height,
-            last_frame_ptr: 0, // Will be set on first upload
+            last_frame_identity: None,
         }
     }
 
@@ -4324,7 +4318,7 @@ mod tests {
             id: VIDEO_ID_FROSTED,
             width: N,
             height: N,
-            data: crate::backends::camera::types::FrameData::Copied(
+            data: crate::backends::camera::types::FrameData::from_copied(
                 vec![255u8; (N * N * 4) as usize].into(),
             ),
             format: PixelFormat::RGBA,
@@ -4510,7 +4504,7 @@ mod tests {
             id: 7,
             width: FRAME_W,
             height: FRAME_H,
-            data: crate::backends::camera::types::FrameData::Copied(
+            data: crate::backends::camera::types::FrameData::from_copied(
                 vec![255u8; (FRAME_W * FRAME_H * 4) as usize].into(),
             ),
             format: PixelFormat::RGBA,
@@ -4707,7 +4701,7 @@ mod tests {
             id,
             width: FRAME_W,
             height: FRAME_H,
-            data: crate::backends::camera::types::FrameData::Copied(
+            data: crate::backends::camera::types::FrameData::from_copied(
                 vec![255u8; (FRAME_W * FRAME_H * 4) as usize].into(),
             ),
             format: PixelFormat::RGBA,
@@ -5184,7 +5178,7 @@ mod tests {
             id: VIDEO_ID_FROSTED,
             width: src,
             height: src,
-            data: crate::backends::camera::types::FrameData::Copied(data.into()),
+            data: crate::backends::camera::types::FrameData::from_copied(data.into()),
             format: PixelFormat::RGBA,
             stride: src * 4,
             yuv_planes: None,
@@ -5389,7 +5383,7 @@ mod tests {
                 id: VIDEO_ID_BLUR,
                 width: N,
                 height: N,
-                data: crate::backends::camera::types::FrameData::Copied(data.into()),
+                data: crate::backends::camera::types::FrameData::from_copied(data.into()),
                 format: PixelFormat::RGBA,
                 stride: N * 4,
                 yuv_planes: None,
@@ -5620,7 +5614,9 @@ mod tests {
             id,
             width: SRC,
             height: SRC,
-            data: crate::backends::camera::types::FrameData::Copied(step_edge_frame(SRC).into()),
+            data: crate::backends::camera::types::FrameData::from_copied(
+                step_edge_frame(SRC).into(),
+            ),
             format: PixelFormat::RGBA,
             stride: SRC * 4,
             yuv_planes: None,
@@ -6271,7 +6267,7 @@ mod tests {
             id: VIDEO_ID_FROSTED,
             width: n,
             height: n,
-            data: crate::backends::camera::types::FrameData::Copied(data.into()),
+            data: crate::backends::camera::types::FrameData::from_copied(data.into()),
             format: PixelFormat::RGBA,
             stride: n * 4,
             yuv_planes: None,
@@ -6551,7 +6547,9 @@ mod tests {
                 id: VIDEO_ID_BLUR,
                 width: n,
                 height: n,
-                data: crate::backends::camera::types::FrameData::Copied(src_rgba.to_vec().into()),
+                data: crate::backends::camera::types::FrameData::from_copied(
+                    src_rgba.to_vec().into(),
+                ),
                 format: PixelFormat::RGBA,
                 stride: n * 4,
                 yuv_planes: None,
@@ -6766,7 +6764,7 @@ mod tests {
             id: video_id,
             width: N,
             height: N,
-            data: crate::backends::camera::types::FrameData::Copied(
+            data: crate::backends::camera::types::FrameData::from_copied(
                 std::iter::repeat_n([GREY, GREY, GREY, 255], (N * N) as usize)
                     .flatten()
                     .collect::<Vec<u8>>()
@@ -6977,7 +6975,7 @@ mod tests {
             id: VIDEO_ID_FROSTED,
             width: SW,
             height: SH,
-            data: crate::backends::camera::types::FrameData::Copied(data.into()),
+            data: crate::backends::camera::types::FrameData::from_copied(data.into()),
             format: PixelFormat::RGBA,
             stride: SW * 4,
             yuv_planes: None,
@@ -7203,7 +7201,7 @@ mod tests {
             id: VIDEO_ID_FROSTED,
             width: WW,
             height: WH,
-            data: crate::backends::camera::types::FrameData::Copied(
+            data: crate::backends::camera::types::FrameData::from_copied(
                 vec![255u8; (WW * WH * 4) as usize].into(),
             ),
             format: PixelFormat::RGBA,
@@ -7567,7 +7565,7 @@ mod tests {
             id: VIDEO_ID_FROSTED,
             width: SW,
             height: SH,
-            data: crate::backends::camera::types::FrameData::Copied(data.into()),
+            data: crate::backends::camera::types::FrameData::from_copied(data.into()),
             format: PixelFormat::RGBA,
             stride: SW * 4,
             yuv_planes: None,
@@ -7851,7 +7849,7 @@ mod tests {
             id: VIDEO_ID_FROSTED,
             width: SW,
             height: SH,
-            data: crate::backends::camera::types::FrameData::Copied(data.into()),
+            data: crate::backends::camera::types::FrameData::from_copied(data.into()),
             format: PixelFormat::RGBA,
             stride: SW * 4,
             yuv_planes: None,

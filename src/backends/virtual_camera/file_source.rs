@@ -214,7 +214,7 @@ fn extract_frame_from_sample(sample: &gstreamer::Sample) -> BackendResult<Camera
     let data: Vec<u8> = map.as_slice().to_vec();
 
     Ok(CameraFrame {
-        data: FrameData::Copied(Arc::from(data.into_boxed_slice())),
+        data: FrameData::from_copied(Arc::from(data.into_boxed_slice())),
         width,
         height,
         stride: width * 4,
@@ -305,7 +305,7 @@ pub fn load_image_as_frame(path: &Path) -> BackendResult<CameraFrame> {
     info!(width, height, "Image loaded successfully");
 
     Ok(CameraFrame {
-        data: FrameData::Copied(Arc::from(data.into_boxed_slice())),
+        data: FrameData::from_copied(Arc::from(data.into_boxed_slice())),
         width,
         height,
         stride: width * 4, // RGBA = 4 bytes per pixel
@@ -523,7 +523,7 @@ impl VideoDecoder {
         let data: Vec<u8> = map.as_slice().to_vec();
 
         Some(CameraFrame {
-            data: FrameData::Copied(Arc::from(data.into_boxed_slice())),
+            data: FrameData::from_copied(Arc::from(data.into_boxed_slice())),
             width: self.width,
             height: self.height,
             stride: self.width * 4,

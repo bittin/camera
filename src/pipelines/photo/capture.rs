@@ -113,7 +113,7 @@ mod tests {
         let frame = CameraFrame {
             width: 1920,
             height: 1080,
-            data: FrameData::Copied(Arc::from(vec![0u8; 1920 * 1080 * 4].into_boxed_slice())), // RGBA size (4 bytes per pixel)
+            data: FrameData::from_copied(Arc::from(vec![0u8; 1920 * 1080 * 4].into_boxed_slice())), // RGBA size (4 bytes per pixel)
             format: PixelFormat::RGBA,
             stride: 1920 * 4, // RGBA stride
             yuv_planes: None,
