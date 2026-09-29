@@ -868,7 +868,8 @@ fn run_capture_loop(
                     }
                     combined
                 };
-                let data_slice = combined_data.as_slice();
+                let capture_data = FrameData::from_owned_vec(combined_data);
+                let data_slice = capture_data.as_ref();
 
                 // If JPEG recording mode is active and this is an MJPEG stream,
                 // send raw JPEG bytes to the recorder BEFORE the CPU decode.
@@ -881,7 +882,7 @@ fn run_capture_loop(
                     {
                         let seq = metadata.sequence;
                         let send_result = tx.try_send(RecordingFrame::Jpeg {
-                            data: Arc::from(data_slice),
+                            data: capture_data.clone(),
                             width: formats.vf_size.width,
                             height: formats.vf_size.height,
                             sensor_timestamp_ns,
@@ -935,7 +936,7 @@ fn run_capture_loop(
                         }
                     }
                 } else {
-                    let data = FrameData::from_owned_vec(combined_data);
+                    let data = capture_data;
 
                     let stride = if formats.vf_stride > 0 {
                         formats.vf_stride
