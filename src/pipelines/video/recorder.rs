@@ -108,8 +108,9 @@ pub(super) fn compatible_software_input_format(encoder_name: &str) -> Option<&'s
     }
 }
 
-fn encoder_input_caps_filter(encoder_name: &str) -> String {
+fn encoder_input_caps_filter(encoder_name: &str, negotiated_format: Option<&str>) -> String {
     compatible_software_input_format(encoder_name)
+        .or(negotiated_format)
         .map(|format| format!("! capsfilter caps=video/x-raw,format={format}"))
         .unwrap_or_default()
 }
@@ -118,6 +119,7 @@ fn decoded_video_processing_chain_for_encoder(
     width: u32,
     height: u32,
     encoder_name: &str,
+    negotiated_format: Option<&str>,
     needs_scaling: bool,
 ) -> String {
     let mut chain = if needs_scaling {
@@ -130,12 +132,32 @@ fn decoded_video_processing_chain_for_encoder(
         "! videoconvert".to_string()
     };
 
-    let compatibility_caps = encoder_input_caps_filter(encoder_name);
+    let compatibility_caps = encoder_input_caps_filter(encoder_name, negotiated_format);
     if !compatibility_caps.is_empty() {
         chain.push(' ');
         chain.push_str(&compatibility_caps);
     }
     chain
+}
+
+fn jpeg_video_processing_chain_for_encoder(
+    width: u32,
+    height: u32,
+    encoder_name: &str,
+    negotiated_format: Option<&str>,
+) -> (String, u32, u32) {
+    let (encoder_width, encoder_height) = encoder_output_dimensions(width, height, encoder_name);
+    let (final_width, final_height) =
+        openh264_downscale(encoder_width, encoder_height, encoder_name);
+    let needs_scaling = final_width != width || final_height != height;
+    let processing = decoded_video_processing_chain_for_encoder(
+        final_width,
+        final_height,
+        encoder_name,
+        negotiated_format,
+        needs_scaling,
+    );
+    (processing, final_width, final_height)
 }
 
 fn video_tags(metadata: &crate::pipelines::capture_metadata::CaptureMetadata) -> gst::TagList {
@@ -206,6 +228,29 @@ pub(super) fn apply_video_tags_to_muxer(
 /// OpenH264 maximum pixel count (roughly 3072x3072).
 const OPENH264_MAX_PIXELS: u32 = 9_437_184;
 
+/// Return dimensions that conservative V4L2 memory-to-memory encoders accept.
+///
+/// Some drivers advertise unrestricted width/height ranges in their GStreamer
+/// caps but reject non-macroblock-aligned formats when streaming starts. Keep
+/// other encoder families unchanged and align V4L2 dimensions up so the
+/// encoder's coded size matches its visible size. Aligning down can make the
+/// driver add a cropped macroblock; players that ignore that crop expose its
+/// uninitialised chroma as a green edge.
+fn encoder_output_dimensions(width: u32, height: u32, encoder_name: &str) -> (u32, u32) {
+    const V4L2_MACROBLOCK_ALIGNMENT: u32 = 16;
+
+    if !encoder_name.starts_with("v4l2") {
+        return (width, height);
+    }
+
+    let align_up = |value: u32| {
+        (value.saturating_add(V4L2_MACROBLOCK_ALIGNMENT - 1) / V4L2_MACROBLOCK_ALIGNMENT
+            * V4L2_MACROBLOCK_ALIGNMENT)
+            .max(V4L2_MACROBLOCK_ALIGNMENT)
+    };
+    (align_up(width), align_up(height))
+}
+
 /// Build the optional PA-source-volume guard for a recording. Returns `None`
 /// when audio is disabled, no device was picked (PA default-source path), or
 /// PA can't be reached. Centralised so both recorder entry points
@@ -257,13 +302,14 @@ fn select_encoder_set(
 /// Shared state from the common recorder preparation phase.
 ///
 /// Both `new_from_appsrc` and `new_from_appsrc_jpeg` begin with the same
-/// sequence: encoder selection, V4L2 fallback, audio branch creation, and
+/// sequence: encoder selection, input negotiation, audio branch creation, and
 /// output path resolution. This struct captures the results so each
 /// constructor only handles its format-specific pipeline description and
 /// pusher spawn.
 struct RecorderSetup {
     audio_elements: Option<AudioBranch>,
     encoder_name: String,
+    encoder_input_format: Option<String>,
     parser_str: String,
     muxer_name: String,
     output_path: PathBuf,
@@ -272,7 +318,7 @@ struct RecorderSetup {
 
 /// Common setup for both appsrc recorder constructors.
 ///
-/// Handles encoder selection, V4L2 fallback, audio branch creation,
+/// Handles encoder selection, input negotiation, audio branch creation,
 /// and output path resolution. Format-specific encoder overrides
 /// (e.g. NVIDIA domain matching) should be applied to the returned
 /// [`RecorderSetup`] before building the pipeline description.
@@ -314,13 +360,35 @@ fn prepare_recorder(
         .map(|f| f.name().to_string())
         .unwrap_or_else(|| "openh264enc".to_string());
 
-    let (encoder_name, parser_str, muxer_name) = if selected_encoder.starts_with("v4l2") {
+    let is_v4l2 = selected_encoder.starts_with("v4l2");
+    let (encoder_width, encoder_height) = encoder_output_dimensions(
+        encoder_config.width,
+        encoder_config.height,
+        &selected_encoder,
+    );
+    let v4l2_input_format = is_v4l2.then(|| {
+        crate::media::encoders::video::negotiate_raw_encoder_input_format(
+            &encoders.video.encoder,
+            encoder_width,
+            encoder_height,
+            framerate,
+        )
+    });
+
+    let (encoder_name, encoder_input_format, parser_str, muxer_name) = if matches!(
+        v4l2_input_format,
+        Some(None)
+    ) {
         warn!(
             selected = %selected_encoder,
-            "V4L2 encoder not compatible with appsrc pipeline, falling back to openh264enc"
+            width = encoder_config.width,
+            height = encoder_config.height,
+            framerate,
+            "V4L2 encoder has no compatible CPU-memory input caps, falling back to openh264enc"
         );
         (
             "openh264enc".to_string(),
+            None,
             "! h264parse".to_string(),
             "mp4mux".to_string(),
         )
@@ -333,6 +401,7 @@ fn prepare_recorder(
             || selected_encoder == "x264enc"
             || selected_encoder == "x265enc";
         if !is_software
+            && !is_v4l2
             && !crate::media::encoders::detection::probe_single_encoder(&selected_encoder)
         {
             warn!(
@@ -341,17 +410,23 @@ fn prepare_recorder(
             );
             (
                 "openh264enc".to_string(),
+                None,
                 "! h264parse".to_string(),
                 "mp4mux".to_string(),
             )
         } else {
-            (selected_encoder, parser, muxer)
+            let input_format = v4l2_input_format.flatten();
+            if let Some(format) = input_format.as_deref() {
+                info!(encoder = %selected_encoder, format, "Using negotiated V4L2 encoder input");
+            }
+            (selected_encoder, input_format, parser, muxer)
         }
     };
 
     Ok(RecorderSetup {
         audio_elements,
         encoder_name,
+        encoder_input_format,
         parser_str,
         muxer_name,
         output_path,
@@ -882,9 +957,11 @@ impl VideoRecorder {
 
         let (base_width, base_height) = (width, height);
 
-        // OpenH264 has a maximum resolution limit — downscale if exceeded
+        let (encoder_width, encoder_height) =
+            encoder_output_dimensions(base_width, base_height, &setup.encoder_name);
+        // OpenH264 has a maximum resolution limit — downscale if exceeded.
         let (final_width, final_height) =
-            openh264_downscale(base_width, base_height, &setup.encoder_name);
+            openh264_downscale(encoder_width, encoder_height, &setup.encoder_name);
 
         // Only insert videoscale/capsfilter when downscaling is needed.
         // Capture orientation is stored as container metadata, so recording never
@@ -900,6 +977,7 @@ impl VideoRecorder {
             final_width,
             final_height,
             &setup.encoder_name,
+            setup.encoder_input_format.as_deref(),
             needs_scaling,
         );
 
@@ -1201,6 +1279,7 @@ impl VideoRecorder {
                     "Overriding encoder to match NVIDIA decoder memory domain"
                 );
                 setup.encoder_name = "nvh265enc".to_string();
+                setup.encoder_input_format = None;
                 setup.parser_str = "! h265parse".to_string();
                 setup.muxer_name = "mp4mux".to_string();
             } else if probe_single_encoder("nvh264enc") {
@@ -1211,6 +1290,7 @@ impl VideoRecorder {
                     "Overriding encoder to match NVIDIA decoder memory domain"
                 );
                 setup.encoder_name = "nvh264enc".to_string();
+                setup.encoder_input_format = None;
                 setup.parser_str = "! h264parse".to_string();
                 setup.muxer_name = "mp4mux".to_string();
             } else {
@@ -1221,7 +1301,12 @@ impl VideoRecorder {
             }
         }
 
-        let encoder_caps = encoder_input_caps_filter(&setup.encoder_name);
+        let (processing_chain, final_width, final_height) = jpeg_video_processing_chain_for_encoder(
+            width,
+            height,
+            &setup.encoder_name,
+            setup.encoder_input_format.as_deref(),
+        );
         let pipeline_desc = format!(
             "appsrc name=camera-appsrc \
                caps=image/jpeg,width={w},height={h},framerate={fps}/1 \
@@ -1229,8 +1314,7 @@ impl VideoRecorder {
                min-latency={lat} max-latency={lat} \
              ! queue max-size-buffers=60 max-size-time=3000000000 \
              ! {decoder} name=jpeg-decoder \
-             ! videoconvert \
-             {encoder_caps} \
+             {processing} \
              ! {encoder} name=recording-encoder \
              {parser} \
              ! {muxer} name=recording-muxer \
@@ -1240,7 +1324,7 @@ impl VideoRecorder {
             fps = framerate,
             lat = setup.frame_duration_ns,
             decoder = va_jpeg_dec,
-            encoder_caps = encoder_caps,
+            processing = processing_chain,
             encoder = setup.encoder_name,
             parser = setup.parser_str,
             muxer = setup.muxer_name,
@@ -1257,8 +1341,8 @@ impl VideoRecorder {
             &pipeline_desc,
             &setup.encoder_name,
             &encoder_config,
-            width,
-            height,
+            final_width,
+            final_height,
             setup.audio_elements.as_ref(),
             &audio_levels,
         )?;
@@ -1278,7 +1362,7 @@ impl VideoRecorder {
             mode: format!("JPEG zero-copy ({} → {})", va_jpeg_dec, setup.encoder_name),
             pipeline_string: pipeline_desc.clone(),
             encoder: setup.encoder_name.clone(),
-            resolution: format!("{}x{}", width, height),
+            resolution: format!("{}x{}", final_width, final_height),
             framerate,
         });
 
@@ -1705,7 +1789,8 @@ mod tests {
 
     #[test]
     fn decoded_recording_orientation_does_not_transform_pixels() {
-        let processing = decoded_video_processing_chain_for_encoder(1080, 1920, "nvh264enc", true);
+        let processing =
+            decoded_video_processing_chain_for_encoder(1080, 1920, "nvh264enc", None, true);
 
         assert!(!processing.contains("videoflip"));
         assert!(processing.contains("width=1080,height=1920"));
@@ -1713,11 +1798,59 @@ mod tests {
 
     #[test]
     fn software_encoder_rgba_processing_constrains_chroma_to_i420() {
-        let x264 = decoded_video_processing_chain_for_encoder(4000, 3000, "x264enc", false);
-        let x265 = decoded_video_processing_chain_for_encoder(4000, 3000, "x265enc", false);
+        let x264 = decoded_video_processing_chain_for_encoder(4000, 3000, "x264enc", None, false);
+        let x265 = decoded_video_processing_chain_for_encoder(4000, 3000, "x265enc", None, false);
 
         assert!(x264.contains("format=I420"));
         assert!(x265.contains("format=I420"));
+    }
+
+    #[test]
+    fn hardware_encoder_rgba_processing_uses_negotiated_input_format() {
+        let processing = decoded_video_processing_chain_for_encoder(
+            1436,
+            1080,
+            "v4l2h264enc",
+            Some("NV12"),
+            false,
+        );
+
+        assert!(processing.contains("format=NV12"));
+    }
+
+    #[test]
+    fn jpeg_v4l2_processing_applies_negotiated_format_and_aligned_dimensions() {
+        let (processing, width, height) =
+            jpeg_video_processing_chain_for_encoder(1436, 1080, "v4l2h265enc", Some("NV12"));
+
+        assert_eq!((width, height), (1440, 1088));
+        assert!(processing.contains("videoscale"));
+        assert!(processing.contains("width=1440,height=1088"));
+        assert!(processing.contains("format=NV12"));
+    }
+
+    #[test]
+    fn v4l2_encoder_dimensions_align_up_to_avoid_visible_coded_padding() {
+        assert_eq!(
+            encoder_output_dimensions(1436, 1080, "v4l2h264enc"),
+            (1440, 1088)
+        );
+        assert_eq!(
+            encoder_output_dimensions(1436, 1080, "v4l2h265enc"),
+            (1440, 1088)
+        );
+    }
+
+    #[test]
+    fn encoder_dimensions_preserve_aligned_and_non_v4l2_sizes() {
+        assert_eq!(
+            encoder_output_dimensions(1280, 720, "v4l2h264enc"),
+            (1280, 720)
+        );
+        assert_eq!(
+            encoder_output_dimensions(1436, 1080, "x264enc"),
+            (1436, 1080)
+        );
     }
 
     #[test]

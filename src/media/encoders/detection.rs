@@ -193,6 +193,10 @@ pub fn probe_single_encoder(encoder_name: &str) -> bool {
     probe_gst_pipeline(&pipeline_desc)
 }
 
+fn defer_probe_until_recording(encoder_name: &str) -> bool {
+    encoder_name.starts_with("v4l2")
+}
+
 /// Probe all given video encoder names and return the names of the broken ones.
 ///
 /// Hardware encoders are tested sequentially (they may share a single V4L2 or
@@ -203,20 +207,19 @@ pub fn probe_broken_encoders(encoder_names: &[String]) -> Vec<String> {
 
     let mut broken = Vec::new();
 
-    // V4L2 encoders share CMA/IOMMU resources with the camera ISP on
-    // embedded SoCs — probing them while the camera is active can crash
-    // the capture pipeline.  Mark them as broken unconditionally so they
-    // are removed from the settings UI.  The runtime fallback in
-    // recorder.rs handles V4L2 → software encoder substitution if one
-    // is ever selected.
-    for name in encoder_names.iter().filter(|n| n.starts_with("v4l2")) {
-        warn!(encoder = %name, "V4L2 encoder cannot be probed safely — marking as broken");
-        broken.push(name.to_string());
+    // V4L2 mem2mem encoders can share resources with an active camera. Keep
+    // them available here and negotiate their exact sink caps only when the
+    // user starts recording instead of running a competing test pipeline.
+    for name in encoder_names
+        .iter()
+        .filter(|name| defer_probe_until_recording(name))
+    {
+        info!(encoder = %name, "Deferring V4L2 encoder probe until recording");
     }
 
     let (hw, sw): (Vec<&String>, Vec<&String>) = encoder_names
         .iter()
-        .filter(|name| !name.starts_with("v4l2"))
+        .filter(|name| !defer_probe_until_recording(name))
         .partition(|name| {
             name.starts_with("vaapi")
                 || name.starts_with("va")
@@ -286,5 +289,13 @@ mod tests {
         // Just ensure detection doesn't panic
         let _ = detect_video_encoders();
         let _ = detect_audio_encoders();
+    }
+
+    #[test]
+    fn v4l2_encoder_probe_is_deferred_without_marking_it_broken() {
+        assert!(defer_probe_until_recording("v4l2h264enc"));
+        assert!(defer_probe_until_recording("v4l2h265enc"));
+        assert!(!defer_probe_until_recording("x264enc"));
+        assert!(!defer_probe_until_recording("vah264enc"));
     }
 }
