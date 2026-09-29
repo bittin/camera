@@ -221,16 +221,25 @@ impl PulseClient {
     }
 }
 
-/// RAII guard that boosts a PulseAudio source's software volume to 100% and
-/// restores the previous value on `Drop`.
+/// Choose a capture level that reaches hardware unity without asking the
+/// source for analogue or software amplification above 0 dB.
+fn safe_recording_volume(base_volume: Volume) -> Volume {
+    if base_volume == Volume::MUTED || base_volume.as_u32() > Volume::NORM.as_u32() {
+        Volume::NORM
+    } else {
+        base_volume
+    }
+}
+
+/// RAII guard that normalises a PulseAudio source for recording and restores
+/// the previous value on `Drop`.
 ///
 /// Some platforms (notably Alpine + alsa-ucm on the Pixel 3a) ship the
-/// built-in mic's PA volume clamped to a low default (~32% / -30 dB). Even
-/// with the compressor + makeup-gain in the recording pipeline, that
-/// pre-attenuation gives us a poor SNR — software gain can't recover what
-/// PA threw away. By raising the source volume to 100% for the duration of
-/// the recording we keep the signal at full strength, and restore the user's
-/// original setting on stop so we don't permanently mutate their PA state.
+/// built-in mic's hardware-unity level at ~32%. Raising that source to 100%
+/// applies roughly 30 dB of analogue capture gain and clips loud recordings
+/// before the application's limiter can protect them. PulseAudio exposes the
+/// hardware 0 dB point as `base_volume`, so recording uses that level (capped
+/// at normal volume) and leaves loudness shaping to the digital dynamics chain.
 ///
 /// Best-effort: if the PA socket isn't reachable or the source doesn't
 /// exist, the guard is a no-op (logged as debug) — recording still proceeds.
@@ -244,11 +253,12 @@ pub struct PulseSourceVolumeGuard {
 }
 
 impl PulseSourceVolumeGuard {
-    /// Query the source's current volume, set it to 100% on every channel,
+    /// Query the source's current volume, set every channel to the source's
+    /// safe hardware-unity level,
     /// and return a guard that restores the originals on drop. `None` if
     /// `device` is empty (caller picked the PA default source — we don't
     /// second-guess the default's volume) or if PA can't be reached.
-    pub fn boost_to_full(device: &str) -> Option<Self> {
+    pub fn normalize_for_recording(device: &str) -> Option<Self> {
         if device.is_empty() {
             return None;
         }
@@ -261,6 +271,7 @@ impl PulseSourceVolumeGuard {
             return None;
         }
 
+        let target = safe_recording_volume(info.base_volume);
         info!(
             device,
             previous_db = original
@@ -268,15 +279,20 @@ impl PulseSourceVolumeGuard {
                 .first()
                 .map(|v| v.to_db())
                 .unwrap_or(f32::NEG_INFINITY),
+            base_db = info.base_volume.to_db(),
+            target_db = target.to_db(),
             channels,
-            "Boosting PA source volume to 100% for recording"
+            "Normalising PA source volume for recording"
         );
 
-        let boosted = ChannelVolume::norm(channels);
-        if !client.set_source_volume(device, boosted) {
+        let mut adjusted = ChannelVolume::empty();
+        for _ in 0..channels {
+            adjusted.push(target);
+        }
+        if !client.set_source_volume(device, adjusted) {
             warn!(
                 device,
-                "Failed to boost PA source volume — skipping restore"
+                "Failed to normalise PA source volume — skipping restore"
             );
             return None;
         }
@@ -666,6 +682,25 @@ fn channel_info_from_pa(src: &SourceInfo) -> Vec<AudioChannelInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_gain_uses_the_hardware_zero_db_level() {
+        let hardware_zero_db = Volume::from_u32_clamped(20_724);
+
+        assert_eq!(safe_recording_volume(hardware_zero_db), hardware_zero_db);
+    }
+
+    #[test]
+    fn recording_gain_uses_unity_when_the_base_level_is_unknown() {
+        assert_eq!(safe_recording_volume(Volume::MUTED), Volume::NORM);
+    }
+
+    #[test]
+    fn recording_gain_never_amplifies_above_unity() {
+        let amplified = Volume::from_linear(2.0);
+
+        assert_eq!(safe_recording_volume(amplified), Volume::NORM);
+    }
 
     #[test]
     fn a_missing_cookie_is_padded_to_the_protocol_length() {
