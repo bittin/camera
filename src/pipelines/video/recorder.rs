@@ -16,8 +16,8 @@ use super::stats::{
 };
 use crate::backends::camera::types::{CameraFrame, PixelFormat, RecordingFrame};
 use crate::media::encoders::video::SelectedVideoEncoder;
-use crate::pipelines::audio_level::PULSESRC_SLAVE_METHOD;
 use crate::pipelines::audio_level::install_level_sync_handler as install_shared_level_sync_handler;
+use crate::pipelines::audio_level::{PULSESRC_BUFFER_TIME_US, PULSESRC_SLAVE_METHOD};
 use chrono::{Datelike, Timelike, Utc};
 use gstreamer as gst;
 use gstreamer::prelude::*;
@@ -1344,19 +1344,15 @@ impl VideoRecorder {
         audio_encoder_config: crate::media::encoders::audio::SelectedAudioEncoder,
     ) -> Result<Option<AudioBranch>, String> {
         let mut source_builder = gst::ElementFactory::make("pulsesrc")
-            // `skew` keeps the device clock and inserts/drops samples to
-            // resync against the pipeline clock, which avoids cumulative
-            // drift on long recordings (the previous `re-timestamp` mode
-            // stamps buffers on arrival and can diverge over time when
-            // PipeWire and pipeline clocks differ). Tradeoff: per-buffer
-            // PipeWire routing latency is no longer absorbed into the
-            // timestamps, so non-default audio devices may need their own
-            // sync compensation if A/V offset becomes audible.
+            // Resample against the pipeline clock so audio stays synchronized
+            // without `skew` advancing the capture pointer and dropping mic
+            // samples when video processing temporarily starves the process.
             //
             // The value is sourced from `PULSESRC_SLAVE_METHOD` so the
             // pre-recording probe in `audio_probe.rs` configures pulsesrc
             // identically.
             .property_from_str("slave-method", PULSESRC_SLAVE_METHOD)
+            .property("buffer-time", PULSESRC_BUFFER_TIME_US)
             .property("provide-clock", false);
 
         // pulsesrc `device` property takes the PipeWire/PulseAudio node name
