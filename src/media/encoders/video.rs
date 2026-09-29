@@ -161,6 +161,65 @@ pub struct SelectedVideoEncoder {
     pub extension: &'static str,
 }
 
+/// Select a CPU-backed raw format accepted by both `videoconvert` and an encoder.
+///
+/// Hardware encoder sink caps are device-specific. Prefer common 4:2:0 formats,
+/// then consider every raw format known to GStreamer so V4L2 encoders are not
+/// tied to a hard-coded device format.
+pub fn select_raw_encoder_input_format(
+    encoder_caps: &gst::Caps,
+    converter_caps: &gst::Caps,
+    width: u32,
+    height: u32,
+    framerate: u32,
+) -> Option<String> {
+    let preferred = ["NV12", "I420", "YV12", "NV21", "P010_10LE", "YUY2", "UYVY"];
+    let mut formats: Vec<String> = preferred
+        .iter()
+        .map(|format| (*format).to_string())
+        .collect();
+
+    for format in gstreamer_video::VideoFormat::iter_raw() {
+        let format = format.to_str().to_string();
+        if !formats.contains(&format) {
+            formats.push(format);
+        }
+    }
+
+    formats.into_iter().find(|format| {
+        let candidate = gst::Caps::builder("video/x-raw")
+            .field("format", format.as_str())
+            .field("width", width as i32)
+            .field("height", height as i32)
+            .field("framerate", gst::Fraction::new(framerate as i32, 1))
+            .build();
+        encoder_caps.can_intersect(&candidate) && converter_caps.can_intersect(&candidate)
+    })
+}
+
+/// Query an encoder's actual sink caps and choose a compatible CPU-memory format.
+pub fn negotiate_raw_encoder_input_format(
+    encoder: &gst::Element,
+    width: u32,
+    height: u32,
+    framerate: u32,
+) -> Option<String> {
+    let encoder_caps = encoder.static_pad("sink")?.query_caps(None);
+    let converter = gst::ElementFactory::make("videoconvert").build().ok()?;
+    let converter_caps = converter.static_pad("src")?.query_caps(None);
+
+    debug!(
+        encoder = encoder.name().as_str(),
+        caps = %encoder_caps,
+        width,
+        height,
+        framerate,
+        "Negotiating raw encoder input format"
+    );
+
+    select_raw_encoder_input_format(&encoder_caps, &converter_caps, width, height, framerate)
+}
+
 /// Enumerate all available video encoders
 ///
 /// Returns a list of available encoders sorted by priority
@@ -584,6 +643,7 @@ pub fn configure_video_encoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn test_codec_extensions() {
@@ -608,5 +668,60 @@ mod tests {
         assert_eq!(ContainerFormat::WebM.extension(), "webm");
         assert_eq!(ContainerFormat::MP4.muxer_name(), "mp4mux");
         assert_eq!(ContainerFormat::WebM.muxer_name(), "webmmux");
+    }
+
+    #[test]
+    fn hardware_input_format_prefers_nv12_when_supported() {
+        gst::init().unwrap();
+        let encoder_caps = gst::Caps::from_str(
+            "video/x-raw,format=(string){ I420, NV12 },width=[ 16, 4096 ],height=[ 16, 4096 ]",
+        )
+        .unwrap();
+        let converter_caps =
+            gst::Caps::from_str("video/x-raw,format=(string){ NV12, I420 }").unwrap();
+
+        assert_eq!(
+            select_raw_encoder_input_format(&encoder_caps, &converter_caps, 1436, 1080, 30),
+            Some("NV12".to_string())
+        );
+    }
+
+    #[test]
+    fn hardware_input_format_uses_other_system_memory_formats_generically() {
+        gst::init().unwrap();
+        let encoder_caps = gst::Caps::from_str("video/x-raw,format=YUY2").unwrap();
+        let converter_caps =
+            gst::Caps::from_str("video/x-raw,format=(string){ NV12, YUY2 }").unwrap();
+
+        assert_eq!(
+            select_raw_encoder_input_format(&encoder_caps, &converter_caps, 1280, 720, 30),
+            Some("YUY2".to_string())
+        );
+    }
+
+    #[test]
+    fn hardware_input_format_rejects_unsupported_dimensions() {
+        gst::init().unwrap();
+        let encoder_caps =
+            gst::Caps::from_str("video/x-raw,format=NV12,width=[ 16, 1280 ],height=[ 16, 720 ]")
+                .unwrap();
+        let converter_caps = gst::Caps::from_str("video/x-raw,format=NV12").unwrap();
+
+        assert_eq!(
+            select_raw_encoder_input_format(&encoder_caps, &converter_caps, 1436, 1080, 30),
+            None
+        );
+    }
+
+    #[test]
+    fn hardware_input_format_rejects_dmabuf_only_caps_for_cpu_frames() {
+        gst::init().unwrap();
+        let encoder_caps = gst::Caps::from_str("video/x-raw(memory:DMABuf),format=NV12").unwrap();
+        let converter_caps = gst::Caps::from_str("video/x-raw,format=NV12").unwrap();
+
+        assert_eq!(
+            select_raw_encoder_input_format(&encoder_caps, &converter_caps, 1280, 720, 30),
+            None
+        );
     }
 }
