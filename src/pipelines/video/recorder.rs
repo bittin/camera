@@ -641,6 +641,25 @@ fn install_muxer_fixup_probes(pipeline: &gst::Pipeline) {
     }
 }
 
+/// Wrap tightly-packed RGBA frame storage directly for Standard-filter recording.
+///
+/// The GStreamer buffer owns a clone of [`FrameData`], so the underlying shared
+/// allocation stays alive until downstream releases the buffer. Filtered frames,
+/// padded RGBA, and non-RGBA formats return `None` and use the processing path.
+fn try_shared_rgba_buffer(
+    frame: &CameraFrame,
+    filter_type: crate::app::FilterType,
+) -> Option<gst::Buffer> {
+    let row_bytes = frame.width.checked_mul(4)?;
+    let expected_len = row_bytes.checked_mul(frame.height)? as usize;
+
+    (filter_type == crate::app::FilterType::Standard
+        && frame.format == PixelFormat::RGBA
+        && frame.stride == row_bytes
+        && frame.data.len() == expected_len)
+        .then(|| gst::Buffer::from_slice(frame.data.clone()))
+}
+
 /// Convert a camera frame to tightly-packed RGBA using the GPU compute shader.
 ///
 /// For frames already in RGBA format, strips stride padding.
@@ -827,8 +846,9 @@ impl VideoRecorder {
             live_filter_code,
         } = config;
 
-        // Always use the filtered (RGBA) pipeline so the user can toggle
-        // filters mid-recording and have them apply to the output file.
+        // Keep stable RGBA appsrc caps for the whole recording so live filter
+        // changes never renegotiate the GStreamer pipeline. Standard-filter
+        // frames may still share tightly-packed RGBA storage directly.
         let initial_filter_code = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
 
         info!(
@@ -954,10 +974,8 @@ impl VideoRecorder {
         Ok(recorder)
     }
 
-    /// Spawn the legacy (decoded-frame) pusher task.
-    ///
-    /// Spawn a pusher task that converts frames to RGBA and applies the live
-    /// GPU filter before pushing to appsrc.
+    /// Spawn a pusher task that shares Standard-filter RGBA frames directly or
+    /// converts and filters frames before pushing them to the same RGBA appsrc.
     ///
     /// Reads the current filter code from `live_filter_code` each frame so
     /// filter changes during recording are reflected in the output file.
@@ -1009,38 +1027,43 @@ impl VideoRecorder {
                 let sensor_ts = frame.sensor_timestamp_ns;
                 let sequence = frame.libcamera_metadata.as_ref().and_then(|m| m.sequence);
 
-                // Convert to RGBA via GPU compute shader
-                let t0 = std::time::Instant::now();
-                let rgba = match convert_frame_to_rgba(&frame).await {
-                    Ok(data) => data,
-                    Err(e) => {
-                        warn!(error = %e, "Failed to convert frame to RGBA, skipping");
-                        continue;
-                    }
-                };
-
-                // Read current filter from shared atomic (UI thread updates this)
+                // Read the live filter for every frame so Standard ↔ filtered
+                // switching remains seamless within one fixed-caps pipeline.
                 let filter_code = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
                 let filter_type = crate::app::FilterType::from_gpu_filter_code(filter_code);
 
-                // Apply GPU filter (skip for Standard — just use the RGBA as-is)
-                let filtered = if filter_type == crate::app::FilterType::Standard {
-                    rgba
+                let t0 = std::time::Instant::now();
+                let mut buffer = if let Some(buffer) = try_shared_rgba_buffer(&frame, filter_type) {
+                    buffer
                 } else {
-                    match crate::shaders::apply_filter_gpu_rgba(
-                        &rgba,
-                        frame.width,
-                        frame.height,
-                        filter_type,
-                    )
-                    .await
-                    {
+                    let rgba = match convert_frame_to_rgba(&frame).await {
                         Ok(data) => data,
                         Err(e) => {
-                            warn!(error = %e, "Failed to apply filter, using unfiltered RGBA");
-                            rgba
+                            warn!(error = %e, "Failed to convert frame to RGBA, skipping");
+                            continue;
                         }
-                    }
+                    };
+
+                    let output = if filter_type == crate::app::FilterType::Standard {
+                        rgba
+                    } else {
+                        match crate::shaders::apply_filter_gpu_rgba(
+                            &rgba,
+                            frame.width,
+                            frame.height,
+                            filter_type,
+                        )
+                        .await
+                        {
+                            Ok(data) => data,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to apply filter, using unfiltered RGBA");
+                                rgba
+                            }
+                        }
+                    };
+
+                    gst::Buffer::from_mut_slice(output)
                 };
 
                 RECORDING_STATS
@@ -1059,7 +1082,6 @@ impl VideoRecorder {
                     PtsResult::Skip => continue,
                 };
 
-                let mut buffer = gst::Buffer::from_mut_slice(filtered);
                 {
                     let buf_ref = buffer.get_mut().unwrap();
                     buf_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
@@ -1668,6 +1690,23 @@ pub fn check_available_encoders() {
 mod tests {
     use super::*;
 
+    fn test_rgba_frame(width: u32, height: u32, stride: u32) -> CameraFrame {
+        let len = stride as usize * height as usize;
+        CameraFrame {
+            width,
+            height,
+            data: crate::backends::camera::types::FrameData::from_owned_vec(
+                (0..len).map(|value| value as u8).collect(),
+            ),
+            format: PixelFormat::RGBA,
+            stride,
+            yuv_planes: None,
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        }
+    }
+
     #[test]
     fn decoded_recording_orientation_does_not_transform_pixels() {
         let processing = decoded_video_processing_chain_for_encoder(1080, 1920, "nvh264enc", true);
@@ -1683,6 +1722,38 @@ mod tests {
 
         assert!(x264.contains("format=I420"));
         assert!(x265.contains("format=I420"));
+    }
+
+    #[test]
+    fn standard_filter_wraps_tightly_packed_rgba_without_copying() {
+        gst::init().unwrap();
+        let frame = test_rgba_frame(4, 2, 16);
+        let source_ptr = frame.data.as_ref().as_ptr();
+
+        let buffer = try_shared_rgba_buffer(&frame, crate::app::FilterType::Standard)
+            .expect("tightly packed Standard RGBA should use shared storage");
+        let mapped = buffer.map_readable().expect("buffer should be readable");
+
+        assert_eq!(mapped.as_slice(), frame.data.as_ref());
+        assert_eq!(mapped.as_slice().as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn live_filter_switching_only_uses_shared_storage_for_standard_frames() {
+        gst::init().unwrap();
+        let frame = test_rgba_frame(4, 2, 16);
+
+        assert!(try_shared_rgba_buffer(&frame, crate::app::FilterType::Standard).is_some());
+        assert!(try_shared_rgba_buffer(&frame, crate::app::FilterType::Sepia).is_none());
+        assert!(try_shared_rgba_buffer(&frame, crate::app::FilterType::Standard).is_some());
+    }
+
+    #[test]
+    fn padded_standard_rgba_still_uses_the_repacking_path() {
+        gst::init().unwrap();
+        let frame = test_rgba_frame(4, 2, 20);
+
+        assert!(try_shared_rgba_buffer(&frame, crate::app::FilterType::Standard).is_none());
     }
 
     #[test]
