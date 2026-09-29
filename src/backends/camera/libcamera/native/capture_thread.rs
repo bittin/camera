@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
+const MJPEG_DECODE_WORKERS: usize = 2;
+const MJPEG_DECODE_QUEUE_CAPACITY: usize = 2;
+
 /// Parameters passed to the capture thread for initialization
 pub(crate) struct CaptureThreadParams {
     pub(crate) camera_id: String,
@@ -43,6 +46,186 @@ pub(crate) struct CaptureThreadParams {
 /// Result of capture thread initialization (sent back to main thread)
 pub(crate) struct CaptureThreadInitResult {
     pub(crate) is_multistream: bool,
+}
+
+trait QueueWorker<Job, Output>: Send + 'static {
+    fn process(&mut self, job: Job) -> Output;
+}
+
+struct BoundedWorkerQueue<Job> {
+    job_tx: Option<std::sync::mpsc::SyncSender<Job>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl<Job> BoundedWorkerQueue<Job>
+where
+    Job: Send + 'static,
+{
+    fn new_with_result_sender<Worker, Output>(
+        workers: Vec<Worker>,
+        queue_capacity: usize,
+        result_tx: std::sync::mpsc::Sender<Output>,
+    ) -> Self
+    where
+        Worker: QueueWorker<Job, Output>,
+        Output: Send + 'static,
+    {
+        let (job_tx, job_rx) = std::sync::mpsc::sync_channel(queue_capacity);
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let workers = workers
+            .into_iter()
+            .map(|mut worker| {
+                let job_rx = Arc::clone(&job_rx);
+                let result_tx = result_tx.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        let job = {
+                            let receiver = job_rx.lock().unwrap_or_else(|e| e.into_inner());
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        if result_tx.send(worker.process(job)).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        Self {
+            job_tx: Some(job_tx),
+            workers,
+        }
+    }
+
+    fn try_submit(&self, job: Job) -> Result<(), std::sync::mpsc::TrySendError<Job>> {
+        self.job_tx
+            .as_ref()
+            .expect("worker queue is active")
+            .try_send(job)
+    }
+}
+
+impl<Job> Drop for BoundedWorkerQueue<Job> {
+    fn drop(&mut self) {
+        self.job_tx.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct MjpegDecodeJob {
+    data: FrameData,
+    captured_at: Instant,
+    sensor_timestamp_ns: Option<u64>,
+    metadata: FrameMetadata,
+    frame_num: u64,
+    dispatch_context: FrameDispatchContext<RecordingFrame>,
+    skip_recording: bool,
+}
+
+struct MjpegDecodeOutput {
+    frame_num: u64,
+    frame: Option<CameraFrame>,
+    dispatch_context: FrameDispatchContext<RecordingFrame>,
+    skip_recording: bool,
+    decode_time_us: u64,
+}
+
+// Keep decoded frames inline: boxing would add an allocation and indirection to
+// every preview frame solely to make the uncommon request variant smaller.
+#[allow(clippy::large_enum_variant)]
+enum CaptureEvent {
+    Request(libcamera::request::Request),
+    MjpegDecoded(MjpegDecodeOutput),
+}
+
+struct MjpegDecodeWorker {
+    decompressor: turbojpeg::Decompressor,
+    yuv_pool: FrameDataPool,
+}
+
+impl QueueWorker<MjpegDecodeJob, CaptureEvent> for MjpegDecodeWorker {
+    fn process(&mut self, job: MjpegDecodeJob) -> CaptureEvent {
+        let decode_start = Instant::now();
+        let frame = decode_mjpeg_frame(
+            &mut self.decompressor,
+            job.data.as_ref(),
+            job.captured_at,
+            job.sensor_timestamp_ns,
+            &job.metadata,
+            job.frame_num,
+            &self.yuv_pool,
+        );
+        CaptureEvent::MjpegDecoded(MjpegDecodeOutput {
+            frame_num: job.frame_num,
+            frame,
+            dispatch_context: job.dispatch_context,
+            skip_recording: job.skip_recording,
+            decode_time_us: decode_start.elapsed().as_micros() as u64,
+        })
+    }
+}
+
+type MjpegDecodeQueue = BoundedWorkerQueue<MjpegDecodeJob>;
+
+struct FrameDispatchContext<T> {
+    capture_still: bool,
+    recording_sender: Option<tokio::sync::mpsc::Sender<T>>,
+}
+
+fn snapshot_frame_dispatch_context<T>(
+    is_multistream: bool,
+    still_requested: &AtomicBool,
+    recording_sender: &Mutex<Option<tokio::sync::mpsc::Sender<T>>>,
+) -> FrameDispatchContext<T> {
+    FrameDispatchContext {
+        capture_still: !is_multistream && still_requested.load(Ordering::Acquire),
+        recording_sender: recording_sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+    }
+}
+
+fn advance_mjpeg_dispatch_watermark(
+    last_dispatched_frame: &mut Option<u64>,
+    frame_num: u64,
+    decode_succeeded: bool,
+) -> bool {
+    if !decode_succeeded || last_dispatched_frame.is_some_and(|last| frame_num <= last) {
+        return false;
+    }
+    *last_dispatched_frame = Some(frame_num);
+    true
+}
+
+fn create_mjpeg_decode_queue(
+    result_tx: std::sync::mpsc::Sender<CaptureEvent>,
+) -> Result<MjpegDecodeQueue, BackendError> {
+    let yuv_pool = FrameDataPool::new(MJPEG_DECODE_WORKERS + MJPEG_DECODE_QUEUE_CAPACITY);
+    let workers = (0..MJPEG_DECODE_WORKERS)
+        .map(|_| {
+            let mut decompressor = turbojpeg::Decompressor::new()
+                .map_err(|e| BackendError::Other(format!("turbojpeg init: {e}")))?;
+            if let Err(e) = decompressor.set_scan_limit(MJPEG_SCAN_LIMIT) {
+                debug!(error = %e, "Could not set MJPEG scan limit");
+            }
+            Ok(MjpegDecodeWorker {
+                decompressor,
+                yuv_pool: yuv_pool.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, BackendError>>()?;
+
+    Ok(BoundedWorkerQueue::new_with_result_sender(
+        workers,
+        MJPEG_DECODE_QUEUE_CAPACITY,
+        result_tx,
+    ))
 }
 
 /// Extract the number of bytes actually written to each plane of a frame buffer.
@@ -486,8 +669,13 @@ fn capture_thread_setup_and_run(
         is_multistream,
     )?;
 
-    // Subscribe to request completion via channel
-    let rx = active_cam.subscribe_request_completed();
+    // Route camera requests and worker completions through one channel so a
+    // decoded frame wakes the capture loop immediately instead of being polled.
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let request_event_tx = event_tx.clone();
+    active_cam.on_request_completed(move |request| {
+        let _ = request_event_tx.send(CaptureEvent::Request(request));
+    });
 
     // Start camera
     active_cam
@@ -519,22 +707,15 @@ fn capture_thread_setup_and_run(
         },
     });
 
-    // Create MJPEG decompressor if needed — BEFORE reporting success so that
-    // init failures are propagated to the caller via init_tx.
-    let mut jpeg_decompressor = if formats.vf_is_mjpeg {
-        let mut decompressor = turbojpeg::Decompressor::new()
-            .map_err(|e| BackendError::Other(format!("turbojpeg init: {e}")))?;
-        // Bound the work a single frame can cost us. A camera emitting a
-        // progressive JPEG with a pathological scan count would otherwise stall
-        // the capture thread frame after frame; MJPEG in practice is baseline,
-        // so a generous limit never fires for well-behaved hardware.
-        if let Err(e) = decompressor.set_scan_limit(MJPEG_SCAN_LIMIT) {
-            debug!(error = %e, "Could not set MJPEG scan limit");
-        }
+    // Create MJPEG workers before reporting success so decoder initialization
+    // failures are propagated to the caller via init_tx.
+    let jpeg_decode_queue = if formats.vf_is_mjpeg {
         if let Ok(mut d) = DIAGNOSTICS.write() {
-            d.mjpeg_decoder_name = Some("turbojpeg (libjpeg-turbo)".to_string());
+            d.mjpeg_decoder_name = Some(format!(
+                "turbojpeg (libjpeg-turbo, {MJPEG_DECODE_WORKERS} workers)"
+            ));
         }
-        Some(decompressor)
+        Some(create_mjpeg_decode_queue(event_tx.clone())?)
     } else {
         None
     };
@@ -548,12 +729,12 @@ fn capture_thread_setup_and_run(
 
     run_capture_loop(
         &mut active_cam,
-        &rx,
+        &event_rx,
         &stream_vf,
         &stream_raw,
         &formats,
         is_multistream,
-        &mut jpeg_decompressor,
+        jpeg_decode_queue,
         &mut params,
     );
 
@@ -564,7 +745,8 @@ fn capture_thread_setup_and_run(
     // Drop all libcamera objects in correct dependency order.
     // Previously, dropping mgr before cam/alloc caused use-after-free (SIGSEGV)
     // because those objects still referenced the CameraManager's internal state.
-    drop(rx);
+    drop(event_tx);
+    drop(event_rx);
     drop(alloc);
     drop(config);
     drop(active_cam);
@@ -773,18 +955,48 @@ fn allocate_and_create_requests(
     Ok((alloc, requests))
 }
 
-/// Run the capture loop — receive completed requests, process viewfinder/raw
-/// buffers, send frames to consumers. Returns when `stop_flag` is set or the
-/// request channel disconnects.
+/// Dispatch one completed MJPEG decode to preview and recording consumers.
+fn dispatch_mjpeg_frame(
+    output: MjpegDecodeOutput,
+    params: &mut CaptureThreadParams,
+    is_multistream: bool,
+    last_dispatched_frame: &mut Option<u64>,
+) {
+    if !advance_mjpeg_dispatch_watermark(
+        last_dispatched_frame,
+        output.frame_num,
+        output.frame.is_some(),
+    ) {
+        return;
+    }
+
+    MJPEG_DECODE_TIME_US.store(output.decode_time_us, Ordering::Relaxed);
+    if let Some(frame) = output.frame {
+        dispatch_viewfinder_frame(
+            frame,
+            output.frame_num,
+            params,
+            is_multistream,
+            output.dispatch_context,
+            output.skip_recording,
+        );
+    }
+}
+
+fn drain_pending_events<T>(receiver: &std::sync::mpsc::Receiver<T>) {
+    while receiver.try_recv().is_ok() {}
+}
+
+/// Run the capture loop until `stop_flag` is set or the event channel closes.
 #[allow(clippy::too_many_arguments)]
 fn run_capture_loop(
     active_cam: &mut libcamera::camera::ActiveCamera<'_>,
-    rx: &std::sync::mpsc::Receiver<libcamera::request::Request>,
+    event_rx: &std::sync::mpsc::Receiver<CaptureEvent>,
     stream_vf: &libcamera::stream::Stream,
     stream_raw: &Option<libcamera::stream::Stream>,
     formats: &StreamFormats,
     is_multistream: bool,
-    jpeg_decompressor: &mut Option<turbojpeg::Decompressor>,
+    jpeg_decode_queue: Option<MjpegDecodeQueue>,
     params: &mut CaptureThreadParams,
 ) {
     use libcamera::framebuffer::AsFrameBuffer;
@@ -792,22 +1004,33 @@ fn run_capture_loop(
     use libcamera::request::{RequestStatus, ReuseFlag};
 
     info!("Entering capture loop");
-
-    // Decoded frames return their allocation here after the last preview,
-    // recording, QR, or still-capture owner drops it.
-    let jpeg_yuv_pool = FrameDataPool::new(3);
+    let mut last_dispatched_mjpeg_frame = None;
 
     type MmapFB = MemoryMappedFrameBuffer<libcamera::framebuffer_allocator::FrameBuffer>;
 
     while !params.stop_flag.load(Ordering::Acquire) {
-        // Wait for completed request with timeout
-        let mut req = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(req) => req,
+        // Worker completions share this channel with libcamera requests, so
+        // completed decodes wake the loop immediately. The timeout exists only
+        // to observe the atomic stop flag if camera delivery itself stalls.
+        let event = match event_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(event) => event,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                info!("Request channel disconnected, stopping capture loop");
+                info!("Capture event channel disconnected, stopping capture loop");
                 break;
             }
+        };
+        let mut req = match event {
+            CaptureEvent::MjpegDecoded(output) => {
+                dispatch_mjpeg_frame(
+                    output,
+                    params,
+                    is_multistream,
+                    &mut last_dispatched_mjpeg_frame,
+                );
+                continue;
+            }
+            CaptureEvent::Request(req) => req,
         };
 
         if req.status() != RequestStatus::Complete {
@@ -868,71 +1091,64 @@ fn run_capture_loop(
                     }
                     combined
                 };
-                let data_slice = combined_data.as_slice();
-
-                // If JPEG recording mode is active and this is an MJPEG stream,
-                // send raw JPEG bytes to the recorder BEFORE the CPU decode.
-                // The recorder's VA-API pipeline will decode on GPU.
-                let jpeg_sent_to_recorder = if formats.vf_is_mjpeg
-                    && params.jpeg_recording_mode.load(Ordering::Relaxed)
-                {
-                    if let Ok(guard) = params.recording_sender.lock()
-                        && let Some(ref tx) = *guard
+                if let Some(queue) = jpeg_decode_queue.as_ref() {
+                    let jpeg_data = FrameData::from_owned_vec(combined_data);
+                    let dispatch_context = snapshot_frame_dispatch_context(
+                        is_multistream,
+                        &params.still_requested,
+                        &params.recording_sender,
+                    );
+                    let jpeg_sent_to_recorder = if params
+                        .jpeg_recording_mode
+                        .load(Ordering::Relaxed)
                     {
-                        let seq = metadata.sequence;
-                        let send_result = tx.try_send(RecordingFrame::Jpeg {
-                            data: Arc::from(data_slice),
-                            width: formats.vf_size.width,
-                            height: formats.vf_size.height,
-                            sensor_timestamp_ns,
-                            sequence: seq,
-                        });
-                        if send_result.is_err() {
-                            crate::pipelines::video::stats::rec_stats_capture_dropped();
-                            if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-                                warn!(frame = frame_num, seq = ?seq, "JPEG recording frame dropped (channel full)");
+                        if let Some(ref tx) = dispatch_context.recording_sender {
+                            let seq = metadata.sequence;
+                            let send_result = tx.try_send(RecordingFrame::Jpeg {
+                                data: jpeg_data.clone(),
+                                width: formats.vf_size.width,
+                                height: formats.vf_size.height,
+                                sensor_timestamp_ns,
+                                sequence: seq,
+                            });
+                            if send_result.is_err() {
+                                crate::pipelines::video::stats::rec_stats_capture_dropped();
+                                if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
+                                    warn!(frame = frame_num, seq = ?seq, "JPEG recording frame dropped (channel full)");
+                                }
+                            } else {
+                                crate::pipelines::video::stats::rec_stats_capture_sent();
                             }
+                            if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
+                                debug!(
+                                    frame = frame_num,
+                                    seq = ?seq,
+                                    sensor_ts_ms = ?sensor_timestamp_ns.map(|t| t / 1_000_000),
+                                    "Sent JPEG to recorder"
+                                );
+                            }
+                            true
                         } else {
-                            crate::pipelines::video::stats::rec_stats_capture_sent();
+                            false
                         }
-                        if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-                            debug!(
-                                frame = frame_num,
-                                seq = ?seq,
-                                sensor_ts_ms = ?sensor_timestamp_ns.map(|t| t / 1_000_000),
-                                "Sent JPEG to recorder"
-                            );
-                        }
-                        true
                     } else {
                         false
-                    }
-                } else {
-                    false
-                };
+                    };
 
-                // Decode MJPEG or copy raw data from mmap BEFORE req.reuse()
-                let frame = if let Some(decompressor) = jpeg_decompressor {
-                    let decode_start = Instant::now();
-                    let decode_result = decode_mjpeg_frame(
-                        decompressor,
-                        data_slice,
-                        captured_at,
-                        sensor_timestamp_ns,
-                        &metadata,
-                        frame_num,
-                        &jpeg_yuv_pool,
-                    );
-                    MJPEG_DECODE_TIME_US
-                        .store(decode_start.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    match decode_result {
-                        Some(f) => f,
-                        None => {
-                            // Decode failed, skip this frame
-                            req.reuse(ReuseFlag::REUSE_BUFFERS);
-                            requeue_request(active_cam, req, &params.stop_flag);
-                            continue;
-                        }
+                    if queue
+                        .try_submit(MjpegDecodeJob {
+                            data: jpeg_data,
+                            captured_at,
+                            sensor_timestamp_ns,
+                            metadata: metadata.clone(),
+                            frame_num,
+                            dispatch_context,
+                            skip_recording: jpeg_sent_to_recorder,
+                        })
+                        .is_err()
+                        && frame_num.is_multiple_of(LOG_EVERY_N_FRAMES)
+                    {
+                        debug!(frame = frame_num, "MJPEG decode queue full, dropping frame");
                     }
                 } else {
                     let data = FrameData::from_owned_vec(combined_data);
@@ -948,7 +1164,7 @@ fn run_capture_loop(
                         )
                     };
 
-                    build_camera_frame(
+                    let frame = build_camera_frame(
                         data,
                         FrameLayout {
                             width: formats.vf_size.width,
@@ -959,16 +1175,21 @@ fn run_capture_loop(
                         captured_at,
                         sensor_timestamp_ns,
                         metadata.clone(),
-                    )
-                };
-
-                dispatch_viewfinder_frame(
-                    frame,
-                    frame_num,
-                    params,
-                    is_multistream,
-                    jpeg_sent_to_recorder,
-                );
+                    );
+                    let dispatch_context = snapshot_frame_dispatch_context(
+                        is_multistream,
+                        &params.still_requested,
+                        &params.recording_sender,
+                    );
+                    dispatch_viewfinder_frame(
+                        frame,
+                        frame_num,
+                        params,
+                        is_multistream,
+                        dispatch_context,
+                        false,
+                    );
+                }
             }
         } else if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
             warn!("No viewfinder buffer in completed request");
@@ -1026,6 +1247,11 @@ fn run_capture_loop(
         req.reuse(ReuseFlag::REUSE_BUFFERS);
         requeue_request(active_cam, req, &params.stop_flag);
     }
+
+    // Stop and join decode workers, then release completed outputs that retain
+    // capture-time recording sender clones.
+    drop(jpeg_decode_queue);
+    drain_pending_events(event_rx);
 }
 
 /// Dispatch a completed viewfinder frame to all consumers:
@@ -1038,6 +1264,7 @@ fn dispatch_viewfinder_frame(
     frame_num: u64,
     params: &mut CaptureThreadParams,
     is_multistream: bool,
+    dispatch_context: FrameDispatchContext<RecordingFrame>,
     skip_recording: bool,
 ) {
     static FIRST_FRAME: AtomicBool = AtomicBool::new(false);
@@ -1050,7 +1277,13 @@ fn dispatch_viewfinder_frame(
 
     // In single-stream mode, also handle still capture from preview.
     // Acquire pairs with the Release store in `request_still_capture`.
-    if !is_multistream && params.still_requested.load(Ordering::Acquire) {
+    if !is_multistream
+        && dispatch_context.capture_still
+        && params
+            .still_requested
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
         info!(
             frame = frame_num,
             width = frame.width,
@@ -1063,7 +1296,6 @@ fn dispatch_viewfinder_frame(
         } else {
             false
         };
-        params.still_requested.store(false, Ordering::Release);
         if stored {
             params.still_frame_notify.notify_waiters();
         }
@@ -1071,10 +1303,7 @@ fn dispatch_viewfinder_frame(
 
     // Send ViewFinder frames to recording (via appsrc encoder pipeline).
     // Skip if raw JPEG was already sent to the recorder in JPEG mode.
-    if !skip_recording
-        && let Ok(guard) = params.recording_sender.lock()
-        && let Some(ref tx) = *guard
-    {
+    if !skip_recording && let Some(ref tx) = dispatch_context.recording_sender {
         let seq = frame.libcamera_metadata.as_ref().and_then(|m| m.sequence);
         let send_result = tx.try_send(RecordingFrame::Decoded(Arc::new(frame.clone())));
         if send_result.is_err() {
@@ -1343,4 +1572,150 @@ fn compute_stride(pf: PixelFormat, width: u32, buffer_size: usize, height: u32) 
     // Use the larger of computed and buffer-derived stride
     // (buffer may have alignment padding)
     computed.max(buffer_stride)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BoundedWorkerQueue, QueueWorker, advance_mjpeg_dispatch_watermark, drain_pending_events,
+        snapshot_frame_dispatch_context,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    struct BlockingWorker {
+        started: Arc<AtomicUsize>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl QueueWorker<u32, u32> for BlockingWorker {
+        fn process(&mut self, job: u32) -> u32 {
+            self.started.fetch_add(1, Ordering::Release);
+            let (lock, condvar) = &*self.release;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            job
+        }
+    }
+
+    struct IdentityWorker;
+
+    impl QueueWorker<u32, u32> for IdentityWorker {
+        fn process(&mut self, job: u32) -> u32 {
+            job
+        }
+    }
+
+    #[test]
+    fn bounded_worker_queue_notifies_an_external_result_channel() {
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let queue = BoundedWorkerQueue::new_with_result_sender(vec![IdentityWorker], 1, result_tx);
+
+        queue.try_submit(42).unwrap();
+
+        assert_eq!(result_rx.recv_timeout(Duration::from_secs(1)), Ok(42));
+    }
+
+    #[test]
+    fn draining_pending_events_releases_held_senders() {
+        let (sink_tx, sink_rx) = tokio::sync::mpsc::channel::<u8>(1);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        event_tx.send(sink_tx.clone()).unwrap();
+        drop(event_tx);
+        drop(sink_tx);
+        assert!(!sink_rx.is_closed());
+
+        drain_pending_events(&event_rx);
+
+        assert!(sink_rx.is_closed());
+    }
+
+    #[test]
+    fn bounded_worker_queue_runs_two_workers_and_rejects_excess_jobs() {
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let workers = (0..2)
+            .map(|_| BlockingWorker {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            })
+            .collect();
+        let (result_tx, _result_rx) = std::sync::mpsc::channel();
+        let queue = BoundedWorkerQueue::new_with_result_sender(workers, 1, result_tx);
+
+        queue.try_submit(1).unwrap();
+        let first_deadline = Instant::now() + Duration::from_secs(1);
+        while started.load(Ordering::Acquire) != 1 && Instant::now() < first_deadline {
+            std::thread::yield_now();
+        }
+        queue.try_submit(2).unwrap();
+        let second_deadline = Instant::now() + Duration::from_secs(1);
+        while started.load(Ordering::Acquire) != 2 && Instant::now() < second_deadline {
+            std::thread::yield_now();
+        }
+
+        queue.try_submit(3).unwrap();
+        let excess_was_rejected = queue.try_submit(4).is_err();
+
+        assert_eq!(started.load(Ordering::Acquire), 2);
+        assert!(excess_was_rejected);
+
+        let (lock, condvar) = &*release;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+    }
+
+    #[test]
+    fn failed_newer_decode_does_not_suppress_an_older_success() {
+        let mut last_dispatched = None;
+
+        assert!(!advance_mjpeg_dispatch_watermark(
+            &mut last_dispatched,
+            2,
+            false
+        ));
+        assert!(advance_mjpeg_dispatch_watermark(
+            &mut last_dispatched,
+            1,
+            true
+        ));
+        assert_eq!(last_dispatched, Some(1));
+    }
+
+    #[test]
+    fn older_decode_cannot_replace_a_newer_success() {
+        let mut last_dispatched = None;
+
+        assert!(advance_mjpeg_dispatch_watermark(
+            &mut last_dispatched,
+            2,
+            true
+        ));
+        assert!(!advance_mjpeg_dispatch_watermark(
+            &mut last_dispatched,
+            1,
+            true
+        ));
+        assert_eq!(last_dispatched, Some(2));
+    }
+
+    #[test]
+    fn async_dispatch_uses_capture_time_still_and_recording_state() {
+        let still_requested = AtomicBool::new(false);
+        let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(1);
+        let recording_sender = Mutex::new(Some(old_tx));
+
+        let context = snapshot_frame_dispatch_context(false, &still_requested, &recording_sender);
+        still_requested.store(true, Ordering::Release);
+        *recording_sender.lock().unwrap() = Some(new_tx);
+
+        assert!(!context.capture_still);
+        context.recording_sender.unwrap().try_send(7_u8).unwrap();
+        assert_eq!(old_rx.try_recv(), Ok(7));
+        assert!(new_rx.try_recv().is_err());
+    }
 }
