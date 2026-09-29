@@ -218,7 +218,7 @@ fn build_pulse_volume_guard(
     if !enable_audio {
         return None;
     }
-    audio_device.and_then(crate::backends::audio::PulseSourceVolumeGuard::boost_to_full)
+    audio_device.and_then(crate::backends::audio::PulseSourceVolumeGuard::normalize_for_recording)
 }
 
 /// Downscale dimensions if they exceed OpenH264's pixel limit.
