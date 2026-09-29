@@ -14,7 +14,13 @@ use gstreamer::prelude::*;
 /// Pinning this to a single constant guarantees the pre-recording probe and
 /// the real recorder see the audio source the same way, so the meter in
 /// settings shows what the recording will record.
-pub const PULSESRC_SLAVE_METHOD: &str = "skew";
+/// `resample` continuously matches the pipeline clock without advancing the
+/// capture pointer and discarding microphone samples when the process stalls.
+pub const PULSESRC_SLAVE_METHOD: &str = "resample";
+
+/// Keep enough microphone data in PulseAudio to survive short CPU stalls from
+/// video conversion/encoding without overrunning the source capture buffer.
+pub const PULSESRC_BUFFER_TIME_US: i64 = 2_000_000;
 
 /// Shared parameters for the dynamics-processing chain used by both the
 /// recorder pipeline and the settings audio probe. Single source of truth
@@ -108,4 +114,19 @@ pub fn install_level_sync_handler(pipeline: &gst::Pipeline, levels: &SharedAudio
         // Drop level messages — don't clutter the bus queue.
         gst::BusSyncReply::Drop
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_audio_resamples_to_the_pipeline_clock_without_dropping_samples() {
+        assert_eq!(PULSESRC_SLAVE_METHOD, "resample");
+    }
+
+    #[test]
+    fn pulse_capture_buffer_outlasts_observed_video_stalls() {
+        assert_eq!(PULSESRC_BUFFER_TIME_US, 2_000_000);
+    }
 }

@@ -20,7 +20,8 @@ use gstreamer::prelude::*;
 use tracing::{info, warn};
 
 use crate::pipelines::audio_level::{
-    PULSESRC_SLAVE_METHOD, SharedAudioLevels, dynamics, install_level_sync_handler,
+    PULSESRC_BUFFER_TIME_US, PULSESRC_SLAVE_METHOD, SharedAudioLevels, dynamics,
+    install_level_sync_handler,
 };
 
 /// Running probe pipeline. Drop or call [`AudioLevelProbe::stop`] to tear down.
@@ -53,7 +54,7 @@ impl AudioLevelProbe {
         // parameters come from `dynamics::*` so the meter reflects exactly
         // what the recording will capture.
         let desc = format!(
-            "pulsesrc name=probe-src {device_str}slave-method={slave} do-timestamp=true provide-clock=false \
+            "pulsesrc name=probe-src {device_str}slave-method={slave} buffer-time={buffer_time} do-timestamp=true provide-clock=false \
              ! audioconvert \
              ! audioresample \
              ! capsfilter caps=audio/x-raw,channels=1,rate={rate} \
@@ -63,6 +64,7 @@ impl AudioLevelProbe {
              ! level name=audio-level-output post-messages=true interval=100000000 \
              ! fakesink sync=false",
             slave = PULSESRC_SLAVE_METHOD,
+            buffer_time = PULSESRC_BUFFER_TIME_US,
             rate = target_rate,
             ct = dynamics::COMPRESSOR_THRESHOLD,
             cr = dynamics::COMPRESSOR_RATIO,
