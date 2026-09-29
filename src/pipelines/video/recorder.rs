@@ -101,12 +101,41 @@ pub struct VideoRecorder {
     pusher_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
-fn decoded_video_processing_chain(width: u32, height: u32) -> String {
-    format!(
-        "! videoconvert ! videoscale \
-         ! capsfilter caps=video/x-raw,format=I420,width={width},height={height} \
-         ! videoconvert"
-    )
+pub(super) fn compatible_software_input_format(encoder_name: &str) -> Option<&'static str> {
+    match encoder_name {
+        "x264enc" | "x265enc" | "openh264enc" => Some("I420"),
+        _ => None,
+    }
+}
+
+fn encoder_input_caps_filter(encoder_name: &str) -> String {
+    compatible_software_input_format(encoder_name)
+        .map(|format| format!("! capsfilter caps=video/x-raw,format={format}"))
+        .unwrap_or_default()
+}
+
+fn decoded_video_processing_chain_for_encoder(
+    width: u32,
+    height: u32,
+    encoder_name: &str,
+    needs_scaling: bool,
+) -> String {
+    let mut chain = if needs_scaling {
+        format!(
+            "! videoconvert ! videoscale \
+             ! capsfilter caps=video/x-raw,format=I420,width={width},height={height} \
+             ! videoconvert"
+        )
+    } else {
+        "! videoconvert".to_string()
+    };
+
+    let compatibility_caps = encoder_input_caps_filter(encoder_name);
+    if !compatibility_caps.is_empty() {
+        chain.push(' ');
+        chain.push_str(&compatibility_caps);
+    }
+    chain
 }
 
 fn video_tags(metadata: &crate::pipelines::capture_metadata::CaptureMetadata) -> gst::TagList {
@@ -847,11 +876,12 @@ impl VideoRecorder {
         // This lets the user toggle filters mid-recording.
         let initial_gst_format = "RGBA";
 
-        let processing_chain = if needs_scaling {
-            decoded_video_processing_chain(final_width, final_height)
-        } else {
-            "! videoconvert".to_string()
-        };
+        let processing_chain = decoded_video_processing_chain_for_encoder(
+            final_width,
+            final_height,
+            &setup.encoder_name,
+            needs_scaling,
+        );
 
         let pipeline_desc = format!(
             "appsrc name=camera-appsrc \
@@ -1169,6 +1199,7 @@ impl VideoRecorder {
             }
         }
 
+        let encoder_caps = encoder_input_caps_filter(&setup.encoder_name);
         let pipeline_desc = format!(
             "appsrc name=camera-appsrc \
                caps=image/jpeg,width={w},height={h},framerate={fps}/1 \
@@ -1177,6 +1208,7 @@ impl VideoRecorder {
              ! queue max-size-buffers=60 max-size-time=3000000000 \
              ! {decoder} name=jpeg-decoder \
              ! videoconvert \
+             {encoder_caps} \
              ! {encoder} name=recording-encoder \
              {parser} \
              ! {muxer} name=recording-muxer \
@@ -1186,6 +1218,7 @@ impl VideoRecorder {
             fps = framerate,
             lat = setup.frame_duration_ns,
             decoder = va_jpeg_dec,
+            encoder_caps = encoder_caps,
             encoder = setup.encoder_name,
             parser = setup.parser_str,
             muxer = setup.muxer_name,
@@ -1637,10 +1670,19 @@ mod tests {
 
     #[test]
     fn decoded_recording_orientation_does_not_transform_pixels() {
-        let processing = decoded_video_processing_chain(1080, 1920);
+        let processing = decoded_video_processing_chain_for_encoder(1080, 1920, "nvh264enc", true);
 
         assert!(!processing.contains("videoflip"));
         assert!(processing.contains("width=1080,height=1920"));
+    }
+
+    #[test]
+    fn software_encoder_rgba_processing_constrains_chroma_to_i420() {
+        let x264 = decoded_video_processing_chain_for_encoder(4000, 3000, "x264enc", false);
+        let x265 = decoded_video_processing_chain_for_encoder(4000, 3000, "x265enc", false);
+
+        assert!(x264.contains("format=I420"));
+        assert!(x265.contains("format=I420"));
     }
 
     #[test]

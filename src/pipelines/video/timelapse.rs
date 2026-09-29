@@ -10,7 +10,9 @@
 
 use super::encoder_selection::{EncoderConfig, select_encoders, select_encoders_with_video};
 use super::muxer::{create_muxer, link_muxer_to_sink, link_video_to_muxer};
-use super::recorder::{apply_video_tags_to_muxer, convert_frame_to_rgba};
+use super::recorder::{
+    apply_video_tags_to_muxer, compatible_software_input_format, convert_frame_to_rgba,
+};
 use crate::backends::camera::types::CameraFrame;
 use crate::media::encoders::video::EncoderInfo;
 use gstreamer as gst;
@@ -139,15 +141,11 @@ pub async fn run_timelapse_encoder(
         pipeline
             .add(p)
             .map_err(|e| format!("pipeline add parser: {e}"))?;
-        videoconvert
-            .link(&encoder_elem)
-            .map_err(|_| "link videoconvert→encoder")?;
+        link_converter_to_encoder(&videoconvert, &encoder_elem, &enc_name)?;
         encoder_elem.link(p).map_err(|_| "link encoder→parser")?;
         link_video_to_muxer(p, &muxer_cfg.muxer)?;
     } else {
-        videoconvert
-            .link(&encoder_elem)
-            .map_err(|_| "link videoconvert→encoder")?;
+        link_converter_to_encoder(&videoconvert, &encoder_elem, &enc_name)?;
         link_video_to_muxer(&encoder_elem, &muxer_cfg.muxer)?;
     }
     link_muxer_to_sink(&muxer_cfg.muxer, &muxer_cfg.filesink)?;
@@ -246,6 +244,25 @@ pub async fn run_timelapse_encoder(
 
     info!(path = %final_output.display(), frames = frame_index, "Timelapse video saved");
     Ok(final_output.display().to_string())
+}
+
+fn link_converter_to_encoder(
+    videoconvert: &gst::Element,
+    encoder: &gst::Element,
+    encoder_name: &str,
+) -> Result<(), String> {
+    if let Some(format) = compatible_software_input_format(encoder_name) {
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", format)
+            .build();
+        videoconvert
+            .link_filtered(encoder, &caps)
+            .map_err(|_| format!("link videoconvert→{encoder_name} with {format} caps"))
+    } else {
+        videoconvert
+            .link(encoder)
+            .map_err(|_| "link videoconvert→encoder".to_string())
+    }
 }
 
 /// Convert a frame to RGBA and apply the current live filter (if any).
