@@ -257,19 +257,21 @@ fn planes_bytes_used(
 /// the frame. Pool storage is returned only after the last `FrameData` clone is
 /// dropped, so a later capture can never overwrite a retained frame.
 fn pooled_copy_frame_planes(planes: &[&[u8]], used: &[usize], pool: &FrameDataPool) -> FrameData {
+    assert_eq!(
+        planes.len(),
+        used.len(),
+        "expected one bytes-used entry per capture plane"
+    );
     let copied_len = planes
         .iter()
         .zip(used)
         .map(|(plane, &bytes)| bytes.min(plane.len()))
         .sum();
     let mut lease = pool.acquire(copied_len);
-    lease.resize(copied_len, 0);
 
-    let mut offset = 0;
     for (plane, &bytes) in planes.iter().zip(used) {
         let bytes = bytes.min(plane.len());
-        lease.as_mut_slice()[offset..offset + bytes].copy_from_slice(&plane[..bytes]);
-        offset += bytes;
+        lease.extend_from_slice(&plane[..bytes]);
     }
 
     lease.freeze()
@@ -1629,14 +1631,18 @@ mod tests {
     }
 
     #[test]
-    fn pooled_capture_copy_concatenates_only_used_plane_bytes() {
+    fn pooled_capture_copy_reuses_storage_for_clamped_multi_plane_bytes() {
         let pool = FrameDataPool::new(1);
-        let first = [1, 2, 3, 99];
-        let second = [4, 5, 88, 77];
+        let first = pooled_copy_frame_planes(&[&[1, 2, 3, 99], &[4, 5, 88, 77]], &[3, 2], &pool);
+        let original_ptr = first.as_ptr();
 
-        let data = pooled_copy_frame_planes(&[&first, &second], &[3, 2], &pool);
+        assert_eq!(first.as_ref(), &[1, 2, 3, 4, 5]);
+        drop(first);
 
-        assert_eq!(data.as_ref(), &[1, 2, 3, 4, 5]);
+        let reused = pooled_copy_frame_planes(&[&[6, 7, 8, 66], &[9, 55]], &[3, 8], &pool);
+
+        assert_eq!(reused.as_ref(), &[6, 7, 8, 9, 55]);
+        assert_eq!(reused.as_ptr(), original_ptr);
     }
 
     #[test]
@@ -1650,6 +1656,14 @@ mod tests {
         assert_eq!(retained.as_ref(), &[1, 2, 3, 4]);
         assert_eq!(second.as_ref(), &[9, 8, 7, 6]);
         assert_ne!(retained.as_ptr(), second.as_ptr());
+    }
+
+    #[test]
+    #[should_panic(expected = "one bytes-used entry per capture plane")]
+    fn pooled_capture_copy_rejects_mismatched_plane_metadata() {
+        let pool = FrameDataPool::new(1);
+
+        let _ = pooled_copy_frame_planes(&[&[1, 2], &[3, 4]], &[2], &pool);
     }
 
     #[test]
