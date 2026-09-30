@@ -8,11 +8,12 @@
 //!
 //! Pipeline: appsrc (RGBA) → videoconvert → encoder → muxer → filesink
 
-use super::encoder_selection::{EncoderConfig, select_encoders, select_encoders_with_video};
-use super::muxer::{create_muxer, link_muxer_to_sink, link_video_to_muxer};
-use super::recorder::{
-    apply_video_tags_to_muxer, compatible_software_input_format, convert_frame_to_rgba,
+use super::encoder_selection::{
+    EncoderConfig, VideoEncoderInput, prepare_video_encoder_input, select_encoders,
+    select_encoders_with_video,
 };
+use super::muxer::{create_muxer, link_muxer_to_sink, link_video_to_muxer};
+use super::recorder::{apply_video_tags_to_muxer, convert_frame_to_rgba};
 use crate::backends::camera::types::CameraFrame;
 use crate::media::encoders::video::EncoderInfo;
 use gstreamer as gst;
@@ -25,10 +26,6 @@ use tracing::{error, info, warn};
 
 /// Target framerate for the output timelapse video.
 const TIMELAPSE_FPS: u32 = 30;
-
-fn timelapse_output_dimensions(width: u32, height: u32) -> (u32, u32) {
-    (width, height)
-}
 
 /// Run the timelapse encoding loop.
 ///
@@ -63,12 +60,10 @@ pub async fn run_timelapse_encoder(
         "Starting timelapse encoder"
     );
 
-    let (out_width, out_height) = timelapse_output_dimensions(width, height);
-
     // --- encoder selection ---------------------------------------------------
     let encoder_config = EncoderConfig {
-        width: out_width,
-        height: out_height,
+        width,
+        height,
         bitrate_override_kbps: bitrate_kbps,
         ..Default::default()
     };
@@ -88,11 +83,19 @@ pub async fn run_timelapse_encoder(
         .map(|f| f.name().to_string())
         .unwrap_or_default();
     let extension = video_enc.extension;
+    let encoder_input =
+        prepare_video_encoder_input(&video_enc.encoder, &enc_name, width, height, TIMELAPSE_FPS)
+            .map_err(|e| format!("Encoder input preparation failed: {e}"))?;
 
     let mut final_output = output_path;
     final_output.set_extension(extension);
 
-    info!(encoder = %enc_name, output = %final_output.display(),
+    info!(
+          encoder = %enc_name,
+          input_format = ?encoder_input.format,
+          encode_width = encoder_input.width,
+          encode_height = encoder_input.height,
+          output = %final_output.display(),
           "Timelapse encoder selected");
 
     // --- build GStreamer pipeline (always RGBA input) -------------------------
@@ -116,6 +119,7 @@ pub async fn run_timelapse_encoder(
         .map_err(|e| format!("videoconvert: {e}"))?;
 
     let encoder_elem = video_enc.encoder;
+    let input_chain = create_encoder_input_chain(&encoder_input)?;
     let parser = video_enc.parser;
     let muxer_elem = video_enc.muxer;
     let muxer_cfg = create_muxer(muxer_elem, final_output.clone())?;
@@ -126,6 +130,8 @@ pub async fn run_timelapse_encoder(
         .add_many([
             appsrc.upcast_ref(),
             &videoconvert,
+            &input_chain.videoscale,
+            &input_chain.capsfilter,
             &encoder_elem,
             &muxer_cfg.muxer,
             &muxer_cfg.filesink,
@@ -136,16 +142,15 @@ pub async fn run_timelapse_encoder(
     appsrc
         .link(&videoconvert)
         .map_err(|_| "link appsrc→videoconvert")?;
+    link_converter_to_encoder(&videoconvert, &input_chain, &encoder_elem)?;
 
     if let Some(ref p) = parser {
         pipeline
             .add(p)
             .map_err(|e| format!("pipeline add parser: {e}"))?;
-        link_converter_to_encoder(&videoconvert, &encoder_elem, &enc_name)?;
         encoder_elem.link(p).map_err(|_| "link encoder→parser")?;
         link_video_to_muxer(p, &muxer_cfg.muxer)?;
     } else {
-        link_converter_to_encoder(&videoconvert, &encoder_elem, &enc_name)?;
         link_video_to_muxer(&encoder_elem, &muxer_cfg.muxer)?;
     }
     link_muxer_to_sink(&muxer_cfg.muxer, &muxer_cfg.filesink)?;
@@ -246,23 +251,38 @@ pub async fn run_timelapse_encoder(
     Ok(final_output.display().to_string())
 }
 
+struct EncoderInputChain {
+    videoscale: gst::Element,
+    capsfilter: gst::Element,
+}
+
+fn create_encoder_input_chain(input: &VideoEncoderInput) -> Result<EncoderInputChain, String> {
+    let videoscale = gst::ElementFactory::make("videoscale")
+        .build()
+        .map_err(|e| format!("videoscale: {e}"))?;
+    let capsfilter = gst::ElementFactory::make("capsfilter")
+        .property("caps", input.caps(TIMELAPSE_FPS))
+        .build()
+        .map_err(|e| format!("capsfilter: {e}"))?;
+
+    Ok(EncoderInputChain {
+        videoscale,
+        capsfilter,
+    })
+}
+
 fn link_converter_to_encoder(
     videoconvert: &gst::Element,
+    input_chain: &EncoderInputChain,
     encoder: &gst::Element,
-    encoder_name: &str,
 ) -> Result<(), String> {
-    if let Some(format) = compatible_software_input_format(encoder_name) {
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", format)
-            .build();
-        videoconvert
-            .link_filtered(encoder, &caps)
-            .map_err(|_| format!("link videoconvert→{encoder_name} with {format} caps"))
-    } else {
-        videoconvert
-            .link(encoder)
-            .map_err(|_| "link videoconvert→encoder".to_string())
-    }
+    gst::Element::link_many([
+        videoconvert,
+        &input_chain.videoscale,
+        &input_chain.capsfilter,
+        encoder,
+    ])
+    .map_err(|_| "link videoconvert→videoscale→capsfilter→encoder".to_string())
 }
 
 /// Convert a frame to RGBA and apply the current live filter (if any).
@@ -309,7 +329,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn orientation_metadata_preserves_timelapse_pixel_dimensions() {
-        assert_eq!(timelapse_output_dimensions(1920, 1080), (1920, 1080));
+    fn v4l2_timelapse_chain_remains_linked_after_elements_enter_pipeline() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst::ElementFactory::make("appsrc").build().unwrap();
+        let videoconvert = gst::ElementFactory::make("videoconvert").build().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .field("width", gst::IntRange::<i32>::new(16, 4096))
+            .field("height", gst::IntRange::<i32>::new(16, 4096))
+            .build();
+        let encoder = gst::ElementFactory::make("capsfilter")
+            .property("caps", caps)
+            .build()
+            .unwrap();
+        let input = super::super::encoder_selection::prepare_video_encoder_input(
+            &encoder,
+            "v4l2h265enc",
+            1436,
+            1080,
+            TIMELAPSE_FPS,
+        )
+        .unwrap();
+
+        let chain = create_encoder_input_chain(&input).unwrap();
+        pipeline
+            .add_many([
+                &appsrc,
+                &videoconvert,
+                &chain.videoscale,
+                &chain.capsfilter,
+                &encoder,
+            ])
+            .unwrap();
+        appsrc.link(&videoconvert).unwrap();
+        link_converter_to_encoder(&videoconvert, &chain, &encoder).unwrap();
+
+        assert_eq!((input.width, input.height), (1440, 1088));
+        assert_eq!(input.format.as_deref(), Some("NV12"));
+        assert!(videoconvert.static_pad("src").unwrap().is_linked());
+        assert!(chain.videoscale.static_pad("src").unwrap().is_linked());
+        assert!(chain.capsfilter.static_pad("src").unwrap().is_linked());
     }
 }
