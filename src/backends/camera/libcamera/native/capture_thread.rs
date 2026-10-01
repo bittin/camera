@@ -19,6 +19,8 @@ use tracing::{debug, error, info, warn};
 
 const MJPEG_DECODE_WORKERS: usize = 2;
 const MJPEG_DECODE_QUEUE_CAPACITY: usize = 2;
+const CAPTURE_COPY_POOL_CACHE_CAPACITY: usize =
+    crate::constants::latency::FRAME_CHANNEL_CAPACITY + 2;
 
 /// Parameters passed to the capture thread for initialization
 pub(crate) struct CaptureThreadParams {
@@ -246,6 +248,33 @@ fn planes_bytes_used(
         }
     }
     fallback_lens.to_vec()
+}
+
+/// Copy completed capture planes into refcounted, recyclable application storage.
+///
+/// The copy is required because the libcamera request is requeued immediately
+/// after dispatch while preview, QR, recording, and still consumers may retain
+/// the frame. Pool storage is returned only after the last `FrameData` clone is
+/// dropped, so a later capture can never overwrite a retained frame.
+fn pooled_copy_frame_planes(planes: &[&[u8]], used: &[usize], pool: &FrameDataPool) -> FrameData {
+    assert_eq!(
+        planes.len(),
+        used.len(),
+        "expected one bytes-used entry per capture plane"
+    );
+    let copied_len = planes
+        .iter()
+        .zip(used)
+        .map(|(plane, &bytes)| bytes.min(plane.len()))
+        .sum();
+    let mut lease = pool.acquire(copied_len);
+
+    for (plane, &bytes) in planes.iter().zip(used) {
+        let bytes = bytes.min(plane.len());
+        lease.extend_from_slice(&plane[..bytes]);
+    }
+
+    lease.freeze()
 }
 
 /// Memory-map a vec of frame buffers, returning an error with the given label on failure.
@@ -1005,6 +1034,7 @@ fn run_capture_loop(
 
     info!("Entering capture loop");
     let mut last_dispatched_mjpeg_frame = None;
+    let capture_copy_pool = FrameDataPool::new(CAPTURE_COPY_POOL_CACHE_CAPACITY);
 
     type MmapFB = MemoryMappedFrameBuffer<libcamera::framebuffer_allocator::FrameBuffer>;
 
@@ -1077,22 +1107,12 @@ fn run_capture_loop(
                     continue;
                 }
 
-                // Concatenate all mmap planes into a single contiguous buffer.
-                // libcamera may return multi-plane formats (e.g. NV12) as separate
-                // mmap regions depending on the driver/platform.
-                let combined_data: Vec<u8> = if planes.len() == 1 {
-                    let bytes = used[0].min(planes[0].len());
-                    planes[0][..bytes].to_vec()
-                } else {
-                    let mut combined = Vec::with_capacity(total_bytes_used);
-                    for (plane, &bytes) in planes.iter().zip(used.iter()) {
-                        let bytes = bytes.min(plane.len());
-                        combined.extend_from_slice(&plane[..bytes]);
-                    }
-                    combined
-                };
+                // Copy mmap data once into recyclable owned storage before the
+                // request is requeued. Multi-plane formats are concatenated in
+                // plane order for the existing FrameData/YuvPlanes contract.
+                let captured_data = pooled_copy_frame_planes(&planes, &used, &capture_copy_pool);
                 if let Some(queue) = jpeg_decode_queue.as_ref() {
-                    let jpeg_data = FrameData::from_owned_vec(combined_data);
+                    let jpeg_data = captured_data;
                     let dispatch_context = snapshot_frame_dispatch_context(
                         is_multistream,
                         &params.still_requested,
@@ -1151,7 +1171,7 @@ fn run_capture_loop(
                         debug!(frame = frame_num, "MJPEG decode queue full, dropping frame");
                     }
                 } else {
-                    let data = FrameData::from_owned_vec(combined_data);
+                    let data = captured_data;
 
                     let stride = if formats.vf_stride > 0 {
                         formats.vf_stride
@@ -1578,8 +1598,9 @@ fn compute_stride(pf: PixelFormat, width: u32, buffer_size: usize, height: u32) 
 mod tests {
     use super::{
         BoundedWorkerQueue, QueueWorker, advance_mjpeg_dispatch_watermark, drain_pending_events,
-        snapshot_frame_dispatch_context,
+        pooled_copy_frame_planes, snapshot_frame_dispatch_context,
     };
+    use crate::backends::camera::types::FrameDataPool;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
@@ -1607,6 +1628,42 @@ mod tests {
         fn process(&mut self, job: u32) -> u32 {
             job
         }
+    }
+
+    #[test]
+    fn pooled_capture_copy_reuses_storage_for_clamped_multi_plane_bytes() {
+        let pool = FrameDataPool::new(1);
+        let first = pooled_copy_frame_planes(&[&[1, 2, 3, 99], &[4, 5, 88, 77]], &[3, 2], &pool);
+        let original_ptr = first.as_ptr();
+
+        assert_eq!(first.as_ref(), &[1, 2, 3, 4, 5]);
+        drop(first);
+
+        let reused = pooled_copy_frame_planes(&[&[6, 7, 8, 66], &[9, 55]], &[3, 8], &pool);
+
+        assert_eq!(reused.as_ref(), &[6, 7, 8, 9, 55]);
+        assert_eq!(reused.as_ptr(), original_ptr);
+    }
+
+    #[test]
+    fn pooled_capture_copy_never_overwrites_a_retained_frame() {
+        let pool = FrameDataPool::new(1);
+        let first = pooled_copy_frame_planes(&[&[1, 2, 3, 4]], &[4], &pool);
+        let retained = first.clone();
+
+        let second = pooled_copy_frame_planes(&[&[9, 8, 7, 6]], &[4], &pool);
+
+        assert_eq!(retained.as_ref(), &[1, 2, 3, 4]);
+        assert_eq!(second.as_ref(), &[9, 8, 7, 6]);
+        assert_ne!(retained.as_ptr(), second.as_ptr());
+    }
+
+    #[test]
+    #[should_panic(expected = "one bytes-used entry per capture plane")]
+    fn pooled_capture_copy_rejects_mismatched_plane_metadata() {
+        let pool = FrameDataPool::new(1);
+
+        let _ = pooled_copy_frame_planes(&[&[1, 2], &[3, 4]], &[2], &pool);
     }
 
     #[test]

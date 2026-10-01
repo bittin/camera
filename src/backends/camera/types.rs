@@ -83,6 +83,13 @@ pub(crate) struct FrameDataLease {
 }
 
 impl FrameDataLease {
+    pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.data
+            .as_mut()
+            .expect("frame lease is live")
+            .extend_from_slice(bytes);
+    }
+
     pub(crate) fn resize(&mut self, new_len: usize, value: u8) {
         self.data
             .as_mut()
@@ -925,11 +932,24 @@ mod tests {
     }
 
     #[test]
+    fn frame_data_lease_appends_into_reserved_storage() {
+        let pool = FrameDataPool::new(1);
+        let mut lease = pool.acquire(5);
+        let original_ptr = lease.as_ptr();
+
+        lease.extend_from_slice(&[1, 2, 3]);
+        lease.extend_from_slice(&[4, 5]);
+        let data = lease.freeze();
+
+        assert_eq!(data.as_ref(), &[1, 2, 3, 4, 5]);
+        assert_eq!(data.as_ptr(), original_ptr);
+    }
+
+    #[test]
     fn pooled_frame_reuses_storage_only_after_the_last_owner_drops() {
         let pool = FrameDataPool::new(1);
         let mut lease = pool.acquire(4);
-        lease.resize(4, 0);
-        lease.as_mut_slice().copy_from_slice(&[1, 2, 3, 4]);
+        lease.extend_from_slice(&[1, 2, 3, 4]);
         let original_ptr = lease.as_ptr();
         let data = lease.freeze();
         let clone = data.clone();
