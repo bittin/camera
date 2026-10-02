@@ -15,11 +15,13 @@ depends="
 	gst-plugins-bad
 	gst-plugins-base
 	gst-plugins-good
+	libdav1d
 "
 makedepends="
 	cargo-auditable
 	clang-libclang
 	cmake
+	dav1d-dev
 	glib-dev
 	gst-plugins-base-dev
 	gstreamer-dev

@@ -30,7 +30,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 gstreamer = { version = "0.25.2", features = ["v1_20"] }
 gstreamer-app = { version = "0.25.2", features = ["v1_20"] }
 gstreamer-video = "0.25.2"
-image = "0.25.10"
+image = { version = "0.25.10", features = ["avif-native"] }
 chrono = "0.4.45"
 ctrlc = "3.5.2"
 bytemuck = { version = "1.25.0", features = ["derive"] }

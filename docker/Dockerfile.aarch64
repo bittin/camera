@@ -33,6 +33,7 @@ RUN dpkg --add-architecture arm64 && \
     gcc-aarch64-linux-gnu \
     g++-aarch64-linux-gnu \
     libcamera-dev:arm64 \
+    libdav1d-dev:arm64 \
     libglib2.0-dev:arm64 \
     libgstreamer1.0-dev:arm64 \
     libgstreamer-plugins-base1.0-dev:arm64 \

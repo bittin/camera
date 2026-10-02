@@ -72,6 +72,39 @@ impl CaptureOrientation {
     }
 }
 
+/// Read EXIF orientation where image decoders do not expose it (including AVIF).
+pub(crate) fn embedded_image_orientation(bytes: &[u8]) -> image::metadata::Orientation {
+    use little_exif::exif_tag::ExifTag;
+    use little_exif::filetype::FileExtension;
+    use little_exif::metadata::Metadata;
+
+    let file_type = if bytes.starts_with(&[0xff, 0xd8]) {
+        FileExtension::JPEG
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        FileExtension::PNG {
+            as_zTXt_chunk: true,
+        }
+    } else if matches!(image::guess_format(bytes), Ok(image::ImageFormat::Avif)) {
+        FileExtension::HEIF
+    } else {
+        return image::metadata::Orientation::NoTransforms;
+    };
+
+    Metadata::new_from_vec(&bytes.to_vec(), file_type)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get_tag(&ExifTag::Orientation(Vec::new()))
+                .next()
+                .and_then(|tag| match tag {
+                    ExifTag::Orientation(values) => values.first().copied(),
+                    _ => None,
+                })
+        })
+        .and_then(|value| image::metadata::Orientation::from_exif(value as u8))
+        .unwrap_or(image::metadata::Orientation::NoTransforms)
+}
+
 /// Metadata snapshot shared by still-image and video capture pipelines.
 #[derive(Debug, Clone, Default)]
 pub struct CaptureMetadata {

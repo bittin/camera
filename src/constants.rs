@@ -286,7 +286,7 @@ pub fn get_resolution_label(width: u32) -> Option<&'static str> {
 /// Supported file formats for virtual camera file source
 pub mod file_formats {
     /// Supported image file extensions
-    pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp"];
+    pub const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "avif"];
 
     /// Supported video file extensions
     pub const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm", "avi", "mov"];

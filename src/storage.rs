@@ -3,6 +3,7 @@
 //! Storage utilities for managing photo and video files
 
 use crate::constants::file_formats;
+use crate::pipelines::capture_metadata::embedded_image_orientation;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, warn};
@@ -107,7 +108,7 @@ pub async fn load_latest_thumbnail(
         }
 
         let mut img = image::load_from_memory(&bytes_clone).ok()?;
-        img.apply_orientation(embedded_orientation(&bytes_clone));
+        img.apply_orientation(embedded_image_orientation(&bytes_clone));
         let rgba = img.to_rgba8();
         let (width, height) = img.dimensions();
 
@@ -196,39 +197,8 @@ fn decode_jpeg_thumbnail(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
         pixels,
         scaled.width as u32,
         scaled.height as u32,
-        embedded_orientation(bytes),
+        embedded_image_orientation(bytes),
     )
-}
-
-fn embedded_orientation(bytes: &[u8]) -> image::metadata::Orientation {
-    use little_exif::exif_tag::ExifTag;
-    use little_exif::filetype::FileExtension;
-    use little_exif::metadata::Metadata;
-
-    let file_type = if bytes.starts_with(&[0xff, 0xd8]) {
-        FileExtension::JPEG
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        FileExtension::PNG {
-            as_zTXt_chunk: true,
-        }
-    } else {
-        return image::metadata::Orientation::NoTransforms;
-    };
-
-    let bytes = bytes.to_vec();
-    Metadata::new_from_vec(&bytes, file_type)
-        .ok()
-        .and_then(|metadata| {
-            metadata
-                .get_tag(&ExifTag::Orientation(Vec::new()))
-                .next()
-                .and_then(|tag| match tag {
-                    ExifTag::Orientation(values) => values.first().copied(),
-                    _ => None,
-                })
-        })
-        .and_then(|value| image::metadata::Orientation::from_exif(value as u8))
-        .unwrap_or(image::metadata::Orientation::NoTransforms)
 }
 
 fn orient_thumbnail(
@@ -298,6 +268,42 @@ fn encode_rgba_to_png(rgba_data: &[u8], width: u32, height: u32) -> Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn latest_avif_thumbnail_applies_capture_orientation() {
+        use crate::pipelines::capture_metadata::CaptureOrientation;
+        use crate::pipelines::photo::processing::ProcessedImage;
+        use crate::pipelines::photo::{CameraMetadata, EncodingFormat, PhotoEncoder};
+
+        let root = std::env::temp_dir().join(format!("camera-avif-test-{}", uuid::Uuid::new_v4()));
+        let photos = root.join("photos");
+        let mut encoder = PhotoEncoder::new();
+        encoder.set_format(EncodingFormat::Avif);
+        encoder.set_camera_metadata(CameraMetadata {
+            orientation: CaptureOrientation::Rotate270,
+            ..Default::default()
+        });
+        let encoded = encoder
+            .encode(ProcessedImage {
+                image: image::RgbImage::from_pixel(65, 33, image::Rgb([200, 90, 40])),
+                width: 65,
+                height: 33,
+            })
+            .await
+            .unwrap();
+        let path = encoder.save(encoded, photos.clone()).await.unwrap();
+        assert_eq!(path.extension().unwrap(), "avif");
+        let result = load_latest_thumbnail(photos, root.join("videos")).await;
+        std::fs::remove_dir_all(&root).unwrap();
+        let (_, rgba, width, height, loaded_path) = result.expect("AVIF thumbnail missing");
+        assert_eq!(loaded_path, path);
+        assert_eq!((width, height), (33, 65));
+        assert_eq!(rgba.len(), (width * height * 4) as usize);
+        assert!(rgba[0].abs_diff(200) < 12);
+        assert!(rgba[1].abs_diff(90) < 12);
+        assert!(rgba[2].abs_diff(40) < 12);
+        assert_eq!(rgba[3], 255);
+    }
 
     fn jpeg(width: u32, height: u32) -> Vec<u8> {
         let img = image::RgbImage::from_fn(width, height, |x, y| {

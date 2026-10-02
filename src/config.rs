@@ -34,6 +34,8 @@ pub enum PhotoOutputFormat {
     Png,
     /// DNG format (raw image data)
     Dng,
+    /// AVIF format (lossy AV1 compression)
+    Avif,
 }
 
 impl PhotoOutputFormat {
@@ -43,6 +45,7 @@ impl PhotoOutputFormat {
             PhotoOutputFormat::Jpeg => "jpg",
             PhotoOutputFormat::Png => "png",
             PhotoOutputFormat::Dng => "dng",
+            PhotoOutputFormat::Avif => "avif",
         }
     }
 
@@ -52,14 +55,16 @@ impl PhotoOutputFormat {
             PhotoOutputFormat::Jpeg => "JPEG",
             PhotoOutputFormat::Png => "PNG",
             PhotoOutputFormat::Dng => "DNG (Raw)",
+            PhotoOutputFormat::Avif => "AVIF",
         }
     }
 
     /// Get all available formats
-    pub const ALL: [PhotoOutputFormat; 3] = [
+    pub const ALL: [PhotoOutputFormat; 4] = [
         PhotoOutputFormat::Jpeg,
         PhotoOutputFormat::Png,
         PhotoOutputFormat::Dng,
+        PhotoOutputFormat::Avif,
     ];
 }
 
