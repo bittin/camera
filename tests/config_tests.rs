@@ -4,6 +4,34 @@
 
 use camera::Config;
 
+#[test]
+fn avif_preference_round_trips_through_cosmic_config() {
+    use camera::config::PhotoOutputFormat;
+    use cosmic::cosmic_config::{Config as Store, CosmicConfigEntry};
+
+    let root = std::env::temp_dir().join(format!("camera-config-test-{}", uuid::Uuid::new_v4()));
+    let store = Store::with_custom_path("camera-test", Config::VERSION, root.clone()).unwrap();
+    let config = Config {
+        photo_output_format: PhotoOutputFormat::Avif,
+        ..Default::default()
+    };
+    config.write_entry(&store).unwrap();
+    let restored = Config::get_entry(&store);
+    std::fs::remove_dir_all(root).unwrap();
+    let restored = restored.expect("AVIF preference must survive persistence");
+    assert_eq!(restored.photo_output_format, PhotoOutputFormat::Avif);
+    assert_eq!(PhotoOutputFormat::default(), PhotoOutputFormat::Jpeg);
+    assert_eq!(PhotoOutputFormat::Avif.display_name(), "AVIF");
+    assert_eq!(
+        &PhotoOutputFormat::ALL[..3],
+        &[
+            PhotoOutputFormat::Jpeg,
+            PhotoOutputFormat::Png,
+            PhotoOutputFormat::Dng
+        ]
+    );
+}
+
 fn assigned_number(source: &str, prefix: &str) -> u64 {
     source
         .lines()

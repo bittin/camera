@@ -30,6 +30,7 @@ RUN mkdir -p /aarch64-sysroot/etc/apk && \
         gcc \
         g++ \
         musl-dev \
+        dav1d-dev \
         glib-dev \
         gstreamer-dev \
         gst-plugins-base-dev \

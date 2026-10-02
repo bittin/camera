@@ -32,6 +32,7 @@ RUN dpkg --add-architecture armhf && \
     gcc-arm-linux-gnueabihf \
     g++-arm-linux-gnueabihf \
     libcamera-dev:armhf \
+    libdav1d-dev:armhf \
     libglib2.0-dev:armhf \
     libgstreamer1.0-dev:armhf \
     libgstreamer-plugins-base1.0-dev:armhf \

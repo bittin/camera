@@ -384,7 +384,7 @@ settings-photo = Photo
 settings-photo-format = Output format
 # Description under the output format dropdown. The format names are not
 # translated.
-settings-photo-format-description = File format for saved photos. JPEG is compressed, PNG is lossless, DNG preserves raw data for editing.
+settings-photo-format-description = File format for saved photos. JPEG and AVIF are lossy, PNG is lossless, DNG preserves raw data for editing.
 # Dropdown label for the HDR+ frame count. HDR+ is a product name, keep it.
 settings-hdr-plus = HDR+ (experimental)
 # Description under the HDR+ dropdown.

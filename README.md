@@ -56,6 +56,7 @@ flatpak install camera-x86_64.flatpak
 - [cosmic-icons](https://github.com/pop-os/cosmic-icons)
 - GStreamer 1.20 or newer with plugins (base, good, bad, ugly)
 - libcamera (>= 0.4.0)
+- dav1d (>= 1.3.0), including development headers and pkg-config metadata, for AVIF decoding
 - cmake (for building embedded libjpeg-turbo)
 - libwayland
 - libxkbcommon

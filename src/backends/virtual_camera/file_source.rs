@@ -273,6 +273,62 @@ fn video_playback_pipeline_description(path: &str) -> String {
 mod orientation_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn avif_file_source_applies_all_capture_orientations() {
+        use crate::pipelines::capture_metadata::CaptureOrientation;
+        use crate::pipelines::photo::processing::ProcessedImage;
+        use crate::pipelines::photo::{CameraMetadata, EncodingFormat, PhotoEncoder};
+
+        let source = image::RgbImage::from_fn(65, 33, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 7) as u8, 40])
+        });
+        for orientation in [
+            CaptureOrientation::Rotate0,
+            CaptureOrientation::Rotate90,
+            CaptureOrientation::Rotate180,
+            CaptureOrientation::Rotate270,
+            CaptureOrientation::FlipRotate0,
+            CaptureOrientation::FlipRotate90,
+            CaptureOrientation::FlipRotate180,
+            CaptureOrientation::FlipRotate270,
+        ] {
+            let mut encoder = PhotoEncoder::new();
+            encoder.set_format(EncodingFormat::Avif);
+            encoder.set_camera_metadata(CameraMetadata {
+                orientation,
+                ..Default::default()
+            });
+            let encoded = encoder
+                .encode(ProcessedImage {
+                    image: source.clone(),
+                    width: 65,
+                    height: 33,
+                })
+                .await
+                .unwrap();
+            let mut expected = image::load_from_memory(&encoded.data).unwrap();
+            expected.apply_orientation(
+                image::metadata::Orientation::from_exif(orientation.exif_value() as u8).unwrap(),
+            );
+            let path =
+                std::env::temp_dir().join(format!("camera-source-{}.avif", uuid::Uuid::new_v4()));
+            std::fs::write(&path, encoded.data).unwrap();
+            let frame = load_image_as_frame(&path);
+            std::fs::remove_file(&path).unwrap();
+            let frame = frame.unwrap();
+            assert_eq!(
+                (frame.width, frame.height),
+                (expected.width(), expected.height()),
+                "{orientation:?}"
+            );
+            assert_eq!(
+                frame.data.as_ref(),
+                expected.to_rgba8().as_raw().as_slice(),
+                "{orientation:?}"
+            );
+        }
+    }
+
     #[test]
     fn video_frame_extraction_applies_container_orientation() {
         let pipeline = frame_extraction_pipeline_description("/tmp/video.mp4");
@@ -348,7 +404,7 @@ fn load_video_first_frame(path: &Path) -> BackendResult<CameraFrame> {
 
 /// Load an image file and convert it to a CameraFrame
 ///
-/// Supports common image formats: PNG, JPEG, GIF, BMP, WebP
+/// Supports common image formats: PNG, JPEG, GIF, BMP, WebP, AVIF
 pub fn load_image_as_frame(path: &Path) -> BackendResult<CameraFrame> {
     use image::ImageDecoder;
 
@@ -357,6 +413,31 @@ pub fn load_image_as_frame(path: &Path) -> BackendResult<CameraFrame> {
     let reader = image::ImageReader::open(path).map_err(|e| {
         BackendError::Other(format!("Failed to load image '{}': {}", path.display(), e))
     })?;
+    let (reader, avif_orientation) = if reader.format() == Some(image::ImageFormat::Avif) {
+        use std::io::{Read, Seek};
+
+        // image's AVIF decoder does not expose EXIF orientation. Read metadata
+        // from the same open file, then rewind for decoding, avoiding a reopen
+        // race if the path is replaced while loading.
+        let mut input = reader.into_inner();
+        let mut bytes = Vec::new();
+        input
+            .read_to_end(&mut bytes)
+            .and_then(|_| input.rewind())
+            .map_err(|error| {
+                BackendError::Other(format!(
+                    "Failed to read AVIF metadata '{}': {error}",
+                    path.display()
+                ))
+            })?;
+        let orientation = crate::pipelines::capture_metadata::embedded_image_orientation(&bytes);
+        (
+            image::ImageReader::with_format(input, image::ImageFormat::Avif),
+            Some(orientation),
+        )
+    } else {
+        (reader, None)
+    };
     let mut decoder = reader.into_decoder().map_err(|e| {
         BackendError::Other(format!(
             "Failed to decode image '{}': {}",
@@ -364,13 +445,17 @@ pub fn load_image_as_frame(path: &Path) -> BackendResult<CameraFrame> {
             e
         ))
     })?;
-    let orientation = decoder.orientation().map_err(|e| {
-        BackendError::Other(format!(
-            "Failed to read image orientation '{}': {}",
-            path.display(),
-            e
-        ))
-    })?;
+    let orientation = if let Some(orientation) = avif_orientation {
+        orientation
+    } else {
+        decoder.orientation().map_err(|e| {
+            BackendError::Other(format!(
+                "Failed to read image orientation '{}': {}",
+                path.display(),
+                e
+            ))
+        })?
+    };
     let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| {
         BackendError::Other(format!("Failed to load image '{}': {}", path.display(), e))
     })?;

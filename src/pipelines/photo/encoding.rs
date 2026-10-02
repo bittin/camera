@@ -5,6 +5,7 @@
 //! This module handles encoding processed images to various formats:
 //! - JPEG (with quality control)
 //! - PNG (lossless)
+//! - AVIF (with quality control)
 //!
 //! All encoding operations run asynchronously to avoid blocking.
 
@@ -28,6 +29,8 @@ pub enum EncodingFormat {
     Png,
     /// DNG format (raw image data)
     Dng,
+    /// AVIF format (lossy AV1 compression)
+    Avif,
 }
 
 impl EncodingFormat {
@@ -37,6 +40,7 @@ impl EncodingFormat {
             EncodingFormat::Jpeg => "jpg",
             EncodingFormat::Png => "png",
             EncodingFormat::Dng => "dng",
+            EncodingFormat::Avif => "avif",
         }
     }
 }
@@ -47,6 +51,7 @@ impl From<crate::config::PhotoOutputFormat> for EncodingFormat {
             crate::config::PhotoOutputFormat::Jpeg => EncodingFormat::Jpeg,
             crate::config::PhotoOutputFormat::Png => EncodingFormat::Png,
             crate::config::PhotoOutputFormat::Dng => EncodingFormat::Dng,
+            crate::config::PhotoOutputFormat::Avif => EncodingFormat::Avif,
         }
     }
 }
@@ -148,7 +153,7 @@ impl PhotoEncoder {
         self.format = format;
     }
 
-    /// Set encoding quality (only affects JPEG)
+    /// Set encoding quality (affects JPEG and AVIF)
     pub fn set_quality(&mut self, quality: EncodingQuality) {
         self.quality = quality;
     }
@@ -250,6 +255,25 @@ impl PhotoEncoder {
                 }
                 EncodingFormat::Dng => {
                     Self::encode_dng(&image, processed.width, processed.height, &camera_metadata)?
+                }
+                EncodingFormat::Avif => {
+                    let metadata = build_standard_exif(
+                        processed.width,
+                        processed.height,
+                        &camera_metadata,
+                    );
+                    match metadata.as_u8_vec(FileExtension::HEIF) {
+                        Ok(exif) => Self::encode_avif(&image, quality, Some(exif))?,
+                        Err(error) => {
+                            warn!(%error, "Failed to serialize AVIF metadata; baking orientation into pixels");
+                            Self::encode_oriented_fallback(
+                                &image,
+                                format,
+                                quality,
+                                camera_metadata.orientation,
+                            )?
+                        }
+                    }
                 }
             };
 
@@ -429,6 +453,44 @@ impl PhotoEncoder {
         Ok(buffer)
     }
 
+    /// Encode AVIF with a bounded worker pool, leaving two CPUs for the UI.
+    fn encode_avif(
+        image: &RgbImage,
+        quality: EncodingQuality,
+        exif: Option<Vec<u8>>,
+    ) -> Result<Vec<u8>, String> {
+        use image::ImageEncoder;
+
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        let threads = avif_thread_count(available);
+        let quality = match quality {
+            EncodingQuality::Low => 60,
+            EncodingQuality::Medium => 70,
+            EncodingQuality::High => 80,
+            EncodingQuality::Maximum => 90,
+        };
+        let mut buffer = Vec::new();
+        let mut encoder =
+            image::codecs::avif::AvifEncoder::new_with_speed_quality(&mut buffer, 8, quality)
+                .with_num_threads(Some(threads));
+        if let Some(exif) = exif {
+            // little_exif's HEIF serialization includes the TIFF offset and
+            // Exif header; the AVIF encoder embeds this item unchanged.
+            encoder
+                .set_exif_metadata(exif)
+                .map_err(|error| format!("AVIF metadata failed: {error}"))?;
+        }
+        encoder
+            .write_image(
+                image.as_raw(),
+                image.width(),
+                image.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|error| format!("AVIF encoding failed: {error}"))?;
+        Ok(buffer)
+    }
+
     /// Embed standard EXIF fields in an encoded JPEG or PNG.
     ///
     /// Metadata is written into a copy so a metadata-writer failure can never
@@ -528,6 +590,7 @@ impl PhotoEncoder {
         match format {
             EncodingFormat::Jpeg => Self::encode_jpeg(&oriented, quality),
             EncodingFormat::Png => Self::encode_png(&oriented),
+            EncodingFormat::Avif => Self::encode_avif(&oriented, quality, None),
             EncodingFormat::Dng => Err("DNG metadata is written during encoding".into()),
         }
     }
@@ -731,6 +794,10 @@ impl Default for PhotoEncoder {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn avif_thread_count(available: usize) -> usize {
+    available.saturating_sub(2).max(1)
 }
 
 fn build_standard_exif(width: u32, height: u32, camera_metadata: &CameraMetadata) -> Metadata {
@@ -940,6 +1007,101 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Timelike};
+
+    #[test]
+    fn avif_workers_leave_two_cpus_with_at_least_one_worker() {
+        for (available, expected) in [(0, 1), (1, 1), (2, 1), (3, 1), (4, 2), (16, 14)] {
+            assert_eq!(avif_thread_count(available), expected);
+        }
+    }
+
+    #[test]
+    fn avif_metadata_fallback_bakes_orientation_into_pixels() {
+        let source = test_image(65, 33);
+        let encoded = PhotoEncoder::encode_oriented_fallback(
+            &source,
+            EncodingFormat::Avif,
+            EncodingQuality::High,
+            crate::pipelines::capture_metadata::CaptureOrientation::Rotate270,
+        )
+        .expect("fallback encoding failed");
+        let decoded = image::load_from_memory(&encoded).expect("fallback must decode");
+        assert_eq!((decoded.width(), decoded.height()), (33, 65));
+    }
+
+    #[test]
+    fn avif_quality_presets_round_trip_odd_sized_images() {
+        for quality in [
+            EncodingQuality::Low,
+            EncodingQuality::Medium,
+            EncodingQuality::High,
+            EncodingQuality::Maximum,
+        ] {
+            let encoded = PhotoEncoder::encode_avif(&test_image(65, 33), quality, None)
+                .expect("encoding failed");
+            let decoded = image::load_from_memory(&encoded)
+                .expect("decoding failed")
+                .to_rgb8();
+            assert_eq!(decoded.dimensions(), (65, 33));
+            let image::Rgb([r, g, b]) = *decoded.get_pixel(32, 16);
+            assert!(r.abs_diff(200) < 12 && g.abs_diff(90) < 12 && b.abs_diff(40) < 12);
+        }
+    }
+
+    #[tokio::test]
+    async fn avif_export_round_trips_with_capture_metadata() {
+        let format: crate::config::PhotoOutputFormat =
+            serde_json::from_str("\"Avif\"").expect("AVIF must be a selectable format");
+        assert!(crate::config::PhotoOutputFormat::ALL.contains(&format));
+        assert_eq!(format.extension(), "avif");
+        let mut encoder = PhotoEncoder::new();
+        encoder.set_format(format.into());
+        let captured_at = FixedOffset::east_opt(7200)
+            .unwrap()
+            .with_ymd_and_hms(2026, 9, 28, 14, 5, 6)
+            .unwrap();
+        encoder.set_camera_metadata(CameraMetadata {
+            captured_at: Some(captured_at),
+            device_make: Some("Google".into()),
+            device_model: Some("Pixel 3a".into()),
+            orientation: crate::pipelines::capture_metadata::CaptureOrientation::Rotate270,
+            ..Default::default()
+        });
+        let encoded = encoder
+            .encode(ProcessedImage {
+                image: test_image(65, 33),
+                width: 65,
+                height: 33,
+            })
+            .await
+            .expect("AVIF encoding failed");
+        assert_eq!(encoded.format.extension(), "avif");
+        assert_eq!(encoded.captured_at, Some(captured_at));
+        let decoded = image::load_from_memory(&encoded.data)
+            .expect("gallery must be able to decode AVIF")
+            .to_rgb8();
+        assert_eq!(decoded.dimensions(), (65, 33));
+        let image::Rgb([r, g, b]) = *decoded.get_pixel(32, 16);
+        assert!(r.abs_diff(200) < 12 && g.abs_diff(90) < 12 && b.abs_diff(40) < 12);
+        let metadata = Metadata::new_from_vec(&encoded.data, FileExtension::HEIF)
+            .expect("AVIF EXIF must be readable");
+        assert_eq!(
+            tag_string(&metadata, ExifTag::Make(String::new())),
+            "Google"
+        );
+        assert_eq!(
+            tag_string(&metadata, ExifTag::Model(String::new())),
+            "Pixel 3a"
+        );
+        assert_eq!(
+            tag_string(&metadata, ExifTag::DateTimeOriginal(String::new())),
+            "2026:09:28 14:05:06"
+        );
+        assert!(matches!(
+            metadata.get_tag(&ExifTag::Orientation(Vec::new())).next(),
+            Some(ExifTag::Orientation(value)) if value == &vec![8]
+        ));
+    }
 
     #[test]
     fn test_format_extensions() {
