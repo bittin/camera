@@ -3156,51 +3156,29 @@ async fn process_burst_mode_rgba(
 }
 
 /// Parameters for saving burst mode output
-pub struct SaveOutputParams<'a> {
+pub struct SaveOutputParams {
     pub output_dir: std::path::PathBuf,
     pub crop_rect: Option<(u32, u32, u32, u32)>,
     pub encoding_format: super::EncodingFormat,
     pub camera_metadata: super::CameraMetadata,
     pub filter: Option<crate::app::FilterType>,
-    pub filename_suffix: Option<&'a str>,
 }
 
 /// Save output image to disk with optional filter and aspect ratio cropping.
 pub async fn save_output(
     frame: &MergedFrame,
-    params: SaveOutputParams<'_>,
+    params: SaveOutputParams,
 ) -> Result<std::path::PathBuf, String> {
     use super::{EncodingQuality, PhotoEncoder};
     use crate::shaders::apply_filter_gpu_rgba;
     use image::{ImageBuffer, Rgba};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     let SaveOutputParams {
         output_dir,
         crop_rect,
         encoding_format,
         camera_metadata,
         filter,
-        filename_suffix,
     } = params;
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let suffix = filename_suffix.unwrap_or("");
-    let filename = format!(
-        "IMG_{}{}.{}",
-        timestamp,
-        suffix,
-        encoding_format.extension()
-    );
-    let output_path = output_dir.join(&filename);
-
-    tokio::fs::create_dir_all(&output_dir)
-        .await
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
     // Apply filter to the RGBA data if specified and not Standard
     let image_data = match filter {
@@ -3260,16 +3238,8 @@ pub async fn save_output(
     // Encode and save using the standard photo pipeline
     let encoded = encoder.encode(processed).await?;
 
-    // Save the encoded data
-    let output_path_clone = output_path.clone();
-    let data = encoded.data;
-    tokio::task::spawn_blocking(move || {
-        std::fs::write(&output_path_clone, data).map_err(|e| format!("Failed to save image: {}", e))
-    })
-    .await
-    .map_err(|e| format!("Task join error: {}", e))??;
-
-    Ok(output_path)
+    // Share timestamp naming and atomic no-overwrite allocation with all stills.
+    encoder.save(encoded, output_dir).await
 }
 
 /// Export raw burst frames as PNG files for testing/debugging
@@ -3433,6 +3403,47 @@ pub async fn export_burst_frames_dng(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn burst_output_uses_standard_shutter_names_without_overwriting() {
+        use chrono::{TimeZone, Timelike};
+        let root = std::env::temp_dir().join(format!("burst-names-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let timestamp = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, 8, 14, 5, 6)
+            .unwrap()
+            .with_nanosecond(123_000_000)
+            .unwrap();
+        let existing = root.join("IMG_20261008_140506_123.jpg");
+        std::fs::write(&existing, b"existing photo").unwrap();
+        let frame = MergedFrame {
+            data: vec![180, 20, 30, 255].repeat(16 * 16),
+            width: 16,
+            height: 16,
+        };
+        for i in 1..=2 {
+            let path = save_output(
+                &frame,
+                SaveOutputParams {
+                    output_dir: root.clone(),
+                    crop_rect: None,
+                    encoding_format: super::super::EncodingFormat::Jpeg,
+                    camera_metadata: super::super::CameraMetadata {
+                        captured_at: Some(timestamp),
+                        ..Default::default()
+                    },
+                    filter: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(path, root.join(format!("IMG_20261008_140506_123_{i}.jpg")));
+            assert!(image::open(path).is_ok());
+        }
+        assert_eq!(std::fs::read(existing).unwrap(), b"existing photo");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn hdr_bayer_honors_ccm_without_supplied_gains() {

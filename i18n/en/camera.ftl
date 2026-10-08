@@ -31,6 +31,14 @@ mode-timelapse = Timelapse
 # Status badge shown while the recorded timelapse video is being finalised.
 # Replaces the shot counter in a small pill, so keep it short.
 timelapse-saving = Saving video...
+# Non-interactive shutdown screen, below the same spinner used at startup.
+# A Motion Photo (still plus embedded clip) counts as one pending save.
+shutdown-pending-saves =
+    { $count ->
+        [0] Finishing shutdown
+        [one] 1 pending photo/video save
+       *[other] { $count } pending photo/video saves
+    }
 # Mode that streams the camera to other apps instead of capturing. Only listed
 # when the virtual camera is enabled. Same carousel length constraint.
 mode-virtual = Virtual
@@ -137,8 +145,14 @@ settings-device = Device
 settings-microphone = Microphone
 # Toggle that records audio alongside video.
 settings-record-audio = Record audio
+# Toggle in Photo settings. The preference is kept for unsupported formats.
+settings-motion-photo = Motion Photo
+motion-photo-error-title = Motion Photo could not be saved
+motion-photo-error-dismiss = Dismiss
+settings-motion-photo-description = Continuously buffer a short video in memory with the selected video encoder. Save JPEG/AVIF photos with 1.25 seconds before and after the shutter. Not available for PNG/DNG; your preference is kept when switching formats.
 # Dropdown label for the audio codec used in recordings.
-settings-audio-encoder = Audio encoder
+settings-audio-encoder = Video audio encoder
+settings-audio-encoder-description = Applies to video recordings only. Motion Photos always use AAC, as required by the Android Motion Photo specification.
 # Label of the live microphone meter row. The row also holds the meter and a
 # decibel readout, so the label must stay short.
 settings-mic-level = Microphone level

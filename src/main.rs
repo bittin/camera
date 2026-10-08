@@ -82,7 +82,7 @@ enum Commands {
         #[arg(short, long, default_value = "0")]
         camera: usize,
 
-        /// Output file path (default: ~/Pictures/Camera/photo_TIMESTAMP.jpg)
+        /// Output file path (default: ~/Pictures/Camera/IMG_YYYYMMDD_HHMMSS_mmm.jpg)
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
@@ -255,11 +255,15 @@ fn run_gui(
     i18n::init(&requested_languages);
 
     // Settings for configuring the application window and iced runtime.
-    let mut settings = cosmic::app::Settings::default().size_limits(
-        cosmic::iced::Limits::NONE
-            .min_width(WINDOW_MIN_WIDTH)
-            .min_height(WINDOW_MIN_HEIGHT),
-    );
+    // Native CloseRequested and COSMIC Close are intercepted by AppModel.
+    // Do not let the framework close the surface before accepted media drains.
+    let mut settings = cosmic::app::Settings::default()
+        .exit_on_close(false)
+        .size_limits(
+            cosmic::iced::Limits::NONE
+                .min_width(WINDOW_MIN_WIDTH)
+                .min_height(WINDOW_MIN_HEIGHT),
+        );
 
     // When a preview source is provided, set a fixed window size — defaults
     // to 900x700 (Flathub's recommended standard-display size) but the user

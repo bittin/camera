@@ -28,6 +28,36 @@ fn capture_metadata_for_rotation(rotation: SensorRotation) -> CaptureMetadata {
     }
 }
 
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn requested_photo_destination_never_overwrites_a_concurrent_output() {
+        let root = std::env::temp_dir().join(format!("cli-publication-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("IMG_20261008_140506_123.jpg");
+        let destination = root.join("requested.jpg");
+        std::fs::write(&source, b"complete new photo").unwrap();
+        // Simulate an output appearing after take_photo's initial validation.
+        std::fs::write(&destination, b"concurrent output").unwrap();
+        assert_eq!(
+            publish_requested_photo(&source, &destination)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"concurrent output");
+        assert_eq!(std::fs::read(&source).unwrap(), b"complete new photo");
+        std::fs::remove_file(&destination).unwrap();
+        publish_requested_photo(&source, &destination).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete new photo");
+        assert!(!source.exists());
+        publish_requested_photo(&destination, &destination).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// List all available cameras
 pub fn list_cameras() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize GStreamer
@@ -189,17 +219,30 @@ pub fn take_photo(
             .await
     })?;
 
-    // If user specified a specific filename, rename the file
+    // If user specified a filename, atomically publish it without overwriting
     if let Some(user_path) = output
         && !user_path.is_dir()
     {
-        std::fs::rename(&output_path, &user_path)?;
+        publish_requested_photo(&output_path, &user_path)?;
         println!("Photo saved: {}", user_path.display());
         return Ok(());
     }
 
     println!("Photo saved: {}", output_path.display());
     Ok(())
+}
+
+fn publish_requested_photo(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    if source == destination {
+        return Ok(());
+    }
+    // Both paths are in the requested directory. Publish the already-synced
+    // photo atomically without rename's destination-clobber race.
+    std::fs::hard_link(source, destination)?;
+    std::fs::remove_file(source)
 }
 
 /// Record a video using the specified camera
@@ -521,7 +564,6 @@ pub fn process_burst_mode(
                 encoding_format: EncodingFormat::Jpeg,
                 camera_metadata,
                 filter: None,
-                filename_suffix: Some("_HDR+"),
             },
         )
         .await

@@ -20,6 +20,39 @@ fn disabled_text_style(theme: &cosmic::Theme) -> cosmic::iced::widget::text::Sty
     }
 }
 
+/// Resolve the native switch appearance independently from its input callback.
+fn motion_photo_toggle_style(
+    theme: &cosmic::Theme,
+    status: cosmic::iced::widget::toggler::Status,
+) -> cosmic::iced::widget::toggler::Style {
+    let mut style = cosmic::iced::widget::toggler::Catalog::style(theme, &(), status);
+    if matches!(
+        status,
+        cosmic::iced::widget::toggler::Status::Disabled { .. }
+    ) {
+        let button = &theme.cosmic().button;
+        style.background = cosmic::iced::Background::Color(button.disabled.into());
+        style.foreground = cosmic::iced::Background::Color(button.on_disabled.into());
+        style.text_color = disabled_text_style(theme).color;
+    }
+    style
+}
+
+/// Native disabled switch with COSMIC colors and geometry. The outer Iced
+/// theme supplies only the class mechanism; every painted color is overridden.
+fn disabled_motion_photo_toggle<'a, Renderer>(
+    checked: bool,
+    theme: cosmic::Theme,
+) -> cosmic::iced::widget::Toggler<'a, Message, cosmic::iced::Theme, Renderer>
+where
+    Renderer: cosmic::iced::advanced::text::Renderer + 'a,
+{
+    cosmic::iced::widget::toggler(checked)
+        .size(24)
+        .on_toggle_maybe(None::<fn(bool) -> Message>)
+        .style(move |_, status| motion_photo_toggle_style(&theme, status))
+}
+
 /// A drill-down list row: label on the left, chevron on the right.
 fn settings_nav_row<'a>(label: String, message: Message) -> widget::list::ListButton<'a, Message> {
     widget::list::button(
@@ -354,7 +387,40 @@ impl AppModel {
                         Some(current_photo_format_index),
                         Message::SelectPhotoOutputFormat,
                     )),
-            )
+            );
+
+        if self.motion_photo_format_compatible() {
+            photo_section = photo_section.add(
+                widget::settings::item::builder(fl!("settings-motion-photo"))
+                    .description(fl!("settings-motion-photo-description"))
+                    .control(super::touch_toggle::TouchToggle::new(
+                        widget::toggler(self.config.motion_photo)
+                            .on_toggle(Message::ToggleMotionPhoto),
+                        Some(Message::ToggleMotionPhoto(!self.config.motion_photo)),
+                    )),
+            );
+        } else {
+            // The pinned COSMIC toggler draws Active/Hovered even without a
+            // callback and exposes no style override. Iced's native toggler
+            // emits Disabled correctly; keep the saved thumb position and use
+            // COSMIC geometry and disabled palette, not Iced's default theme.
+            let toggle =
+                disabled_motion_photo_toggle(self.config.motion_photo, cosmic::theme::active());
+            let toggle: Element<'_, Message> =
+                cosmic::iced::widget::themer(Some(cosmic::iced::Theme::Dark), toggle).into();
+            let disabled = cosmic::theme::style::iced::Text::Custom(disabled_text_style);
+            let label = widget::Column::new()
+                .spacing(2)
+                .push(widget::text::body(fl!("settings-motion-photo")).class(disabled))
+                .push(
+                    widget::text::caption(fl!("settings-motion-photo-description")).class(disabled),
+                )
+                .width(Length::Fill);
+            photo_section =
+                photo_section.add(widget::settings::item::item_row(vec![label.into(), toggle]));
+        }
+
+        photo_section = photo_section
             .add(
                 widget::settings::item::builder(fl!("settings-demosaicing"))
                     .description(fl!("settings-demosaicing-description"))
@@ -460,14 +526,14 @@ impl AppModel {
             if is_recording {
                 video_section = video_section
                     .add(
-                        widget::settings::item::builder(fl!("settings-audio-encoder")).control(
-                            disabled_text(
+                        widget::settings::item::builder(fl!("settings-audio-encoder"))
+                            .description(fl!("settings-audio-encoder-description"))
+                            .control(disabled_text(
                                 self.audio_encoder_dropdown_options
                                     .get(current_audio_encoder_index)
                                     .cloned()
                                     .unwrap_or_default(),
-                            ),
-                        ),
+                            )),
                     )
                     .add(
                         widget::settings::item::builder(fl!("settings-microphone")).control(
@@ -482,13 +548,13 @@ impl AppModel {
             } else {
                 video_section = video_section
                     .add(
-                        widget::settings::item::builder(fl!("settings-audio-encoder")).control(
-                            widget::dropdown(
+                        widget::settings::item::builder(fl!("settings-audio-encoder"))
+                            .description(fl!("settings-audio-encoder-description"))
+                            .control(widget::dropdown(
                                 &self.audio_encoder_dropdown_options,
                                 Some(current_audio_encoder_index),
                                 Message::SelectAudioEncoder,
-                            ),
-                        ),
+                            )),
                     )
                     .add(
                         widget::settings::item::builder(fl!("settings-microphone")).control(
@@ -758,9 +824,295 @@ mod tests {
     }
 
     #[test]
+    fn motion_photo_settings_explain_format_and_encoder_compatibility() {
+        let loader = &crate::i18n::LANGUAGE_LOADER;
+        assert_eq!(loader.get("settings-motion-photo"), "Motion Photo");
+        let description = loader.get("settings-motion-photo-description");
+        for required in [
+            "short video",
+            "JPEG",
+            "AVIF",
+            "selected video encoder",
+            "PNG",
+            "DNG",
+        ] {
+            assert!(
+                description.contains(required),
+                "missing {required}: {description}"
+            );
+        }
+    }
+
+    #[test]
     fn overlay_controls_position_index_tracks_every_option() {
         for (expected, position) in ControlsPosition::ALL.into_iter().enumerate() {
             assert_eq!(controls_position_index(position), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod motion_photo_appearance_tests {
+    use super::*;
+    use cosmic::iced::widget::toggler::{Catalog, Status};
+
+    #[test]
+    fn audio_encoder_description_distinguishes_video_from_motion_photos() {
+        let loader = &crate::i18n::LANGUAGE_LOADER;
+        assert_eq!(loader.get("settings-audio-encoder"), "Video audio encoder");
+        let description = loader.get("settings-audio-encoder-description");
+        assert!(description.contains("video recordings only"));
+        assert!(description.contains("Motion Photos always use AAC"));
+        assert!(description.contains("Android Motion Photo specification"));
+    }
+
+    #[test]
+    fn motion_photo_touch_tap_without_mouse_cursor_publishes_toggle() {
+        use cosmic::iced::advanced::{Layout, Shell, Widget, clipboard, layout, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse, touch};
+
+        let mut toggle = super::super::touch_toggle::TouchToggle::new(
+            cosmic::iced::widget::toggler::<Message, cosmic::Theme, ()>(false)
+                .size(24)
+                .on_toggle(Message::ToggleMotionPhoto),
+            Some(Message::ToggleMotionPhoto(true)),
+        );
+        let mut tree = Tree::new(&toggle as &dyn Widget<Message, cosmic::Theme, ()>);
+        let node = toggle.layout(
+            &mut tree,
+            &(),
+            &layout::Limits::new(Size::ZERO, Size::new(100.0, 100.0)),
+        );
+        let layout = Layout::new(&node);
+        let viewport = Rectangle::with_size(Size::new(100.0, 100.0));
+        let mut messages = Vec::new();
+        for event in [
+            touch::Event::FingerPressed {
+                id: touch::Finger(1),
+                position: Point::new(10.0, 10.0),
+            },
+            touch::Event::FingerLifted {
+                id: touch::Finger(1),
+                position: Point::new(10.0, 10.0),
+            },
+        ] {
+            toggle.update(
+                &mut tree,
+                &Event::Touch(event),
+                layout,
+                mouse::Cursor::Unavailable,
+                &(),
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+        }
+        assert!(
+            matches!(messages.as_slice(), [Message::ToggleMotionPhoto(true)]),
+            "expected exactly one Motion Photo toggle, got {messages:?}"
+        );
+    }
+
+    #[test]
+    fn motion_photo_touch_actions_persist_for_jpeg_avif_and_stay_disabled_for_png_dng() {
+        use cosmic::cosmic_config::{Config as Store, CosmicConfigEntry};
+        use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse, touch};
+        let root = std::env::temp_dir().join(format!(
+            "camera-motion-photo-touch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store =
+            Store::with_custom_path("camera-test", crate::config::Config::VERSION, root.clone())
+                .unwrap();
+        let mut app = AppModel {
+            config_handler: Some(store),
+            ..AppModel::default()
+        };
+        for format in PhotoOutputFormat::ALL {
+            for saved in [false, true] {
+                app.config.photo_output_format = format;
+                app.config.motion_photo = saved;
+                app.config
+                    .write_entry(app.config_handler.as_ref().unwrap())
+                    .unwrap();
+                let compatible = app.motion_photo_format_compatible();
+                // Exercise the adaptation with a real headless Iced toggler;
+                // the production enabled branch wraps COSMIC's painted switch.
+                let mut toggle: cosmic::iced::Element<'_, Message, cosmic::iced::Theme, ()> =
+                    if compatible {
+                        super::super::touch_toggle::TouchToggle::new(
+                            cosmic::iced::widget::toggler(saved)
+                                .on_toggle(Message::ToggleMotionPhoto),
+                            Some(Message::ToggleMotionPhoto(!saved)),
+                        )
+                        .into()
+                    } else {
+                        disabled_motion_photo_toggle(saved, cosmic::Theme::dark()).into()
+                    };
+                let mut tree = Tree::new(&toggle);
+                let node = toggle.as_widget_mut().layout(
+                    &mut tree,
+                    &(),
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 100.0)),
+                );
+                let viewport = Rectangle::with_size(Size::new(100.0, 100.0));
+                let mut messages = Vec::new();
+                for event in [
+                    touch::Event::FingerPressed {
+                        id: touch::Finger(1),
+                        position: Point::new(10.0, 10.0),
+                    },
+                    touch::Event::FingerLifted {
+                        id: touch::Finger(1),
+                        position: Point::new(10.0, 10.0),
+                    },
+                ] {
+                    toggle.as_widget_mut().update(
+                        &mut tree,
+                        &Event::Touch(event),
+                        Layout::new(&node),
+                        mouse::Cursor::Unavailable,
+                        &(),
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                }
+                assert_eq!(
+                    messages.len(),
+                    usize::from(compatible),
+                    "{format:?}, saved={saved}"
+                );
+                for message in messages {
+                    let _ = app.update(message);
+                }
+                let expected = if compatible { !saved } else { saved };
+                assert_eq!(app.config.motion_photo, expected);
+                let persisted =
+                    crate::config::Config::get_entry(app.config_handler.as_ref().unwrap()).unwrap();
+                assert_eq!(persisted.motion_photo, expected);
+                assert_eq!(persisted.photo_output_format, format);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn disabled_motion_photo_native_widget_stays_disabled_under_hover_and_click() {
+        use cosmic::iced::advanced::{Layout, Shell};
+        use cosmic::iced::advanced::{Widget, clipboard, layout, renderer, widget::Tree};
+        use cosmic::iced::{Event, Point, Rectangle, Size, mouse};
+        use std::cell::Cell;
+
+        for checked in [true, false] {
+            let theme = cosmic::Theme::dark();
+            let observed = Cell::new(None);
+            // Observe the actual status supplied by the native widget's draw
+            // path, not an assumed Disabled status from the application.
+            let mut toggle =
+                disabled_motion_photo_toggle::<()>(checked, theme.clone()).style(|_, status| {
+                    observed.set(Some(status));
+                    motion_photo_toggle_style(&theme, status)
+                });
+            let mut tree = Tree::new(&toggle as &dyn Widget<Message, cosmic::iced::Theme, ()>);
+            let node = toggle.layout(
+                &mut tree,
+                &(),
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 100.0)),
+            );
+            let layout = Layout::new(&node);
+            let viewport = Rectangle::with_size(Size::new(100.0, 100.0));
+            let mut messages = Vec::new();
+            for cursor in [
+                mouse::Cursor::Unavailable,
+                mouse::Cursor::Available(Point::new(10.0, 10.0)),
+            ] {
+                for event in [
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ] {
+                    toggle.update(
+                        &mut tree,
+                        &event,
+                        layout,
+                        cursor,
+                        &(),
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                        &viewport,
+                    );
+                }
+                toggle.draw(
+                    &tree,
+                    &mut (),
+                    &cosmic::iced::Theme::Dark,
+                    &renderer::Style::default(),
+                    layout,
+                    cursor,
+                    &viewport,
+                );
+                assert_eq!(
+                    observed.get(),
+                    Some(Status::Disabled {
+                        is_toggled: checked
+                    })
+                );
+                assert_eq!(
+                    toggle.mouse_interaction(&tree, layout, cursor, &viewport, &()),
+                    if cursor.is_over(layout.bounds()) {
+                        mouse::Interaction::NotAllowed
+                    } else {
+                        mouse::Interaction::default()
+                    }
+                );
+            }
+            assert!(
+                messages.is_empty(),
+                "disabled switch must publish no action"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_motion_photo_switch_uses_theme_disabled_colors_for_both_saved_states() {
+        for theme in [
+            cosmic::Theme::dark(),
+            cosmic::Theme::light(),
+            cosmic::Theme::dark_hc(),
+            cosmic::Theme::light_hc(),
+        ] {
+            for is_toggled in [true, false] {
+                let style = motion_photo_toggle_style(&theme, Status::Disabled { is_toggled });
+                assert_eq!(
+                    style.background,
+                    cosmic::iced::Background::Color(theme.cosmic().button.disabled.into())
+                );
+                assert_eq!(
+                    style.foreground,
+                    cosmic::iced::Background::Color(theme.cosmic().button.on_disabled.into())
+                );
+                assert_eq!(style.text_color, disabled_text_style(&theme).color);
+                assert_ne!(
+                    style.background,
+                    cosmic::iced::Background::Color(theme.cosmic().accent.base.into())
+                );
+                let native = Catalog::style(&theme, &(), Status::Disabled { is_toggled });
+                assert_eq!(style.border_radius, native.border_radius);
+                assert_eq!(style.handle_radius, native.handle_radius);
+                assert_eq!(style.handle_margin, native.handle_margin);
+            }
+            for status in [
+                Status::Active { is_toggled: true },
+                Status::Active { is_toggled: false },
+                Status::Hovered { is_toggled: true },
+                Status::Hovered { is_toggled: false },
+            ] {
+                assert_eq!(
+                    motion_photo_toggle_style(&theme, status),
+                    Catalog::style(&theme, &(), status)
+                );
+            }
         }
     }
 }

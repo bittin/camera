@@ -694,8 +694,26 @@ pub struct AppModel {
     pub file_source_preview_receiver: Option<
         std::sync::Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Arc<CameraFrame>>>>,
     >,
-    /// Whether a photo capture is in progress
+    /// Independently identified ordinary still/live encoding jobs (bounded to 8).
+    pub(crate) photo_jobs:
+        std::collections::BTreeMap<u64, crate::app::handlers::motion_photo::PhotoJob>,
+    pub(crate) next_photo_id: u64,
+    pub(crate) hardware_photo_id: Option<u64>,
+    pub(crate) last_published_photo_id: u64,
+    pub(crate) shutdown_waiting_for_recorder: bool,
+    pub(crate) recording_jobs: std::collections::BTreeSet<u64>,
+    /// Whether hardware/raw/HDR acquisition is in progress
     pub is_capturing: bool,
+    /// Continuous encoded memory recording, retired independently of frames.
+    pub(crate) motion_photo_recorder:
+        Option<crate::app::handlers::motion_photo::MotionPhotoRecorder>,
+    pub(crate) motion_photo_retiring: Option<std::thread::JoinHandle<()>>,
+    /// Owns a shutter clip until embedding has completed.
+    pub motion_photo_capture: Option<crate::app::handlers::motion_photo::MotionPhotoCapture>,
+    /// Last explicit Motion Photo error, available to the UI without hiding failure.
+    pub motion_photo_error: Option<String>,
+    /// Session-only top-bar override; leaves the settings preference enabled.
+    pub motion_photo_override_disabled: bool,
     /// Whether the format picker is visible (iOS-style popup)
     pub format_picker_visible: bool,
     /// Whether the exposure picker is visible (iOS-style popup)
@@ -1612,6 +1630,8 @@ pub enum Message {
     DismissFlashError,
     /// Toggle burst mode for photo capture (multi-frame HDR+ burst)
     ToggleBurstMode,
+    /// Toggle Motion Photo for subsequent captures without hiding its button.
+    ToggleMotionPhotoCapture,
     /// Set burst mode frame count (0 = Auto, 1 = 4 frames, 2 = 6 frames, 3 = 8 frames)
     SetBurstModeFrameCount(usize),
     /// Burst mode capture progress update (overall_progress 0.0-1.0)
@@ -1676,6 +1696,13 @@ pub enum Message {
     PinchZoom(f32),
     /// Photo was saved successfully with the given file path
     PhotoSaved(Result<String, String>),
+    PhotoCaptureSaved(u64, Result<String, String>),
+    PhotoEncodingWatchdog(u64),
+    PhotoCaptureFinished(u64, Result<String, String>),
+    ShutdownRecorderStopped(Result<(), String>),
+    ShutdownDrainWatchdog,
+    /// Dismiss a Motion Photo capture warning without changing saved media.
+    DismissMotionPhotoError,
     /// Clear capture animation after brief delay
     ClearCaptureAnimation,
     /// Toggle video recording
@@ -1771,6 +1798,8 @@ pub enum Message {
     SelectPhotoOutputFormat(usize),
     /// Set the RAW photo demosaicing algorithm.
     SetDemosaicMethod(crate::shaders::DemosaicMethod),
+    /// Enable embedding a short video in JPEG/AVIF photo captures.
+    ToggleMotionPhoto(bool),
     /// Toggle recording audio with video
     ToggleRecordAudio,
     /// Fired by the 100 ms subscription whenever a level source is active.
@@ -1802,13 +1831,19 @@ pub enum Message {
 
     // ===== System & Recovery =====
     /// Camera backend recovery started
-    CameraRecoveryStarted { attempt: u32, max_attempts: u32 },
+    CameraRecoveryStarted {
+        attempt: u32,
+        max_attempts: u32,
+    },
     /// Camera backend recovery succeeded
     CameraRecoverySucceeded,
     /// Camera backend recovery failed
     CameraRecoveryFailed(String),
     /// Audio backend recovery started
-    AudioRecoveryStarted { attempt: u32, max_attempts: u32 },
+    AudioRecoveryStarted {
+        attempt: u32,
+        max_attempts: u32,
+    },
     /// Audio backend recovery succeeded
     AudioRecoverySucceeded,
     /// Audio backend recovery failed

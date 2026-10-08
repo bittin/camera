@@ -84,6 +84,7 @@ jobs:
             gstreamer1.0-plugins-bad \
             gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav \
+            ffmpeg \
             libwayland-dev \
             libxkbcommon-dev \
             libinput-dev \

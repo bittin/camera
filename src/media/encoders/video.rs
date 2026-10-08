@@ -592,7 +592,7 @@ pub fn configure_video_encoder(
 
         // AOM AV1 encoder
         "av1enc" => {
-            encoder.set_property("target-bitrate", bitrate * 1000); // bits per second
+            encoder.set_property("target-bitrate", bitrate); // kilobits per second
             let cpu_used = match quality {
                 VideoQuality::Low => 8,
                 VideoQuality::Medium => 5,
@@ -601,9 +601,8 @@ pub fn configure_video_encoder(
             };
             encoder.set_property("cpu-used", cpu_used);
             debug!(
-                "Configured av1enc: cpu-used={}, bitrate={} bps",
-                cpu_used,
-                bitrate * 1000
+                "Configured av1enc: cpu-used={}, bitrate={} kbps",
+                cpu_used, bitrate
             );
         }
 
@@ -644,6 +643,14 @@ pub fn configure_video_encoder(
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn aom_av1_bitrate_uses_kilobits_per_second() {
+        gst::init().unwrap();
+        let encoder = gst::ElementFactory::make("av1enc").build().unwrap();
+        configure_video_encoder(&encoder, "av1enc", VideoQuality::Low, 64, 48, Some(800));
+        assert_eq!(encoder.property::<u32>("target-bitrate"), 800);
+    }
 
     #[test]
     fn test_codec_extensions() {

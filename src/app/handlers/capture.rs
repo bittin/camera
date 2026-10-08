@@ -6,7 +6,6 @@
 
 use crate::app::state::{AppModel, CameraMode, Message, RecordingState, TimelapseState};
 use crate::backends::camera::types::RecordingFrame;
-use crate::backends::camera::v4l2_controls::read_exposure_metadata;
 use crate::pipelines::photo::burst_mode::BurstModeConfig;
 use crate::pipelines::photo::burst_mode::burst::{
     calculate_adaptive_params, estimate_scene_brightness,
@@ -189,37 +188,37 @@ impl AppModel {
     }
 
     /// Build camera metadata (name, driver, exposure info) for photo encoding.
-    fn build_camera_metadata(&self) -> crate::pipelines::photo::CameraMetadata {
-        let host = crate::pipelines::capture_metadata::host_device_metadata();
-        self.available_cameras
+    pub(super) fn build_camera_metadata(&self) -> crate::pipelines::photo::CameraMetadata {
+        let host = crate::pipelines::capture_metadata::cached_host_device_metadata();
+        let mut metadata = self
+            .available_cameras
             .get(self.current_camera_index)
-            .map(|cam| {
-                let mut metadata = crate::pipelines::photo::CameraMetadata {
-                    camera_name: Some(cam.name.clone()),
-                    camera_driver: cam.device_info.as_ref().map(|info| info.driver.clone()),
-                    sensor_model: cam.sensor_model.clone(),
-                    camera_location: cam.camera_location.clone(),
-                    pipeline_handler: cam.pipeline_handler.clone(),
-                    libcamera_version: cam.libcamera_version.clone(),
-                    device_make: host.make.clone(),
-                    device_model: host.model.clone(),
-                    captured_at: Some(chrono::Local::now().fixed_offset()),
-                    ..Default::default()
-                };
-                if let Some(device_info) = &cam.device_info {
-                    let exposure = read_exposure_metadata(&device_info.path);
-                    metadata.exposure_time = exposure.exposure_time;
-                    metadata.iso = exposure.iso;
-                    metadata.gain = exposure.gain;
-                }
-                metadata
-            })
-            .unwrap_or_else(|| crate::pipelines::photo::CameraMetadata {
-                device_make: host.make.clone(),
-                device_model: host.model.clone(),
+            .map(|cam| crate::pipelines::photo::CameraMetadata {
+                camera_name: Some(cam.name.clone()),
+                camera_driver: cam.device_info.as_ref().map(|info| info.driver.clone()),
+                sensor_model: cam.sensor_model.clone(),
+                camera_location: cam.camera_location.clone(),
+                pipeline_handler: cam.pipeline_handler.clone(),
+                libcamera_version: cam.libcamera_version.clone(),
+                device_make: host.and_then(|h| h.make.clone()),
+                device_model: host.and_then(|h| h.model.clone()),
                 captured_at: Some(chrono::Local::now().fixed_offset()),
                 ..Default::default()
             })
+            .unwrap_or_else(|| crate::pipelines::photo::CameraMetadata {
+                device_make: host.and_then(|h| h.make.clone()),
+                device_model: host.and_then(|h| h.model.clone()),
+                captured_at: Some(chrono::Local::now().fixed_offset()),
+                ..Default::default()
+            });
+        // Last observed controls, not a claim of exact RAW/HDR/ZSL exposure.
+        // Never open/ioctl a device or initialize host discovery at shutter.
+        if let Some(settings) = &self.exposure_settings {
+            metadata.exposure_time = settings.exposure_time.map(|v| f64::from(v) * 0.0001);
+            metadata.iso = settings.iso.and_then(|v| u32::try_from(v).ok());
+            metadata.gain = settings.gain;
+        }
+        metadata
     }
 
     /// Capture the current frame as a photo with the selected filter and zoom
@@ -233,18 +232,54 @@ impl AppModel {
         &mut self,
         zsl_frame: Option<Arc<crate::backends::camera::types::CameraFrame>>,
     ) -> Task<cosmic::Action<Message>> {
+        if self.pending_close || self.photo_jobs.len() >= 8 {
+            self.motion_photo_error = Some(
+                "Photo shutter not accepted: closing or eight encoding jobs already pending".into(),
+            );
+            return Task::none();
+        }
+        if self.is_capturing || self.motion_photo_capture.is_some() || self.burst_mode.is_active() {
+            self.motion_photo_error =
+                Some("Photo shutter not accepted: hardware/HDR acquisition is busy".into());
+            return Task::none();
+        }
+        if self.motion_photo_enabled()
+            && matches!(
+                self.config.photo_output_format,
+                crate::config::PhotoOutputFormat::Jpeg | crate::config::PhotoOutputFormat::Avif
+            )
+        {
+            if let Err(error) = self.start_motion_photo_capture() {
+                error!(%error, "Motion Photo unavailable; still shutter continues");
+                self.motion_photo_error = Some(error);
+            } else {
+                self.motion_photo_error = None;
+            }
+        }
+        let capture_id = self.next_photo_id.max(1);
+        self.next_photo_id = capture_id + 1;
         // Use HDR+ burst mode only if it would actually be used (frame_count > 1)
         // This respects auto-detected brightness and user override.
         // Skip when file source is active — burst needs multiple live frames.
         if self.would_use_burst_mode() && !self.current_frame_is_file_source {
-            return self.capture_burst_mode_photo();
+            self.hardware_photo_id = Some(capture_id);
+            let task = self.capture_burst_mode_photo();
+            return Task::batch([
+                task,
+                Self::delay_task(60_000, Message::PhotoEncodingWatchdog(capture_id)),
+            ]);
         }
 
         // In multistream mode, capture from the raw stream (full sensor resolution)
         // instead of the preview stream (1080p).
         // Skip when file source is active — there is no capture thread to provide raw frames.
         if self.is_current_camera_multistream() && !self.current_frame_is_file_source {
-            return self.capture_photo_from_raw_stream();
+            self.hardware_photo_id = Some(capture_id);
+            let task = self.capture_photo_from_raw_stream();
+            return Task::batch([
+                task,
+                Self::delay_task(60_000, Message::PhotoEncodingWatchdog(capture_id)),
+            ]);
         }
 
         let frame_arc = if let Some(frame) = zsl_frame {
@@ -258,7 +293,15 @@ impl AppModel {
         };
 
         info!("Capturing photo...");
-        self.is_capturing = true;
+        self.photo_jobs.insert(
+            capture_id,
+            crate::app::handlers::motion_photo::PhotoJob {
+                live: self.motion_photo_capture.take(),
+                still_path: None,
+            },
+        );
+        // Ordinary acquisition is an Arc snapshot, so encoding must not lock
+        // the shutter. Hardware/HDR still retains its explicit acquisition lock.
 
         let save_dir = crate::app::get_photo_directory(&self.config.save_folder_name);
         let filter_type = self.selected_filter;
@@ -342,11 +385,15 @@ impl AppModel {
                     .await
                     .map(|p| p.display().to_string())
             },
-            |result| cosmic::Action::App(Message::PhotoSaved(result)),
+            move |result| cosmic::Action::App(Message::PhotoCaptureSaved(capture_id, result)),
         );
 
         let animation_task = Self::delay_task(150, Message::ClearCaptureAnimation);
-        Task::batch([save_task, animation_task])
+        Task::batch([
+            save_task,
+            animation_task,
+            Self::delay_task(60_000, Message::PhotoEncodingWatchdog(capture_id)),
+        ])
     }
 
     /// Capture a photo from the raw stream (multistream mode)
@@ -654,6 +701,27 @@ impl AppModel {
         Task::none()
     }
 
+    /// A lost viewfinder cannot finish HDR collection. Encoding/processing
+    /// already dispatched owns its bytes and must continue independently.
+    pub(crate) fn fail_unfinished_viewfinder_hdr(&mut self, error: &str) {
+        if !self.burst_mode.is_collecting_frames()
+            || self.is_current_camera_multistream()
+            // All frames may already be owned while FramesCollected is queued.
+            || self.burst_mode.frames_captured() >= self.burst_mode.target_frame_count
+        {
+            return;
+        }
+        self.burst_mode.take_frames();
+        self.burst_mode.error();
+        self.is_capturing = false;
+        self.hardware_photo_id = None;
+        // Drop cancels only this acquisition's motion request, not photo_jobs.
+        self.motion_photo_capture = None;
+        self.motion_photo_error = Some(error.to_owned());
+        self.turn_off_flash_hardware();
+        self.flash.active = false;
+    }
+
     /// Handle raw burst frames captured via capture_photo() (multistream mode)
     pub(crate) fn handle_burst_mode_raw_frames_captured(
         &mut self,
@@ -672,8 +740,12 @@ impl AppModel {
             }
             Err(e) => {
                 error!("Failed to capture raw burst frames: {}", e);
+                if self.motion_photo_capture.take().is_some() {
+                    self.motion_photo_error = Some(e.clone());
+                }
                 self.burst_mode.error();
                 self.is_capturing = false;
+                self.hardware_photo_id = None;
                 // Turn off flash
                 self.turn_off_flash_hardware();
                 if self.flash.active {
@@ -712,35 +784,53 @@ impl AppModel {
         // Stop the camera stream during HDR+ processing
         // This frees GPU/CPU resources for burst processing
         // The stream will be restarted in handle_burst_mode_complete
-        info!("Stopping camera stream for HDR+ processing");
-        self.camera_cancel_flag
-            .store(true, std::sync::atomic::Ordering::Release);
+        if self.motion_photo_capture.is_none() {
+            info!("Stopping camera stream for HDR+ processing");
+            self.camera_cancel_flag
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
 
         // Take the frames from the buffer
         let frames: Vec<Arc<crate::backends::camera::types::CameraFrame>> =
             self.burst_mode.take_frames();
 
         if frames.len() < 2 {
+            if self.motion_photo_capture.take().is_some() {
+                self.motion_photo_error = Some("Not enough frames collected for burst mode".into());
+            }
             error!("Not enough frames collected for burst mode");
             self.burst_mode.error();
             self.is_capturing = false;
+            self.hardware_photo_id = None;
             return Task::none();
         }
 
         let save_dir = crate::app::get_photo_directory(&self.config.save_folder_name);
 
-        // Get encoding format and camera metadata (including exposure info)
-        let encoding_format: crate::pipelines::photo::EncodingFormat =
-            self.config.photo_output_format.into();
-
-        let mut camera_metadata = self.build_camera_metadata();
-
+        // Motion Photo stills and clips share the shutter snapshot even if the
+        // user changes controls while a raw/HDR burst is being collected.
+        let live_snapshot = self
+            .motion_photo_capture
+            .as_ref()
+            .map(|live| &live.snapshot);
+        let encoding_format: crate::pipelines::photo::EncodingFormat = live_snapshot
+            .map(|s| s.photo_output_format)
+            .unwrap_or(self.config.photo_output_format)
+            .into();
+        let mut camera_metadata = live_snapshot
+            .map(|s| s.camera_metadata.clone())
+            .unwrap_or_else(|| self.build_camera_metadata());
         let geometry_rotation = self.capture_geometry_rotation();
-        let media_rotation = self.capture_media_rotation();
+        let media_rotation = live_snapshot
+            .map(|s| s.media_rotation)
+            .unwrap_or_else(|| self.capture_media_rotation());
+        let mirror = live_snapshot
+            .map(|s| s.mirror)
+            .unwrap_or_else(|| self.should_mirror_captures());
         camera_metadata.orientation =
             crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
                 media_rotation,
-                self.should_mirror_captures(),
+                mirror,
             );
 
         // Calculate crop rectangle based on preview mode and aspect ratio.
@@ -748,7 +838,11 @@ impl AppModel {
         // framed rect back to sensor coords (`cover_capture_crop`) so the
         // saved photo matches what the user sees inside the crop bars.
         let portrait = self.screen_is_portrait();
-        let crop_rect = if let Some(frame) = frames.first() {
+        let crop_rect = if self.motion_photo_capture.is_some()
+            && let Some(frame) = frames.first()
+        {
+            self.motion_photo_burst_crop(frame.width, frame.height)
+        } else if let Some(frame) = frames.first() {
             let (rw, rh) = if geometry_rotation.swaps_dimensions() {
                 (frame.height, frame.width)
             } else {
@@ -808,8 +902,10 @@ impl AppModel {
             );
         }
 
-        // Get selected filter to apply after processing
-        let selected_filter = self.selected_filter;
+        // Preserve the shutter filter while a Motion Photo is in flight.
+        let selected_filter = live_snapshot
+            .map(|s| s.filter)
+            .unwrap_or(self.selected_filter);
 
         // Start processing task - BurstModeState handles the communication channels
         let (progress_atomic, result_tx) = self.burst_mode.start_processing_task();
@@ -1078,6 +1174,9 @@ impl AppModel {
     }
 
     pub(crate) fn handle_flash_complete(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            return Task::none();
+        }
         info!("Flash complete - capturing photo");
         self.turn_off_flash_hardware();
         self.flash.active = false;
@@ -1094,6 +1193,9 @@ impl AppModel {
     }
 
     pub(crate) fn handle_photo_timer_tick(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            return Task::none();
+        }
         if let Some(remaining) = self.photo_timer_countdown {
             if remaining <= 1 {
                 // Countdown complete - capture the photo
@@ -1189,14 +1291,96 @@ impl AppModel {
         Task::none()
     }
 
+    pub(crate) fn handle_photo_capture_saved(
+        &mut self,
+        id: u64,
+        result: Result<String, String>,
+    ) -> Task<cosmic::Action<Message>> {
+        let Some(job) = self.photo_jobs.get_mut(&id) else {
+            return Task::none();
+        };
+        if let Ok(path) = &result {
+            job.still_path = Some(path.clone());
+            if let Some(live) = &mut job.live
+                && let Some(clip) = live.result.take()
+            {
+                return Task::perform(
+                    crate::app::handlers::motion_photo::embed_completed_clip(
+                        PathBuf::from(path),
+                        clip,
+                    ),
+                    move |result| cosmic::Action::App(Message::PhotoCaptureFinished(id, result)),
+                );
+            }
+        }
+        self.handle_photo_capture_finished(id, result)
+    }
+
+    pub(crate) fn handle_photo_capture_finished(
+        &mut self,
+        id: u64,
+        result: Result<String, String>,
+    ) -> Task<cosmic::Action<Message>> {
+        let Some(job) = self.photo_jobs.remove(&id) else {
+            return Task::none();
+        };
+        let path = match result {
+            Ok(path) => Some(path),
+            Err(error) => {
+                error!(capture_id = id, %error, "Photo/Motion Photo completion failed");
+                self.motion_photo_error = Some(error);
+                job.still_path
+            }
+        };
+        // A late completion cannot clear another job or replace a newer image.
+        if let Some(path) = path
+            && id > self.last_published_photo_id
+        {
+            self.last_published_photo_id = id;
+            self.last_media_path = Some(path);
+            return Task::done(cosmic::Action::App(Message::RefreshGalleryThumbnail));
+        }
+        Task::none()
+    }
+
     pub(crate) fn handle_photo_saved(
         &mut self,
         result: Result<String, String>,
     ) -> Task<cosmic::Action<Message>> {
+        if let Some(capture_id) = self.hardware_photo_id.take() {
+            self.is_capturing = false;
+            self.hardware_photo_id = None;
+            self.photo_jobs.insert(
+                capture_id,
+                crate::app::handlers::motion_photo::PhotoJob {
+                    live: self.motion_photo_capture.take(),
+                    still_path: None,
+                },
+            );
+            return self.handle_photo_capture_saved(capture_id, result);
+        }
+        if let Some(live) = &mut self.motion_photo_capture {
+            if let Ok(path) = &result
+                && let Some(job) = live.result.take()
+            {
+                self.is_capturing = true;
+                self.last_media_path = Some(path.clone());
+                let path = PathBuf::from(path);
+                return Task::perform(
+                    crate::app::handlers::motion_photo::embed_completed_clip(path, job),
+                    |result| cosmic::Action::App(Message::PhotoSaved(result)),
+                );
+            }
+            if let Err(error) = &result {
+                self.motion_photo_error = Some(error.clone());
+            }
+            self.motion_photo_capture = None;
+        }
         // Always release the capture lock here; the separate
         // `ClearCaptureAnimation` task may be dropped on backpressure or panic,
         // which would otherwise leave the capture button permanently disabled.
         self.is_capturing = false;
+        self.hardware_photo_id = None;
         match result {
             Ok(path) => {
                 info!(path = %path, "Photo saved successfully");
@@ -1249,51 +1433,149 @@ impl AppModel {
     /// `handle_timelapse_assembly_complete`) sees `pending_close == true`
     /// and exits. Otherwise exit immediately.
     pub(crate) fn handle_window_close(&mut self) -> Task<cosmic::Action<Message>> {
-        // Already closing — second click is a no-op.
         if self.pending_close {
             return Task::none();
         }
-
-        // Turn off hardware flash LEDs regardless of the exit path so we
-        // never leave them on after the app window goes away.
-        if self.flash.enabled {
-            self.flash.enabled = false;
+        self.pending_close = true;
+        self.current_frame = None;
+        self.core.window.show_context = false;
+        self.tools_menu_visible = false;
+        self.format_picker_visible = false;
+        self.exposure_picker_visible = false;
+        self.color_picker_visible = false;
+        self.motor_picker_visible = false;
+        self.recording_keybind = None;
+        self.fit_animation = None;
+        self.zoom_animation = None;
+        crate::backends::volume_keys::set_focused(false);
+        self.sync_audio_probe();
+        if let Some(stop) = self.video_preview_stop_tx.take() {
+            let _ = stop.send(());
         }
+        if let Some(stop) = self.virtual_camera.take_stop_sender() {
+            let _ = stop.send(());
+        }
+        self.quick_record = crate::app::state::QuickRecordState::Idle;
+        self.photo_timer_countdown = None;
+        self.photo_timer_tick_start = None;
+        self.flash.enabled = false;
+        self.flash.active = false;
         self.turn_off_flash_hardware();
+        // Keep camera/encoded memory worker alive until all accepted post-roll
+        // windows and still encoders finish. Closing never cancels accepted media.
+        if let Some(sender) = self.recording.take_stop_sender() {
+            let _ = sender.send(());
+        }
+        let timelapse_stop = if self.timelapse.is_running() {
+            self.stop_timelapse()
+        } else {
+            Task::none()
+        };
+        self.reconcile_shutdown_preview();
+        Task::batch([
+            timelapse_stop,
+            Self::delay_task(30_000, Message::ShutdownDrainWatchdog),
+        ])
+    }
 
-        if self.recording.is_recording() {
-            info!("Window close requested during recording — signalling EOS first");
-            self.pending_close = true;
-            if let Some(sender) = self.recording.take_stop_sender() {
-                let _ = sender.send(());
-            }
-            // Leave RecordingState::Recording in place so the UI still
-            // shows the timer until the recorder task emits
-            // RecordingStopped.
+    pub(crate) fn handle_shutdown_drain_watchdog(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.pending_close
+            && (self.shutdown_has_pending_media() || self.shutdown_waiting_for_recorder)
+        {
+            let error = "Shutdown drain exceeded its watchdog deadline; waiting for accepted media, not abandoning it".to_string();
+            error!(%error);
+            self.motion_photo_error = Some(error);
+        }
+        Task::none()
+    }
+
+    pub(crate) fn handle_photo_encoding_watchdog(
+        &mut self,
+        id: u64,
+    ) -> Task<cosmic::Action<Message>> {
+        if self.photo_jobs.contains_key(&id) || self.hardware_photo_id == Some(id) {
+            let error = format!(
+                "Photo {id} encoder exceeded its watchdog deadline; still waiting to preserve accepted media"
+            );
+            error!(%error);
+            self.motion_photo_error = Some(error);
+        }
+        Task::none()
+    }
+
+    /// Count accepted output files, not acquisition/encoding phases. A Live
+    /// Photo's still and embedded clip are one save, as is an HDR frame burst.
+    pub(crate) fn shutdown_pending_saves(&self) -> usize {
+        let acquisition = self.hardware_photo_id.map_or_else(
+            || usize::from(self.is_capturing || self.motion_photo_capture.is_some()),
+            |id| usize::from(!self.photo_jobs.contains_key(&id)),
+        );
+        let active_video = self
+            .recording
+            .session()
+            .map_or(0, |id| usize::from(!self.recording_jobs.contains(&id)));
+        self.photo_jobs.len()
+            + acquisition
+            + self.recording_jobs.len()
+            + active_video
+            + usize::from(self.timelapse.is_active())
+    }
+
+    pub(crate) fn shutdown_has_pending_media(&self) -> bool {
+        self.shutdown_pending_saves() != 0
+    }
+
+    pub(crate) fn maybe_finish_shutdown(&mut self) -> Task<cosmic::Action<Message>> {
+        if !self.pending_close
+            || self.shutdown_waiting_for_recorder
+            || self.shutdown_has_pending_media()
+        {
             return Task::none();
         }
+        self.shutdown_waiting_for_recorder = true;
+        let recorder = self.motion_photo_recorder.take();
+        let retired = self.motion_photo_retiring.take();
+        Task::perform(
+            async move {
+                if let Some(recorder) = recorder {
+                    recorder.stop_and_wait().await?;
+                }
+                if let Some(worker) = retired {
+                    tokio::task::spawn_blocking(move || {
+                        worker
+                            .join()
+                            .map_err(|_| "Retired Motion Photo worker panicked".to_string())
+                    })
+                    .await
+                    .map_err(|e| e.to_string())??;
+                }
+                Ok(())
+            },
+            |result| cosmic::Action::App(Message::ShutdownRecorderStopped(result)),
+        )
+    }
 
-        if self.timelapse.is_running() {
-            info!("Window close requested during timelapse — finalising first");
-            self.pending_close = true;
-            // Transition to Finalising; the frame sender is dropped,
-            // closing the channel so the encoder task drains and emits
-            // TimelapseAssemblyComplete.
-            return self.stop_timelapse();
+    pub(crate) fn handle_shutdown_recorder_stopped(
+        &mut self,
+        result: Result<(), String>,
+    ) -> Task<cosmic::Action<Message>> {
+        self.shutdown_waiting_for_recorder = false;
+        if let Err(error) = result {
+            self.motion_photo_error = Some(error);
         }
-
-        if self.timelapse.is_finalising() {
-            // Already finalising — just defer the exit.
-            info!("Window close requested while timelapse is finalising — waiting");
-            self.pending_close = true;
-            return Task::none();
+        if self.pending_close && !self.shutdown_has_pending_media() {
+            self.shutdown_and_exit(0);
         }
-
-        info!("Window close — exiting");
-        self.shutdown_and_exit(0);
+        Task::none()
     }
 
     pub(crate) fn handle_toggle_recording(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.pending_close || (!self.recording.is_recording() && !self.recording_jobs.is_empty())
+        {
+            self.motion_photo_error =
+                Some("Video shutter waits for prior video finalization or shutdown".into());
+            return Task::none();
+        }
         self.haptic_tap();
         if self.recording.is_recording() {
             // Stopping: animate release (scale back up)
@@ -1351,6 +1633,7 @@ impl AppModel {
         // wake from `stop_rx.await` with an error and self-terminate via
         // `recorder.stop()`. We still log the result and update
         // `last_media_path` / the gallery for the just-finalized file.
+        self.recording_jobs.remove(&session);
         let is_current = self.recording.session() == Some(session);
 
         if is_current {
@@ -1360,14 +1643,6 @@ impl AppModel {
             self.update_idle_inhibit();
             // Turn off torch when recording ends
             self.turn_off_flash_hardware();
-        }
-
-        if is_current && self.pending_close {
-            match &result {
-                Ok(path) => info!(path = %path, "Recording finalized — exiting"),
-                Err(err) => error!(error = %err, "Recording finalize failed — exiting anyway"),
-            }
-            self.shutdown_and_exit(0);
         }
 
         match result {
@@ -1406,10 +1681,13 @@ impl AppModel {
         use crate::app::state::QuickRecordState;
 
         // Only handle in Photo mode when idle
-        if self.mode != CameraMode::Photo
+        if self.pending_close
+            || self.mode != CameraMode::Photo
             || self.recording.is_recording()
             || self.burst_mode.is_active()
             || self.quick_record.is_recording()
+            || self.motion_photo_capture.is_some()
+            || self.is_capturing
         {
             return Task::none();
         }
@@ -1417,6 +1695,22 @@ impl AppModel {
         // If photo timer is counting down, abort it
         if self.photo_timer_countdown.is_some() {
             return self.handle_abort_photo_timer();
+        }
+
+        // Compatible Motion Photos accept the shutter on press, so both the
+        // still snapshot and the centered motion window use the press instant.
+        // Timer/flash and ordinary long-press quick-record keep their delays.
+        if self.motion_photo_enabled()
+            && matches!(
+                self.config.photo_output_format,
+                crate::config::PhotoOutputFormat::Jpeg | crate::config::PhotoOutputFormat::Avif
+            )
+            && self.photo_timer_setting == crate::app::state::PhotoTimerSetting::Off
+            && !self.flash.enabled
+        {
+            self.quick_record = QuickRecordState::Idle;
+            self.animate_capture_scale(0.82);
+            return self.capture_photo_with_frame(self.current_frame.clone());
         }
 
         // Capture current frame for zero-shutter-lag photo
@@ -1434,6 +1728,9 @@ impl AppModel {
 
     /// Photo mode: finger lifted — either process photo or stop recording.
     pub(crate) fn handle_capture_button_released(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            return Task::none();
+        }
         use crate::app::state::QuickRecordState;
 
         match std::mem::take(&mut self.quick_record) {
@@ -1499,7 +1796,16 @@ impl AppModel {
     pub(crate) fn handle_quick_record_threshold(&mut self) -> Task<cosmic::Action<Message>> {
         use crate::app::state::QuickRecordState;
         // Only act if still in Pressed state (finger hasn't lifted)
-        if !self.quick_record.is_pressed() {
+        if self.pending_close
+            || !matches!(&self.quick_record,
+            QuickRecordState::Pressed { press_time, .. } if press_time.elapsed() >= std::time::Duration::from_millis(300))
+        {
+            return Task::none();
+        }
+        if !self.photo_jobs.is_empty() || !self.recording_jobs.is_empty() {
+            self.motion_photo_error =
+                Some("Quick recording waits for pending photo/video encoding".into());
+            self.quick_record = QuickRecordState::Idle;
             return Task::none();
         }
         self.haptic_tap();
@@ -1596,6 +1902,11 @@ impl AppModel {
     }
 
     pub(crate) fn handle_start_recording_after_delay(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.pending_close || !self.recording_jobs.is_empty() {
+            self.motion_photo_error =
+                Some("Video capture cannot start during finalization or shutdown".into());
+            return Task::none();
+        }
         let Some(camera) = self.available_cameras.get(self.current_camera_index) else {
             error!("Camera disappeared");
             self.recording = RecordingState::Idle;
@@ -1695,6 +2006,12 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         use crate::backends::camera::types::PixelFormat;
 
+        if self.motion_photo_capture.is_some() {
+            self.quick_record = crate::app::state::QuickRecordState::Idle;
+            self.motion_photo_error =
+                Some("Wait for Motion Photo capture to complete before recording".into());
+            return Task::none();
+        }
         let AppsrcRecordingConfig {
             width,
             height,
@@ -1811,6 +2128,7 @@ impl AppModel {
         let audio_levels: crate::pipelines::video::SharedAudioLevels = Default::default();
         self.recording_session_counter += 1;
         let session = self.recording_session_counter;
+        self.recording_jobs.insert(session);
         self.recording = RecordingState::start(
             session,
             path_for_message.clone(),
@@ -1971,7 +2289,12 @@ impl AppModel {
         &mut self,
         result: Result<String, String>,
     ) -> Task<cosmic::Action<Message>> {
-        self.is_capturing = false;
+        // Successful HDR still publication is delivered by the queued
+        // PhotoSaved message below. Keep its logical save alive until then.
+        self.is_capturing = result.is_ok();
+        if result.is_err() {
+            self.hardware_photo_id = None;
+        }
 
         // Start a short blur transition (200ms) after stream restarts
         // This keeps the last frame blurred until new frames arrive, then fades out smoothly
@@ -1985,9 +2308,16 @@ impl AppModel {
         // The stream was stopped when processing began to free GPU resources.
         // Increment the restart counter to change the subscription ID and trigger restart.
         // Create a new cancel flag so the new subscription isn't immediately cancelled.
-        info!("Restarting camera stream after HDR+ processing");
-        self.camera_stream_restart_counter = self.camera_stream_restart_counter.wrapping_add(1);
-        self.camera_cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if !self.pending_close && self.motion_photo_capture.is_none() {
+            info!("Restarting camera stream after HDR+ processing");
+            self.camera_stream_restart_counter = self.camera_stream_restart_counter.wrapping_add(1);
+            self.camera_cancel_flag =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        }
+        if let Err(error) = &result {
+            self.motion_photo_capture = None;
+            self.motion_photo_error = Some(error.clone());
+        }
 
         match result {
             Ok(path) => {
@@ -2070,6 +2400,9 @@ impl AppModel {
     // =========================================================================
 
     pub(crate) fn handle_toggle_timelapse(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            return Task::none();
+        }
         self.haptic_tap();
         if self.timelapse.is_running() {
             self.animate_capture_scale(1.0);
@@ -2081,7 +2414,10 @@ impl AppModel {
             return self.stop_timelapse();
         }
 
-        if self.timelapse.is_finalising() {
+        if self.timelapse.is_finalising()
+            || self.motion_photo_capture.is_some()
+            || self.is_capturing
+        {
             return Task::none();
         }
 
@@ -2186,14 +2522,6 @@ impl AppModel {
     ) -> Task<cosmic::Action<Message>> {
         self.timelapse = TimelapseState::Idle;
         self.update_idle_inhibit();
-
-        if self.pending_close {
-            match &result {
-                Ok(path) => info!(path = %path, "Timelapse finalized — exiting"),
-                Err(err) => error!(error = %err, "Timelapse finalize failed — exiting anyway"),
-            }
-            self.shutdown_and_exit(0);
-        }
 
         match result {
             Ok(path) => {
@@ -2368,7 +2696,6 @@ async fn process_burst_mode_frames_with_atomic(
             encoding_format,
             camera_metadata,
             filter: Some(filter),
-            filename_suffix: Some("_HDR+"),
         },
     )
     .await?;
@@ -2417,7 +2744,7 @@ async fn save_first_burst_frame(
         height: frame.height,
     };
 
-    // Reuse save_output with no filename suffix (plain IMG_{timestamp})
+    // Reuse save_output with standard timestamp naming and collision-safe creation
     let path = save_output(
         &merged,
         SaveOutputParams {
@@ -2426,7 +2753,6 @@ async fn save_first_burst_frame(
             encoding_format,
             camera_metadata: camera_metadata.clone(),
             filter: Some(filter),
-            filename_suffix: None, // No suffix for first frame
         },
     )
     .await?;
@@ -2502,6 +2828,1297 @@ mod tests {
     use super::{capture_with_preview_fallback, should_use_jpeg_recording_pipeline};
     use crate::backends::camera::types::SensorRotation;
     use std::cell::Cell;
+    use std::sync::Arc;
+
+    fn live_model() -> crate::app::state::AppModel {
+        let mut model = crate::app::state::AppModel::default();
+        model.config.motion_photo = true;
+        model.config.record_audio = false;
+        model.config.burst_mode_setting = crate::config::BurstModeSetting::Off;
+        model.current_frame = Some(Arc::new(crate::backends::camera::types::CameraFrame {
+            width: 64,
+            height: 48,
+            data: crate::backends::camera::types::FrameData::from_copied(
+                vec![80; 64 * 48 * 4].into(),
+            ),
+            format: crate::backends::camera::types::PixelFormat::RGBA,
+            stride: 256,
+            yuv_planes: None,
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        }));
+        model
+            .available_video_encoders
+            .push(crate::media::encoders::video::EncoderInfo {
+                element_name: "x264enc".into(),
+                display_name: "H.264".into(),
+                codec: crate::media::encoders::video::VideoCodec::H264,
+                is_hardware: false,
+                priority: 0,
+            });
+        model
+    }
+
+    async fn warm_live_model(model: &mut crate::app::state::AppModel) {
+        model.preview_fit_to_view = true;
+        model.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Native;
+        model.sync_motion_photo_recorder();
+        for _ in 0..18 {
+            let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            frame.captured_at = std::time::Instant::now();
+            model.forward_motion_photo_frame(&Arc::new(frame));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn motion_photo_encodes_preroll_preview_frames_even_during_hdr_processing() {
+        let mut model = live_model();
+        warm_live_model(&mut model).await;
+        model.start_motion_photo_capture().unwrap();
+        // HDR must not starve the independent Motion Photo frame stream.
+        model.burst_mode.stage = crate::app::state::BurstModeStage::Processing;
+        for _ in 0..26 {
+            let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            frame.captured_at = std::time::Instant::now();
+            let _ = model.handle_camera_frame(Arc::new(frame));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let job = model
+            .motion_photo_capture
+            .as_mut()
+            .unwrap()
+            .result
+            .take()
+            .unwrap();
+        let clip = job.await.unwrap().unwrap();
+        let bytes = std::fs::read(&clip.0).unwrap();
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert!(bytes.windows(4).any(|x| x == b"avc1"));
+    }
+
+    #[tokio::test]
+    async fn slow_still_watchdog_reports_without_abandoning_accepted_media() {
+        let mut model = live_model();
+        model.config.motion_photo = false;
+        let _task = model.capture_photo();
+        let _warning = model.handle_photo_encoding_watchdog(1);
+        assert!(
+            model
+                .motion_photo_error
+                .as_ref()
+                .unwrap()
+                .contains("watchdog")
+        );
+        assert_eq!(
+            model.photo_jobs.len(),
+            1,
+            "warning must not drop a slow but still active encoder"
+        );
+    }
+
+    #[tokio::test]
+    async fn hardware_still_completion_releases_acquisition_before_live_embedding() {
+        let mut model = live_model();
+        model.start_motion_photo_capture().unwrap();
+        model.hardware_photo_id = Some(1);
+        model.is_capturing = true;
+        let _task = model.handle_photo_saved(Ok("accepted-hardware-still.jpg".into()));
+        assert!(
+            !model.is_capturing,
+            "only scarce acquisition may block, not post-roll/embedding"
+        );
+        assert!(model.hardware_photo_id.is_none());
+        assert_eq!(model.photo_jobs.len(), 1);
+        assert!(model.motion_photo_capture.is_none());
+        assert!(model.photo_jobs[&1].live.as_ref().unwrap().result.is_none());
+    }
+
+    #[test]
+    fn shutter_metadata_uses_cached_controls_without_opening_the_camera() {
+        let mut model = live_model();
+        model.exposure_settings = Some(crate::app::exposure_picker::ExposureSettings {
+            exposure_time: Some(100),
+            gain: Some(20),
+            iso: Some(200),
+            ..Default::default()
+        });
+        let metadata = model.build_camera_metadata();
+        assert_eq!(metadata.gain, Some(20));
+        assert_eq!(metadata.iso, Some(200));
+        assert_eq!(metadata.exposure_time, Some(0.01));
+    }
+
+    #[test]
+    fn close_during_ordinary_encoding_keeps_process_alive_until_completion() {
+        const CHILD: &str = "CAMERA_TEST_CLOSE_ORDINARY";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let _entered = runtime.enter();
+            let mut model = live_model();
+            model.config.motion_photo = false;
+            let _pending_task = model.capture_photo();
+            let _close_task = model.handle_window_close();
+            assert!(model.pending_close);
+            assert_eq!(model.photo_jobs.len(), 1);
+            println!("CLOSE_DRAIN_STILL_ALIVE");
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "app::handlers::capture::tests::close_during_ordinary_encoding_keeps_process_alive_until_completion", "--nocapture"])
+            .env(CHILD, "1").output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&child.stdout).contains("CLOSE_DRAIN_STILL_ALIVE"),
+            "close must not _exit while ordinary still encoding is pending"
+        );
+    }
+
+    // Run exit-sensitive regressions in a child: _exit(0) is not a test pass.
+    fn assert_shutdown_child(test: &str, marker: &str, scenario: impl FnOnce()) {
+        const CHILD: &str = "CAMERA_TEST_SHUTDOWN_SCENARIO";
+        if std::env::var(CHILD).as_deref() == Ok(test) {
+            scenario();
+            println!("{marker}");
+            return;
+        }
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, test)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains(marker),
+            "child must reach all assertions, not _exit early: status={}\nstdout={stdout}\nstderr={}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    fn shutdown_model() -> crate::app::state::AppModel {
+        let mut model = live_model();
+        model.config.motion_photo = false;
+        model
+    }
+
+    #[tokio::test]
+    async fn shutdown_progress_counts_logical_saves_and_tracks_completions() {
+        let mut model = shutdown_model();
+        pending_photo(&mut model, 1);
+        model.hardware_photo_id = Some(2);
+        model.is_capturing = true;
+        model.recording_jobs.insert(7);
+        let (stop, _stopped) = tokio::sync::oneshot::channel();
+        model.recording = super::RecordingState::start(7, "video.mp4".into(), stop, None);
+        let _ = model.update(super::Message::WindowClose);
+        assert_eq!(model.shutdown_pending_saves(), 3);
+        let _ = model.update(super::Message::PhotoSaved(Ok("hardware.jpg".into())));
+        assert_eq!(model.shutdown_pending_saves(), 2);
+        let _ = model.update(super::Message::RecordingStopped {
+            session: 7,
+            result: Err("video failed".into()),
+        });
+        assert_eq!(model.shutdown_pending_saves(), 1);
+        let _ = model.update(super::Message::PhotoCaptureFinished(
+            1,
+            Ok("photo.jpg".into()),
+        ));
+        assert_eq!(model.shutdown_pending_saves(), 0);
+        assert!(model.shutdown_waiting_for_recorder);
+    }
+
+    #[tokio::test]
+    async fn shutdown_hides_preview_and_all_interactive_surfaces_immediately() {
+        let mut model = shutdown_model();
+        pending_photo(&mut model, 1);
+        model.core.window.show_context = true;
+        model.tools_menu_visible = true;
+        model.format_picker_visible = true;
+        model.exposure_picker_visible = true;
+        model.color_picker_visible = true;
+        model.motor_picker_visible = true;
+        let frame = model.current_frame.clone().unwrap();
+        let _ = model.update(super::Message::WindowClose);
+        assert!(
+            model.current_frame.is_none(),
+            "never present a live/frozen frame during drain"
+        );
+        assert!(!model.core.window.show_context);
+        assert!(!model.tools_menu_visible);
+        assert!(!model.format_picker_visible);
+        assert!(!model.exposure_picker_visible);
+        assert!(!model.color_picker_visible);
+        assert!(!model.motor_picker_visible);
+        let _ = model.update(super::Message::CameraFrame(frame));
+        assert!(
+            model.current_frame.is_none(),
+            "queued source frames must not repopulate preview"
+        );
+        assert_eq!(model.shutdown_pending_saves(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_frame_producer_after_postroll_without_cancelling_slow_still() {
+        let mut model = live_model();
+        warm_live_model(&mut model).await;
+        let mut source_frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+        model.start_motion_photo_capture().unwrap();
+        model.is_capturing = true;
+        model.hardware_photo_id = Some(1);
+        let _ = model.update(super::Message::WindowClose);
+        assert_eq!(
+            model.shutdown_pending_saves(),
+            1,
+            "live still/clip/acquisition are one save"
+        );
+        assert!(
+            !model
+                .camera_cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        for _ in 0..22 {
+            source_frame.captured_at = std::time::Instant::now();
+            let _ = model.update(super::Message::CameraFrame(Arc::new(source_frame.clone())));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // Simulate raw acquisition having delivered its frame while its still
+        // encoder is slow. No additional camera frames are needed for encoding.
+        model
+            .still_capture_requested
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _ = model.update(super::Message::Noop);
+        assert!(
+            model
+                .camera_cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire),
+            "post-roll finished: do not process prebuffer frames while slow still drains"
+        );
+        assert!(model.current_frame.is_none());
+        assert_eq!(model.shutdown_pending_saves(), 1);
+        assert!(
+            !model
+                .motion_photo_capture
+                .as_ref()
+                .unwrap()
+                .cancel
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let clip = model
+            .motion_photo_capture
+            .as_mut()
+            .unwrap()
+            .result
+            .take()
+            .unwrap()
+            .await
+            .unwrap()
+            .expect("accepted clip survives preview producer shutdown");
+        let bytes = std::fs::read(&clip.0).unwrap();
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert!(bytes.windows(4).any(|x| x == b"avc1"));
+        let _ = model.update(super::Message::PhotoSaved(Err(
+            "synthetic still error".into()
+        )));
+        assert_eq!(model.shutdown_pending_saves(), 0);
+        assert!(model.shutdown_waiting_for_recorder);
+    }
+
+    #[tokio::test]
+    async fn shutdown_source_removal_fails_partial_hdr_but_drains_dispatched_photos() {
+        assert_source_loss_drains_photos(super::Message::HotplugDeviceRemoved(vec![
+            "video-test".into(),
+        ]))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_permanent_source_failure_fails_partial_hdr_but_drains_dispatched_photos() {
+        assert_source_loss_drains_photos(super::Message::CameraRecoveryFailed(
+            "permanent source failure".into(),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_source_loss_preserves_hdr_with_all_frames_already_owned() {
+        for processing in [false, true] {
+            for source_loss in [
+                super::Message::HotplugDeviceRemoved(vec!["video-test".into()]),
+                super::Message::CameraRecoveryFailed("permanent source failure".into()),
+            ] {
+                let mut model = shutdown_model();
+                model
+                    .available_cameras
+                    .push(crate::backends::camera::types::CameraDevice {
+                        device_info: Some(crate::backends::camera::types::DeviceInfo {
+                            path: "/dev/video-test".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                model.config.burst_mode_setting = crate::config::BurstModeSetting::Frames4;
+                let _ = model.capture_photo();
+                for _ in 0..4 {
+                    model
+                        .burst_mode
+                        .add_frame(model.current_frame.clone().unwrap());
+                }
+                if processing {
+                    model.burst_mode.take_frames();
+                    model.burst_mode.stage = crate::app::state::BurstModeStage::Processing;
+                }
+                let stage = model.burst_mode.stage;
+                let _ = model.update(super::Message::WindowClose);
+                let _ = model.update(source_loss);
+                assert_eq!(
+                    model.burst_mode.stage, stage,
+                    "owned HDR bytes must finish processing/publication"
+                );
+                assert!(model.is_capturing);
+                assert_eq!(model.hardware_photo_id, Some(1));
+                assert_eq!(model.shutdown_pending_saves(), 1);
+                assert!(!model.shutdown_waiting_for_recorder);
+            }
+        }
+    }
+
+    async fn assert_source_loss_drains_photos(source_loss: super::Message) {
+        use crate::backends::camera::types::{CameraDevice, DeviceInfo};
+        use std::sync::atomic::Ordering;
+
+        let mut model = live_model();
+        model.available_cameras.push(CameraDevice {
+            device_info: Some(DeviceInfo {
+                path: "/dev/video-test".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // An independent, already-dispatched Motion Photo/mux and still encoder.
+        model.start_motion_photo_capture().unwrap();
+        let mut live = model.motion_photo_capture.take().unwrap();
+        let dispatched_cancel = live.cancel.clone();
+        let (complete, completion) = tokio::sync::oneshot::channel();
+        live.result = Some(tokio::spawn(async move { completion.await.unwrap() }));
+        model.photo_jobs.insert(
+            90,
+            crate::app::handlers::motion_photo::PhotoJob {
+                live: Some(live),
+                still_path: None,
+            },
+        );
+        pending_photo(&mut model, 91);
+        model.config.burst_mode_setting = crate::config::BurstModeSetting::Frames4;
+        let _shutter = model.capture_photo();
+        let acquisition_cancel = model.motion_photo_capture.as_ref().unwrap().cancel.clone();
+        assert!(model.burst_mode.is_collecting_frames());
+        assert!(
+            !model
+                .burst_mode
+                .add_frame(model.current_frame.clone().unwrap())
+        );
+        assert_eq!(model.burst_mode.frames_captured(), 1);
+        let _ = model.update(super::Message::WindowClose);
+        assert_eq!(model.shutdown_pending_saves(), 3);
+        let _ = model.update(source_loss);
+        assert!(
+            !model.is_capturing,
+            "lost source must release unfinished HDR acquisition"
+        );
+        assert!(model.hardware_photo_id.is_none());
+        assert_eq!(
+            model.burst_mode.stage,
+            crate::app::state::BurstModeStage::Error
+        );
+        assert_eq!(model.burst_mode.frames_captured(), 0);
+        assert!(model.motion_photo_error.is_some());
+        assert!(model.motion_photo_capture.is_none());
+        assert!(acquisition_cancel.load(Ordering::Acquire));
+        assert!(model.camera_cancel_flag.load(Ordering::Acquire));
+        assert_eq!(model.shutdown_pending_saves(), 2);
+        assert!(!dispatched_cancel.load(Ordering::Acquire));
+        assert!(
+            !model.photo_jobs[&90]
+                .live
+                .as_ref()
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .is_finished()
+        );
+        assert!(!model.shutdown_waiting_for_recorder);
+        // Resolve independent work normally; never deliver ShutdownRecorderStopped
+        // here because that intentionally calls _exit in production.
+        assert!(
+            complete
+                .send(Err("synthetic mux completion".into()))
+                .is_ok()
+        );
+        let clip = model
+            .photo_jobs
+            .get_mut(&90)
+            .unwrap()
+            .live
+            .as_mut()
+            .unwrap()
+            .result
+            .take()
+            .unwrap()
+            .await
+            .unwrap();
+        assert!(clip.is_err());
+        let _ = model.update(super::Message::PhotoCaptureFinished(
+            90,
+            Ok("live.jpg".into()),
+        ));
+        assert_eq!(model.shutdown_pending_saves(), 1);
+        let _ = model.update(super::Message::PhotoCaptureFinished(
+            91,
+            Ok("still.jpg".into()),
+        ));
+        assert_eq!(model.shutdown_pending_saves(), 0);
+        assert!(
+            model.shutdown_waiting_for_recorder,
+            "all remaining encodes drained: shutdown eligible"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_hdr_completion_keeps_save_count_until_publication_message() {
+        let mut model = shutdown_model();
+        model.hardware_photo_id = Some(3);
+        model.is_capturing = true;
+        model.burst_mode.stage = crate::app::state::BurstModeStage::Processing;
+        let generation = model.camera_cancel_flag.clone();
+        let _ = model.update(super::Message::WindowClose);
+        assert_eq!(model.shutdown_pending_saves(), 1);
+        let _ = model.update(super::Message::BurstModeComplete(Ok("hdr.jpg".into())));
+        assert_eq!(
+            model.shutdown_pending_saves(),
+            1,
+            "HDR complete still queues PhotoSaved; native close must not race publication"
+        );
+        assert!(!model.shutdown_waiting_for_recorder);
+        assert!(Arc::ptr_eq(&generation, &model.camera_cancel_flag));
+        assert!(
+            model
+                .camera_cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        let _ = model.update(super::Message::PhotoSaved(Ok("hdr.jpg".into())));
+        assert_eq!(model.shutdown_pending_saves(), 0);
+        assert_eq!(model.last_media_path.as_deref(), Some("hdr.jpg"));
+        assert!(model.shutdown_waiting_for_recorder);
+    }
+
+    fn pending_photo(model: &mut crate::app::state::AppModel, id: u64) {
+        model.photo_jobs.insert(
+            id,
+            crate::app::handlers::motion_photo::PhotoJob {
+                live: None,
+                still_path: None,
+            },
+        );
+    }
+
+    fn assert_drain_blocked(model: &mut crate::app::state::AppModel) {
+        assert!(model.pending_close);
+        assert!(model.shutdown_has_pending_media());
+        assert!(!model.shutdown_waiting_for_recorder);
+        assert!(cosmic::iced::runtime::task::into_stream(model.maybe_finish_shutdown()).is_none());
+        let _ = model.update(super::Message::ShutdownDrainWatchdog);
+        assert!(
+            model
+                .motion_photo_error
+                .as_deref()
+                .unwrap()
+                .contains("watchdog")
+        );
+        assert!(
+            model.shutdown_has_pending_media(),
+            "watchdog must not abandon jobs"
+        );
+    }
+
+    async fn assert_recorder_drain_scheduled(task: cosmic::Task<cosmic::Action<super::Message>>) {
+        use futures::StreamExt;
+        let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+        let drain = async {
+            while let Some(action) = stream.next().await {
+                if matches!(
+                    action,
+                    cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                        super::Message::ShutdownRecorderStopped(Ok(()))
+                    ))
+                ) {
+                    return;
+                }
+            }
+            panic!("missing shutdown recorder drain completion");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), drain)
+            .await
+            .unwrap();
+        // Do not dispatch this terminal message: it legitimately calls _exit.
+    }
+
+    #[tokio::test]
+    async fn shutdown_video_stop_then_close_waits_for_finalization() {
+        for result in [
+            Ok("video.mp4".into()),
+            Err("synthetic video failure".into()),
+        ] {
+            let mut model = shutdown_model();
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            model.recording = super::RecordingState::start(7, "video.mp4".into(), stop, None);
+            model.recording_jobs.insert(7);
+            let _ = model.update(super::Message::ToggleRecording);
+            assert_eq!(stopped.try_recv(), Ok(()));
+            assert!(!model.recording.is_recording());
+            assert!(model.recording_jobs.contains(&7));
+            let _ = model.update(super::Message::WindowClose);
+            assert_drain_blocked(&mut model);
+            let task = model.update(super::Message::RecordingStopped { session: 7, result });
+            assert!(model.recording_jobs.is_empty());
+            assert!(!model.shutdown_has_pending_media());
+            assert!(model.shutdown_waiting_for_recorder);
+            assert_recorder_drain_scheduled(task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_close_signals_active_video_without_dropping_finalization() {
+        let mut model = shutdown_model();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        model.recording = super::RecordingState::start(7, "video.mp4".into(), stop, None);
+        model.recording_jobs.insert(7);
+        let _ = model.update(super::Message::WindowClose);
+        assert_eq!(stopped.try_recv(), Ok(()));
+        assert!(model.recording.is_recording());
+        assert!(model.recording_jobs.contains(&7));
+        assert_drain_blocked(&mut model);
+        let _ = model.update(super::Message::WindowClose);
+        assert_drain_blocked(&mut model);
+    }
+
+    #[tokio::test]
+    async fn shutdown_timelapse_close_and_stop_then_close_preserve_finalization() {
+        for stop_first in [false, true] {
+            let mut model = shutdown_model();
+            let (frame_sender, mut frames) = tokio::sync::mpsc::unbounded_channel();
+            let start_time = std::time::Instant::now();
+            model.timelapse = super::TimelapseState::Running {
+                start_time,
+                shots_taken: 2,
+                interval_ms: 1000,
+                frame_sender,
+            };
+            if stop_first {
+                let _ = model.update(super::Message::ToggleTimelapse);
+            }
+            let _ = model.update(super::Message::WindowClose);
+            assert!(
+                matches!(model.timelapse, super::TimelapseState::Finalising {
+                start_time: actual, shots_taken: 2,
+            } if actual == start_time)
+            );
+            assert!(matches!(
+                frames.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ));
+            assert_drain_blocked(&mut model);
+            let _ = model.update(super::Message::TimelapseTick);
+            let _ = model.update(super::Message::WindowClose);
+            assert!(model.timelapse.is_finalising());
+            assert_drain_blocked(&mut model);
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_combined_ordinary_photo_video_waits_in_either_completion_order() {
+        for photo_first in [false, true] {
+            let mut model = shutdown_model();
+            pending_photo(&mut model, 1);
+            model.recording_jobs.insert(7);
+            let _ = model.update(super::Message::WindowClose);
+            assert_drain_blocked(&mut model);
+            let photo = super::Message::PhotoCaptureSaved(1, Ok("photo.jpg".into()));
+            let video = super::Message::RecordingStopped {
+                session: 7,
+                result: Ok("video.mp4".into()),
+            };
+            let (first, last) = if photo_first {
+                (photo, video)
+            } else {
+                (video, photo)
+            };
+            let _ = model.update(first);
+            assert_eq!(model.photo_jobs.len(), usize::from(!photo_first));
+            assert_eq!(model.recording_jobs.len(), usize::from(photo_first));
+            assert_drain_blocked(&mut model);
+            // Extra accepted-photo sentinel keeps terminal transition safe to inspect.
+            pending_photo(&mut model, 2);
+            let _ = model.update(last);
+            assert_eq!(model.photo_jobs.len(), 1);
+            assert!(model.photo_jobs.contains_key(&2));
+            assert!(model.recording_jobs.is_empty());
+            assert_drain_blocked(&mut model);
+            let task = model.update(super::Message::PhotoCaptureFinished(
+                2,
+                Err("synthetic sentinel completion".into()),
+            ));
+            assert!(!model.shutdown_has_pending_media());
+            assert!(model.shutdown_waiting_for_recorder);
+            assert_recorder_drain_scheduled(task).await;
+        }
+    }
+
+    #[test]
+    fn shutdown_timelapse_failed_completion_waits_for_pending_video() {
+        assert_shutdown_child(
+            "app::handlers::capture::tests::shutdown_timelapse_failed_completion_waits_for_pending_video",
+            "FAILED_TIMELAPSE_STILL_DRAINING",
+            || {
+                let mut model = shutdown_model();
+                model.recording_jobs.insert(7);
+                model.timelapse = super::TimelapseState::Finalising {
+                    start_time: std::time::Instant::now(),
+                    shots_taken: 2,
+                };
+                let _ = model.update(super::Message::WindowClose);
+                let _ = model.update(super::Message::TimelapseAssemblyComplete(Err(
+                    "synthetic timelapse failure".into(),
+                )));
+                assert!(!model.timelapse.is_active());
+                assert!(model.recording_jobs.contains(&7));
+                assert_drain_blocked(&mut model);
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_press_respects_timer_flash_and_incompatible_format() {
+        for delayed in 0..3 {
+            let mut model = live_model();
+            match delayed {
+                0 => model.photo_timer_setting = crate::app::state::PhotoTimerSetting::Sec3,
+                1 => model.flash.enabled = true,
+                _ => model.config.photo_output_format = crate::config::PhotoOutputFormat::Png,
+            }
+            let _ = model.handle_capture_button_pressed();
+            assert!(model.photo_jobs.is_empty());
+            assert!(model.quick_record.is_pressed());
+        }
+    }
+
+    #[test]
+    fn shutdown_timelapse_completion_waits_for_pending_ordinary_photo() {
+        assert_shutdown_child(
+            "app::handlers::capture::tests::shutdown_timelapse_completion_waits_for_pending_ordinary_photo",
+            "TIMELAPSE_COMPLETION_STILL_DRAINING",
+            || {
+                let mut model = live_model();
+                model.config.motion_photo = false;
+                model.photo_jobs.insert(
+                    1,
+                    crate::app::handlers::motion_photo::PhotoJob {
+                        live: None,
+                        still_path: None,
+                    },
+                );
+                model.timelapse = crate::app::state::TimelapseState::Finalising {
+                    start_time: std::time::Instant::now(),
+                    shots_taken: 2,
+                };
+                let _ = model.update(super::Message::WindowClose);
+                let _ = model.update(super::Message::TimelapseAssemblyComplete(Ok(
+                    "timelapse.mp4".into(),
+                )));
+                assert!(!model.timelapse.is_active());
+                assert_eq!(model.photo_jobs.len(), 1);
+                assert_eq!(model.last_media_path.as_deref(), Some("timelapse.mp4"));
+                assert!(!model.shutdown_waiting_for_recorder);
+                assert!(model.shutdown_has_pending_media());
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_press_dispatches_once_and_close_before_release_drains() {
+        let mut model = live_model();
+        let press = model.handle_capture_button_pressed();
+        assert_eq!(
+            model.photo_jobs.len(),
+            1,
+            "accepted Motion Photo starts on press, not release"
+        );
+        assert!(cosmic::iced::runtime::task::into_stream(press).is_some());
+        let _ = model.update(super::Message::WindowClose);
+        assert!(model.pending_close);
+        assert!(model.shutdown_has_pending_media());
+        assert!(!model.shutdown_waiting_for_recorder);
+        let _ = model.update(super::Message::CaptureButtonReleased);
+        assert_eq!(
+            model.photo_jobs.len(),
+            1,
+            "release must not duplicate the press shutter"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_press_release_does_not_dispatch_a_second_shutter() {
+        let mut model = live_model();
+        let _ = model.handle_capture_button_pressed();
+        assert_eq!(model.photo_jobs.len(), 1);
+        let _ = model.handle_capture_button_released();
+        assert_eq!(model.photo_jobs.len(), 1);
+        assert!(matches!(
+            model.quick_record,
+            crate::app::state::QuickRecordState::Idle
+        ));
+    }
+
+    #[tokio::test]
+    async fn stale_quick_record_timer_cannot_promote_a_new_press() {
+        let mut model = live_model();
+        model.config.motion_photo = false;
+        let _ = model.handle_capture_button_pressed();
+        let _ = model.handle_capture_button_released();
+        let _ = model.handle_capture_button_pressed();
+        let _ = model.handle_quick_record_threshold();
+        assert!(
+            model.quick_record.is_pressed(),
+            "old press timer cannot promote a fresh <300ms press"
+        );
+    }
+
+    #[tokio::test]
+    async fn three_rapid_motion_photos_save_distinct_centered_windows_while_close_drains() {
+        use futures::StreamExt;
+        let root = std::env::temp_dir().join(format!("three-live-{}", uuid::Uuid::new_v4()));
+        let mut model = live_model();
+        model.config.save_folder_name = root.display().to_string();
+        let mut red = model.current_frame.as_ref().unwrap().as_ref().clone();
+        red.data = crate::backends::camera::types::FrameData::from_copied(
+            [220u8, 10, 10, 255].repeat(64 * 48).into(),
+        );
+        model.current_frame = Some(Arc::new(red));
+        warm_live_model(&mut model).await;
+        let mut streams = futures::stream::SelectAll::new();
+        for _ in 0..3 {
+            streams.push(
+                cosmic::iced::runtime::task::into_stream(model.handle_capture_button_pressed())
+                    .unwrap(),
+            );
+            let _ = model.handle_capture_button_released();
+            let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            frame.captured_at = std::time::Instant::now();
+            frame.data = crate::backends::camera::types::FrameData::from_copied(
+                [10u8, 10, 220, 255].repeat(64 * 48).into(),
+            );
+            model.current_frame = Some(Arc::new(frame));
+            model.forward_motion_photo_frame(&model.current_frame.clone().unwrap());
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(model.photo_jobs.len(), 3);
+        let source_frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+        let _ = model.update(super::Message::WindowClose);
+        assert_eq!(model.shutdown_pending_saves(), 3);
+        assert!(model.pending_close);
+        assert!(
+            model.motion_photo_recorder.is_some(),
+            "close must preserve accepted post-roll"
+        );
+        let mut completed = Vec::new();
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        let drain = async {
+            while !model.photo_jobs.is_empty() {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let mut frame = source_frame.clone();
+                        frame.captured_at = std::time::Instant::now();
+                        let _ = model.update(super::Message::CameraFrame(Arc::new(frame)));
+                        assert!(model.current_frame.is_none());
+                    }
+                    action = streams.next() => {
+                        if let Some(cosmic::iced::runtime::Action::Output(cosmic::Action::App(message))) = action {
+                            let task = match message {
+                                super::Message::PhotoCaptureSaved(id, result) => model.handle_photo_capture_saved(id, result),
+                                super::Message::PhotoCaptureFinished(id, result) => {
+                                    completed.push((id, result.as_ref().unwrap().clone()));
+                                    model.handle_photo_capture_finished(id, result)
+                                }
+                                _ => cosmic::Task::none(),
+                            };
+                            assert_eq!(model.shutdown_pending_saves(), model.photo_jobs.len(),
+                                "still completion and embedding must not double-count a Motion Photo");
+                            if let Some(stream) = cosmic::iced::runtime::task::into_stream(task) { streams.push(stream); }
+                        }
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), drain)
+            .await
+            .unwrap();
+        completed.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            completed.iter().map(|p| p.0).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let paths: std::collections::BTreeSet<_> = completed.iter().map(|p| p.1.clone()).collect();
+        assert_eq!(paths.len(), 3);
+        for (id, path) in &completed {
+            let bytes = std::fs::read(path).unwrap();
+            let xmp = String::from_utf8_lossy(&bytes);
+            assert!(xmp.contains("MotionPhotoPresentationTimestampUs=\"-1\""));
+            let item = xmp
+                .split("<Container:Item ")
+                .find(|s| {
+                    s.starts_with("Item:Mime=\"video/mp4\"")
+                        || (s
+                            .split("/>")
+                            .next()
+                            .unwrap()
+                            .contains("Item:Semantic=\"MotionPhoto\""))
+                })
+                .unwrap();
+            let length: usize = item
+                .split("Item:Length=\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+            let extracted = root.join(format!("extracted-{id}.mp4"));
+            std::fs::write(&extracted, &bytes[bytes.len() - length..]).unwrap();
+            let decode = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-xerror", "-i"])
+                .arg(&extracted)
+                .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+                .output()
+                .unwrap();
+            assert!(
+                decode.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decode.stderr)
+            );
+            let frames: Vec<_> = decode.stdout.chunks_exact(64 * 48 * 3).collect();
+            assert!(
+                frames.len() >= 23,
+                "10fps synthetic source should span the nominal 2.5s window, got {} frames",
+                frames.len()
+            );
+            let probe = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "json",
+                ])
+                .arg(&extracted)
+                .output()
+                .unwrap();
+            let duration: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+            let seconds: f64 = duration["format"]["duration"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                (2.3..=2.65).contains(&seconds),
+                "capture {id} duration={seconds}"
+            );
+            assert!(frames.first().unwrap()[0] > 180);
+            assert!(frames.last().unwrap()[2] > 180);
+            let boundary =
+                frames.iter().position(|f| f[2] > 180).unwrap() as f64 / frames.len() as f64;
+            assert!(
+                (0.32..0.65).contains(&boundary),
+                "warmed shutter {id} not near midpoint: red/blue boundary {boundary}"
+            );
+            eprintln!(
+                "capture {id}: {} decoded frames, BEFORE/AFTER boundary {boundary}, {}",
+                frames.len(),
+                path
+            );
+        }
+        assert_eq!(model.last_published_photo_id, 3);
+        assert_eq!(
+            model.last_media_path.as_deref(),
+            Some(completed[2].1.as_str())
+        );
+        if let Some(recorder) = model.motion_photo_recorder.take() {
+            recorder.stop_and_wait().await.unwrap();
+        }
+        assert!(!model.shutdown_has_pending_media());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn three_rapid_ordinary_shutters_are_all_dispatched() {
+        let mut model = live_model();
+        for _ in 0..3 {
+            let task = model.capture_photo();
+            assert!(
+                cosmic::iced::runtime::task::into_stream(task).is_some(),
+                "ordinary shutter must not be dropped while prior post-roll/encoding is pending"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn motion_photo_top_bar_override_saves_an_ordinary_still() {
+        let mut model = live_model();
+        let _ = model.update(crate::app::Message::ToggleMotionPhotoCapture);
+        let _ = model.capture_photo();
+        assert!(model.config.motion_photo);
+        assert_eq!(model.photo_jobs.len(), 1);
+        assert!(!model.is_capturing);
+        assert!(model.photo_jobs[&1].live.is_none());
+        assert!(model.motion_photo_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn motion_photo_still_completion_waits_for_embedding_before_releasing_capture() {
+        let mut model = live_model();
+        let _ = model.capture_photo();
+        let _ = model.handle_photo_capture_saved(1, Ok("still.jpg".into()));
+        assert_eq!(
+            model.photo_jobs.len(),
+            1,
+            "job is retained through embedding"
+        );
+        assert!(
+            !model.is_capturing,
+            "post-roll must not block another ordinary shutter"
+        );
+        assert!(model.photo_jobs[&1].live.as_ref().unwrap().result.is_none());
+    }
+
+    #[tokio::test]
+    async fn motion_photo_hdr_processing_keeps_preview_source_running() {
+        let mut model = live_model();
+        model.start_motion_photo_capture().unwrap();
+        // Insufficient burst frames ends before the expensive HDR worker starts.
+        let _ = model.handle_burst_mode_frames_collected();
+        assert!(
+            !model
+                .camera_cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire),
+            "HDR processing must keep the live clip source streaming"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_hdr_completion_does_not_replace_running_source_generation() {
+        let mut model = live_model();
+        model.start_motion_photo_capture().unwrap();
+        let source = model.camera_cancel_flag.clone();
+        let _ = model.handle_burst_mode_complete(Err("synthetic HDR failure".into()));
+        assert!(Arc::ptr_eq(&source, &model.camera_cancel_flag));
+        assert!(
+            model.motion_photo_capture.is_none(),
+            "A failed still must cancel its clip"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_busy_lock_survives_settings_toggle() {
+        let mut model = live_model();
+        let _ = model.capture_photo();
+        model.config.motion_photo = false;
+        model.is_capturing = false; // completion animation cannot authorize overlap
+        let _ = model.capture_photo();
+        assert!(
+            !model.is_capturing,
+            "A pending clip must reject a second still even after the toggle changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_close_defers_exit_until_the_capture_completion() {
+        let mut model = live_model();
+        model.start_motion_photo_capture().unwrap();
+        let cancel = model.motion_photo_capture.as_ref().unwrap().cancel.clone();
+        let _ = model.handle_window_close();
+        assert!(model.pending_close);
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::Acquire),
+            "closing drains accepted clips instead of cancelling them"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_raw_burst_failure_releases_pending_clip() {
+        let mut model = live_model();
+        model.start_motion_photo_capture().unwrap();
+        let _ = model.handle_burst_mode_raw_frames_captured(Err("raw frame timeout".into()));
+        assert!(model.motion_photo_capture.is_none());
+        assert!(model.motion_photo_error.is_some());
+    }
+
+    #[test]
+    fn timelapse_start_rejects_pending_motion_photo() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut model = live_model();
+        {
+            let _entered = runtime.enter();
+            model.start_motion_photo_capture().unwrap();
+        }
+        let _ = model.handle_toggle_timelapse();
+        assert!(
+            !model.timelapse.is_active(),
+            "timelapse must not overlap an unfinished Motion Photo"
+        );
+    }
+
+    #[test]
+    fn timelapse_start_rejects_pending_still_capture() {
+        let mut model = live_model();
+        model.is_capturing = true;
+        let _ = model.handle_toggle_timelapse();
+        assert!(
+            !model.timelapse.is_active(),
+            "timelapse must not overlap an unfinished still capture"
+        );
+    }
+
+    #[test]
+    fn timelapse_stop_remains_allowed_during_capture() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut model = live_model();
+        {
+            let _entered = runtime.enter();
+            model.start_motion_photo_capture().unwrap();
+        }
+        model.is_capturing = true;
+        let (frame_sender, _frames) = tokio::sync::mpsc::unbounded_channel();
+        model.timelapse = crate::app::state::TimelapseState::Running {
+            start_time: std::time::Instant::now(),
+            shots_taken: 2,
+            interval_ms: 1000,
+            frame_sender,
+        };
+        let _ = model.handle_toggle_timelapse();
+        assert!(model.timelapse.is_finalising());
+    }
+
+    #[tokio::test]
+    async fn motion_photo_pending_clip_rejects_quick_record_press() {
+        let mut model = live_model();
+        model.start_motion_photo_capture().unwrap();
+        let _ = model.handle_capture_button_pressed();
+        assert!(!model.quick_record.is_pressed());
+    }
+
+    #[tokio::test]
+    async fn motion_photo_starts_for_raw_multistream_and_hdr_shutters() {
+        for burst in [
+            crate::config::BurstModeSetting::Off,
+            crate::config::BurstModeSetting::Frames4,
+        ] {
+            let mut model = live_model();
+            model
+                .available_cameras
+                .push(crate::backends::camera::types::CameraDevice {
+                    supports_multistream: true,
+                    ..Default::default()
+                });
+            model.config.burst_mode_setting = burst;
+            let _ = model.capture_photo();
+            assert!(model.motion_photo_capture.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn motion_photo_source_change_cancels_clip_and_removes_temporary_file() {
+        let mut model = live_model();
+        model.start_motion_photo_capture().unwrap();
+        model
+            .camera_cancel_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        let live = model.motion_photo_capture.as_mut().unwrap();
+        let path = live.temporary_path.clone();
+        let job = live.result.take().unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), job)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn motion_photo_file_source_and_missing_microphone_fail_explicitly() {
+        let mut model = live_model();
+        model.current_frame_is_file_source = true;
+        let _ = model.capture_photo();
+        assert!(
+            model
+                .motion_photo_error
+                .as_deref()
+                .unwrap()
+                .contains("file preview")
+        );
+        assert!(model.motion_photo_capture.is_none());
+        assert_eq!(
+            model.photo_jobs.len(),
+            1,
+            "a video error must not reject the still shutter"
+        );
+        model.is_capturing = false;
+        model.current_frame_is_file_source = false;
+        model.config.record_audio = true;
+        let _ = model.capture_photo();
+        assert!(
+            model
+                .motion_photo_error
+                .as_deref()
+                .unwrap()
+                .contains("no microphone")
+        );
+        assert!(model.motion_photo_capture.is_none());
+    }
+
+    #[tokio::test]
+    async fn motion_photo_saved_handler_embeds_real_clip_and_extracted_video_decodes() {
+        use futures::StreamExt;
+        let root = std::env::temp_dir().join(format!(
+            "motion-photo-runtime-probe-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut model = live_model();
+        warm_live_model(&mut model).await;
+        let _ = model.capture_photo();
+        let still = root.join("synthetic.jpg");
+        image::RgbImage::from_pixel(64, 48, image::Rgb([80, 80, 80]))
+            .save(&still)
+            .unwrap();
+        let task = model.handle_photo_capture_saved(1, Ok(still.display().to_string()));
+        let mut completion = cosmic::iced::runtime::task::into_stream(task).unwrap();
+        for _ in 0..26 {
+            let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            frame.captured_at = std::time::Instant::now();
+            model.forward_motion_photo_frame(&Arc::new(frame));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let clip_path = model.photo_jobs[&1]
+            .live
+            .as_ref()
+            .unwrap()
+            .temporary_path
+            .clone();
+        let clip_bytes = std::fs::read(&clip_path).unwrap();
+        let Some(cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+            super::Message::PhotoCaptureFinished(1, result),
+        ))) = completion.next().await
+        else {
+            panic!("missing Motion Photo completion");
+        };
+        let output = result.as_ref().unwrap().clone();
+        let _ = model.handle_photo_capture_finished(1, result);
+        assert!(model.photo_jobs.is_empty());
+        assert!(!model.is_capturing);
+        assert!(model.motion_photo_capture.is_none());
+        assert!(!clip_path.exists());
+        assert!(
+            !still.exists(),
+            "A successful Motion Photo must not leave a duplicate still"
+        );
+        let packaged = std::fs::read(&output).unwrap();
+        let extracted = root.join("extracted.mp4");
+        let video = &packaged[packaged.len() - clip_bytes.len()..];
+        assert_eq!(video, clip_bytes);
+        std::fs::write(&extracted, video).unwrap();
+        let decode = std::process::Command::new("timeout")
+            .args(["10s", "ffmpeg", "-v", "error", "-i"])
+            .arg(&extracted)
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            decode.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decode.stderr)
+        );
+        image::open(&output).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn motion_photo_hdr_crop_retains_shutter_zoom_after_controls_change() {
+        let mut model = live_model();
+        model.preview_fit_to_view = true;
+        model.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Native;
+        model.zoom_level = 2.0;
+        model.start_motion_photo_capture().unwrap();
+        model.zoom_level = 1.0;
+        assert_eq!(
+            model.motion_photo_burst_crop(64, 48),
+            Some((16, 12, 32, 24))
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_hdr_fractional_zoom_matches_still_postprocessor_rounding() {
+        let mut model = live_model();
+        model.preview_fit_to_view = true;
+        model.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Native;
+        model.zoom_level = 1.7;
+        model.start_motion_photo_capture().unwrap();
+        assert_eq!(
+            model.motion_photo_burst_crop(64, 48),
+            Some((13, 10, 38, 28))
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_shutter_starts_bounded_clip_before_still_dispatch() {
+        let mut model = live_model();
+        let _ = model.capture_photo();
+        assert!(
+            model.photo_jobs[&1].live.is_some(),
+            "Motion Photo shutter must snapshot its own independently identified clip"
+        );
+    }
+
+    #[tokio::test]
+    async fn motion_photo_without_selected_encoder_still_dispatches_immediately() {
+        let mut model = crate::app::state::AppModel::default();
+        model.config.motion_photo = true;
+        model.config.burst_mode_setting = crate::config::BurstModeSetting::Off;
+        model.current_frame = Some(Arc::new(crate::backends::camera::types::CameraFrame {
+            width: 64,
+            height: 48,
+            data: crate::backends::camera::types::FrameData::from_copied(
+                vec![0; 64 * 48 * 4].into(),
+            ),
+            format: crate::backends::camera::types::PixelFormat::RGBA,
+            stride: 256,
+            yuv_planes: None,
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        }));
+        let _ = model.capture_photo();
+        assert!(
+            model.photo_jobs.len() == 1,
+            "Missing prebuffer/encoder must never delay or reject the still shutter"
+        );
+    }
 
     #[test]
     fn photo_jobs_snapshot_demosaicing_at_capture_start() {
