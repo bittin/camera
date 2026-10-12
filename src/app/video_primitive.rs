@@ -2337,7 +2337,18 @@ impl VideoPipeline {
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: VideoFrame) {
         use std::time::Instant;
 
-        if frame.width == 0 || frame.height == 0 {
+        // Reject malformed replacements before resizing the shared output or
+        // invalidating ANY binding to the last valid image (including rendered sources).
+        if crate::backends::camera::types::validate_frame_layout(
+            frame.data_slice(),
+            frame.format,
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.yuv_planes.as_ref(),
+        )
+        .is_err()
+        {
             return;
         }
 
@@ -2513,7 +2524,12 @@ impl VideoPipeline {
             // Include STORAGE_BINDING for YUV→RGBA compute shader output
             usage: wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::STORAGE_BINDING,
+                | wgpu::TextureUsages::STORAGE_BINDING
+                | if cfg!(test) {
+                    wgpu::TextureUsages::COPY_SRC
+                } else {
+                    wgpu::TextureUsages::empty()
+                },
             view_formats: &[],
         });
 
@@ -2662,6 +2678,18 @@ impl VideoPipeline {
         tex_id: u64,
         frame: &VideoFrame,
     ) -> bool {
+        if crate::backends::camera::types::validate_frame_layout(
+            frame.data_slice(),
+            frame.format,
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.yuv_planes.as_ref(),
+        )
+        .is_err()
+        {
+            return false;
+        }
         let (uv_width, uv_height) = frame
             .yuv_planes
             .as_ref()
@@ -2741,9 +2769,9 @@ impl VideoPipeline {
                     texture: yuv.tex_y.clone(),
                     source_offset: 0,
                     source_stride: frame.stride as usize,
-                    row_bytes: frame.width as usize * 2,
+                    row_bytes: frame.width.div_ceil(2) as usize * 4,
                     rows: frame.height as usize,
-                    extent: extent(frame.width / 2, frame.height),
+                    extent: extent(frame.width.div_ceil(2), frame.height),
                 }]
             }
             PixelFormat::NV12 | PixelFormat::NV21 => {
@@ -2999,7 +3027,7 @@ impl VideoPipeline {
         // Calculate Y texture width (packed formats store 2 pixels per texel)
         let y_tex_width = match format {
             PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
-                y_width / 2
+                y_width.div_ceil(2)
             }
             _ => y_width,
         };
@@ -3928,6 +3956,222 @@ mod tests {
                 .slots
                 .iter()
                 .any(|slot| slot.state.load(Ordering::Acquire) == UPLOAD_SLOT_READY)
+        );
+    }
+
+    fn read_normal_source(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+    ) -> Vec<u8> {
+        let row = (texture.width() * 4).next_multiple_of(256);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("normal preview fixture"),
+            size: (row * texture.height()) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(texture.height()),
+                },
+            },
+            texture.size(),
+        );
+        queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        let mapped = staging.slice(..).get_mapped_range();
+        let result = mapped
+            .chunks_exact(row as usize)
+            .flat_map(|r| r[..texture.width() as usize * 4].iter().copied())
+            .collect();
+        drop(mapped);
+        staging.unmap();
+        result
+    }
+
+    #[test]
+    fn review_r4_resized_invalid_preview_retains_pixels_and_bindings() {
+        let Some((_guard, device, queue)) = headless_device() else {
+            skip_no_gpu("review_r4_resized_invalid_preview_retains_pixels_and_bindings");
+            return;
+        };
+        let mut preview = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let planes = YuvPlanes {
+            y_offset: 0,
+            y_size: 9,
+            uv_offset: 9,
+            uv_size: 4,
+            uv_stride: 2,
+            v_offset: 13,
+            v_size: 4,
+            v_stride: 2,
+            uv_width: 2,
+            uv_height: 2,
+        };
+        preview.upload(
+            &device,
+            &queue,
+            VideoFrame {
+                id: VIDEO_ID_NORMAL,
+                width: 3,
+                height: 3,
+                stride: 3,
+                format: PixelFormat::I420,
+                data: FrameData::from_owned_vec([vec![100; 9], vec![128; 8]].concat()),
+                yuv_planes: Some(planes),
+            },
+        );
+        let original = preview.textures[&VIDEO_ID_NORMAL].texture.clone();
+        let identity = preview.textures[&VIDEO_ID_NORMAL].last_frame_identity;
+        let pixels = read_normal_source(&device, &queue, &original);
+        preview
+            .get_or_create_binding(&device, VIDEO_ID_NORMAL, 0)
+            .unwrap();
+        preview
+            .get_or_create_binding(&device, VIDEO_ID_FROSTED, 0)
+            .unwrap();
+        let binding = preview.bindings[&(VIDEO_ID_NORMAL, 0)].bind_group.clone();
+        let frosted = preview.bindings[&(VIDEO_ID_FROSTED, 0)].bind_group.clone();
+        let converted = preview.yuv_textures[&VIDEO_ID_NORMAL]
+            .convert_bind_group
+            .clone()
+            .unwrap();
+        let resized = YuvPlanes {
+            y_size: 16,
+            uv_offset: 16,
+            v_offset: 20,
+            ..planes
+        };
+        for (format, stride, data, layout, expected) in [
+            (
+                PixelFormat::I420,
+                4,
+                vec![0; 2],
+                Some(resized),
+                crate::backends::camera::types::FrameLayoutError::Truncated,
+            ),
+            (
+                PixelFormat::I420,
+                4,
+                vec![0; 24],
+                None,
+                crate::backends::camera::types::FrameLayoutError::MissingPlanes,
+            ),
+            (
+                PixelFormat::I420,
+                4,
+                vec![0; 24],
+                Some(YuvPlanes {
+                    uv_width: 0,
+                    ..resized
+                }),
+                crate::backends::camera::types::FrameLayoutError::InvalidGeometry,
+            ),
+            (
+                PixelFormat::RGBA,
+                16,
+                vec![0; 2],
+                None,
+                crate::backends::camera::types::FrameLayoutError::Truncated,
+            ),
+            (
+                PixelFormat::BGRA,
+                1,
+                vec![0; 64],
+                None,
+                crate::backends::camera::types::FrameLayoutError::InvalidStride,
+            ),
+        ] {
+            assert_eq!(
+                crate::backends::camera::types::validate_frame_layout(
+                    &data,
+                    format,
+                    4,
+                    4,
+                    stride,
+                    layout.as_ref()
+                ),
+                Err(expected)
+            );
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            preview.upload(
+                &device,
+                &queue,
+                VideoFrame {
+                    id: VIDEO_ID_NORMAL,
+                    width: 4,
+                    height: 4,
+                    stride,
+                    format,
+                    data: FrameData::from_owned_vec(data),
+                    yuv_planes: layout,
+                },
+            );
+            assert!(pollster::block_on(scope.pop()).is_none());
+            assert_eq!(
+                preview.textures[&VIDEO_ID_NORMAL].texture, original,
+                "invalid {format:?} replaced the last valid texture"
+            );
+            assert_eq!(
+                preview.textures[&VIDEO_ID_NORMAL].last_frame_identity,
+                identity
+            );
+            assert_eq!(preview.bindings[&(VIDEO_ID_NORMAL, 0)].bind_group, binding);
+            assert_eq!(preview.bindings[&(VIDEO_ID_FROSTED, 0)].bind_group, frosted);
+            assert_eq!(
+                preview.yuv_textures[&VIDEO_ID_NORMAL]
+                    .convert_bind_group
+                    .as_ref()
+                    .unwrap(),
+                &converted
+            );
+            assert_eq!(read_normal_source(&device, &queue, &original), pixels);
+        }
+    }
+
+    #[test]
+    fn normal_preview_packed422_preserves_odd_final_pair() {
+        let Some((_guard, device, queue)) = headless_device() else {
+            skip_no_gpu("normal_preview_packed422_preserves_odd_final_pair");
+            return;
+        };
+        let mut pipeline = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        pipeline.upload(
+            &device,
+            &queue,
+            VideoFrame {
+                id: VIDEO_ID_NORMAL,
+                width: 3,
+                height: 2,
+                data: FrameData::from_owned_vec([100, 128, 110, 128, 120, 128, 99, 128].repeat(2)),
+                format: PixelFormat::YUYV,
+                stride: 8,
+                yuv_planes: None,
+            },
+        );
+        let out = read_normal_source(
+            &device,
+            &queue,
+            &pipeline.textures[&VIDEO_ID_NORMAL].texture,
+        );
+        let v = (120.0f32 - 16.0) / 219.0;
+        let expected = ((v + 1.402 * (128.0 / 255.0 - 0.5)) * 255.0).round() as u8;
+        assert!(
+            out[8].abs_diff(expected) <= 1,
+            "last odd pixel={:?}, expected={expected}",
+            &out[8..12]
         );
     }
 

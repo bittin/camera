@@ -794,6 +794,82 @@ pub fn checked_plane(
     data.get(offset..end).ok_or(FrameLayoutError::Truncated)
 }
 
+/// Shared source admission contract for preview and still. Padding, plane spans
+/// and active geometry are separate. This does not assign unknown producer color.
+pub fn validate_frame_layout(
+    data: &[u8],
+    format: PixelFormat,
+    width: u32,
+    height: u32,
+    stride: u32,
+    layout: Option<&YuvPlanes>,
+) -> Result<(), FrameLayoutError> {
+    if width == 0 || height == 0 {
+        return Err(FrameLayoutError::InvalidGeometry);
+    }
+    if matches!(
+        format,
+        PixelFormat::NV12 | PixelFormat::NV21 | PixelFormat::I420
+    ) {
+        let p = layout.ok_or(FrameLayoutError::MissingPlanes)?;
+        let half = (width.div_ceil(2), height.div_ceil(2));
+        if format == PixelFormat::I420 {
+            if ![width, half.0, width.div_ceil(4)].contains(&p.uv_width)
+                || ![height, half.1, height.div_ceil(4)].contains(&p.uv_height)
+            {
+                return Err(FrameLayoutError::InvalidGeometry);
+            }
+        } else if (p.uv_width, p.uv_height) != half {
+            return Err(FrameLayoutError::InvalidGeometry);
+        }
+        checked_plane(
+            data,
+            p.y_offset,
+            p.y_size,
+            stride as usize,
+            width as usize,
+            height as usize,
+        )?;
+        checked_plane(
+            data,
+            p.uv_offset,
+            p.uv_size,
+            p.uv_stride as usize,
+            p.uv_width as usize * if format == PixelFormat::I420 { 1 } else { 2 },
+            p.uv_height as usize,
+        )?;
+        if format == PixelFormat::I420 {
+            checked_plane(
+                data,
+                p.v_offset,
+                p.v_size,
+                p.v_stride as usize,
+                p.uv_width as usize,
+                p.uv_height as usize,
+            )?;
+        }
+    } else {
+        let row = match format {
+            PixelFormat::RGBA | PixelFormat::BGRA | PixelFormat::ABGR => width.checked_mul(4),
+            PixelFormat::RGB24 => width.checked_mul(3),
+            PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                width.div_ceil(2).checked_mul(4)
+            }
+            _ => Some(width), // RAW packing checked by the RAW consumer, never guessed here.
+        }
+        .ok_or(FrameLayoutError::Overflow)?;
+        checked_plane(
+            data,
+            0,
+            data.len(),
+            stride as usize,
+            row as usize,
+            height as usize,
+        )?;
+    }
+    Ok(())
+}
+
 impl std::fmt::Debug for YuvPlanes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("YuvPlanes")

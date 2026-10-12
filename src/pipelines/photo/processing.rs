@@ -91,6 +91,15 @@ impl PostProcessor {
             "Starting post-processing"
         );
 
+        crate::backends::camera::types::validate_frame_layout(
+            frame.data.as_ref(),
+            frame.format,
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.yuv_planes.as_ref(),
+        )
+        .map_err(|e| e.to_string())?;
         let config = self.config.clone();
         let frame_width = frame.width;
         let frame_height = frame.height;
@@ -296,6 +305,7 @@ impl PostProcessor {
             y_stride: frame.stride,
             uv_data: None,
             uv_stride: 0,
+            uv_dimensions: None,
             v_data: None,
             v_stride: 0,
             colour_gains,
@@ -329,7 +339,7 @@ impl PostProcessor {
             return Ok(frame.data.as_ref().to_vec());
         }
 
-        let input = GpuFrameInput::from_camera_frame(frame)?;
+        let input = GpuFrameInput::from_camera_frame(frame).map_err(|e| e.to_string())?;
 
         // Use GPU compute shader pipeline for conversion
         let mut pipeline_guard = get_gpu_convert_pipeline()

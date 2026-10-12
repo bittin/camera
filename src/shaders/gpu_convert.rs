@@ -94,6 +94,8 @@ pub struct GpuFrameInput<'a> {
     /// UV plane data (NV12: interleaved UV, I420: U plane)
     pub uv_data: Option<&'a [u8]>,
     pub uv_stride: u32,
+    /// Active chroma extent, never row padding.
+    pub uv_dimensions: Option<(u32, u32)>,
     /// V plane data (I420 only)
     pub v_data: Option<&'a [u8]>,
     pub v_stride: u32,
@@ -110,12 +112,22 @@ impl<'a> GpuFrameInput<'a> {
     ///
     /// Handles all YUV, packed, single-plane, and Bayer formats.
     /// Callers must handle `PixelFormat::RGBA` separately (it needs no conversion).
-    pub fn from_camera_frame(frame: &'a CameraFrame) -> Result<Self, String> {
+    pub fn from_camera_frame(
+        frame: &'a CameraFrame,
+    ) -> Result<Self, crate::backends::camera::types::FrameLayoutError> {
         if frame.format == PixelFormat::RGBA {
-            return Err("RGBA format doesn't need conversion".to_string());
+            return Err(crate::backends::camera::types::FrameLayoutError::UnsupportedFormat);
         }
 
         let buffer_data = frame.data.as_ref();
+        crate::backends::camera::types::validate_frame_layout(
+            buffer_data,
+            frame.format,
+            frame.width,
+            frame.height,
+            frame.stride,
+            frame.yuv_planes.as_ref(),
+        )?;
 
         let mut input = GpuFrameInput {
             format: frame.format,
@@ -125,6 +137,7 @@ impl<'a> GpuFrameInput<'a> {
             y_stride: frame.stride,
             uv_data: None,
             uv_stride: 0,
+            uv_dimensions: frame.yuv_planes.map(|p| (p.uv_width, p.uv_height)),
             v_data: None,
             v_stride: 0,
             colour_gains: None,
@@ -137,24 +150,66 @@ impl<'a> GpuFrameInput<'a> {
                 let planes = frame
                     .yuv_planes
                     .as_ref()
-                    .ok_or("NV12/NV21 frame missing yuv_planes")?;
-                input.y_data = &buffer_data[planes.y_offset..planes.y_offset + planes.y_size];
-                input.uv_data =
-                    Some(&buffer_data[planes.uv_offset..planes.uv_offset + planes.uv_size]);
+                    .ok_or(crate::backends::camera::types::FrameLayoutError::MissingPlanes)?;
+                input.y_data = crate::backends::camera::types::checked_plane(
+                    buffer_data,
+                    planes.y_offset,
+                    planes.y_size,
+                    frame.stride as usize,
+                    frame.width as usize,
+                    frame.height as usize,
+                )?;
+                input.uv_data = Some(crate::backends::camera::types::checked_plane(
+                    buffer_data,
+                    planes.uv_offset,
+                    planes.uv_size,
+                    planes.uv_stride as usize,
+                    planes.uv_width as usize
+                        * if frame.format == PixelFormat::I420 {
+                            1
+                        } else {
+                            2
+                        },
+                    planes.uv_height as usize,
+                )?);
                 input.uv_stride = planes.uv_stride;
             }
             PixelFormat::I420 => {
                 let planes = frame
                     .yuv_planes
                     .as_ref()
-                    .ok_or("I420 frame missing yuv_planes")?;
-                input.y_data = &buffer_data[planes.y_offset..planes.y_offset + planes.y_size];
-                input.uv_data =
-                    Some(&buffer_data[planes.uv_offset..planes.uv_offset + planes.uv_size]);
+                    .ok_or(crate::backends::camera::types::FrameLayoutError::MissingPlanes)?;
+                input.y_data = crate::backends::camera::types::checked_plane(
+                    buffer_data,
+                    planes.y_offset,
+                    planes.y_size,
+                    frame.stride as usize,
+                    frame.width as usize,
+                    frame.height as usize,
+                )?;
+                input.uv_data = Some(crate::backends::camera::types::checked_plane(
+                    buffer_data,
+                    planes.uv_offset,
+                    planes.uv_size,
+                    planes.uv_stride as usize,
+                    planes.uv_width as usize
+                        * if frame.format == PixelFormat::I420 {
+                            1
+                        } else {
+                            2
+                        },
+                    planes.uv_height as usize,
+                )?);
                 input.uv_stride = planes.uv_stride;
                 if planes.v_size > 0 {
-                    input.v_data =
-                        Some(&buffer_data[planes.v_offset..planes.v_offset + planes.v_size]);
+                    input.v_data = Some(crate::backends::camera::types::checked_plane(
+                        buffer_data,
+                        planes.v_offset,
+                        planes.v_size,
+                        planes.v_stride as usize,
+                        planes.uv_width as usize,
+                        planes.uv_height as usize,
+                    )?);
                 }
                 input.v_stride = planes.v_stride;
             }
@@ -171,6 +226,130 @@ impl<'a> GpuFrameInput<'a> {
         }
 
         Ok(input)
+    }
+}
+
+#[cfg(test)]
+mod normal_input_tests {
+    use super::*;
+    use crate::backends::camera::types::{FrameData, YuvPlanes};
+
+    #[test]
+    fn normal_still_gpu_ignores_planar_chroma_padding() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu("normal_still_gpu_ignores_planar_chroma_padding");
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = gpu::get_shared_gpu().await.unwrap();
+            println!(
+                "Production still adapter: {:?}; features: {:?}; limits: {:?}",
+                gpu.info,
+                gpu.device.features(),
+                gpu.device.limits()
+            );
+            let frame = CameraFrame {
+                width: 3,
+                height: 3,
+                stride: 4,
+                format: PixelFormat::I420,
+                data: FrameData::from_owned_vec(vec![
+                    100, 100, 100, 1, 100, 100, 100, 1, 100, 100, 100, 1, 128, 128, 255, 255, 128,
+                    128, 255, 255, 128, 128, 0, 0, 128, 128, 0, 0,
+                ]),
+                yuv_planes: Some(YuvPlanes {
+                    y_offset: 0,
+                    y_size: 12,
+                    uv_offset: 12,
+                    uv_size: 8,
+                    uv_stride: 4,
+                    v_offset: 20,
+                    v_size: 8,
+                    v_stride: 4,
+                    uv_width: 2,
+                    uv_height: 2,
+                }),
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let mut pipeline = GpuConvertPipeline::new().await.unwrap();
+            pipeline.convert(&input).unwrap();
+            let output = pipeline.read_rgba_to_cpu(3, 3).await.unwrap();
+            for pixel in output.as_chunks::<4>().0 {
+                assert_eq!(pixel, &output[0..4]);
+            }
+        });
+    }
+
+    #[test]
+    fn normal_yuv_rejects_missing_v_and_invalid_active_geometry() {
+        let base = CameraFrame {
+            width: 3,
+            height: 3,
+            stride: 4,
+            format: PixelFormat::I420,
+            data: FrameData::from_owned_vec(vec![0; 28]),
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+            yuv_planes: Some(YuvPlanes {
+                y_offset: 0,
+                y_size: 12,
+                uv_offset: 12,
+                uv_size: 8,
+                uv_stride: 4,
+                v_offset: 20,
+                v_size: 0,
+                v_stride: 4,
+                uv_width: 2,
+                uv_height: 2,
+            }),
+        };
+        assert!(
+            GpuFrameInput::from_camera_frame(&base).is_err(),
+            "Missing V must fail before touching GPU state"
+        );
+        let mut invalid = base.clone();
+        let p = invalid.yuv_planes.as_mut().unwrap();
+        p.v_size = 8;
+        p.uv_width = 4;
+        assert!(
+            GpuFrameInput::from_camera_frame(&invalid).is_err(),
+            "Active chroma cannot include row padding"
+        );
+    }
+
+    #[test]
+    fn normal_yuv_rejects_malformed_planes_without_panicking() {
+        let frame = CameraFrame {
+            width: 3,
+            height: 3,
+            stride: 4,
+            format: PixelFormat::NV12,
+            data: FrameData::from_owned_vec(vec![0; 24]),
+            yuv_planes: Some(YuvPlanes {
+                y_offset: usize::MAX,
+                y_size: 12,
+                uv_offset: 12,
+                uv_size: 8,
+                uv_stride: 4,
+                v_offset: 0,
+                v_size: 0,
+                v_stride: 0,
+                uv_width: 2,
+                uv_height: 2,
+            }),
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            GpuFrameInput::from_camera_frame(&frame).map(|_| ())
+        }));
+        assert!(result.is_ok(), "Malformed producer planes must not panic");
+        assert!(result.unwrap().is_err());
     }
 }
 
@@ -787,7 +966,7 @@ impl GpuConvertPipeline {
         // Y plane texture format and dimensions
         let (y_format, y_width) = match format {
             PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
-                (wgpu::TextureFormat::Rgba8Unorm, width / 2)
+                (wgpu::TextureFormat::Rgba8Unorm, width.div_ceil(2))
             }
             PixelFormat::RGBA | PixelFormat::RGB24 | PixelFormat::ABGR | PixelFormat::BGRA => {
                 (wgpu::TextureFormat::Rgba8Unorm, width)
@@ -1184,13 +1363,7 @@ impl GpuConvertPipeline {
         }
 
         // YUV/packed-YUV path
-        let uv_dims = if input.uv_stride > 0 {
-            input
-                .uv_data
-                .map(|uv_data| (input.uv_stride, uv_data.len() as u32 / input.uv_stride))
-        } else {
-            None
-        };
+        let uv_dims = input.uv_dimensions;
 
         self.ensure_resources(input.width, input.height, input.format, uv_dims);
         self.ensure_yuv_pipeline();
@@ -1322,17 +1495,6 @@ impl GpuConvertPipeline {
         );
     }
 
-    /// Derive plane (width, height) from stride and data length, with fallback height.
-    ///
-    /// Used for I420 U/V planes where actual dimensions come from data layout.
-    fn plane_dims(stride: u32, data_len: u32, fallback_h: u32) -> (u32, u32) {
-        if stride > 0 {
-            (stride, data_len / stride)
-        } else {
-            (stride, fallback_h)
-        }
-    }
-
     /// Upload textures based on format
     fn upload_textures(
         &self,
@@ -1348,7 +1510,7 @@ impl GpuConvertPipeline {
                     tex_y,
                     input.y_data,
                     input.y_stride,
-                    input.width / 2,
+                    input.width.div_ceil(2),
                     input.height,
                 );
             }
@@ -1363,8 +1525,10 @@ impl GpuConvertPipeline {
                     input.height,
                 );
                 if let Some(uv_data) = input.uv_data {
-                    let uv_height = input.height / 2;
-                    self.write_plane(tex_uv, uv_data, input.uv_stride, input.width / 2, uv_height);
+                    let (w, h) = input
+                        .uv_dimensions
+                        .ok_or("Missing active chroma geometry")?;
+                    self.write_plane(tex_uv, uv_data, input.uv_stride, w, h);
                 }
             }
 
@@ -1379,13 +1543,15 @@ impl GpuConvertPipeline {
                     input.height,
                 );
                 if let Some(uv_data) = input.uv_data {
-                    let (uv_w, uv_h) =
-                        Self::plane_dims(input.uv_stride, uv_data.len() as u32, input.height / 2);
+                    let (uv_w, uv_h) = input
+                        .uv_dimensions
+                        .ok_or("Missing active chroma geometry")?;
                     self.write_plane(tex_uv, uv_data, input.uv_stride, uv_w, uv_h);
                 }
                 if let Some(v_data) = input.v_data {
-                    let (v_w, v_h) =
-                        Self::plane_dims(input.v_stride, v_data.len() as u32, input.height / 2);
+                    let (v_w, v_h) = input
+                        .uv_dimensions
+                        .ok_or("Missing active chroma geometry")?;
                     self.write_plane(tex_v, v_data, input.v_stride, v_w, v_h);
                 }
             }
