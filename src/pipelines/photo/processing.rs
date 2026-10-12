@@ -672,7 +672,8 @@ mod tests {
 
     #[test]
     fn normal_photo_decode_failure_is_not_rendered_as_raw_bytes() {
-        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
             crate::test_gpu::skip_no_gpu(
                 "normal_photo_decode_failure_is_not_rendered_as_raw_bytes",
             );

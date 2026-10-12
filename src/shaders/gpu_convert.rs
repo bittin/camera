@@ -238,7 +238,8 @@ mod normal_input_tests {
 
     #[test]
     fn normal_still_gpu_ignores_planar_chroma_padding() {
-        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
             crate::test_gpu::skip_no_gpu("normal_still_gpu_ignores_planar_chroma_padding");
             return;
         };
@@ -359,7 +360,8 @@ mod normal_input_tests {
 
     #[test]
     fn normal_raw_unknown_packing_is_an_error_not_stale_pixels() {
-        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
             crate::test_gpu::skip_no_gpu("normal_raw_unknown_packing_is_an_error_not_stale_pixels");
             return;
         };

@@ -1696,7 +1696,7 @@ mod tests {
 
     #[test]
     fn review_r2_real_mjpeg_411_441_all_consumers() {
-        let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {
             crate::test_gpu::skip_no_gpu("review_r2_real_mjpeg_411_441_all_consumers");
             return;
         };
@@ -1811,7 +1811,7 @@ mod tests {
 
     #[test]
     fn review_n1_real_gray_jpeg_bounds_still_dummy_chroma() {
-        let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {
             crate::test_gpu::skip_no_gpu("review_n1_real_gray_jpeg_bounds_still_dummy_chroma");
             return;
         };
@@ -1861,7 +1861,7 @@ mod tests {
 
     #[test]
     fn review_r3_real_gray_mjpeg_all_consumers() {
-        let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {
             crate::test_gpu::skip_no_gpu("review_r3_real_gray_mjpeg_all_consumers");
             return;
         };
@@ -1915,7 +1915,8 @@ mod tests {
 
     #[test]
     fn normal_mjpeg_photo_uses_decoder_full_range() {
-        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
             crate::test_gpu::skip_no_gpu("normal_mjpeg_photo_uses_decoder_full_range");
             return;
         };
