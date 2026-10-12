@@ -791,6 +791,8 @@ pub struct AppModel {
     pub current_frame: Option<Arc<CameraFrame>>,
     /// Available camera devices
     pub available_cameras: Vec<CameraDevice>,
+    /// Whether camera discovery has returned, including an empty result.
+    pub camera_discovery_complete: bool,
     /// Current camera index
     pub current_camera_index: usize,
     /// Camera selection awaiting first-frame confirmation before being

@@ -206,6 +206,8 @@ device-info-none = No device information available
 
 # Centred placeholder shown before any camera has been found.
 initializing-camera = Initializing camera...
+# Centred empty state after camera discovery finishes without supported devices.
+no-camera-available = No camera available
 
 ## Format picker, the resolution and frame rate chooser.
 

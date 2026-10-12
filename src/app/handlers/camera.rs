@@ -148,8 +148,11 @@ impl AppModel {
         self.camera_cancel_flag
             .store(true, std::sync::atomic::Ordering::Release);
         self.camera_cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.current_frame = None;
+        if self.virtual_camera_file_source.is_none() {
+            self.current_frame = None;
+        }
         self.available_cameras.clear();
+        self.camera_discovery_complete = false;
         self.camera_dropdown_options.clear();
 
         Task::perform(
@@ -432,6 +435,7 @@ impl AppModel {
         );
 
         self.available_cameras = cameras;
+        self.camera_discovery_complete = true;
         self.current_camera_index = camera_index;
         self.available_formats = formats.clone();
 
@@ -534,6 +538,7 @@ impl AppModel {
         });
 
         self.available_cameras = new_cameras;
+        self.camera_discovery_complete = true;
         self.camera_dropdown_options = Self::build_camera_dropdown_labels(&self.available_cameras);
 
         if !current_camera_still_available {
@@ -557,6 +562,9 @@ impl AppModel {
 
             if self.available_cameras.is_empty() {
                 error!("Current camera disconnected and no other cameras available");
+                if self.virtual_camera_file_source.is_none() {
+                    self.current_frame = None;
+                }
                 self.current_camera_index = 0;
                 self.available_formats.clear();
                 self.active_format = None;

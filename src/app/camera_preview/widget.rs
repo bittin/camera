@@ -5,6 +5,7 @@
 use crate::app::state::{AppModel, Message};
 use crate::app::video_widget::{self, VideoContentFit};
 use crate::backends::camera::types::SensorRotation;
+use crate::fl;
 use cosmic::Element;
 use cosmic::iced::Length;
 use cosmic::widget;
@@ -26,9 +27,36 @@ pub struct FrozenPreviewTransforms {
     pub zoom: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewState {
+    Discovering,
+    NoCamera,
+    WaitingForFrame,
+    Streaming,
+}
+
 impl AppModel {
+    pub(crate) fn preview_state(&self) -> PreviewState {
+        let file_source_active = self.virtual_camera_file_source.is_some();
+        if !file_source_active
+            && self.camera_discovery_complete
+            && self.available_cameras.is_empty()
+        {
+            PreviewState::NoCamera
+        } else if self.current_frame.is_some() {
+            PreviewState::Streaming
+        } else if file_source_active || !self.available_cameras.is_empty() {
+            PreviewState::WaitingForFrame
+        } else {
+            PreviewState::Discovering
+        }
+    }
+
     pub(crate) fn is_waiting_for_preview_frame(&self) -> bool {
-        self.current_frame.is_none()
+        matches!(
+            self.preview_state(),
+            PreviewState::Discovering | PreviewState::WaitingForFrame
+        )
     }
 
     fn preview_loading_indicator(&self) -> Element<'_, Message> {
@@ -176,11 +204,26 @@ impl AppModel {
     /// Build the camera preview widget
     ///
     /// Uses custom video widget with handle caching for optimized rendering.
-    /// Shows a centered loading spinner until the first frame is available.
+    /// Shows a spinner during discovery or while waiting for the first frame,
+    /// and an empty-state message when discovery finishes without cameras.
     /// Shows a blurred last frame during camera transitions.
     pub fn build_camera_preview(&self) -> Element<'_, Message> {
         if self.is_waiting_for_preview_frame() {
             return self.preview_loading_indicator();
+        }
+
+        if self.preview_state() == PreviewState::NoCamera {
+            return widget::container(widget::text(fl!("no-camera-available")).size(20))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding(20)
+                .align_x(cosmic::iced::alignment::Horizontal::Center)
+                .align_y(cosmic::iced::alignment::Vertical::Center)
+                .style(|theme| widget::container::Style {
+                    text_color: Some(theme.cosmic().on_bg_color().into()),
+                    ..crate::app::overlay_style::window_bg_style(theme)
+                })
+                .into();
         }
 
         // Build the main video preview (either current frame or placeholder)
@@ -254,7 +297,90 @@ mod tests {
     #[test]
     fn preview_spinner_is_shown_until_the_first_frame() {
         assert!(AppModel::default().is_waiting_for_preview_frame());
+        assert_eq!(
+            AppModel::default().preview_state(),
+            PreviewState::Discovering
+        );
         assert!(!model().is_waiting_for_preview_frame());
+        assert_eq!(model().preview_state(), PreviewState::Streaming);
+    }
+
+    #[test]
+    fn empty_camera_discovery_stops_the_loading_spinner() {
+        let mut m = AppModel::default();
+        let _ = m.handle_cameras_initialized(Vec::new(), 0, Vec::new());
+
+        assert!(m.available_cameras.is_empty());
+        assert!(!m.is_waiting_for_preview_frame());
+        assert_eq!(m.preview_state(), PreviewState::NoCamera);
+    }
+
+    #[test]
+    fn discovered_camera_waits_for_its_first_frame() {
+        let mut m = AppModel::default();
+        let (cameras, formats) = crate::backends::camera::synthetic::synthetic_preview_cameras();
+        let _ = m.handle_cameras_initialized(cameras, 0, formats);
+
+        assert_eq!(m.preview_state(), PreviewState::WaitingForFrame);
+        m.current_frame = model().current_frame;
+        assert_eq!(m.preview_state(), PreviewState::Streaming);
+    }
+
+    #[test]
+    fn losing_the_last_camera_clears_the_stale_preview() {
+        let mut m = model();
+        m.available_cameras = vec![crate::backends::camera::types::CameraDevice::default()];
+        let _ = m.handle_camera_list_changed(Vec::new());
+
+        assert!(m.current_frame.is_none());
+        assert_eq!(m.preview_state(), PreviewState::NoCamera);
+    }
+
+    #[test]
+    fn hotplugged_camera_leaves_the_no_camera_state() {
+        let mut m = AppModel::default();
+        let _ = m.handle_cameras_initialized(Vec::new(), 0, Vec::new());
+        let _ = m.handle_hotplug_device_added(vec![(
+            "/dev/video-test".to_string(),
+            "Test camera".to_string(),
+        )]);
+
+        assert_eq!(m.preview_state(), PreviewState::WaitingForFrame);
+    }
+
+    #[test]
+    fn file_preview_does_not_require_a_camera() {
+        let mut m = AppModel {
+            virtual_camera_file_source: Some(crate::app::state::FileSource::Image(
+                "preview.png".into(),
+            )),
+            ..Default::default()
+        };
+        let _ = m.handle_cameras_initialized(Vec::new(), 0, Vec::new());
+
+        assert_eq!(m.preview_state(), PreviewState::WaitingForFrame);
+        m.current_frame = model().current_frame;
+        let _ = m.handle_camera_list_changed(Vec::new());
+        assert_eq!(m.preview_state(), PreviewState::Streaming);
+    }
+
+    #[test]
+    fn unplugging_the_active_camera_restarts_discovery() {
+        let mut m = model();
+        m.camera_discovery_complete = true;
+        m.available_cameras = vec![crate::backends::camera::types::CameraDevice {
+            device_info: Some(crate::backends::camera::types::DeviceInfo {
+                path: "/dev/video-test".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let _ = m.handle_hotplug_device_removed(vec!["video-test".to_string()]);
+
+        assert!(!m.camera_discovery_complete);
+        assert_eq!(m.preview_state(), PreviewState::Discovering);
+        let _ = m.handle_camera_list_changed(Vec::new());
+        assert_eq!(m.preview_state(), PreviewState::NoCamera);
     }
 
     #[test]
