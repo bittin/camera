@@ -269,108 +269,6 @@ fn video_playback_pipeline_description(path: &str) -> String {
     )
 }
 
-#[cfg(test)]
-mod orientation_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn avif_file_source_applies_all_capture_orientations() {
-        use crate::pipelines::capture_metadata::CaptureOrientation;
-        use crate::pipelines::photo::processing::ProcessedImage;
-        use crate::pipelines::photo::{CameraMetadata, EncodingFormat, PhotoEncoder};
-
-        let source = image::RgbImage::from_fn(65, 33, |x, y| {
-            image::Rgb([(x * 3) as u8, (y * 7) as u8, 40])
-        });
-        for orientation in [
-            CaptureOrientation::Rotate0,
-            CaptureOrientation::Rotate90,
-            CaptureOrientation::Rotate180,
-            CaptureOrientation::Rotate270,
-            CaptureOrientation::FlipRotate0,
-            CaptureOrientation::FlipRotate90,
-            CaptureOrientation::FlipRotate180,
-            CaptureOrientation::FlipRotate270,
-        ] {
-            let mut encoder = PhotoEncoder::new();
-            encoder.set_format(EncodingFormat::Avif);
-            encoder.set_camera_metadata(CameraMetadata {
-                orientation,
-                ..Default::default()
-            });
-            let encoded = encoder
-                .encode(ProcessedImage {
-                    image: source.clone(),
-                    width: 65,
-                    height: 33,
-                })
-                .await
-                .unwrap();
-            let mut expected = image::load_from_memory(&encoded.data).unwrap();
-            expected.apply_orientation(
-                image::metadata::Orientation::from_exif(orientation.exif_value() as u8).unwrap(),
-            );
-            let path =
-                std::env::temp_dir().join(format!("camera-source-{}.avif", uuid::Uuid::new_v4()));
-            std::fs::write(&path, encoded.data).unwrap();
-            let frame = load_image_as_frame(&path);
-            std::fs::remove_file(&path).unwrap();
-            let frame = frame.unwrap();
-            assert_eq!(
-                (frame.width, frame.height),
-                (expected.width(), expected.height()),
-                "{orientation:?}"
-            );
-            assert_eq!(
-                frame.data.as_ref(),
-                expected.to_rgba8().as_raw().as_slice(),
-                "{orientation:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn video_frame_extraction_applies_container_orientation() {
-        let pipeline = frame_extraction_pipeline_description("/tmp/video.mp4");
-        assert!(pipeline.contains("videoflip video-direction=auto"));
-    }
-
-    #[test]
-    fn video_playback_applies_container_orientation() {
-        let pipeline = video_playback_pipeline_description("/tmp/video.mp4");
-        assert!(pipeline.contains("videoflip video-direction=auto"));
-    }
-
-    #[test]
-    fn image_file_source_applies_embedded_orientation() {
-        use little_exif::exif_tag::ExifTag;
-        use little_exif::filetype::FileExtension;
-        use little_exif::metadata::Metadata;
-
-        let image = image::RgbImage::from_pixel(4, 2, image::Rgb([10, 20, 30]));
-        let mut encoded = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new(&mut encoded)
-            .encode(image.as_raw(), 4, 2, image::ExtendedColorType::Rgb8)
-            .unwrap();
-        let mut metadata = Metadata::new();
-        metadata.set_tag(ExifTag::Orientation(vec![6]));
-        metadata
-            .write_to_vec(&mut encoded, FileExtension::JPEG)
-            .unwrap();
-
-        let path = std::env::temp_dir().join(format!(
-            "camera-oriented-source-{}-{}.jpg",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        std::fs::write(&path, encoded).unwrap();
-        let frame = load_image_as_frame(&path).unwrap();
-        let _ = std::fs::remove_file(path);
-
-        assert_eq!((frame.width, frame.height), (2, 4));
-    }
-}
-
 /// Load the first frame from a video file
 ///
 /// Creates a temporary decoder to extract just the first frame.
@@ -885,5 +783,107 @@ impl VideoDecoder {
 impl Drop for VideoDecoder {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod orientation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn avif_file_source_applies_all_capture_orientations() {
+        use crate::pipelines::capture_metadata::CaptureOrientation;
+        use crate::pipelines::photo::processing::ProcessedImage;
+        use crate::pipelines::photo::{CameraMetadata, EncodingFormat, PhotoEncoder};
+
+        let source = image::RgbImage::from_fn(65, 33, |x, y| {
+            image::Rgb([(x * 3) as u8, (y * 7) as u8, 40])
+        });
+        for orientation in [
+            CaptureOrientation::Rotate0,
+            CaptureOrientation::Rotate90,
+            CaptureOrientation::Rotate180,
+            CaptureOrientation::Rotate270,
+            CaptureOrientation::FlipRotate0,
+            CaptureOrientation::FlipRotate90,
+            CaptureOrientation::FlipRotate180,
+            CaptureOrientation::FlipRotate270,
+        ] {
+            let mut encoder = PhotoEncoder::new();
+            encoder.set_format(EncodingFormat::Avif);
+            encoder.set_camera_metadata(CameraMetadata {
+                orientation,
+                ..Default::default()
+            });
+            let encoded = encoder
+                .encode(ProcessedImage {
+                    image: source.clone(),
+                    width: 65,
+                    height: 33,
+                })
+                .await
+                .unwrap();
+            let mut expected = image::load_from_memory(&encoded.data).unwrap();
+            expected.apply_orientation(
+                image::metadata::Orientation::from_exif(orientation.exif_value() as u8).unwrap(),
+            );
+            let path =
+                std::env::temp_dir().join(format!("camera-source-{}.avif", uuid::Uuid::new_v4()));
+            std::fs::write(&path, encoded.data).unwrap();
+            let frame = load_image_as_frame(&path);
+            std::fs::remove_file(&path).unwrap();
+            let frame = frame.unwrap();
+            assert_eq!(
+                (frame.width, frame.height),
+                (expected.width(), expected.height()),
+                "{orientation:?}"
+            );
+            assert_eq!(
+                frame.data.as_ref(),
+                expected.to_rgba8().as_raw().as_slice(),
+                "{orientation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_frame_extraction_applies_container_orientation() {
+        let pipeline = frame_extraction_pipeline_description("/tmp/video.mp4");
+        assert!(pipeline.contains("videoflip video-direction=auto"));
+    }
+
+    #[test]
+    fn video_playback_applies_container_orientation() {
+        let pipeline = video_playback_pipeline_description("/tmp/video.mp4");
+        assert!(pipeline.contains("videoflip video-direction=auto"));
+    }
+
+    #[test]
+    fn image_file_source_applies_embedded_orientation() {
+        use little_exif::exif_tag::ExifTag;
+        use little_exif::filetype::FileExtension;
+        use little_exif::metadata::Metadata;
+
+        let image = image::RgbImage::from_pixel(4, 2, image::Rgb([10, 20, 30]));
+        let mut encoded = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new(&mut encoded)
+            .encode(image.as_raw(), 4, 2, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let mut metadata = Metadata::new();
+        metadata.set_tag(ExifTag::Orientation(vec![6]));
+        metadata
+            .write_to_vec(&mut encoded, FileExtension::JPEG)
+            .unwrap();
+
+        let path = std::env::temp_dir().join(format!(
+            "camera-oriented-source-{}-{}.jpg",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, encoded).unwrap();
+        let frame = load_image_as_frame(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!((frame.width, frame.height), (2, 4));
     }
 }
