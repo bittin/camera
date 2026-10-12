@@ -479,6 +479,13 @@ impl CameraBackend for LibcameraBackend {
                     v4l2_utils::build_device_info(&v4l2_path, sensor_model.as_deref())
                 });
 
+            // USB cameras may expose a generic UVC or positional label.
+            // Enrich the display name from the USB parent's udev
+            // database, keeping the native ID and original sensor metadata.
+            let pretty_name = device_info.as_ref().map_or(pretty_name.clone(), |info| {
+                super::usb_name::display_name(&pretty_name, &info.path)
+            });
+
             devices.push(CameraDevice {
                 name: pretty_name,
                 path: camera_id,
