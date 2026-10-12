@@ -356,6 +356,30 @@ mod normal_input_tests {
         assert!(result.is_ok(), "Malformed producer planes must not panic");
         assert!(result.unwrap().is_err());
     }
+
+    #[test]
+    fn normal_raw_unknown_packing_is_an_error_not_stale_pixels() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu("normal_raw_unknown_packing_is_an_error_not_stale_pixels");
+            return;
+        };
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 8,
+                height: 8,
+                stride: 17,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(vec![50; 136]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let mut pipeline = GpuConvertPipeline::new().await.unwrap();
+            assert!(pipeline.convert(&input).is_err());
+        });
+    }
 }
 
 /// Filter parameters uniform (matches filter_compute.wgsl)
@@ -1228,12 +1252,9 @@ impl GpuConvertPipeline {
                     self.ensure_unpack_buffers(packed_size, input.width, input.height);
                 Some((bit_depth, output_stride_u32))
             } else {
-                warn!(
-                    packed_stride = input.y_stride,
-                    width = input.width,
-                    "Unknown CSI-2 packing ratio, falling back to CPU unpack"
+                return Err(
+                    "Unsupported RAW packing: producer did not describe a recognized layout".into(),
                 );
-                None
             }
         } else {
             None
