@@ -27,7 +27,7 @@ pub(crate) struct CaptureThreadParams {
     pub(crate) camera_id: String,
     pub(crate) preview_width: u32,
     pub(crate) preview_height: u32,
-    pub(crate) supports_multistream: bool,
+    pub(crate) limit_preview: bool,
     pub(crate) stop_flag: Arc<AtomicBool>,
     pub(crate) latest_preview: Arc<Mutex<Option<CameraFrame>>>,
     pub(crate) latest_still: Arc<Mutex<Option<CameraFrame>>>,
@@ -805,52 +805,24 @@ fn configure_streams(
     active_cam: &mut libcamera::camera::ActiveCamera<'_>,
     params: &CaptureThreadParams,
 ) -> Result<(libcamera::camera::CameraConfiguration, bool), BackendError> {
-    use libcamera::stream::StreamRole;
-
-    // All modes use the same stream layout to avoid pipeline restarts on mode switch.
-    // ViewFinder+Raw on multistream cameras: ViewFinder for preview and video encoding
-    // (via appsrc), Raw for full-res Bayer photo/timelapse capture.
-    // ViewFinder only on single-stream cameras.
-    let roles = if params.supports_multistream {
-        vec![StreamRole::ViewFinder, StreamRole::Raw]
-    } else {
-        vec![StreamRole::ViewFinder]
-    };
-
-    info!(
-        second_stream = params.supports_multistream,
-        "Requesting stream roles"
-    );
-
-    let mut config = cam.generate_configuration(&roles).ok_or_else(|| {
-        BackendError::InitializationFailed("Failed to generate camera configuration".to_string())
-    })?;
-
-    let is_multistream = config.len() >= 2 && params.supports_multistream;
-
-    // Configure stream sizes
-    if let Some(mut vf_cfg) = config.get_mut(0) {
-        let size = libcamera::geometry::Size::new(params.preview_width, params.preview_height);
-        vf_cfg.set_size(size);
-        debug!(
-            width = params.preview_width,
-            height = params.preview_height,
-            "Set viewfinder size"
+    super::super::stream_negotiation::negotiate(|dual| {
+        let size = super::super::stream_negotiation::preview_size(
+            params.preview_width,
+            params.preview_height,
+            dual && params.limit_preview,
         );
-    }
-
-    let status = config.validate();
-    info!(
-        status = ?status,
-        config = config.to_string_repr(),
-        "Configuration validated"
-    );
-
-    active_cam
-        .configure(&mut config)
-        .map_err(|e| BackendError::InitializationFailed(format!("Camera configure: {}", e)))?;
-
-    Ok((config, is_multistream))
+        let mut config = super::super::stream_negotiation::prepare(cam, dual, Some(size))?;
+        active_cam
+            .configure(&mut config)
+            .map_err(|e| format!("Camera configure: {e}"))?;
+        info!(
+            second_stream = dual,
+            config = config.to_string_repr(),
+            "Configured stream layout"
+        );
+        Ok(config)
+    })
+    .map_err(BackendError::InitializationFailed)
 }
 
 /// Read back actual stream formats after hardware configure.

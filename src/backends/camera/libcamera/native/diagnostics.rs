@@ -164,5 +164,6 @@ pub(crate) fn publish_diagnostics(p: DiagnosticParams) {
     } else {
         d.preview_role = Some("View-finder (single)".to_string());
         d.capture_role = None;
+        d.capture_stream_info = None;
     }
 }

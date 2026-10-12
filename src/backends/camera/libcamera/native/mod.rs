@@ -63,6 +63,8 @@ pub(crate) struct PipelineSharedState {
 pub(crate) struct NativeLibcameraPipeline {
     /// Capture processing thread (owns all libcamera objects)
     capture_thread: Option<JoinHandle<()>>,
+    /// Accepted stream layout, not the discovery hint.
+    is_multistream: bool,
     /// Stop flag for capture thread
     stop_flag: Arc<AtomicBool>,
     /// Still capture requested flag
@@ -86,19 +88,19 @@ impl NativeLibcameraPipeline {
     ///
     /// # Arguments
     /// * `camera_id` - libcamera camera ID (from enumeration)
-    /// * `preview_format` - Format for preview stream (typically 1080p or lower)
-    /// * `supports_multistream` - Whether camera supports dual-stream capture
+    /// * `preview_format` - Requested capture resolution, retained on single-stream fallback
+    /// * `limit_preview` - Cap a dual-stream viewfinder at 1080p (GUI only)
     /// * `shared` - Shared communication handles (frame sender, still capture, recording)
     pub(crate) fn new(
         camera_id: &str,
         preview_format: &CameraFormat,
-        supports_multistream: bool,
+        limit_preview: bool,
         shared: PipelineSharedState,
     ) -> BackendResult<Self> {
         info!(
             camera = camera_id,
             preview = %preview_format,
-            multistream = supports_multistream,
+            limit_preview,
             "Creating native libcamera pipeline"
         );
 
@@ -116,7 +118,7 @@ impl NativeLibcameraPipeline {
             camera_id: camera_id.to_string(),
             preview_width: preview_format.width,
             preview_height: preview_format.height,
-            supports_multistream,
+            limit_preview,
             stop_flag: Arc::clone(&stop_flag),
             latest_preview: Arc::clone(&latest_preview),
             latest_still: Arc::clone(&shared.still_frame),
@@ -152,8 +154,11 @@ impl NativeLibcameraPipeline {
             "Native libcamera pipeline started"
         );
 
+        super::record_stream_capability(camera_id, init_result.is_multistream);
+
         Ok(Self {
             capture_thread: Some(capture_thread),
+            is_multistream: init_result.is_multistream,
             stop_flag,
             still_capture_requested: shared.still_requested,
             latest_preview,
@@ -162,6 +167,10 @@ impl NativeLibcameraPipeline {
             still_frame_count,
             _recording_sender: shared.recording_sender,
         })
+    }
+
+    pub(crate) fn is_multistream(&self) -> bool {
+        self.is_multistream
     }
 
     /// Request a still capture (full resolution).
