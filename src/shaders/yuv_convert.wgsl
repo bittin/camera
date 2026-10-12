@@ -230,8 +230,10 @@ fn convert_gray8(pos: vec2<u32>) -> vec3<f32> {
 // RGB24: 3 bytes per pixel (R, G, B), uploaded with padding to RGBA8
 // The alpha channel should be ignored
 fn convert_rgb24(pos: vec2<u32>) -> vec3<f32> {
-    let rgba = textureLoad(tex_y, pos, 0);
-    return rgba.rgb;
+    let x = pos.x*3u;
+    return vec3(textureLoad(tex_y,vec2(x,pos.y),0).r,
+        textureLoad(tex_y,vec2(x+1u,pos.y),0).r,
+        textureLoad(tex_y,vec2(x+2u,pos.y),0).r);
 }
 
 // Convert ABGR pixel at given position
