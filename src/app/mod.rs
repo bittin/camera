@@ -1134,7 +1134,7 @@ impl cosmic::Application for AppModel {
                             }
 
                             // Create camera pipeline based on backend type
-                            use crate::backends::camera::libcamera::NativeLibcameraPipeline;
+                            use crate::backends::camera::pipeline::CapturePipeline;
                             use crate::backends::camera::types::{CameraDevice, CameraFormat};
 
                             let (sender, mut receiver) =
@@ -1186,7 +1186,14 @@ impl cosmic::Application for AppModel {
                             };
 
                             let pipeline_opt = {
-                                info!(backend = "libcamera", "Creating multi-stream pipeline");
+                                info!(
+                                    backend = if device.path.starts_with("pipewire:") {
+                                        "pipewire-v4l2"
+                                    } else {
+                                        "libcamera"
+                                    },
+                                    "Creating camera pipeline"
+                                );
 
                                 // Small delay to allow previous pipeline to fully release camera hardware
                                 // This is necessary because libcamera's "simple" pipeline handler
@@ -1197,12 +1204,7 @@ impl cosmic::Application for AppModel {
                                         .await;
                                 }
 
-                                // Extract camera name from device path
-                                // e.g., "pipewire-serial-60" -> "60" (legacy path format)
-                                let camera_name = device
-                                    .path
-                                    .strip_prefix("pipewire-serial-")
-                                    .unwrap_or(&device.path);
+                                let camera_name = &device.path;
 
                                 // Pass capture resolution intact. The native negotiation
                                 // caps preview only if a separate raw stream succeeds.
@@ -1213,7 +1215,7 @@ impl cosmic::Application for AppModel {
                                     .clone()
                                     .unwrap_or_else(|| Arc::new(Mutex::new(None)));
 
-                                match NativeLibcameraPipeline::new(
+                                match CapturePipeline::new(
                                     camera_name,
                                     &format,
                                     true,
@@ -1228,12 +1230,12 @@ impl cosmic::Application for AppModel {
                                     },
                                 ) {
                                     Ok(pipeline) => {
-                                        info!("Native libcamera pipeline started");
+                                        info!("Camera capture pipeline started");
                                         crate::startup::milestone("camera_pipeline_ready");
                                         Some(pipeline)
                                     }
                                     Err(e) => {
-                                        error!(error = %e, "Failed to create libcamera pipeline");
+                                        error!(error = %e, "Failed to create camera pipeline");
                                         None
                                     }
                                 }
@@ -1242,6 +1244,7 @@ impl cosmic::Application for AppModel {
                             is_first_pipeline = false;
 
                             if let Some(pipeline) = pipeline_opt {
+                                let preview_metrics = pipeline.preview_metrics();
                                 info!("Waiting for frames from pipeline...");
                                 // Keep pipeline alive and forward frames
                                 loop {
@@ -1301,6 +1304,7 @@ impl cosmic::Application for AppModel {
                                                 }
                                             }
 
+                                            preview_metrics.record_drops(drained_count as u64);
                                             frame_count += 1;
                                             if frame_count == 1 {
                                                 crate::startup::milestone(
@@ -1337,6 +1341,7 @@ impl cosmic::Application for AppModel {
                                                     }
                                                 }
                                                 Err(e) => {
+                                                    preview_metrics.record_drops(1);
                                                     // Always log dropped frames for diagnostics
                                                     tracing::warn!(
                                                         frame = frame_count,
@@ -1378,87 +1383,99 @@ impl cosmic::Application for AppModel {
             )
         }; // End of camera_sub if/else
 
-        // Camera hotplug monitoring subscription
-        // Monitors /dev/video* device nodes instead of calling enumerate_cameras(),
-        // which returns stale cached results when a capture pipeline is active.
+        // Reconcile discovery snapshots, including PipeWire node creation/removal
+        // without /dev changes (session-manager restart, monitor availability).
+        // Native enumeration uses its cache during capture; PipeWire is always fresh.
+        let initial_camera_paths: std::collections::BTreeSet<String> = self
+            .available_cameras
+            .iter()
+            .map(|d| d.path.clone())
+            .collect();
         let hotplug_sub = subscription_with_id(
             "camera_hotplug",
             cosmic::iced::stream::channel(10, async move |mut output| {
-                info!("Camera hotplug monitoring started (device node scanning)");
-
-                // Collect initial set of /dev/video* device nodes
-                let mut last_video_nodes: std::collections::BTreeSet<std::ffi::OsString> =
+                let mut last_paths = initial_camera_paths;
+                let mut last_video_nodes =
                     crate::backends::camera::v4l2_utils::scan_video_device_nodes();
-
-                info!(count = last_video_nodes.len(), "Initial /dev/video* nodes");
-
                 loop {
-                    // Wait 2 seconds between checks
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
+                    if output.is_closed() {
+                        break;
+                    }
                     let current_nodes =
                         crate::backends::camera::v4l2_utils::scan_video_device_nodes();
-
-                    if current_nodes != last_video_nodes {
-                        let added: std::collections::BTreeSet<_> = current_nodes
-                            .difference(&last_video_nodes)
-                            .cloned()
-                            .collect();
-                        let removed: std::collections::BTreeSet<_> = last_video_nodes
-                            .difference(&current_nodes)
-                            .cloned()
-                            .collect();
-
-                        info!(
-                            old_count = last_video_nodes.len(),
-                            new_count = current_nodes.len(),
-                            added = added.len(),
-                            removed = removed.len(),
-                            "Device node change detected - hotplug event"
-                        );
-
-                        let msg = if !removed.is_empty() {
-                            // Nodes removed → camera unplugged.
-                            // Always update tracking set for removals.
-                            last_video_nodes = current_nodes;
-                            let removed_names: Vec<String> = removed
-                                .iter()
-                                .filter_map(|n| n.to_str().map(String::from))
-                                .collect();
-                            Message::HotplugDeviceRemoved(removed_names)
-                        } else {
-                            // Only additions → camera plugged in. Wait briefly
-                            // for the device to finish initializing before
-                            // querying V4L2 capabilities.
-                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-                            let new_devices =
-                                crate::backends::camera::v4l2_utils::discover_v4l2_capture_devices(
-                                    &added,
-                                );
-
-                            if new_devices.is_empty() {
-                                // Device not ready for VIDIOC_QUERYCAP yet.
-                                // Don't update last_video_nodes so the next
-                                // poll detects the same added nodes and retries.
-                                info!(
-                                    "V4L2 query returned no capture devices — will retry next poll"
-                                );
-                                continue;
+                    let added: std::collections::BTreeSet<_> = current_nodes
+                        .difference(&last_video_nodes)
+                        .cloned()
+                        .collect();
+                    let removed: Vec<String> = last_video_nodes
+                        .difference(&current_nodes)
+                        .filter_map(|n| n.to_str().map(String::from))
+                        .collect();
+                    last_video_nodes = current_nodes;
+                    if !removed.is_empty()
+                        && output
+                            .send(Message::HotplugDeviceRemoved(removed))
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
+                    let mut cameras = match tokio::task::spawn_blocking(|| {
+                        crate::backends::camera::create_backend().enumerate_cameras()
+                    })
+                    .await
+                    {
+                        Ok(cameras) => cameras,
+                        Err(e) => {
+                            warn!(error = %e, "Camera discovery task failed");
+                            continue;
+                        }
+                    };
+                    cameras.retain(|d| {
+                        d.v4l2_path()
+                            .is_none_or(|p| std::path::Path::new(p).exists())
+                    });
+                    let paths: std::collections::BTreeSet<_> =
+                        cameras.iter().map(|d| d.path.clone()).collect();
+                    if paths != last_paths {
+                        last_paths = paths;
+                        if output
+                            .send(Message::CameraListChanged(cameras))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    if !added.is_empty()
+                        && crate::backends::camera::libcamera::native::is_capture_active()
+                    {
+                        // Native libcamera cannot re-enumerate while its manager is
+                        // capturing. Retain the existing native hotplug placeholder
+                        // mechanism; selecting it stops capture and does full discovery.
+                        // PipeWire fallback additions above never use placeholders.
+                        let new_devices =
+                            crate::backends::camera::v4l2_utils::discover_v4l2_capture_devices(
+                                &added,
+                            );
+                        if new_devices.is_empty() {
+                            // Preserve native hotplug's readiness retry: a device
+                            // node can exist before VIDIOC_QUERYCAP succeeds.
+                            for node in &added {
+                                last_video_nodes.remove(node);
                             }
-
-                            last_video_nodes = current_nodes;
-                            Message::HotplugDeviceAdded(new_devices)
-                        };
-
-                        if output.send(msg).await.is_err() {
-                            warn!("Failed to send hotplug message - channel closed");
+                            continue;
+                        }
+                        if output
+                            .send(Message::HotplugDeviceAdded(new_devices))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
                 }
-
-                info!("Camera hotplug monitoring stopped");
             }),
         );
 

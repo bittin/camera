@@ -593,6 +593,15 @@ impl AppModel {
                             .iter()
                             .position(|c| c.v4l2_path() == Some(target.as_str()))
                     })
+                    .or_else(|| {
+                        old_current.as_ref().and_then(|current| {
+                            self.available_cameras.iter().position(|candidate| {
+                                crate::backends::camera::pipewire::same_physical_camera(
+                                    current, candidate,
+                                )
+                            })
+                        })
+                    })
                     .unwrap_or(0);
 
                 info!(target_index, "Switching to camera after re-enumeration");

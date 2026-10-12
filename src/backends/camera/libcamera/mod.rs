@@ -39,6 +39,7 @@ mod stream_negotiation;
 pub(crate) use native::{NativeLibcameraPipeline, PipelineSharedState};
 
 use super::CameraBackend;
+use super::pipeline::CapturePipeline;
 use super::types::*;
 use super::v4l2_utils;
 use libcamera::camera_manager::CameraManager;
@@ -131,8 +132,8 @@ pub struct LibcameraBackend {
     current_device: Option<CameraDevice>,
     /// Current preview format
     current_format: Option<CameraFormat>,
-    /// Active native pipeline
-    pipeline: Option<NativeLibcameraPipeline>,
+    /// Selected native or PipeWire fallback pipeline
+    pipeline: Option<CapturePipeline>,
     /// Frame receiver for preview stream (given to UI once)
     frame_receiver: Mutex<Option<FrameReceiver>>,
 }
@@ -405,14 +406,16 @@ impl CameraBackend for LibcameraBackend {
         // Check under the lock to avoid TOCTOU race with capture thread
         if native::is_capture_active() {
             debug!("Capture active, returning cached camera list");
-            return CACHED_DEVICES.read().map(|g| g.clone()).unwrap_or_default();
+            return super::pipewire::append_fallbacks(
+                CACHED_DEVICES.read().map(|g| g.clone()).unwrap_or_default(),
+            );
         }
 
         let mgr = match CameraManager::new() {
             Ok(mgr) => mgr,
             Err(e) => {
                 warn!(error = %e, "Failed to create CameraManager");
-                return Vec::new();
+                return super::pipewire::append_fallbacks(Vec::new());
             }
         };
 
@@ -542,10 +545,13 @@ impl CameraBackend for LibcameraBackend {
         }
 
         debug!(count = devices.len(), "Enumerated libcamera cameras");
-        devices
+        super::pipewire::append_fallbacks(devices)
     }
 
     fn get_formats(&self, device: &CameraDevice, video_mode: bool) -> Vec<CameraFormat> {
+        if device.path.starts_with("pipewire:") {
+            return super::pipewire::formats(device);
+        }
         debug!(device_path = %device.path, video_mode, "Getting formats via libcamera-rs");
 
         // Return cached formats if available (populated by enumerate_cameras).
@@ -627,7 +633,7 @@ impl CameraBackend for LibcameraBackend {
         info!(
             device = %device.name,
             format = %format,
-            "Initializing libcamera backend (native)"
+            "Initializing camera backend (native preferred, PipeWire fallback)"
         );
 
         // Shutdown any existing pipeline
@@ -655,7 +661,7 @@ impl CameraBackend for LibcameraBackend {
         // Create native pipeline
         let still_requested = Arc::new(AtomicBool::new(false));
         let still_frame = Arc::new(Mutex::new(None));
-        let pipeline = NativeLibcameraPipeline::new(
+        let pipeline = CapturePipeline::new(
             &device.path,
             format,
             false,
@@ -679,7 +685,7 @@ impl CameraBackend for LibcameraBackend {
         self.current_device = Some(current_device);
         self.current_format = Some(format.clone());
 
-        info!("libcamera backend initialized with native pipeline");
+        info!("Camera backend initialized with selected capture pipeline");
         Ok(())
     }
 
@@ -797,7 +803,7 @@ impl CameraBackend for LibcameraBackend {
     }
 
     fn is_available(&self) -> bool {
-        Self::is_libcamera_available()
+        Self::is_libcamera_available() || !super::pipewire::append_fallbacks(Vec::new()).is_empty()
     }
 
     fn current_device(&self) -> Option<&CameraDevice> {
@@ -815,7 +821,7 @@ impl CameraBackend for LibcameraBackend {
 
 /// Opaque handle that keeps a camera pipeline alive. Drop to stop.
 pub struct CameraPipelineHandle {
-    _pipeline: NativeLibcameraPipeline,
+    _pipeline: CapturePipeline,
     recording_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<RecordingFrame>>>>,
 }
 
@@ -839,7 +845,7 @@ pub fn create_pipeline(
     let (sender, receiver) = futures::channel::mpsc::channel(10);
     let recording_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<RecordingFrame>>>> =
         Arc::new(Mutex::new(None));
-    let pipeline = NativeLibcameraPipeline::new(
+    let pipeline = CapturePipeline::new(
         &device.path,
         format,
         false,
@@ -899,6 +905,65 @@ mod tests {
             frame.width, frame.height, frame.format
         );
         backend.shutdown().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires a live PipeWire V4L2 camera"]
+    fn pipewire_fallback_captures_live_frame() {
+        use super::super::CameraBackend;
+        let backend = super::LibcameraBackend::new();
+        let devices = backend.enumerate_cameras();
+        let device = devices
+            .iter()
+            .find(|d| d.path.starts_with("pipewire:"))
+            .expect("PipeWire camera");
+        let formats = backend.get_formats(device, true);
+        let format = formats
+            .iter()
+            .find(|f| f.width == 640 && f.height == 480)
+            .unwrap_or(&formats[0]);
+        let (_handle, mut receiver) =
+            super::create_pipeline(device, format).expect("fallback pipeline");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        loop {
+            if let Ok(frame) = receiver.try_recv() {
+                assert_eq!((frame.width, frame.height), (format.width, format.height));
+                assert!(!frame.data.is_empty());
+                assert!(
+                    frame.sensor_timestamp_ns.is_some(),
+                    "PipeWire capture timestamp must reach recorder"
+                );
+                println!(
+                    "PipeWire app frame: {}x{} {:?}, stride={}, bytes={}",
+                    frame.width,
+                    frame.height,
+                    frame.format,
+                    frame.stride,
+                    frame.data.len()
+                );
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no app frame within eight seconds"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a PipeWire V4L2 camera and no native libcamera support"]
+    fn pipewire_fallback_discovers_live_camera() {
+        use super::super::CameraBackend;
+        let devices = super::LibcameraBackend::new().enumerate_cameras();
+        assert!(
+            super::LibcameraBackend::new().is_available(),
+            "fallback must make backend available"
+        );
+        assert!(
+            devices.iter().any(|d| d.path.starts_with("pipewire:")),
+            "unsupported native camera must be discovered through PipeWire: {devices:?}"
+        );
     }
 
     /// The hardware-release delay before a new CameraManager is created is

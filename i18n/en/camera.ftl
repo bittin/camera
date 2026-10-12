@@ -628,13 +628,13 @@ settings-timelapse-interval-description = Time between consecutive photo capture
 ## reports, marked with whether libcamera also offers it.
 
 # Status for a resolution libcamera offers. Shown after a check mark.
-insights-v4l2-in-libcamera = Available in libcamera
+insights-v4l2-in-backend = Available in { $backend }
 # Status for the resolution currently in use. Shown after a check mark and
 # highlighted.
-insights-v4l2-active-in-libcamera = Active in libcamera
+insights-v4l2-active-in-backend = Active in { $backend }
 # Status for a resolution libcamera does not offer. Shown after a cross and in
 # the error colour.
-insights-v4l2-not-in-libcamera = Not available in libcamera
+insights-v4l2-not-in-backend = Not available in { $backend }
 
 ## Insights, manual capture buttons for debugging.
 
@@ -793,3 +793,6 @@ metainfo-caption-recording = Video recording in progress
 metainfo-caption-qr = QR code detection
 # Caption for the screenshot of the settings panel.
 metainfo-caption-settings = Advanced settings
+
+insights-frame-copy-time = Frame buffer copy time
+insights-preview-delivery-drops = Camera preview drops

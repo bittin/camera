@@ -28,17 +28,6 @@ fn capture_metadata_for_rotation(rotation: SensorRotation) -> CaptureMetadata {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recording_metadata_preserves_sensor_orientation() {
-        let metadata = capture_metadata_for_rotation(SensorRotation::Rotate90);
-        assert_eq!(metadata.orientation, CaptureOrientation::Rotate270);
-    }
-}
-
 /// List all available cameras
 pub fn list_cameras() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize GStreamer
@@ -663,4 +652,15 @@ fn load_burst_mode_frames(
     }
 
     Ok(frames)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recording_metadata_preserves_sensor_orientation() {
+        let metadata = capture_metadata_for_rotation(SensorRotation::Rotate90);
+        assert_eq!(metadata.orientation, CaptureOrientation::Rotate270);
+    }
 }

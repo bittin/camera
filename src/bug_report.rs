@@ -770,21 +770,22 @@ impl BugReportGenerator {
         let latency_ms = insights.frame_latency_us as f64 / 1000.0;
         info.push_str(&format!("- **Frame Latency:** {:.2} ms\n", latency_ms));
         info.push_str(&format!(
-            "- **Dropped Frames:** {}\n",
-            insights.dropped_frames
+            "- **Camera Preview Drops:** {}\n",
+            insights
+                .dropped_frames
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "N/A".into())
         ));
-        let frame_mb = insights.frame_size_decoded as f64 / (1024.0 * 1024.0);
+        let frame_mb = insights.frame_size_decoded as f64 / 1_000_000.0;
         info.push_str(&format!("- **Frame Size:** {:.2} MB\n", frame_mb));
         if insights.cpu_decode_time_us > 0 {
             let cpu_ms = insights.cpu_decode_time_us as f64 / 1000.0;
             info.push_str(&format!("- **CPU Decode Time:** {:.2} ms\n", cpu_ms));
         }
-        let copy_ms = insights.copy_time_us as f64 / 1000.0;
-        if copy_ms < 0.01 {
-            info.push_str("- **Frame Wrap Time:** < 0.01 ms (zero-copy)\n");
-        } else {
-            info.push_str(&format!("- **Frame Wrap Time:** {:.2} ms\n", copy_ms));
-        }
+        info.push_str(&format!(
+            "- **Frame Copy Time:** {}\n",
+            crate::app::insights::types::frame_copy_time_text(insights.copy_time_us)
+        ));
         let gpu_ms = insights.gpu_conversion_time_us as f64 / 1000.0;
         info.push_str(&format!("- **GPU Upload Time:** {:.2} ms\n", gpu_ms));
         if insights.copy_bandwidth_mbps > 0.0 {
@@ -1003,7 +1004,7 @@ impl BugReportGenerator {
                 let mut sorted_sizes = fmt.sizes.clone();
                 sorted_sizes.sort_by_key(|b| std::cmp::Reverse(b.width * b.height));
                 for size in &sorted_sizes {
-                    let in_libcamera = insights.libcamera_formats.iter().any(|lf| {
+                    let in_backend = insights.backend_formats.iter().any(|lf| {
                         lf.width == size.width
                             && lf.height == size.height
                             && (lf.pixel_format.eq_ignore_ascii_case(fourcc_trimmed)
@@ -1012,10 +1013,15 @@ impl BugReportGenerator {
                                     ("MJPEG", "MJPG") | ("MJPG", "MJPEG")
                                 ))
                     });
-                    let status = if in_libcamera {
-                        "\u{2713} libcamera"
+                    let backend = if insights.backend_type.is_empty() {
+                        "selected backend"
                     } else {
-                        "\u{2717} not in libcamera"
+                        insights.backend_type
+                    };
+                    let status = if in_backend {
+                        format!("\u{2713} {backend}")
+                    } else {
+                        format!("\u{2717} not in {backend}")
                     };
                     if size.framerates.is_empty() {
                         info.push_str(&format!("- {}x{} — {}\n", size.width, size.height, status));

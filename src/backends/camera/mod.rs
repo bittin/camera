@@ -3,7 +3,8 @@
 
 //! Camera backend abstraction
 //!
-//! This module provides the libcamera camera backend with trait-based abstraction.
+//! Native libcamera is preferred. Processed V4L2 cameras it does not enumerate
+//! are discovered and streamed through the user's PipeWire session.
 //!
 //! # Architecture
 //!
@@ -30,6 +31,9 @@
 
 pub mod libcamera;
 pub mod manager;
+pub(crate) mod pipeline;
+pub(crate) mod pipewire;
+pub(crate) mod preview_metrics;
 pub mod synthetic;
 pub mod types;
 mod usb_name;
