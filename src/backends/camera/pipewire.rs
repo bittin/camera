@@ -15,6 +15,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+#[path = "pipewire_metadata.rs"]
+mod metadata;
+
 pub(crate) struct PipeWirePipeline {
     pub(crate) preview_metrics: Arc<PreviewMetrics>,
     stop_flag: Arc<AtomicBool>,
@@ -78,6 +81,7 @@ fn build_stream(
         .add_many(elements.iter().copied())
         .map_err(|e| e.to_string())?;
     gst::Element::link_many(elements).map_err(|e| e.to_string())?;
+    metadata::install(&source)?;
     Ok((pipeline, sink))
 }
 
