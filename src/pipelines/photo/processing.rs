@@ -94,15 +94,58 @@ impl PostProcessor {
         let config = self.config.clone();
         let frame_width = frame.width;
         let frame_height = frame.height;
-        let compact_rgba = if frame.format == PixelFormat::RGBA {
-            Some(Self::copy_rgba_without_padding(
-                frame.data.as_ref(),
-                frame.width,
-                frame.height,
-                frame.stride,
-            )?)
-        } else {
-            None
+        let compact_rgba = match frame.format {
+            PixelFormat::RGBA | PixelFormat::BGRA | PixelFormat::ABGR => {
+                let mut rgba = Self::copy_rgba_without_padding(
+                    frame.data.as_ref(),
+                    frame.width,
+                    frame.height,
+                    frame.stride,
+                )?;
+                for pixel in rgba.as_chunks_mut::<4>().0 {
+                    match frame.format {
+                        PixelFormat::BGRA => pixel.swap(0, 2),
+                        PixelFormat::ABGR => pixel.reverse(),
+                        _ => {}
+                    }
+                }
+                Some(rgba)
+            }
+            PixelFormat::RGB24 | PixelFormat::Gray8 => {
+                let channels = if frame.format == PixelFormat::RGB24 {
+                    3
+                } else {
+                    1
+                };
+                let row_bytes = frame.width as usize * channels;
+                crate::backends::camera::types::checked_plane(
+                    frame.data.as_ref(),
+                    0,
+                    frame.data.as_ref().len(),
+                    frame.stride as usize,
+                    row_bytes,
+                    frame.height as usize,
+                )
+                .map_err(|e| e.to_string())?;
+                let mut rgba = Vec::new();
+                for y in 0..frame.height as usize {
+                    let start = y * frame.stride as usize;
+                    let row = frame
+                        .data
+                        .as_ref()
+                        .get(start..start + row_bytes)
+                        .ok_or("Rendered frame is truncated")?;
+                    for pixel in row.chunks_exact(channels) {
+                        if channels == 3 {
+                            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+                        } else {
+                            rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255]);
+                        }
+                    }
+                }
+                Some(rgba)
+            }
+            _ => None,
         };
 
         // Step 0: Convert to RGBA (with optional integrated filter for Bayer)
@@ -524,6 +567,98 @@ impl PostProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn normal_photo_normalizes_padded_bgra() {
+        let frame = CameraFrame {
+            width: 2,
+            height: 2,
+            data: crate::backends::camera::types::FrameData::from_owned_vec(vec![
+                30, 20, 10, 255, 60, 50, 40, 255, 99, 99, 99, 99, 90, 80, 70, 255, 120, 110, 100,
+                255,
+            ]),
+            format: PixelFormat::BGRA,
+            stride: 12,
+            yuv_planes: None,
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        };
+        let result = PostProcessor::new(PostProcessingConfig::default())
+            .process(Arc::new(frame))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.image.as_raw(),
+            &[10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120]
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_photo_normalizes_other_rendered_formats() {
+        for (format, stride, data, expected) in [
+            (
+                PixelFormat::ABGR,
+                12,
+                vec![
+                    255, 30, 20, 10, 255, 60, 50, 40, 99, 99, 99, 99, 255, 90, 80, 70, 255, 120,
+                    110, 100,
+                ],
+                vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+            ),
+            (
+                PixelFormat::RGB24,
+                8,
+                vec![10, 20, 30, 40, 50, 60, 99, 99, 70, 80, 90, 100, 110, 120],
+                vec![10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120],
+            ),
+            (
+                PixelFormat::Gray8,
+                3,
+                vec![10, 40, 99, 70, 100],
+                vec![10, 10, 10, 40, 40, 40, 70, 70, 70, 100, 100, 100],
+            ),
+        ] {
+            let frame = CameraFrame {
+                width: 2,
+                height: 2,
+                data: crate::backends::camera::types::FrameData::from_owned_vec(data),
+                format,
+                stride,
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let result = PostProcessor::new(PostProcessingConfig::default())
+                .process(Arc::new(frame))
+                .await;
+            assert_eq!(result.unwrap().image.as_raw(), &expected, "{format:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_photo_rejects_overlapping_rendered_rows() {
+        for format in [PixelFormat::RGB24, PixelFormat::Gray8] {
+            let frame = CameraFrame {
+                width: 2,
+                height: 2,
+                data: crate::backends::camera::types::FrameData::from_owned_vec(vec![0; 16]),
+                format,
+                stride: 1,
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            assert!(
+                PostProcessor::new(PostProcessingConfig::default())
+                    .process(Arc::new(frame))
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     #[test]
     fn test_default_config() {

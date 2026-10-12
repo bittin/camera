@@ -744,6 +744,56 @@ pub struct YuvPlanes {
     pub uv_height: u32,
 }
 
+/// Invalid producer byte layout. Kept typed until the pipeline's user-facing boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameLayoutError {
+    Overflow,
+    Truncated,
+    InvalidStride,
+    InvalidGeometry,
+    MissingPlanes,
+    UnsupportedFormat,
+}
+
+impl std::fmt::Display for FrameLayoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Invalid frame layout: {self:?}")
+    }
+}
+impl std::error::Error for FrameLayoutError {}
+impl From<FrameLayoutError> for String {
+    fn from(error: FrameLayoutError) -> Self {
+        error.to_string()
+    }
+}
+
+/// Validate the declared plane separately from its active last row. Row padding
+/// is not image geometry; trailing last-row padding need not be present.
+pub fn checked_plane(
+    data: &[u8],
+    offset: usize,
+    size: usize,
+    stride: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> Result<&[u8], FrameLayoutError> {
+    if row_bytes == 0 || rows == 0 {
+        return Err(FrameLayoutError::InvalidGeometry);
+    }
+    if stride < row_bytes {
+        return Err(FrameLayoutError::InvalidStride);
+    }
+    let end = offset.checked_add(size).ok_or(FrameLayoutError::Overflow)?;
+    let required = (rows - 1)
+        .checked_mul(stride)
+        .and_then(|n| n.checked_add(row_bytes))
+        .ok_or(FrameLayoutError::Overflow)?;
+    if required > size {
+        return Err(FrameLayoutError::Truncated);
+    }
+    data.get(offset..end).ok_or(FrameLayoutError::Truncated)
+}
+
 impl std::fmt::Debug for YuvPlanes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("YuvPlanes")
