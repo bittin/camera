@@ -271,7 +271,10 @@ impl AppModel {
         let portrait = self.screen_is_portrait();
         let crop_rect = {
             let (x, y, w, h) = if self.preview_fit_to_view {
-                self.photo_aspect_ratio.crop_rect(fw, fh, portrait)
+                // Fit preview applies the canonical crop in sensor space.
+                // Only the preview rotation, not window shape, swaps its axes.
+                self.photo_aspect_ratio
+                    .crop_rect(fw, fh, geometry_rotation.swaps_dimensions())
             } else {
                 // Map the on-screen frame rect (the same one the canvas
                 // crop overlay highlights) back to sensor coords via the
@@ -368,11 +371,12 @@ impl AppModel {
         // framed rect — see `cover_capture_crop`.
         let photo_aspect_ratio = self.photo_aspect_ratio;
         let preview_fit_to_view = self.preview_fit_to_view;
-        let portrait = self.screen_is_portrait();
         let cover_screen_w = self.screen_width;
         let cover_screen_h = self.screen_height;
         let cover_insets = self.settled_bar_insets();
-        let cover_target_ratio = self.photo_aspect_ratio.display_ratio(portrait);
+        let cover_target_ratio = self
+            .photo_aspect_ratio
+            .display_ratio(self.screen_is_portrait());
 
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
@@ -416,7 +420,11 @@ impl AppModel {
                     };
                     let crop_rect = {
                         let (x, y, w, h) = if preview_fit_to_view {
-                            photo_aspect_ratio.crop_rect(rw, rh, portrait)
+                            photo_aspect_ratio.crop_rect(
+                                rw,
+                                rh,
+                                geometry_rotation.swaps_dimensions(),
+                            )
                         } else {
                             crate::app::preview_geometry::cover_capture_crop(
                                 rw,
@@ -475,7 +483,11 @@ impl AppModel {
                     };
                     let crop_rect = {
                         let (x, y, w, h) = if preview_fit_to_view {
-                            photo_aspect_ratio.crop_rect(fw, fh, portrait)
+                            photo_aspect_ratio.crop_rect(
+                                fw,
+                                fh,
+                                geometry_rotation.swaps_dimensions(),
+                            )
                         } else {
                             crate::app::preview_geometry::cover_capture_crop(
                                 fw,
@@ -731,7 +743,8 @@ impl AppModel {
                 (frame.width, frame.height)
             };
             let (x, y, w, h) = if self.preview_fit_to_view {
-                self.photo_aspect_ratio.crop_rect(rw, rh, portrait)
+                self.photo_aspect_ratio
+                    .crop_rect(rw, rh, geometry_rotation.swaps_dimensions())
             } else {
                 crate::app::preview_geometry::cover_capture_crop(
                     rw,
@@ -2476,6 +2489,57 @@ mod tests {
     use super::{capture_with_preview_fallback, should_use_jpeg_recording_pipeline};
     use crate::backends::camera::types::SensorRotation;
     use std::cell::Cell;
+
+    #[tokio::test]
+    async fn fit_photo_capture_keeps_the_preview_aspect_in_a_tall_desktop_window() {
+        use crate::app::state::{AppModel, Message, PhotoAspectRatio};
+        use crate::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
+        use futures::StreamExt;
+        use std::sync::Arc;
+
+        let save_dir =
+            std::env::temp_dir().join(format!("camera-fit-aspect-test-{}", uuid::Uuid::new_v4()));
+        let mut model = AppModel {
+            current_frame: Some(Arc::new(CameraFrame {
+                width: 160,
+                height: 120,
+                data: FrameData::from_owned_vec(vec![128; 160 * 120 * 4]),
+                format: PixelFormat::RGBA,
+                stride: 160 * 4,
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            })),
+            preview_fit_to_view: true,
+            photo_aspect_ratio: PhotoAspectRatio::Ratio2x1,
+            screen_width: 600.0,
+            screen_height: 900.0,
+            zoom_level: 1.0,
+            hdr_override_disabled: true,
+            ..AppModel::default()
+        };
+        model.config.save_folder_name = save_dir.to_string_lossy().into_owned();
+
+        let task = model.capture_photo();
+        let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+        let mut saved_path = None;
+        while let Some(action) = stream.next().await {
+            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                Message::PhotoSaved(result),
+            )) = action
+            {
+                saved_path = Some(result.expect("photo must save"));
+            }
+        }
+        let image = image::open(saved_path.expect("capture must report the saved photo")).unwrap();
+        std::fs::remove_dir_all(save_dir).unwrap();
+        assert_eq!(
+            (image.width(), image.height()),
+            (160, 80),
+            "Fit capture must retain the preview's sensor-space 2:1 crop, regardless of window shape"
+        );
+    }
 
     #[tokio::test]
     async fn raw_capture_failure_uses_preview_fallback() {
