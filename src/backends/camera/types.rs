@@ -674,12 +674,24 @@ pub enum AwbState {
     Locked,
 }
 
+/// Sensor packing identity. CFA is carried separately by PixelFormat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawLayout {
+    U8,
+    Unpacked16 { bits: u32 },
+    Csi2 { bits: u32 },
+}
+
 /// Frame metadata extracted from libcamera completed requests
 ///
 /// This struct contains the actual values applied by the ISP for a given frame,
 /// as reported by libcamera. Only populated when using the libcamera backend.
 #[derive(Debug, Clone, Default)]
 pub struct FrameMetadata {
+    /// Negotiated source packing, not inferred from row padding. Unknown stays None.
+    pub raw_layout: Option<RawLayout>,
+    /// Per-site [R, Gr, Gb, B] black levels in normalized 16-bit control units.
+    pub sensor_black_levels: Option<[f32; 4]>,
     /// Actual exposure time applied (microseconds)
     pub exposure_time: Option<u64>,
     /// Actual analogue gain applied

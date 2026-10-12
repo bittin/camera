@@ -1076,7 +1076,8 @@ fn run_capture_loop(
         let frame_num = params.preview_frame_count.fetch_add(1, Ordering::Relaxed);
 
         // Extract per-frame metadata
-        let metadata = extract_metadata(&req);
+        let mut metadata = extract_metadata(&req);
+        metadata.raw_layout = normal_raw_layout(&formats.vf_format_name);
 
         // Process viewfinder buffer
         if let Some(vf_buf) = req.buffer::<MmapFB>(stream_vf) {
@@ -1224,6 +1225,8 @@ fn run_capture_loop(
             && let Some(sr) = stream_raw
         {
             let raw_pf = formats.raw_pixel_format.unwrap_or(PixelFormat::BayerRGGB);
+            let mut raw_metadata = metadata.clone();
+            raw_metadata.raw_layout = normal_raw_layout(&formats.raw_format_name);
             if let Some(still_frame) = process_buffer(
                 &req,
                 sr,
@@ -1231,7 +1234,7 @@ fn run_capture_loop(
                 formats.raw_stride,
                 raw_pf,
                 captured_at,
-                &metadata,
+                &raw_metadata,
             ) {
                 let still_count = params.still_frame_count.fetch_add(1, Ordering::Relaxed);
                 info!(
@@ -1352,6 +1355,33 @@ fn dispatch_viewfinder_frame(
     }
 }
 
+// Negotiated libcamera name, not stride or native sensor calibration.
+fn normal_raw_layout(name: &str) -> Option<crate::backends::camera::types::RawLayout> {
+    use crate::backends::camera::types::RawLayout;
+    let suffix = ["SRGGB", "SBGGR", "SGRBG", "SGBRG"]
+        .iter()
+        .find_map(|p| name.strip_prefix(p))?;
+    if suffix == "8" {
+        return Some(RawLayout::U8);
+    }
+    let packed = suffix.strip_suffix("_CSI2P");
+    let bits = packed.unwrap_or(suffix).parse::<u32>().ok()?;
+    if packed.is_some() {
+        [10, 12, 14]
+            .contains(&bits)
+            .then_some(RawLayout::Csi2 { bits })
+    } else {
+        [10, 12, 14, 16]
+            .contains(&bits)
+            .then_some(RawLayout::Unpacked16 { bits })
+    }
+}
+
+// Same reviewed conversion, named so producer units/order can be tested directly.
+fn normal_sensor_black_levels(levels: libcamera::controls::SensorBlackLevels) -> [f32; 4] {
+    levels.0.map(|n| n as f32 / 65535.0)
+}
+
 /// Extract per-frame metadata from a completed request
 fn extract_metadata(req: &libcamera::request::Request) -> FrameMetadata {
     use libcamera::controls;
@@ -1382,6 +1412,11 @@ fn extract_metadata(req: &libcamera::request::Request) -> FrameMetadata {
             .get::<controls::ColourCorrectionMatrix>()
             .ok()
             .map(|v| v.0),
+        raw_layout: None,
+        sensor_black_levels: meta
+            .get::<controls::SensorBlackLevels>()
+            .ok()
+            .map(normal_sensor_black_levels),
         black_level: meta.get::<controls::SensorBlackLevels>().ok().map(|v| {
             // SensorBlackLevels are 16-bit [R, Gr, Gb, B]; average and normalize
             let levels = v.0;
@@ -1893,6 +1928,47 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn normal_negotiated_raw_layout_is_not_inferred_from_stride() {
+        use super::normal_raw_layout;
+        use crate::backends::camera::types::RawLayout;
+        assert_eq!(
+            normal_raw_layout("SRGGB10_CSI2P"),
+            Some(RawLayout::Csi2 { bits: 10 })
+        );
+        assert_eq!(
+            normal_raw_layout("SBGGR12"),
+            Some(RawLayout::Unpacked16 { bits: 12 })
+        );
+        assert_eq!(normal_raw_layout("SGRBG8"), Some(RawLayout::U8));
+        assert_eq!(normal_raw_layout("SRGGB10_IPU3"), None);
+        assert_eq!(normal_raw_layout("NV12"), None);
+        for cfa in ["SRGGB", "SBGGR", "SGRBG", "SGBRG"] {
+            for bits in [10, 12, 14, 16] {
+                assert_eq!(
+                    normal_raw_layout(&format!("{cfa}{bits}")),
+                    Some(RawLayout::Unpacked16 { bits })
+                );
+            }
+            for bits in [10, 12, 14] {
+                assert_eq!(
+                    normal_raw_layout(&format!("{cfa}{bits}_CSI2P")),
+                    Some(RawLayout::Csi2 { bits })
+                );
+            }
+        }
+        let levels = super::normal_sensor_black_levels(libcamera::controls::SensorBlackLevels([
+            0, 16384, 32768, 65535,
+        ]));
+        assert_eq!(levels, [0.0, 16384.0 / 65535.0, 32768.0 / 65535.0, 1.0]);
+        assert!(
+            super::FrameMetadata::default()
+                .sensor_black_levels
+                .is_none()
+        );
+        assert!(super::FrameMetadata::default().raw_layout.is_none());
     }
 
     struct BlockingWorker {
