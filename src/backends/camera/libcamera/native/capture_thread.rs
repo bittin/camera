@@ -11,6 +11,7 @@ use super::diagnostics::{
     PREVIEW_FRAME_COUNT, STILL_FRAME_COUNT, StreamDiag, publish_diagnostics,
 };
 use super::pixel_formats::{map_pixel_format, pixel_format_name};
+use crate::backends::camera::preview_metrics::PreviewMetrics;
 use crate::backends::camera::types::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,7 @@ const CAPTURE_COPY_POOL_CACHE_CAPACITY: usize =
 /// Parameters passed to the capture thread for initialization
 pub(crate) struct CaptureThreadParams {
     pub(crate) camera_id: String,
+    pub(crate) preview_metrics: Arc<PreviewMetrics>,
     pub(crate) preview_width: u32,
     pub(crate) preview_height: u32,
     pub(crate) limit_preview: bool,
@@ -100,6 +102,18 @@ where
             job_tx: Some(job_tx),
             workers,
         }
+    }
+
+    fn try_submit_preview(
+        &self,
+        job: Job,
+        metrics: &PreviewMetrics,
+    ) -> Result<(), std::sync::mpsc::TrySendError<Job>> {
+        let result = self.try_submit(job);
+        if result.is_err() {
+            metrics.record_drops(1);
+        }
+        result
     }
 
     fn try_submit(&self, job: Job) -> Result<(), std::sync::mpsc::TrySendError<Job>> {
@@ -275,6 +289,29 @@ fn pooled_copy_frame_planes(planes: &[&[u8]], used: &[usize], pool: &FrameDataPo
     }
 
     lease.freeze()
+}
+
+/// Empty or missing completed viewfinder data loses a preview before copying.
+fn preview_data_available(total_bytes_used: usize, metrics: &PreviewMetrics) -> bool {
+    if total_bytes_used == 0 {
+        metrics.record_drops(1);
+        false
+    } else {
+        true
+    }
+}
+
+/// Measure only the real mmap-to-owned copy, excluding MJPEG decode and dispatch.
+fn measured_copy_frame_planes(
+    planes: &[&[u8]],
+    used: &[usize],
+    pool: &FrameDataPool,
+    metrics: &PreviewMetrics,
+) -> FrameData {
+    let copy_start = Instant::now();
+    let data = pooled_copy_frame_planes(planes, used, pool);
+    metrics.record_copy(copy_start.elapsed());
+    data
 }
 
 /// Memory-map a vec of frame buffers, returning an error with the given label on failure.
@@ -525,6 +562,16 @@ fn process_buffer(
     ))
 }
 
+/// Clear only this session on every thread exit, including initialization errors
+/// and unwinding. The shared tracker protects any newer session's registration.
+struct PreviewSessionGuard(Arc<PreviewMetrics>);
+
+impl Drop for PreviewSessionGuard {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// Main entry point for the capture thread
 ///
 /// Creates all libcamera objects, runs the capture loop, and cleans up on exit.
@@ -533,6 +580,7 @@ pub(crate) fn capture_thread_main(
     params: CaptureThreadParams,
     init_tx: std::sync::mpsc::SyncSender<Result<CaptureThreadInitResult, BackendError>>,
 ) {
+    let _preview_session = PreviewSessionGuard(Arc::clone(&params.preview_metrics));
     match capture_thread_setup_and_run(params, &init_tx) {
         Ok(()) => info!("Capture thread exiting normally"),
         Err(e) => {
@@ -970,6 +1018,8 @@ fn dispatch_mjpeg_frame(
         output.frame_num,
         output.frame.is_some(),
     ) {
+        // A failed decode or stale output loses one preview, never both.
+        params.preview_metrics.record_drops(1);
         return;
     }
 
@@ -1076,7 +1126,7 @@ fn run_capture_loop(
                 }
 
                 // Skip frames with no data (e.g. first frame from some UVC cameras)
-                if total_bytes_used == 0 {
+                if !preview_data_available(total_bytes_used, &params.preview_metrics) {
                     req.reuse(ReuseFlag::REUSE_BUFFERS);
                     requeue_request(active_cam, req, &params.stop_flag);
                     continue;
@@ -1085,7 +1135,12 @@ fn run_capture_loop(
                 // Copy mmap data once into recyclable owned storage before the
                 // request is requeued. Multi-plane formats are concatenated in
                 // plane order for the existing FrameData/YuvPlanes contract.
-                let captured_data = pooled_copy_frame_planes(&planes, &used, &capture_copy_pool);
+                let captured_data = measured_copy_frame_planes(
+                    &planes,
+                    &used,
+                    &capture_copy_pool,
+                    &params.preview_metrics,
+                );
                 if let Some(queue) = jpeg_decode_queue.as_ref() {
                     let jpeg_data = captured_data;
                     let dispatch_context = snapshot_frame_dispatch_context(
@@ -1131,15 +1186,18 @@ fn run_capture_loop(
                     };
 
                     if queue
-                        .try_submit(MjpegDecodeJob {
-                            data: jpeg_data,
-                            captured_at,
-                            sensor_timestamp_ns,
-                            metadata: metadata.clone(),
-                            frame_num,
-                            dispatch_context,
-                            skip_recording: jpeg_sent_to_recorder,
-                        })
+                        .try_submit_preview(
+                            MjpegDecodeJob {
+                                data: jpeg_data,
+                                captured_at,
+                                sensor_timestamp_ns,
+                                metadata: metadata.clone(),
+                                frame_num,
+                                dispatch_context,
+                                skip_recording: jpeg_sent_to_recorder,
+                            },
+                            &params.preview_metrics,
+                        )
                         .is_err()
                         && frame_num.is_multiple_of(LOG_EVERY_N_FRAMES)
                     {
@@ -1185,9 +1243,14 @@ fn run_capture_loop(
                         false,
                     );
                 }
+            } else {
+                preview_data_available(0, &params.preview_metrics);
             }
-        } else if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-            warn!("No viewfinder buffer in completed request");
+        } else {
+            preview_data_available(0, &params.preview_metrics);
+            if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
+                warn!("No viewfinder buffer in completed request");
+            }
         }
 
         // Process raw buffer only when still capture is requested (multistream only).
@@ -1319,11 +1382,14 @@ fn dispatch_viewfinder_frame(
         }
     }
 
+    // Record actual produced output once, even when UI delivery is backpressured.
+    params.preview_metrics.record_frame(&frame);
     // Send to UI (preview)
-    if let Err(e) = params.frame_sender.try_send(frame)
-        && frame_num.is_multiple_of(LOG_EVERY_N_FRAMES)
-    {
-        debug!(error = ?e, "Preview frame dropped (channel full)");
+    if let Err(e) = params.frame_sender.try_send(frame) {
+        params.preview_metrics.record_drops(1);
+        if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
+            debug!(error = ?e, "Preview frame dropped (channel full)");
+        }
     }
 }
 
@@ -1943,6 +2009,143 @@ mod tests {
         assert!(super::FrameMetadata::default().raw_layout.is_none());
     }
 
+    fn dispatch_test_params(
+        frame_sender: super::FrameSender,
+        preview_metrics: Arc<super::PreviewMetrics>,
+    ) -> super::CaptureThreadParams {
+        super::CaptureThreadParams {
+            camera_id: "native-dispatch-metrics-test".into(),
+            preview_metrics,
+            preview_width: 2,
+            preview_height: 1,
+            limit_preview: false,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            latest_preview: Arc::new(Mutex::new(None)),
+            latest_still: Arc::new(Mutex::new(None)),
+            still_requested: Arc::new(AtomicBool::new(false)),
+            still_frame_notify: Arc::new(tokio::sync::Notify::new()),
+            preview_frame_count: Arc::new(super::AtomicU64::new(0)),
+            still_frame_count: Arc::new(super::AtomicU64::new(0)),
+            frame_sender,
+            recording_sender: Arc::new(Mutex::new(None)),
+            jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn dispatch_test_frame() -> super::CameraFrame {
+        super::build_camera_frame(
+            super::FrameData::from_owned_vec(vec![1; 8]),
+            super::FrameLayout {
+                width: 2,
+                height: 1,
+                format: super::PixelFormat::ABGR,
+                stride: 8,
+            },
+            Instant::now(),
+            None,
+            super::FrameMetadata::default(),
+        )
+    }
+
+    #[test]
+    fn native_dispatch_counts_every_full_channel_drop_and_produced_frame() {
+        let metrics = crate::backends::camera::preview_metrics::PreviewMetrics::start(
+            "native-dispatch-metrics-test",
+        );
+        let (mut sender, _receiver) = cosmic::iced::futures::channel::mpsc::channel(1);
+        while sender.try_send(dispatch_test_frame()).is_ok() {}
+        let mut params = dispatch_test_params(sender, Arc::clone(&metrics));
+        for frame_num in [1, 2] {
+            super::dispatch_viewfinder_frame(
+                dispatch_test_frame(),
+                frame_num,
+                &mut params,
+                false,
+                super::FrameDispatchContext {
+                    capture_still: false,
+                    recording_sender: None,
+                },
+                false,
+            );
+        }
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.dropped_frames, 2);
+        assert_eq!(snapshot.frame_count, 2);
+        assert_eq!(
+            (snapshot.width, snapshot.height, snapshot.frame_size_bytes),
+            (2, 1, 8)
+        );
+        assert_eq!(snapshot.output_format, Some(super::PixelFormat::ABGR));
+        assert!(params.latest_preview.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn native_mjpeg_rejected_outputs_count_once_without_advancing_watermark() {
+        let metrics = super::PreviewMetrics::start("native-mjpeg-rejected-test");
+        let (sender, _receiver) = cosmic::iced::futures::channel::mpsc::channel(4);
+        let mut params = dispatch_test_params(sender, Arc::clone(&metrics));
+        let mut watermark = Some(2);
+        for (frame_num, frame) in [(3, None), (1, Some(dispatch_test_frame())), (0, None)] {
+            super::dispatch_mjpeg_frame(
+                super::MjpegDecodeOutput {
+                    frame_num,
+                    frame,
+                    dispatch_context: super::FrameDispatchContext {
+                        capture_still: false,
+                        recording_sender: None,
+                    },
+                    skip_recording: false,
+                    decode_time_us: 100,
+                },
+                &mut params,
+                false,
+                &mut watermark,
+            );
+        }
+        assert_eq!(metrics.snapshot().dropped_frames, 3);
+        assert_eq!(metrics.snapshot().frame_count, 0);
+        assert_eq!(watermark, Some(2));
+        assert!(params.latest_preview.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn native_decode_queue_rejections_count_even_between_log_frames() {
+        let metrics = super::PreviewMetrics::start("native-queue-metrics-test");
+        let (job_tx, _job_rx) = std::sync::mpsc::sync_channel(1);
+        let queue = BoundedWorkerQueue {
+            job_tx: Some(job_tx),
+            workers: Vec::new(),
+        };
+        queue.try_submit_preview(1_u32, &metrics).unwrap();
+        assert!(queue.try_submit_preview(2_u32, &metrics).is_err());
+        assert!(queue.try_submit_preview(3_u32, &metrics).is_err());
+        assert_eq!(metrics.snapshot().dropped_frames, 2);
+        assert_eq!(metrics.snapshot().frame_count, 0);
+    }
+
+    #[test]
+    fn native_cancelled_capture_stops_its_preview_session_without_hardware() {
+        let metrics = super::PreviewMetrics::start("native-cancelled-session-test");
+        let (sender, _receiver) = cosmic::iced::futures::channel::mpsc::channel(1);
+        let params = dispatch_test_params(sender, Arc::clone(&metrics));
+        params.cancel_flag.store(true, Ordering::Release);
+        let (init_tx, _init_rx) = std::sync::mpsc::sync_channel(1);
+        super::capture_thread_main(params, init_tx);
+        assert!(super::PreviewMetrics::active_for("native-cancelled-session-test").is_none());
+    }
+
+    #[test]
+    fn native_empty_preview_buffers_count_one_loss_each() {
+        let metrics = super::PreviewMetrics::start("native-empty-buffer-test");
+        for total_bytes in [0, 8, 0] {
+            let has_data = super::preview_data_available(total_bytes, &metrics);
+            assert_eq!(has_data, total_bytes > 0);
+        }
+        assert_eq!(metrics.snapshot().dropped_frames, 2);
+        assert_eq!(metrics.snapshot().copy_time_us, None);
+    }
+
     struct BlockingWorker {
         started: Arc<AtomicUsize>,
         release: Arc<(Mutex<bool>, Condvar)>,
@@ -1966,6 +2169,19 @@ mod tests {
         fn process(&mut self, job: u32) -> u32 {
             job
         }
+    }
+
+    #[test]
+    fn native_capture_copy_records_real_copy_without_counting_a_frame() {
+        let metrics = super::PreviewMetrics::start("native-copy-metrics-test");
+        let pool = FrameDataPool::new(1);
+        assert_eq!(metrics.snapshot().copy_time_us, None);
+        let copied =
+            super::measured_copy_frame_planes(&[&[1, 2, 99], &[3, 4]], &[2, 2], &pool, &metrics);
+        assert_eq!(copied.as_ref(), &[1, 2, 3, 4]);
+        assert!(metrics.snapshot().copy_time_us.is_some());
+        assert_eq!(metrics.snapshot().frame_count, 0);
+        assert_eq!(metrics.snapshot().dropped_frames, 0);
     }
 
     #[test]

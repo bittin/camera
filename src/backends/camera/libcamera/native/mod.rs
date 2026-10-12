@@ -33,6 +33,7 @@ pub(crate) mod pixel_formats;
 
 pub use diagnostics::is_capture_active;
 
+use crate::backends::camera::preview_metrics::PreviewMetrics;
 use crate::backends::camera::types::*;
 use capture_thread::{CaptureThreadInitResult, CaptureThreadParams, capture_thread_main};
 use diagnostics::clear_global_diagnostics;
@@ -61,6 +62,7 @@ pub(crate) struct PipelineSharedState {
 /// All libcamera objects live on a dedicated capture thread.
 /// The main thread communicates via atomic flags and mutexed shared state.
 pub(crate) struct NativeLibcameraPipeline {
+    pub(crate) preview_metrics: Arc<PreviewMetrics>,
     /// Capture processing thread (owns all libcamera objects)
     capture_thread: Option<JoinHandle<()>>,
     /// Accepted stream layout, not the discovery hint.
@@ -104,6 +106,8 @@ impl NativeLibcameraPipeline {
             "Creating native libcamera pipeline"
         );
 
+        let preview_metrics = PreviewMetrics::start(camera_id);
+
         // Shared state
         let stop_flag = Arc::new(AtomicBool::new(false));
         let latest_preview = Arc::new(Mutex::new(None));
@@ -116,6 +120,7 @@ impl NativeLibcameraPipeline {
 
         let params = CaptureThreadParams {
             camera_id: camera_id.to_string(),
+            preview_metrics: Arc::clone(&preview_metrics),
             preview_width: preview_format.width,
             preview_height: preview_format.height,
             limit_preview,
@@ -159,6 +164,7 @@ impl NativeLibcameraPipeline {
         Ok(Self {
             capture_thread: Some(capture_thread),
             is_multistream: init_result.is_multistream,
+            preview_metrics,
             stop_flag,
             still_capture_requested: shared.still_requested,
             latest_preview,
@@ -210,6 +216,7 @@ impl NativeLibcameraPipeline {
     /// Stop the pipeline
     pub(crate) fn stop(&self) -> BackendResult<()> {
         info!("Stopping native libcamera pipeline");
+        self.preview_metrics.stop();
         clear_global_diagnostics();
         self.stop_flag.store(true, Ordering::Release);
         Ok(())
@@ -218,6 +225,7 @@ impl NativeLibcameraPipeline {
 
 impl Drop for NativeLibcameraPipeline {
     fn drop(&mut self) {
+        self.preview_metrics.stop();
         clear_global_diagnostics();
         self.stop_flag.store(true, Ordering::Release);
 
@@ -236,5 +244,42 @@ impl Drop for NativeLibcameraPipeline {
             still_frames = still_count,
             "Native libcamera pipeline dropped"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pipeline_without_hardware(metrics: Arc<PreviewMetrics>) -> NativeLibcameraPipeline {
+        NativeLibcameraPipeline {
+            preview_metrics: metrics,
+            is_multistream: false,
+            capture_thread: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            still_capture_requested: Arc::new(AtomicBool::new(false)),
+            latest_preview: Arc::new(Mutex::new(None)),
+            latest_still: Arc::new(Mutex::new(None)),
+            preview_frame_count: Arc::new(AtomicU64::new(0)),
+            still_frame_count: Arc::new(AtomicU64::new(0)),
+            _recording_sender: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn native_pipeline_drop_clears_preview_session_with_retained_tracker() {
+        let metrics = PreviewMetrics::start("native-pipeline-drop-test");
+        let pipeline = pipeline_without_hardware(Arc::clone(&metrics));
+        drop(pipeline);
+        assert!(PreviewMetrics::active_for("native-pipeline-drop-test").is_none());
+    }
+
+    #[test]
+    fn native_pipeline_stop_clears_preview_session_immediately() {
+        let metrics = PreviewMetrics::start("native-pipeline-stop-test");
+        let pipeline = pipeline_without_hardware(Arc::clone(&metrics));
+        pipeline.stop().unwrap();
+        assert!(pipeline.stop_flag.load(Ordering::Acquire));
+        assert!(PreviewMetrics::active_for("native-pipeline-stop-test").is_none());
     }
 }

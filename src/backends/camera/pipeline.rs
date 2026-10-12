@@ -42,6 +42,18 @@ impl CapturePipeline {
             NativeLibcameraPipeline::new(path, format, multistream, shared).map(Self::Native)
         }
     }
+    pub(crate) fn preview_metrics(&self) -> std::sync::Arc<super::preview_metrics::PreviewMetrics> {
+        match self {
+            Self::Native(p) => p.preview_metrics.clone(),
+            Self::PipeWire(p) => p.preview_metrics.clone(),
+        }
+    }
+    pub(crate) fn is_multistream(&self) -> bool {
+        match self {
+            Self::Native(p) => p.is_multistream(),
+            Self::PipeWire(_) => false,
+        }
+    }
     pub(crate) fn request_still_capture(&self) {
         match self {
             Self::Native(p) => p.request_still_capture(),

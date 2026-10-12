@@ -267,23 +267,33 @@ impl AppModel {
     ) -> widget::settings::Section<'a, Message> {
         // Frame latency
         let latency_ms = self.insights.frame_latency_us as f64 / 1000.0;
-        section = section.add(
-            insight_item(fl!("insights-frame-latency"))
-                .control(diagnostic_text(format!("{:.2} ms", latency_ms))),
-        );
+        section = section.add(insight_item(fl!("insights-frame-latency")).control(
+            diagnostic_text(if self.insights.preview_stream.is_some() {
+                format!("{latency_ms:.2} ms")
+            } else {
+                "N/A".into()
+            }),
+        ));
 
         // Dropped frames
         section = section.add(
-            insight_item(fl!("insights-dropped-frames"))
-                .control(diagnostic_text(format!("{}", self.insights.dropped_frames))),
+            insight_item(fl!("insights-preview-delivery-drops")).control(diagnostic_text(
+                self.insights
+                    .dropped_frames
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "N/A".into()),
+            )),
         );
 
         // Frame size
-        let decoded_mb = self.insights.frame_size_decoded as f64 / (1024.0 * 1024.0);
-        section = section.add(
-            insight_item(fl!("insights-frame-size-decoded"))
-                .control(diagnostic_text(format!("{:.2} MB", decoded_mb))),
-        );
+        let decoded_mb = self.insights.frame_size_decoded as f64 / 1_000_000.0;
+        section = section.add(insight_item(fl!("insights-frame-size-decoded")).control(
+            diagnostic_text(if self.insights.preview_stream.is_some() {
+                format!("{decoded_mb:.2} MB")
+            } else {
+                "N/A".into()
+            }),
+        ));
 
         // CPU decode time (turbojpeg MJPEG→I420)
         if self.insights.cpu_decode_time_us > 0 {
@@ -294,22 +304,20 @@ impl AppModel {
             );
         }
 
-        // Frame wrap time
-        let copy_ms = self.insights.copy_time_us as f64 / 1000.0;
-        let copy_text = if copy_ms < 0.01 {
-            "< 0.01 ms (zero-copy)".to_string()
-        } else {
-            format!("{:.2} ms", copy_ms)
-        };
+        // This is a measured CPU buffer copy, not a zero-copy inference.
+        let copy_text = super::types::frame_copy_time_text(self.insights.copy_time_us);
         section = section
-            .add(insight_item(fl!("insights-copy-time")).control(diagnostic_text(copy_text)));
+            .add(insight_item(fl!("insights-frame-copy-time")).control(diagnostic_text(copy_text)));
 
         // GPU upload time
         let gpu_upload_ms = self.insights.gpu_conversion_time_us as f64 / 1000.0;
-        section = section.add(
-            insight_item(fl!("insights-gpu-upload-time"))
-                .control(diagnostic_text(format!("{:.2} ms", gpu_upload_ms))),
-        );
+        section = section.add(insight_item(fl!("insights-gpu-upload-time")).control(
+            diagnostic_text(if self.insights.preview_stream.is_some() {
+                format!("{gpu_upload_ms:.2} ms")
+            } else {
+                "N/A".into()
+            }),
+        ));
 
         // GPU upload bandwidth
         let bandwidth_text = if self.insights.copy_bandwidth_mbps > 0.0 {
@@ -378,13 +386,13 @@ impl AppModel {
             insight_item(fl!("insights-stream-resolution"))
                 .control(diagnostic_text(&stream.resolution)),
         );
-        // Show configured framerate, or measured FPS from frame count
-        let framerate_text = if self.insights.format_chain.framerate != "N/A"
+        // Prefer measured preview FPS; keep the negotiated/configured rate distinct.
+        let framerate_text = if self.insights.measured_fps > 0.0 {
+            format!("{:.1} fps (measured)", self.insights.measured_fps)
+        } else if self.insights.format_chain.framerate != "N/A"
             && !self.insights.format_chain.framerate.is_empty()
         {
             self.insights.format_chain.framerate.clone()
-        } else if self.insights.measured_fps > 0.0 {
-            format!("{:.1} fps (measured)", self.insights.measured_fps)
         } else {
             String::new()
         };
@@ -813,6 +821,17 @@ impl AppModel {
         let title = format!("{} ({})", fmt.fourcc.trim(), fmt.description);
         let mut section = widget::settings::section().title(title);
         let fourcc_trimmed = fmt.fourcc.trim();
+        let backend_name = self
+            .available_cameras
+            .get(self.current_camera_index)
+            .map(|camera| {
+                if camera.path.starts_with("pipewire:") {
+                    "PipeWire (V4L2)"
+                } else {
+                    "libcamera"
+                }
+            })
+            .unwrap_or("selected backend");
 
         // Get the actual running stream info for highlighting.
         // Use preview_stream (the actual negotiated format) rather than active_format
@@ -824,7 +843,7 @@ impl AppModel {
         sorted_sizes.sort_by_key(|b| std::cmp::Reverse(b.width * b.height));
 
         for size in &sorted_sizes {
-            let in_libcamera = self.insights.libcamera_formats.iter().any(|lf| {
+            let in_backend = self.insights.backend_formats.iter().any(|lf| {
                 lf.width == size.width
                     && lf.height == size.height
                     && format_matches_fourcc(&lf.pixel_format, fourcc_trimmed)
@@ -838,7 +857,11 @@ impl AppModel {
                 let matches_res = res_parts.len() == 2
                     && res_parts[0].parse::<u32>().ok() == Some(size.width)
                     && res_parts[1].parse::<u32>().ok() == Some(size.height);
-                let stream_fmt = &s.pixel_format;
+                let stream_fmt = if self.insights.format_chain.native_format.is_empty() {
+                    &s.pixel_format
+                } else {
+                    &self.insights.format_chain.native_format
+                };
                 let matches_fmt = stream_fmt.eq_ignore_ascii_case(fourcc_trimmed)
                     || stream_fmt.contains(fourcc_trimmed)
                     || (fourcc_trimmed == "MJPG"
@@ -848,18 +871,26 @@ impl AppModel {
             });
 
             let status_text = if is_active_resolution {
-                format!("\u{2713} {}", fl!("insights-v4l2-active-in-libcamera"))
-            } else if in_libcamera {
-                format!("\u{2713} {}", fl!("insights-v4l2-in-libcamera"))
+                format!(
+                    "\u{2713} {}",
+                    fl!("insights-v4l2-active-in-backend", backend = backend_name)
+                )
+            } else if in_backend {
+                format!(
+                    "\u{2713} {}",
+                    fl!("insights-v4l2-in-backend", backend = backend_name)
+                )
             } else {
-                format!("\u{2717} {}", fl!("insights-v4l2-not-in-libcamera"))
+                format!(
+                    "\u{2717} {}",
+                    fl!("insights-v4l2-not-in-backend", backend = backend_name)
+                )
             };
 
             let resolution_label = format!("{}x{}", size.width, size.height);
 
             if size.framerates.is_empty() {
-                let status_widget =
-                    v4l2_status_text(status_text, in_libcamera, is_active_resolution);
+                let status_widget = v4l2_status_text(status_text, in_backend, is_active_resolution);
                 section = section.add(insight_item(resolution_label).control(status_widget));
             } else {
                 for &(num, denom) in &size.framerates {
@@ -875,7 +906,7 @@ impl AppModel {
                     };
 
                     let row_status =
-                        v4l2_status_text(status_text.clone(), in_libcamera, is_active_resolution);
+                        v4l2_status_text(status_text.clone(), in_backend, is_active_resolution);
                     section = section.add(
                         insight_item(format!("{} @ {}", resolution_label, fps)).control(row_status),
                     );
@@ -892,8 +923,13 @@ impl AppModel {
 
         // Backend type
         section = section.add(
-            insight_item(fl!("insights-backend-type"))
-                .control(diagnostic_text(self.insights.backend_type)),
+            insight_item(fl!("insights-backend-type")).control(diagnostic_text(
+                if self.insights.backend_type.is_empty() {
+                    "N/A"
+                } else {
+                    self.insights.backend_type
+                },
+            )),
         );
 
         // Pipeline handler

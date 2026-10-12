@@ -1244,6 +1244,7 @@ impl cosmic::Application for AppModel {
                             is_first_pipeline = false;
 
                             if let Some(pipeline) = pipeline_opt {
+                                let preview_metrics = pipeline.preview_metrics();
                                 info!("Waiting for frames from pipeline...");
                                 // Keep pipeline alive and forward frames
                                 loop {
@@ -1303,6 +1304,7 @@ impl cosmic::Application for AppModel {
                                                 }
                                             }
 
+                                            preview_metrics.record_drops(drained_count as u64);
                                             frame_count += 1;
                                             if frame_count == 1 {
                                                 crate::startup::milestone(
@@ -1339,6 +1341,7 @@ impl cosmic::Application for AppModel {
                                                     }
                                                 }
                                                 Err(e) => {
+                                                    preview_metrics.record_drops(1);
                                                     // Always log dropped frames for diagnostics
                                                     tracing::warn!(
                                                         frame = frame_count,

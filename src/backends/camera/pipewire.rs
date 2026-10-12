@@ -2,6 +2,7 @@
 //! Processed V4L2 cameras exposed by the user's PipeWire session.
 //! `pw-dump` is a runtime prerequisite; streaming is exclusively `pipewiresrc`.
 use super::libcamera::PipelineSharedState;
+use super::preview_metrics::{PreviewMetrics, StreamDiagnostics};
 use super::types::*;
 
 use gstreamer as gst;
@@ -15,6 +16,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub(crate) struct PipeWirePipeline {
+    pub(crate) preview_metrics: Arc<PreviewMetrics>,
     stop_flag: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     latest_preview: Arc<Mutex<Option<CameraFrame>>>,
@@ -41,6 +43,7 @@ fn build_stream(
         );
     }
     let filter = gst::ElementFactory::make("capsfilter")
+        .name("camera-input")
         .property("caps", caps.build())
         .build()
         .map_err(|e| e.to_string())?;
@@ -78,7 +81,10 @@ fn build_stream(
     Ok((pipeline, sink))
 }
 
-fn sample_to_frame(sample: &gst::Sample) -> Result<CameraFrame, String> {
+fn sample_to_frame(
+    sample: &gst::Sample,
+    metrics: Option<&PreviewMetrics>,
+) -> Result<CameraFrame, String> {
     let caps = sample.caps().ok_or("missing sample caps")?;
     let info = gstreamer_video::VideoInfo::from_caps(caps).map_err(|e| e.to_string())?;
     if info.format() != gstreamer_video::VideoFormat::Rgba {
@@ -93,6 +99,7 @@ fn sample_to_frame(sample: &gst::Sample) -> Result<CameraFrame, String> {
         return Err("invalid RGBA stride".into());
     }
     let plane = mapped.plane_data(0).map_err(|e| e.to_string())?;
+    let copy_started = Instant::now();
     let mut data = Vec::with_capacity(row_bytes * info.height() as usize);
     for row in 0..info.height() as usize {
         let start = row * stride as usize;
@@ -101,6 +108,9 @@ fn sample_to_frame(sample: &gst::Sample) -> Result<CameraFrame, String> {
                 .get(start..start + row_bytes)
                 .ok_or("truncated RGBA plane")?,
         );
+    }
+    if let Some(metrics) = metrics {
+        metrics.record_copy(copy_started.elapsed());
     }
     Ok(CameraFrame {
         width: info.width(),
@@ -113,6 +123,38 @@ fn sample_to_frame(sample: &gst::Sample) -> Result<CameraFrame, String> {
         sensor_timestamp_ns: None,
         libcamera_metadata: None,
     })
+}
+
+fn stream_diagnostics(serial: &str, caps: &gst::CapsRef) -> StreamDiagnostics {
+    let structure = caps.structure(0);
+    let jpeg = structure.is_some_and(|s| s.name() == "image/jpeg");
+    let source_format = if jpeg {
+        "MJPEG".into()
+    } else {
+        structure
+            .and_then(|s| s.get::<String>("format").ok())
+            .unwrap_or_else(|| "unknown".into())
+    };
+    let framerate = structure
+        .and_then(|s| s.get::<gst::Fraction>("framerate").ok())
+        .and_then(|f| {
+            (f.numer() > 0 && f.denom() > 0)
+                .then(|| Framerate::new(f.numer() as u32, f.denom() as u32))
+        });
+    let decode = if jpeg { " ! jpegdec" } else { "" };
+    StreamDiagnostics {
+        pipeline_string: format!(
+            "pipewiresrc target-object={serial} use-bufferpool=false do-timestamp=true ! {caps}{decode} ! videoconvert ! video/x-raw,format=RGBA ! appsink"
+        ),
+        cpu_processing: Some(if jpeg {
+            "MJPEG → decoded video (jpegdec) → RGBA (videoconvert); buffer copy".into()
+        } else {
+            format!("{source_format} → RGBA (videoconvert); buffer copy")
+        }),
+        source_format,
+        framerate,
+        decoder: jpeg.then_some("jpegdec"),
+    }
 }
 
 impl PipeWirePipeline {
@@ -160,21 +202,27 @@ impl PipeWirePipeline {
             .map_err(|e| BackendError::InitializationFailed(e.to_string()))?;
         let (pipeline, sink) =
             build_stream(source, format).map_err(BackendError::InitializationFailed)?;
+        let preview_metrics = PreviewMetrics::start(&device.path);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let latest_preview = Arc::new(Mutex::new(None));
         let mut result = Self {
+            preview_metrics: Arc::clone(&preview_metrics),
             stop_flag: Arc::clone(&stop_flag),
             thread: None,
             latest_preview: Arc::clone(&latest_preview),
             still_requested: Arc::clone(&shared.still_requested),
             still_frame: Arc::clone(&shared.still_frame),
         };
+        let serial = serial.to_owned();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
         result.thread = Some(
             std::thread::Builder::new()
                 .name("pipewire-camera".into())
                 .spawn(move || {
                     let mut init_tx = Some(init_tx);
+                    let mut published_stream = false;
+                    let mut appsink_dropped = 0u64;
+                    let has_drop_counter = sink.find_property("dropped").is_some();
                     let start = Instant::now();
                     let bus = pipeline.bus().unwrap();
                     let run = || -> Result<(), String> {
@@ -202,7 +250,23 @@ impl PipeWirePipeline {
                         if let Some(sample) =
                             sink.try_pull_sample(gst::ClockTime::from_mseconds(100))
                         {
-                            match sample_to_frame(&sample) {
+                            if !published_stream
+                                && let Some(caps) = pipeline
+                                    .by_name("camera-input")
+                                    .and_then(|element| element.static_pad("src"))
+                                    .and_then(|pad| pad.current_caps())
+                            {
+                                preview_metrics.set_stream(stream_diagnostics(&serial, &caps));
+                                published_stream = true;
+                            }
+                            // GStreamer >= 1.28 exposes losses inside the bounded appsink.
+                            if has_drop_counter {
+                                let dropped = sink.property::<u64>("dropped");
+                                preview_metrics
+                                    .record_drops(dropped.saturating_sub(appsink_dropped));
+                                appsink_dropped = dropped;
+                            }
+                            match sample_to_frame(&sample, Some(&preview_metrics)) {
                                 Ok(mut frame) => {
                                     // Translate stream PTS to CLOCK_BOOTTIME, the recorder's
                                     // timestamp domain. This is a PipeWire presentation timestamp,
@@ -238,6 +302,7 @@ impl PipeWirePipeline {
                                     if let Some(tx) = init_tx.take() {
                                         let _ = tx.send(Ok(()));
                                     }
+                                    preview_metrics.record_frame(&frame);
                                     *latest_preview.lock().unwrap() = Some(frame.clone());
                                     if shared.still_requested.swap(false, Ordering::AcqRel) {
                                         *shared.still_frame.lock().unwrap() = Some(frame.clone());
@@ -250,7 +315,9 @@ impl PipeWirePipeline {
                                             frame.clone(),
                                         )));
                                     }
-                                    let _ = shared.frame_sender.try_send(frame);
+                                    if shared.frame_sender.try_send(frame).is_err() {
+                                        preview_metrics.record_drops(1);
+                                    }
                                 }
                                 Err(e) => {
                                     failure = Some(e);
@@ -263,6 +330,7 @@ impl PipeWirePipeline {
                             );
                         }
                     }
+                    preview_metrics.stop();
                     let _ = pipeline.set_state(gst::State::Null);
                     if let Some(tx) = init_tx.take() {
                         let _ = tx.send(Err(failure
@@ -291,6 +359,7 @@ impl PipeWirePipeline {
         self.latest_preview.lock().ok()?.clone()
     }
     pub(crate) fn stop(&self) -> BackendResult<()> {
+        self.preview_metrics.stop();
         self.stop_flag.store(true, Ordering::Release);
         Ok(())
     }
@@ -815,7 +884,7 @@ mod tests {
         source.end_of_stream().unwrap();
         let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(2));
         pipeline.set_state(gst::State::Null).unwrap();
-        let frame = sample_to_frame(&sample.expect("converted padded NV12 frame")).unwrap();
+        let frame = sample_to_frame(&sample.expect("converted padded NV12 frame"), None).unwrap();
         for pixel in frame.data.as_chunks::<4>().0 {
             let min = *pixel[..3].iter().min().unwrap();
             let max = *pixel[..3].iter().max().unwrap();
@@ -846,7 +915,7 @@ mod tests {
         pipeline.set_state(gst::State::Playing).unwrap();
         let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(2));
         pipeline.set_state(gst::State::Null).unwrap();
-        let frame = sample_to_frame(&sample.expect("decoded MJPEG sample")).unwrap();
+        let frame = sample_to_frame(&sample.expect("decoded MJPEG sample"), None).unwrap();
         assert_eq!(frame.format, PixelFormat::RGBA);
         assert_eq!(frame.data.len(), 16 * 16 * 4);
     }
@@ -1015,7 +1084,7 @@ mod tests {
             4,
             12,
         );
-        let frame = sample_to_frame(&sample).unwrap();
+        let frame = sample_to_frame(&sample, None).unwrap();
         drop(sample);
         assert_eq!(
             &*frame.data,
@@ -1027,9 +1096,46 @@ mod tests {
     }
 
     #[test]
+    fn actual_rgba_buffer_copy_publishes_a_measurement() {
+        let metrics = PreviewMetrics::start("pipewire:copy-test");
+        let sample = rgba_sample(vec![0; 16], 0, 8);
+        assert!(metrics.snapshot().copy_time_us.is_none());
+        let frame = sample_to_frame(&sample, Some(&metrics)).unwrap();
+        metrics.record_frame(&frame);
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.copy_time_us.is_some());
+        assert_eq!(snapshot.frame_size_bytes, frame.data.len());
+        assert_eq!(snapshot.output_format, Some(PixelFormat::RGBA));
+    }
+
+    #[test]
+    fn negotiated_caps_describe_the_actual_pipewire_cpu_pipeline() {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .field("width", 1328i32)
+            .field("height", 1760i32)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .build();
+        let raw = stream_diagnostics("123", &caps);
+        assert_eq!(raw.source_format, "NV12");
+        assert_eq!(raw.framerate, Some(Framerate::new(30, 1)));
+        assert!(
+            raw.pipeline_string
+                .contains("pipewiresrc target-object=123")
+        );
+        assert!(raw.cpu_processing.unwrap().contains("videoconvert"));
+        assert_eq!(raw.decoder, None);
+        let jpeg = stream_diagnostics("123", &gst::Caps::builder("image/jpeg").build());
+        assert_eq!(jpeg.source_format, "MJPEG");
+        assert_eq!(jpeg.decoder, Some("jpegdec"));
+        assert!(jpeg.pipeline_string.contains("! jpegdec ! videoconvert"));
+    }
+
+    #[test]
     fn negative_rgba_stride_is_rejected_without_panicking() {
         let sample = rgba_sample(vec![0; 24], 12, -12);
-        assert!(sample_to_frame(&sample).is_err());
+        assert!(sample_to_frame(&sample, None).is_err());
     }
 
     #[test]
@@ -1070,6 +1176,32 @@ mod tests {
         assert!(backend.is_initialized());
         let photo = backend.capture_photo().unwrap();
         assert_eq!((photo.width, photo.height), (small.width, small.height));
+        let first = PreviewMetrics::active_for(&device.path).unwrap().snapshot();
+        let mut insights = crate::app::insights::InsightsState::default();
+        insights.refresh_preview(&device.path, Some(&first), Instant::now());
+        assert_eq!(insights.backend_type, "PipeWire (V4L2)");
+        assert_eq!(insights.frame_size_decoded, photo.data.len());
+        assert_eq!(
+            insights.preview_stream.as_ref().unwrap().pixel_format,
+            "RGBA"
+        );
+        assert!(insights.copy_time_us.is_some());
+        assert!(
+            insights
+                .full_pipeline_string
+                .as_ref()
+                .unwrap()
+                .contains("pipewiresrc")
+        );
+        assert!(!insights.has_libcamera_metadata);
+        println!(
+            "Live Insights: backend={}, frame_count={}, source_format={}, bytes={}, copy_us={:?}",
+            insights.backend_type,
+            first.frame_count,
+            insights.format_chain.native_format,
+            insights.frame_size_decoded,
+            insights.copy_time_us
+        );
         let larger = formats
             .iter()
             .find(|f| f.width == 1280 && f.height == 720)
@@ -1077,6 +1209,10 @@ mod tests {
         backend.apply_format(larger).unwrap();
         let photo = backend.capture_photo().unwrap();
         assert_eq!((photo.width, photo.height), (larger.width, larger.height));
+        let second = PreviewMetrics::active_for(&device.path).unwrap().snapshot();
+        assert_ne!(first.generation, second.generation);
+        insights.refresh_preview(&device.path, Some(&second), Instant::now());
+        assert_eq!(insights.frame_size_decoded, photo.data.len());
         backend.switch_camera(device).unwrap();
         assert!(backend.capture_photo().is_ok());
         let stop = Instant::now();
@@ -1084,6 +1220,11 @@ mod tests {
         backend.shutdown().unwrap();
         assert!(stop.elapsed() < Duration::from_secs(2));
         assert!(!backend.is_initialized());
+        assert!(PreviewMetrics::active_for(&device.path).is_none());
+        insights.refresh_preview(&device.path, None, Instant::now());
+        assert!(insights.full_pipeline_string.is_none());
+        assert!(insights.copy_time_us.is_none());
+        assert!(insights.dropped_frames.is_none());
         assert!(backend.current_device().is_none());
         assert!(backend.get_preview_receiver().is_none());
         println!(
@@ -1144,6 +1285,20 @@ mod tests {
             RecordingFrame::Decoded(_)
         ));
         assert!(pipeline.get_preview_frame().is_some());
+        // Watch real delivery backpressure instead of inferring zero losses.
+        let metrics = pipeline.preview_metrics();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while metrics.snapshot().dropped_frames == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "full preview queue must count drops"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        println!(
+            "Live Insights: measured preview drops={}",
+            metrics.snapshot().dropped_frames
+        );
         cancel.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

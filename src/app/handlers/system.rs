@@ -841,254 +841,72 @@ impl AppModel {
     // =========================================================================
 
     pub(crate) fn handle_update_insights_metrics(&mut self) -> Task<cosmic::Action<Message>> {
-        self.update_insights_pipeline();
+        use crate::backends::camera::preview_metrics::PreviewMetrics;
+
+        let path = self
+            .available_cameras
+            .get(self.current_camera_index)
+            .map(|camera| camera.path.as_str())
+            .unwrap_or("");
+        let snapshot = PreviewMetrics::active_for(path)
+            .map(|metrics| metrics.snapshot())
+            .filter(|snapshot| snapshot.frame_count > 0);
+        self.insights
+            .refresh_preview(path, snapshot.as_ref(), std::time::Instant::now());
         self.update_insights_backend();
-        self.update_insights_measured_fps();
-        self.update_insights_format_chain();
         self.update_insights_performance();
         self.update_insights_frame_metadata();
         self.update_insights_recording();
-
         Task::none()
     }
 
-    fn update_insights_pipeline(&mut self) {
-        use crate::app::insights::InsightsState;
-        use crate::backends::camera::libcamera::native::diagnostics as diag;
-
-        let new_pipeline = diag::get_pipeline_string();
-
-        let pixel_format = self.active_format.as_ref().map(|f| f.pixel_format.as_str());
-        if new_pipeline != self.insights.full_pipeline_string {
-            let mjpeg_decoder = diag::get_mjpeg_decoder();
-            if mjpeg_decoder.is_some() {
-                self.insights.decoder_chain = vec![crate::app::insights::types::DecoderStatus {
-                    name: "turbojpeg",
-                    description: "libjpeg-turbo MJPEG decoder",
-                    state: crate::app::insights::types::FallbackState::Selected,
-                }];
-            } else {
-                self.insights.decoder_chain =
-                    InsightsState::build_decoder_chain(pixel_format, new_pipeline.as_deref());
-            }
-            self.insights.full_pipeline_string = new_pipeline;
-        }
-    }
-
     fn update_insights_backend(&mut self) {
-        use crate::app::insights::types::StreamInfo;
-        use crate::backends::camera::libcamera::native::diagnostics as diag;
-
-        self.insights.backend_type = "libcamera";
         if let Some(camera) = self.available_cameras.get(self.current_camera_index) {
-            self.insights.pipeline_handler = camera.pipeline_handler.clone();
-            self.insights.libcamera_version = camera.libcamera_version.clone();
-            self.insights.sensor_model = camera.sensor_model.clone();
-            self.insights.libcamera_multistream_capable = camera.pipeline_handler.is_some();
-
-            // Populate V4L2 format list (refresh when camera changes)
+            if self.insights.backend_type == "libcamera" {
+                self.insights.pipeline_handler = camera.pipeline_handler.clone();
+                self.insights.libcamera_version = camera.libcamera_version.clone();
+                self.insights.sensor_model = camera.sensor_model.clone();
+                self.insights.libcamera_multistream_capable = camera.supports_multistream;
+                self.insights.format_chain.framerate = self
+                    .active_format
+                    .as_ref()
+                    .and_then(|format| format.framerate)
+                    .map(|fps| format!("{fps} fps (configured)"))
+                    .unwrap_or_else(|| "N/A".into());
+            }
             let current_v4l2_path = camera.v4l2_path().unwrap_or("").to_string();
             if self.insights.v4l2_formats_device != current_v4l2_path {
                 self.insights.v4l2_formats_device = current_v4l2_path.clone();
-                self.insights.v4l2_formats = if !current_v4l2_path.is_empty() {
-                    crate::backends::camera::v4l2_utils::enumerate_v4l2_formats(&current_v4l2_path)
-                } else {
+                self.insights.v4l2_formats = if current_v4l2_path.is_empty() {
                     Vec::new()
+                } else {
+                    crate::backends::camera::v4l2_utils::enumerate_v4l2_formats(&current_v4l2_path)
                 };
-                self.insights.libcamera_formats = self.available_formats.clone();
             }
-        }
-
-        self.insights.mjpeg_decoder = diag::get_mjpeg_decoder();
-        self.insights.is_multistream = diag::get_is_multistream();
-
-        if let Some((resolution, pixel_fmt, role, frame_count)) = diag::get_preview_stream_info() {
-            self.insights.preview_stream = Some(StreamInfo {
-                role,
-                resolution,
-                pixel_format: pixel_fmt,
-                frame_count,
-                source: "libcamera (native)".to_string(),
-                ..Default::default()
-            });
-        }
-
-        if let Some((resolution, pixel_fmt, role, frame_count, stride, height)) =
-            diag::get_capture_stream_info()
-        {
-            let frame_size_bytes = stride as usize * height as usize;
-            let gpu_processing = if pixel_fmt.contains("CSI2P") {
-                format!(
-                    "{} \u{2192} unpack (compute) \u{2192} demosaic (compute) \u{2192} RGBA",
-                    pixel_fmt
-                )
-            } else if pixel_fmt.starts_with('S') && pixel_fmt.contains("GG") {
-                // Unpacked Bayer (e.g. SRGGB10)
-                format!("{} \u{2192} demosaic (compute) \u{2192} RGBA", pixel_fmt)
-            } else {
-                String::new()
-            };
-            self.insights.capture_stream = Some(StreamInfo {
-                role,
-                resolution,
-                pixel_format: pixel_fmt,
-                frame_count,
-                source: "libcamera (native)".to_string(),
-                gpu_processing,
-                frame_size_bytes,
-            });
-        } else if !self.insights.is_multistream {
-            self.insights.capture_stream = None;
-        }
-    }
-
-    fn update_insights_measured_fps(&mut self) {
-        let current_count = self
-            .insights
-            .preview_stream
-            .as_ref()
-            .map(|s| s.frame_count)
-            .unwrap_or(0);
-        let now = std::time::Instant::now();
-
-        if let Some(prev_instant) = self.insights.prev_fps_instant {
-            let elapsed = now.duration_since(prev_instant).as_secs_f64();
-            let delta = current_count.saturating_sub(self.insights.prev_frame_count);
-            if elapsed > 0.1 && delta > 0 {
-                let instantaneous = delta as f64 / elapsed;
-                // Exponential moving average for stability (alpha=0.3)
-                self.insights.measured_fps = self.insights.measured_fps * 0.7 + instantaneous * 0.3;
-            }
-        }
-
-        self.insights.prev_frame_count = current_count;
-        self.insights.prev_fps_instant = Some(now);
-    }
-
-    fn update_insights_format_chain(&mut self) {
-        use crate::backends::camera::libcamera::native::diagnostics as diag;
-
-        let Some(format) = &self.active_format else {
-            return;
-        };
-
-        let source = "libcamera (native)".to_string();
-
-        let mjpeg_decoder = self.insights.mjpeg_decoder.as_ref();
-
-        let mjpeg_decoded_fmt = if mjpeg_decoder.is_some() {
-            diag::get_mjpeg_decoded_format()
+            // The same V4L2 node can be routed through different backends or modes.
+            // Do not use the kernel-device cache key for backend capabilities.
+            self.insights.backend_formats = self.available_formats.clone();
         } else {
-            None
-        };
-
-        // Use the actual negotiated format from the preview stream, not the
-        // user-selected format. libcamera may negotiate a different pixel format
-        // than what was selected (e.g., user selects YUYV but libcamera uses MJPEG
-        // or NV12 for the ViewFinder stream).
-        let actual_stream_format = self
-            .insights
-            .preview_stream
-            .as_ref()
-            .map(|s| s.pixel_format.as_str());
-
-        let gpu_input_format = if let Some(ref fmt) = mjpeg_decoded_fmt {
-            fmt.as_str()
-        } else if mjpeg_decoder.is_some() {
-            "I420"
-        } else {
-            actual_stream_format.unwrap_or(&format.pixel_format)
-        };
-
-        let wgpu_processing = match gpu_input_format {
-            "I420" => "I420 (YUV 4:2:0) \u{2192} RGBA (compute shader)".to_string(),
-            "I422" => "I422 (YUV 4:2:2) \u{2192} RGBA (compute shader)".to_string(),
-            "I444" => "I444 (YUV 4:4:4) \u{2192} RGBA (compute shader)".to_string(),
-            "Nv12" | "NV12" => "NV12 \u{2192} RGBA (compute shader)".to_string(),
-            "YUYV" | "YUY2" | "Yuy2" => "YUYV \u{2192} RGBA (compute shader)".to_string(),
-            "Rgba" | "RGBA" => "Passthrough".to_string(),
-            other => format!("{} \u{2192} RGBA (compute shader)", other),
-        };
-
-        self.insights.format_chain.source = source;
-        self.insights.format_chain.resolution = self
-            .insights
-            .preview_stream
-            .as_ref()
-            .map(|s| s.resolution.clone())
-            .unwrap_or_else(|| format!("{}x{}", format.width, format.height));
-        self.insights.format_chain.framerate = format
-            .framerate
-            .map(|fps| format!("{} fps", fps))
-            .unwrap_or_else(|| "N/A".to_string());
-        // Use actual negotiated format from stream, not user-selected format
-        self.insights.format_chain.native_format = actual_stream_format
-            .unwrap_or(&format.pixel_format)
-            .to_string();
-        self.insights.format_chain.wgpu_processing = wgpu_processing;
-
-        if let Some(ref decoded) = mjpeg_decoded_fmt {
-            let yuv_label = match decoded.as_str() {
-                "I420" => "YUV 4:2:0",
-                "I422" => "YUV 4:2:2",
-                "I444" => "YUV 4:4:4",
-                "I440" => "YUV 4:4:0",
-                "Y800" => "Grayscale",
-                other => other,
-            };
-            // Non-baseline entropy coding is the usual explanation for a high
-            // CPU decode time, so name it right next to the decode step.
-            let mjpeg_label = match diag::get_mjpeg_entropy_note() {
-                Some(note) => format!("MJPEG ({note})"),
-                None => "MJPEG".to_string(),
-            };
-            self.insights.cpu_processing = Some(format!(
-                "{} \u{2192} {} (turbojpeg)",
-                mjpeg_label, yuv_label
-            ));
-        } else if mjpeg_decoder.is_some() {
-            self.insights.cpu_processing = Some("MJPEG \u{2192} YUV (turbojpeg)".to_string());
-        } else {
-            self.insights.cpu_processing = None;
+            self.insights.backend_formats.clear();
+            self.insights.v4l2_formats.clear();
+            self.insights.v4l2_formats_device.clear();
         }
     }
 
     fn update_insights_performance(&mut self) {
         use crate::app::video_primitive;
-        use crate::backends::camera::libcamera::native::diagnostics as diag;
-
-        self.insights.cpu_decode_time_us = diag::get_mjpeg_decode_time_us();
-
-        if let Some(stream) = &self.insights.preview_stream
-            && let Some((w, h)) = stream.resolution.split_once('x')
-            && let (Ok(w), Ok(h)) = (w.parse::<usize>(), h.parse::<usize>())
-        {
-            let bpp = if stream.pixel_format.contains("I420")
-                || stream.pixel_format.contains("NV12")
-            {
-                1.5_f64
-            } else if stream.pixel_format.contains("RGBA") || stream.pixel_format.contains("BGRA") {
-                4.0
-            } else if stream.pixel_format.contains("YUYV") {
-                2.0
-            } else if stream.pixel_format.contains("RGB24") {
-                3.0
-            } else {
-                1.5
-            };
-            self.insights.frame_size_decoded = (w as f64 * h as f64 * bpp) as usize;
+        if self.insights.preview_stream.is_none() {
+            return;
         }
-
         self.insights.gpu_conversion_time_us = video_primitive::get_gpu_upload_time_us();
         let gpu_frame_size = video_primitive::get_gpu_frame_size() as usize;
-
-        if gpu_frame_size > 0 && self.insights.gpu_conversion_time_us > 10 {
-            let bytes_per_sec = (gpu_frame_size as f64)
-                / (self.insights.gpu_conversion_time_us as f64 / 1_000_000.0);
-            self.insights.copy_bandwidth_mbps = bytes_per_sec / (1024.0 * 1024.0);
-        } else {
-            self.insights.copy_bandwidth_mbps = 0.0;
-        }
+        self.insights.copy_bandwidth_mbps =
+            if gpu_frame_size > 0 && self.insights.gpu_conversion_time_us > 10 {
+                let seconds = self.insights.gpu_conversion_time_us as f64 / 1_000_000.0;
+                gpu_frame_size as f64 / seconds / 1_000_000.0
+            } else {
+                0.0
+            };
     }
 
     fn update_insights_frame_metadata(&mut self) {
@@ -1098,10 +916,15 @@ impl AppModel {
             .and_then(|levels| levels.lock().ok())
             .map(|l| l.clone());
 
-        if let Some(frame) = &self.current_frame {
+        self.insights.clear_frame_metadata();
+        if let Some(frame) = &self.current_frame
+            && !self.insights.backend_type.is_empty()
+        {
             self.insights.frame_latency_us = frame.captured_at.elapsed().as_micros() as u64;
 
-            if let Some(meta) = &frame.libcamera_metadata {
+            if self.insights.backend_type == "libcamera"
+                && let Some(meta) = &frame.libcamera_metadata
+            {
                 self.insights.has_libcamera_metadata = true;
                 self.insights.meta_exposure_us = meta.exposure_time;
                 self.insights.meta_analogue_gain = meta.analogue_gain;
