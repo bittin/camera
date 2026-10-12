@@ -360,9 +360,9 @@ impl std::fmt::Display for SensorRotation {
 #[derive(Debug, Clone, Default)]
 pub struct CameraDevice {
     pub name: String,
-    pub path: String,                       // libcamera camera ID
+    pub path: String, // libcamera camera ID or pipewire:<object.serial>
     pub device_info: Option<DeviceInfo>, // V4L2 device information (card, driver, path, real_path)
-    pub rotation: SensorRotation,        // Sensor rotation from libcamera/device tree
+    pub rotation: SensorRotation, // Sensor rotation from libcamera/device tree
     pub pipeline_handler: Option<String>, // libcamera pipeline handler (e.g., "simple", "vc4", "ipu3")
     pub supports_multistream: bool, // True if camera supports simultaneous preview + raw capture
     pub sensor_model: Option<String>, // Sensor model from device tree compatible (e.g., "sony,imx371")
@@ -933,7 +933,9 @@ pub struct CameraFrame {
     pub yuv_planes: Option<YuvPlanes>,
     /// Timestamp when frame was captured (for latency diagnostics)
     pub captured_at: Instant,
-    /// Kernel/sensor timestamp in nanoseconds (CLOCK_BOOTTIME).
+    /// Capture timestamp in nanoseconds (CLOCK_BOOTTIME): native sensor time,
+    /// or translated PipeWire presentation time. The latter is not hardware
+    /// sensor metadata.
     /// Used for video recording PTS to maintain A/V sync.
     pub sensor_timestamp_ns: Option<u64>,
     /// libcamera metadata (actual exposure, gain, focus state, etc.)

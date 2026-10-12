@@ -384,6 +384,47 @@ mod tests {
     }
 
     #[test]
+    fn pipewire_node_recreation_preserves_selected_physical_camera() {
+        use crate::backends::camera::types::{CameraDevice, DeviceInfo};
+        let native = CameraDevice {
+            name: "Other native camera".into(),
+            path: "native-camera".into(),
+            ..Default::default()
+        };
+        let fallback = CameraDevice {
+            name: "Webcam".into(),
+            path: "pipewire:101".into(),
+            device_info: Some(DeviceInfo {
+                path: "/dev/../dev/null".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut m = AppModel {
+            available_cameras: vec![native.clone(), fallback.clone()],
+            current_camera_index: 1,
+            ..Default::default()
+        };
+        let recreated = CameraDevice {
+            path: "pipewire:202".into(),
+            device_info: Some(DeviceInfo {
+                path: "/dev/null".into(),
+                ..Default::default()
+            }),
+            ..fallback
+        };
+        let _ = m.handle_camera_list_changed(vec![native, recreated]);
+        assert_eq!(
+            m.current_camera_index, 1,
+            "a PipeWire serial change must not switch to an unrelated camera"
+        );
+        assert_eq!(
+            m.available_cameras[m.current_camera_index].path,
+            "pipewire:202"
+        );
+    }
+
+    #[test]
     fn preview_adjusted_rotation_keeps_derived_previews_upright() {
         let m = AppModel {
             display_orientation: DisplayOrientation::Rotate270,

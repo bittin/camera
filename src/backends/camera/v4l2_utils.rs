@@ -128,12 +128,52 @@ pub fn discover_lens_actuators() -> Vec<(String, String)> {
     actuators
 }
 
-/// Find the V4L2 video capture device path for a libcamera camera ID.
-///
-/// libcamera camera IDs for UVC cameras contain the USB VID:PID as the last
-/// segment (e.g., `\_SB_.PCI0.GP17.XHC1.RHUB.PRT4-2.3:1.0-3564:fef8`).
-/// This function extracts the VID:PID, then scans `/sys/class/video4linux/`
-/// to find a matching `/dev/videoX` device.
+/// Match libcamera's complete UVC ID: firmware controller, USB ports/config/
+/// interface, and VID:PID. Never associate same-model cameras by VID:PID alone.
+fn uvc_identity_matches(
+    camera_id: &str,
+    controller: Option<&str>,
+    interface: &str,
+    vendor: &str,
+    product: &str,
+) -> bool {
+    let Some(controller) = controller.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(usb_id) = std::path::Path::new(interface)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(|s| s.split_once('-'))
+        .map(|(_, id)| id)
+    else {
+        return false;
+    };
+    camera_id == format!("{controller}-{usb_id}-{vendor}:{product}")
+}
+
+fn uvc_firmware_controller(interface: &str) -> Option<String> {
+    // Mirror libcamera 0.7's firmwareNodePath/generateId: start at the USB
+    // interface's parent and walk to the first firmware-described device.
+    for parent in std::path::Path::new(interface).ancestors().skip(1) {
+        if let Ok(node) = std::fs::canonicalize(parent.join("of_node")) {
+            let path = node.to_string_lossy();
+            return Some(
+                path.strip_prefix("/sys/firmware/devicetree")
+                    .unwrap_or(&path)
+                    .to_owned(),
+            );
+        }
+        if let Ok(path) = std::fs::read_to_string(parent.join("firmware_node/path"))
+            && let Some(path) = path.lines().next().filter(|s| !s.is_empty())
+        {
+            return Some(path.to_owned());
+        }
+    }
+    None
+}
+
+/// Find a UVC capture node matching the complete native physical camera ID.
+/// Missing firmware identity is not replaced with a VID:PID/model-only match.
 pub fn find_v4l2_device_for_libcamera(camera_id: &str) -> Option<String> {
     // Extract VID:PID from camera ID.
     // UVC IDs end with "-VVVV:PPPP" (4-hex-digit vendor : 4-hex-digit product).
@@ -184,7 +224,14 @@ pub fn find_v4l2_device_for_libcamera(camera_id: &str) -> Option<String> {
                     .unwrap_or_default()
                     .trim()
                     .to_string();
-                if vendor == vid_str && product == pid_str {
+                let controller = uvc_firmware_controller(&resolved);
+                if uvc_identity_matches(
+                    camera_id,
+                    controller.as_deref(),
+                    &resolved,
+                    &vendor,
+                    &product,
+                ) {
                     matched = true;
                 }
                 break;
@@ -511,4 +558,71 @@ pub fn enumerate_v4l2_formats(device_path: &str) -> Vec<V4l2FormatInfo> {
     }
 
     formats
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn uvc_firmware_identity_walks_ancestors_and_preserves_the_literal_path() {
+        let root = std::env::temp_dir().join(format!(
+            "camera-uvc-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let device = root.join("usb2/2-2.3");
+        let interface = device.join("2-2.3:1.0");
+        std::fs::create_dir_all(&interface).unwrap();
+        assert_eq!(uvc_firmware_controller(interface.to_str().unwrap()), None);
+        std::fs::create_dir(device.join("firmware_node")).unwrap();
+        std::fs::write(device.join("firmware_node/path"), "\\_SB_.PCI0.XHC1.RHUB\n").unwrap();
+        assert_eq!(
+            uvc_firmware_controller(interface.to_str().unwrap()),
+            Some("\\_SB_.PCI0.XHC1.RHUB".into())
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn identical_model_uvc_cameras_require_exact_controller_and_usb_interface() {
+        let controller = "\\_SB_.PCI0.XHC1.RHUB";
+        let id = "\\_SB_.PCI0.XHC1.RHUB-2.3:1.0-3564:fef8";
+        assert!(
+            !uvc_identity_matches(
+                id,
+                Some(controller),
+                "/sys/devices/usb2/2-4/2-4:1.0",
+                "3564",
+                "fef8"
+            ),
+            "VID:PID alone must not associate a different same-model webcam with a native camera"
+        );
+        assert!(uvc_identity_matches(
+            id,
+            Some(controller),
+            "/sys/devices/usb2/2-2.3/2-2.3:1.0",
+            "3564",
+            "fef8"
+        ));
+        assert!(!uvc_identity_matches(
+            id,
+            Some("\\_SB_.PCI0.XHC2.RHUB"),
+            "/sys/devices/usb2/2-2.3/2-2.3:1.0",
+            "3564",
+            "fef8"
+        ));
+        assert!(
+            !uvc_identity_matches(
+                id,
+                None,
+                "/sys/devices/usb2/2-2.3/2-2.3:1.0",
+                "3564",
+                "fef8"
+            ),
+            "absent firmware identity cannot be repaired by guessing the model"
+        );
+    }
 }
