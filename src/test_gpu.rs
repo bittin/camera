@@ -28,6 +28,11 @@ static HEADLESS_DEVICE: LazyLock<Option<(wgpu::Device, wgpu::Queue)>> = LazyLock
         force_fallback_adapter: false,
     }))
     .ok()?;
+    eprintln!(
+        "Headless fixture adapter: {:?}; limits: {:?}",
+        adapter.get_info(),
+        adapter.limits()
+    );
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("frosted corner test device"),
         required_features: wgpu::Features::empty(),

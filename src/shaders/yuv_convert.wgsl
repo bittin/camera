@@ -65,6 +65,17 @@ fn yuv_to_rgb_bt601(y: f32, u: f32, v: f32) -> vec3<f32> {
 //     return clamp(vec3(r, g, b), vec3(0.0), vec3(1.0));
 // }
 
+// Conventional discrete chroma groups, not proportional resampling. For odd
+// active dimensions, ceil(9/4)=3 chroma samples still cover FOUR luma pixels.
+fn chroma_step(luma:u32,chroma:u32)->u32 {
+    if luma == chroma {return 1u;}
+    if (luma+1u)/2u == chroma {return 2u;}
+    return 4u;
+}
+fn chroma_position(pos:vec2<u32>,yd:vec2<u32>,uvd:vec2<u32>)->vec2<u32> {
+    return pos/vec2(chroma_step(yd.x,uvd.x),chroma_step(yd.y,uvd.y));
+}
+
 // Convert NV12 pixel at given position
 // NV12: Y plane (full res) + UV plane (half res, interleaved U0V0 U1V1...)
 fn convert_nv12(pos: vec2<u32>) -> vec3<f32> {
@@ -74,7 +85,7 @@ fn convert_nv12(pos: vec2<u32>) -> vec3<f32> {
     // Scale UV coordinates based on actual texture dimensions
     let y_dim = textureDimensions(tex_y);
     let uv_dim = textureDimensions(tex_uv);
-    let uv_pos = vec2(pos.x * uv_dim.x / y_dim.x, pos.y * uv_dim.y / y_dim.y);
+    let uv_pos = chroma_position(pos,y_dim,uv_dim);
     let uv = textureLoad(tex_uv, uv_pos, 0);
 
     return yuv_to_rgb_bt601(y, uv.r, uv.g);
@@ -94,7 +105,7 @@ fn convert_i420(pos: vec2<u32>) -> vec3<f32> {
     //   4:4:4 (I444): UV is full-width, full-height → no scaling
     let y_dim = textureDimensions(tex_y);
     let uv_dim = textureDimensions(tex_uv);
-    let uv_pos = vec2(pos.x * uv_dim.x / y_dim.x, pos.y * uv_dim.y / y_dim.y);
+    let uv_pos = chroma_position(pos,y_dim,uv_dim);
     let u = textureLoad(tex_uv, uv_pos, 0).r;
     let v = textureLoad(tex_v, uv_pos, 0).r;
 
@@ -188,7 +199,7 @@ fn convert_nv21(pos: vec2<u32>) -> vec3<f32> {
     // Scale VU coordinates based on actual texture dimensions
     let y_dim = textureDimensions(tex_y);
     let uv_dim = textureDimensions(tex_uv);
-    let uv_pos = vec2(pos.x * uv_dim.x / y_dim.x, pos.y * uv_dim.y / y_dim.y);
+    let uv_pos = chroma_position(pos,y_dim,uv_dim);
     let vu = textureLoad(tex_uv, uv_pos, 0);
 
     // VU layout: R=V, G=U (swapped from NV12's UV)
