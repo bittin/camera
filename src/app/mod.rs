@@ -537,6 +537,7 @@ impl cosmic::Application for AppModel {
             still_frame_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             current_frame: None,
             available_cameras,
+            camera_discovery_complete: false,
             current_camera_index,
             pending_persist_camera: None,
             available_formats: available_formats.clone(),
