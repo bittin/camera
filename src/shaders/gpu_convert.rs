@@ -973,9 +973,10 @@ impl GpuConvertPipeline {
             PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
                 (wgpu::TextureFormat::Rgba8Unorm, width.div_ceil(2))
             }
-            PixelFormat::RGBA | PixelFormat::RGB24 | PixelFormat::ABGR | PixelFormat::BGRA => {
+            PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA => {
                 (wgpu::TextureFormat::Rgba8Unorm, width)
             }
+            PixelFormat::RGB24 => (wgpu::TextureFormat::R8Unorm, width * 3),
             PixelFormat::BayerRGGB
             | PixelFormat::BayerBGGR
             | PixelFormat::BayerGRBG
@@ -1573,7 +1574,14 @@ impl GpuConvertPipeline {
             }
 
             // RGBA-family: 4 bytes per pixel, uploaded as Rgba8Unorm
-            PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA | PixelFormat::RGB24 => {
+            PixelFormat::RGB24 => self.write_plane(
+                tex_y,
+                input.y_data,
+                input.y_stride,
+                input.width * 3,
+                input.height,
+            ),
+            PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA => {
                 self.write_plane(
                     tex_y,
                     input.y_data,

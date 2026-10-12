@@ -2882,8 +2882,15 @@ impl VideoPipeline {
                 rows: frame.height as usize,
                 extent: extent(frame.width, frame.height),
             }],
-            PixelFormat::RGB24
-            | PixelFormat::RGBA
+            PixelFormat::RGB24 => vec![UploadPlane {
+                texture: yuv.tex_y.clone(),
+                source_offset: 0,
+                source_stride: frame.stride as usize,
+                row_bytes: frame.width as usize * 3,
+                rows: frame.height as usize,
+                extent: extent(frame.width * 3, frame.height),
+            }],
+            PixelFormat::RGBA
             | PixelFormat::BayerRGGB
             | PixelFormat::BayerBGGR
             | PixelFormat::BayerGRBG
@@ -3011,7 +3018,7 @@ impl VideoPipeline {
                 wgpu::TextureFormat::Rgba8Unorm
             }
             // RGBA, RGB24, ABGR, BGRA: full RGBA texture
-            PixelFormat::RGBA | PixelFormat::RGB24 | PixelFormat::ABGR | PixelFormat::BGRA => {
+            PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA => {
                 wgpu::TextureFormat::Rgba8Unorm
             }
             // Y plane or grayscale: single channel
@@ -3031,6 +3038,7 @@ impl VideoPipeline {
             PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
                 y_width.div_ceil(2)
             }
+            PixelFormat::RGB24 => y_width * 3,
             _ => y_width,
         };
 
@@ -4424,6 +4432,41 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn normal_preview_uploads_padded_rgb24_without_cpu_expansion() {
+        let Some((_guard, device, queue)) = headless_device() else {
+            skip_no_gpu("normal_preview_uploads_padded_rgb24_without_cpu_expansion");
+            return;
+        };
+        let mut pipeline = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        pipeline.upload(
+            &device,
+            &queue,
+            VideoFrame {
+                id: VIDEO_ID_NORMAL,
+                width: 2,
+                height: 2,
+                data: FrameData::from_owned_vec(vec![
+                    10, 20, 30, 40, 50, 60, 99, 99, 70, 80, 90, 100, 110, 120,
+                ]),
+                format: PixelFormat::RGB24,
+                stride: 8,
+                yuv_planes: None,
+            },
+        );
+        let output = read_normal_source(
+            &device,
+            &queue,
+            &pipeline.textures[&VIDEO_ID_NORMAL].texture,
+        );
+        assert_eq!(
+            output,
+            vec![
+                10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255
+            ]
+        );
     }
 
     #[test]
