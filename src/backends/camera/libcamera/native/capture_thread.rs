@@ -1451,6 +1451,9 @@ fn extract_metadata(req: &libcamera::request::Request) -> FrameMetadata {
             .ok()
             .map(|v| v.0),
         raw_layout: None,
+        // The standard libcamera 0.7 API provides no documented WhiteLevel
+        // control. Do not guess vendor IDs or substitute a calibration value.
+        sensor_white_levels: None,
         sensor_black_levels: meta
             .get::<controls::SensorBlackLevels>()
             .ok()

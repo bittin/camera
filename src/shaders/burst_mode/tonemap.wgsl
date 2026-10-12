@@ -161,7 +161,8 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 
 // Shadow boost curve
 // Based on HDR+ paper's approach: lift shadows while preserving midtones
-fn shadow_curve(lum: f32, strength: f32) -> f32 {
+fn shadow_curve(input_lum: f32, strength: f32) -> f32 {
+    let lum = clamp(input_lum, 0.0, 1.0);
     // Two-part curve:
     // 1. Aggressive lift for very dark areas (< 0.1)
     // 2. Gentle lift for shadows (0.1 - 0.3)
@@ -185,7 +186,7 @@ fn shadow_curve(lum: f32, strength: f32) -> f32 {
 // Highlight compression curve
 fn highlight_curve(lum: f32, strength: f32) -> f32 {
     // Inverse power curve that compresses highlights
-    return 1.0 - pow(1.0 - lum, 1.0 + strength);
+    return 1.0 - pow(1.0 - clamp(lum, 0.0, 1.0), 1.0 + strength);
 }
 
 // Combined tone curve
@@ -319,7 +320,7 @@ fn tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
         final_b = clamp(final_b + dither_b, 0.0, 1.0);
     }
 
-    store_pixel(x, y, vec4<f32>(final_r, final_g, final_b, pixel.w));
+    store_pixel(x, y, vec4<f32>(clamp(vec3(final_r, final_g, final_b), vec3(0.0), vec3(1.0)), pixel.w));
 }
 
 //=============================================================================
@@ -383,7 +384,8 @@ fn compute_local_luminance(@builtin(global_invocation_id) gid: vec3<u32>) {
 
                 // BT.601 luminance
                 let lum = 0.299 * r + 0.587 * g + 0.114 * b;
-                sum += lum;
+                // Bound only the metering scalar, not the scene-linear RGB.
+                sum += clamp(lum, 0.0, 1.0);
                 count += 1.0;
             }
         }

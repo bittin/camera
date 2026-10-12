@@ -718,9 +718,16 @@ pub(crate) async fn convert_frame_to_rgba(frame: &CameraFrame) -> Result<Vec<u8>
         .as_mut()
         .ok_or("GPU convert pipeline not initialized")?;
 
-    pipeline
-        .convert(&input)
-        .map_err(|e| format!("GPU conversion failed: {}", e))?;
+    // Photo quality selection must not move realtime Bayer recording onto
+    // CPU demosaic. Retain the shared float core's GPU bilinear route.
+    let result = if frame.format.is_bayer() {
+        pipeline
+            .convert_bayer_with_method(&input, crate::shaders::DemosaicMethod::Bilinear)
+            .map_err(|e| e.to_string())
+    } else {
+        pipeline.convert(&input)
+    };
+    result.map_err(|e| format!("GPU conversion failed: {}", e))?;
 
     pipeline
         .read_rgba_to_cpu(frame.width, frame.height)
@@ -1710,6 +1717,106 @@ pub fn check_available_encoders() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bayer_recording_retains_gpu_bilinear_reconstruction() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("bayer_recording_retains_gpu_bilinear_reconstruction");
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata};
+            use crate::shaders::{DemosaicMethod, GpuConvertPipeline, GpuFrameInput};
+            let frame = CameraFrame {
+                width: 16,
+                height: 16,
+                stride: 16,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(
+                    (0..256)
+                        .map(|i| (32 + (i * 37 + i / 16 * 53) % 160) as u8)
+                        .collect(),
+                ),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: Some(FrameMetadata {
+                    colour_gains: Some([1.0, 1.0]),
+                    ..Default::default()
+                }),
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let mut pipeline = GpuConvertPipeline::new().await.unwrap();
+            pipeline
+                .convert_bayer_with_method(&input, DemosaicMethod::Bilinear)
+                .unwrap();
+            let expected = pipeline.read_rgba_to_cpu(16, 16).await.unwrap();
+            pipeline
+                .convert_bayer_with_method(&input, DemosaicMethod::Rcd)
+                .unwrap();
+            let rcd = pipeline.read_rgba_to_cpu(16, 16).await.unwrap();
+            assert_ne!(rcd, expected, "fixture must distinguish RCD from Bilinear");
+            let actual = convert_frame_to_rgba(&frame).await.unwrap();
+            assert_eq!(
+                actual, expected,
+                "photo default must not change realtime recording reconstruction"
+            );
+        });
+    }
+
+    #[test]
+    fn bayer_recording_preserves_signed_headroom_through_ccm() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu("bayer_recording_preserves_signed_headroom_through_ccm");
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            for (format, sites) in [
+                (PixelFormat::BayerRGGB, [0, 1, 2, 3]),
+                (PixelFormat::BayerBGGR, [3, 2, 1, 0]),
+                (PixelFormat::BayerGRBG, [1, 0, 3, 2]),
+                (PixelFormat::BayerGBRG, [2, 3, 0, 1]),
+            ] {
+                let mut data = vec![0xa5; 24];
+                for y in 0..4 {
+                    for x in 0..4 {
+                        data[y * 6 + x] = [16, 64, 64, 96][sites[(y % 2) * 2 + x % 2]];
+                    }
+                }
+                let frame = CameraFrame {
+                    width: 4,
+                    height: 4,
+                    stride: 6,
+                    format,
+                    data: FrameData::from_owned_vec(data),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        raw_layout: Some(RawLayout::U8),
+                        colour_gains: Some([1.0, 1.0]),
+                        black_level: Some(32.0 / 255.0),
+                        colour_correction_matrix: Some([
+                            [1.0, 1.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ]),
+                        ..Default::default()
+                    }),
+                };
+                let rgba = convert_frame_to_rgba(&frame).await.unwrap();
+                assert_eq!(rgba.len(), 4 * 4 * 4);
+                for pixel in rgba.as_chunks::<4>().0 {
+                    for (actual, expected) in pixel[..3].iter().zip([76, 106, 146]) {
+                        assert!(actual.abs_diff(expected) <= 1, "{format:?}: {pixel:?}");
+                    }
+                    assert_eq!(pixel[3], 255);
+                }
+            }
+        });
+    }
 
     fn test_rgba_frame(width: u32, height: u32, stride: u32) -> CameraFrame {
         let len = stride as usize * height as usize;

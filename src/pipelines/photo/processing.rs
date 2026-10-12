@@ -21,6 +21,8 @@ use tracing::{debug, info, warn};
 /// Post-processing configuration
 #[derive(Debug, Clone)]
 pub struct PostProcessingConfig {
+    /// Photo-only demosaic selection, independent of video.
+    pub demosaic_method: crate::shaders::DemosaicMethod,
     /// Enable color correction
     pub color_correction: bool,
     /// Enable sharpening
@@ -42,6 +44,7 @@ pub struct PostProcessingConfig {
 impl Default for PostProcessingConfig {
     fn default() -> Self {
         Self {
+            demosaic_method: crate::shaders::DemosaicMethod::Rcd,
             color_correction: true,
             sharpening: false,
             brightness: 0.0,
@@ -78,7 +81,7 @@ impl PostProcessor {
     /// with software rendering fallback for systems without GPU support.
     ///
     /// # Arguments
-    /// * `frame` - Raw camera frame (RGBA format)
+    /// * `frame` - Camera frame with its negotiated pixel layout and metadata
     ///
     /// # Returns
     /// * `Ok(ProcessedImage)` - Processed RGB image
@@ -157,30 +160,17 @@ impl PostProcessor {
             _ => None,
         };
 
-        // Step 0: Convert to RGBA (with optional integrated filter for Bayer)
-        let filtered_rgba: Vec<u8> = if frame.format.is_bayer()
-            && config.filter_type != FilterType::Standard
-        {
-            // Bayer + filter: use integrated debayer+filter pipeline (no GPU round trip)
-            debug!(
-                format = ?frame.format,
-                filter = ?config.filter_type,
-                "Converting Bayer + filter in single GPU submission"
-            );
-            match Self::convert_bayer_and_filter(&frame, config.filter_type).await {
-                Ok(rgba) => rgba,
-                Err(e) => {
-                    warn!(error = %e, "Integrated debayer+filter failed, falling back");
-                    // Fallback: decode Bayer first, then apply the optional filter.
-                    // Decode is mandatory; only the optional filter may fall
-                    // back. Undecoded Bayer bytes must not be passed downstream as RGBA.
-                    let rgba = Self::convert_yuv_to_rgba(&frame).await?;
-                    apply_filter_gpu_rgba(&rgba, frame_width, frame_height, config.filter_type)
-                        .await
-                        .unwrap_or(rgba)
-                }
+        // Bayer decoding is mandatory; only an optional filter may fall back.
+        let filtered_rgba: Vec<u8> = if frame.format.is_bayer() {
+            let rgba = Self::convert_bayer_to_rgba(&frame, self.config.demosaic_method).await?;
+            if config.filter_type != FilterType::Standard {
+                apply_filter_gpu_rgba(&rgba, frame_width, frame_height, config.filter_type)
+                    .await
+                    .unwrap_or(rgba)
+            } else {
+                rgba
             }
-        } else if frame.format.is_yuv() || frame.format.is_bayer() {
+        } else if frame.format.is_yuv() {
             debug!(format = ?frame.format, "Converting frame to RGBA for photo processing");
             let rgba = Self::convert_yuv_to_rgba(&frame)
                 .await
@@ -279,55 +269,17 @@ impl PostProcessor {
         })
     }
 
-    /// Convert Bayer frame to RGBA with integrated filter in a single GPU submission.
-    ///
-    /// This avoids the GPU→CPU→GPU round trip that would occur with separate
-    /// debayer and filter pipelines. Pre-computes AWB when ISP gains are absent.
-    async fn convert_bayer_and_filter(
+    async fn convert_bayer_to_rgba(
         frame: &CameraFrame,
-        filter: FilterType,
+        method: crate::shaders::DemosaicMethod,
     ) -> Result<Vec<u8>, String> {
-        let buffer_data = frame.data.as_ref();
-
-        // Extract ISP metadata if available; GPU AWB handles the no-gains case
-        let (colour_gains, ccm, black_level) = frame
-            .libcamera_metadata
-            .as_ref()
-            .map(|m| (m.colour_gains, m.colour_correction_matrix, m.black_level))
-            .unwrap_or((None, None, None));
-
-        let input = GpuFrameInput {
-            format: frame.format,
-            width: frame.width,
-            height: frame.height,
-            y_data: buffer_data,
-            y_stride: frame.stride,
-            uv_data: None,
-            uv_stride: 0,
-            uv_dimensions: None,
-            yuv_color: Default::default(),
-            v_data: None,
-            v_stride: 0,
-            colour_gains,
-            colour_correction_matrix: ccm,
-            black_level,
-        };
-
-        let mut pipeline_guard = get_gpu_convert_pipeline()
-            .await
-            .map_err(|e| format!("Failed to get convert pipeline: {}", e))?;
-        let pipeline = pipeline_guard
-            .as_mut()
-            .ok_or("Convert pipeline not initialized")?;
-
+        let input = GpuFrameInput::from_camera_frame(frame).map_err(|e| e.to_string())?;
+        let mut guard = get_gpu_convert_pipeline().await?;
+        let pipeline = guard.as_mut().ok_or("Convert pipeline not initialized")?;
         pipeline
-            .convert_and_filter(&input, filter)
-            .map_err(|e| format!("Debayer+filter failed: {}", e))?;
-
-        pipeline
-            .read_filtered_to_cpu(frame.width, frame.height)
-            .await
-            .map_err(|e| format!("Failed to read filtered data from GPU: {}", e))
+            .convert_bayer_with_method(&input, method)
+            .map_err(|e| e.to_string())?;
+        pipeline.read_rgba_to_cpu(frame.width, frame.height).await
     }
 
     /// Convert YUV frame to RGBA using GPU compute shader
@@ -691,14 +643,721 @@ mod tests {
                 sensor_timestamp_ns: None,
                 libcamera_metadata: None,
             };
-            let processor = PostProcessor::new(PostProcessingConfig {
-                filter_type: FilterType::Sepia,
-                ..Default::default()
-            });
-            assert!(
-                processor.process(Arc::new(frame)).await.is_err(),
-                "Decode is required even when a filter is optional"
+            for filter_type in [FilterType::Standard, FilterType::Sepia] {
+                let processor = PostProcessor::new(PostProcessingConfig {
+                    filter_type,
+                    ..Default::default()
+                });
+                assert!(
+                    processor.process(Arc::new(frame.clone())).await.is_err(),
+                    "Decode is required even when a filter is optional"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn normal_photo_float_raw_preserves_negative_headroom_through_ccm() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu(
+                "normal_photo_float_raw_preserves_negative_headroom_through_ccm",
             );
+            return;
+        };
+        pollster::block_on(async {
+            let data = (0..16)
+                .map(|i| match (i % 4 % 2, i / 4 % 2) {
+                    (0, 0) => 16,
+                    (1, 1) => 96,
+                    _ => 64,
+                })
+                .collect();
+            let frame = CameraFrame {
+                width: 4,
+                height: 4,
+                stride: 4,
+                format: PixelFormat::BayerRGGB,
+                data: crate::backends::camera::types::FrameData::from_owned_vec(data),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: Some(crate::backends::camera::types::FrameMetadata {
+                    colour_gains: Some([1.0, 1.0]),
+                    black_level: Some(32.0 / 255.0),
+                    colour_correction_matrix: Some([
+                        [1.0, 1.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ]),
+                    ..Default::default()
+                }),
+            };
+            let processor = PostProcessor::new(PostProcessingConfig::default());
+            let out = processor.process(Arc::new(frame.clone())).await.unwrap();
+            let encode = |v: f32| {
+                let v = if v <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    1.055 * v.powf(1.0 / 2.4) - 0.055
+                };
+                (v * 255.0).round() as u8
+            };
+            let expected = [
+                encode(16.0 / 223.0),
+                encode(32.0 / 223.0),
+                encode(64.0 / 223.0),
+            ];
+            let actual = out.image.get_pixel(1, 1).0;
+            for c in 0..3 {
+                assert!(
+                    actual[c].abs_diff(expected[c]) <= 1,
+                    "{actual:?} != {expected:?}"
+                );
+            }
+            // Filtering and geometry must consume the canonical float result,
+            // not silently take the retired legacy Bayer conversion route.
+            let config = PostProcessingConfig {
+                filter_type: FilterType::Sepia,
+                crop_rect: Some((1, 1, 2, 2)),
+                zoom_level: 2.0,
+                ..Default::default()
+            };
+            let processor = PostProcessor::new(config);
+            let filtered = processor.process(Arc::new(frame.clone())).await.unwrap();
+            let rgba = out
+                .image
+                .pixels()
+                .flat_map(|p| [p[0], p[1], p[2], 255])
+                .collect();
+            let reference = processor
+                .process(Arc::new(CameraFrame {
+                    stride: 16,
+                    format: PixelFormat::RGBA,
+                    data: crate::backends::camera::types::FrameData::from_owned_vec(rgba),
+                    libcamera_metadata: None,
+                    ..frame
+                }))
+                .await
+                .unwrap();
+            assert_eq!((filtered.width, filtered.height), (1, 1));
+            assert_eq!(filtered.image, reference.image);
+        });
+    }
+
+    #[test]
+    fn explicit_white_levels_normalize_single_gpu() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu("explicit_white_levels_normalize_single_gpu");
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata};
+            let patterns = [
+                (PixelFormat::BayerRGGB, [0, 1, 2, 3]),
+                (PixelFormat::BayerBGGR, [3, 2, 1, 0]),
+                (PixelFormat::BayerGRBG, [1, 0, 3, 2]),
+                (PixelFormat::BayerGBRG, [2, 3, 0, 1]),
+            ];
+            // All channels normalize to 0.5, but each CFA site has a different pedestal.
+            let levels = [20.0, 30.0, 40.0, 50.0].map(|v| v / 255.0);
+            let codes = [80, 100, 120, 140];
+            for (format, sites) in patterns {
+                let pixels = (0..25)
+                    .map(|i| codes[sites[(i / 5 % 2) * 2 + i % 5 % 2]])
+                    .collect();
+                let frame = CameraFrame {
+                    width: 5,
+                    height: 5,
+                    stride: 5,
+                    format,
+                    data: FrameData::from_owned_vec(pixels),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        colour_gains: Some([1.0, 1.0]),
+                        sensor_black_levels: Some(levels),
+                        sensor_white_levels: Some([140.0, 170.0, 200.0, 230.0].map(|v| v / 255.0)),
+                        ..Default::default()
+                    }),
+                };
+                let out = PostProcessor::new(PostProcessingConfig::default())
+                    .process(Arc::new(frame))
+                    .await
+                    .unwrap();
+                for pixel in out.image.pixels() {
+                    for c in pixel.0 {
+                        assert!(c.abs_diff(188) <= 1, "{format:?} -> {pixel:?}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn normal_photo_float_raw_four_cfas_per_site_black() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu("normal_photo_float_raw_four_cfas_per_site_black");
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata};
+            let patterns = [
+                (PixelFormat::BayerRGGB, [0, 1, 2, 3]),
+                (PixelFormat::BayerBGGR, [3, 2, 1, 0]),
+                (PixelFormat::BayerGRBG, [1, 0, 3, 2]),
+                (PixelFormat::BayerGBRG, [2, 3, 0, 1]),
+            ];
+            // All channels normalize to 0.25, but each CFA site has a different pedestal.
+            let levels = [15.0 / 255.0, 35.0 / 255.0, 55.0 / 255.0, 75.0 / 255.0];
+            let codes = [75, 90, 105, 120];
+            for (format, sites) in patterns {
+                let pixels = (0..25)
+                    .map(|i| codes[sites[(i / 5 % 2) * 2 + i % 5 % 2]])
+                    .collect();
+                let frame = CameraFrame {
+                    width: 5,
+                    height: 5,
+                    stride: 5,
+                    format,
+                    data: FrameData::from_owned_vec(pixels),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        colour_gains: Some([1.0, 1.0]),
+                        sensor_black_levels: Some(levels),
+                        ..Default::default()
+                    }),
+                };
+                let out = PostProcessor::new(PostProcessingConfig::default())
+                    .process(Arc::new(frame))
+                    .await
+                    .unwrap();
+                for pixel in out.image.pixels() {
+                    for c in pixel.0 {
+                        assert!(c.abs_diff(137) <= 1, "{format:?} -> {pixel:?}");
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn normal_photo_float_raw_clipped_highlights_do_not_turn_magenta() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu(
+                "normal_photo_float_raw_clipped_highlights_do_not_turn_magenta",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            let patterns = [
+                (PixelFormat::BayerRGGB, [0, 1, 2, 3]),
+                (PixelFormat::BayerBGGR, [3, 2, 1, 0]),
+                (PixelFormat::BayerGRBG, [1, 0, 3, 2]),
+                (PixelFormat::BayerGBRG, [2, 3, 0, 1]),
+            ];
+            for codes in [[0.7296_f32, 0.9954, 0.9954, 0.9771], [1.0; 4]] {
+                for (format, sites) in patterns {
+                    let mut data = vec![0xa5; 60];
+                    for y in 0..5 {
+                        for x in 0..5 {
+                            let code = (codes[sites[(y % 2) * 2 + x % 2]] * 65535.0).round() as u16;
+                            data[y * 12 + x * 2..y * 12 + x * 2 + 2]
+                                .copy_from_slice(&code.to_le_bytes());
+                        }
+                    }
+                    let frame = CameraFrame {
+                        width: 5,
+                        height: 5,
+                        stride: 12,
+                        format,
+                        data: FrameData::from_owned_vec(data),
+                        yuv_planes: None,
+                        captured_at: std::time::Instant::now(),
+                        sensor_timestamp_ns: None,
+                        libcamera_metadata: Some(FrameMetadata {
+                            raw_layout: Some(RawLayout::Unpacked16 { bits: 16 }),
+                            colour_gains: Some([2.1832347, 1.6135153]),
+                            colour_correction_matrix: Some([
+                                [2.100_02, -0.7964949, -0.30352515],
+                                [-0.469_05, 1.9604946, -0.49144363],
+                                [-0.1991288, -0.585788, 1.7849169],
+                            ]),
+                            ..Default::default()
+                        }),
+                    };
+                    let out = PostProcessor::new(PostProcessingConfig::default())
+                        .process(Arc::new(frame))
+                        .await
+                        .unwrap();
+                    for pixel in out.image.pixels() {
+                        let low = *pixel.0.iter().min().unwrap();
+                        let high = *pixel.0.iter().max().unwrap();
+                        assert!(
+                            low >= 240 && high - low <= 8,
+                            "Clipped white became colored: {format:?}, {codes:?} -> {pixel:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn normal_photo_float_raw_rejects_invalid_metadata_before_gpu() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu(
+                "normal_photo_float_raw_rejects_invalid_metadata_before_gpu",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            for metadata in [
+                FrameMetadata {
+                    colour_gains: Some([f32::NAN, 1.0]),
+                    ..Default::default()
+                },
+                FrameMetadata {
+                    colour_gains: Some([0.0, 1.0]),
+                    ..Default::default()
+                },
+                FrameMetadata {
+                    sensor_black_levels: Some([0.0, 1.0, 0.0, 0.0]),
+                    ..Default::default()
+                },
+                FrameMetadata {
+                    colour_correction_matrix: Some([[f32::INFINITY; 3]; 3]),
+                    ..Default::default()
+                },
+            ] {
+                let frame = CameraFrame {
+                    width: 4,
+                    height: 4,
+                    stride: 4,
+                    format: PixelFormat::BayerRGGB,
+                    data: FrameData::from_owned_vec(vec![64; 16]),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        raw_layout: Some(RawLayout::U8),
+                        ..metadata
+                    }),
+                };
+                assert!(
+                    PostProcessor::new(PostProcessingConfig::default())
+                        .process(Arc::new(frame))
+                        .await
+                        .is_err(),
+                    "Invalid metadata must not poison persistent GPU buffers"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn normal_photo_float_raw_sensor_knee_preserves_unclipped_color() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu(
+                "normal_photo_float_raw_sensor_knee_preserves_unclipped_color",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            let ccm = [
+                [2.100_02, -0.7964949, -0.30352515],
+                [-0.469_05, 1.9604946, -0.49144363],
+                [-0.1991288, -0.585788, 1.7849169],
+            ];
+            let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+            for (sensor, gains, matrix) in [
+                ([0.9_f32, 0.1, 0.1], [2.0, 1.5], identity),
+                ([1.0, 0.1, 0.1], [2.0, 1.5], identity),
+                ([0.6, 0.6, 0.55], [2.1832347, 1.6135153], ccm),
+                ([0.7296, 0.979, 0.9771], [2.1832347, 1.6135153], ccm),
+                ([0.7296, 0.9875, 0.9771], [2.1832347, 1.6135153], ccm),
+                ([0.7296, 0.9954, 0.9771], [2.1832347, 1.6135153], ccm),
+            ] {
+                let codes = sensor.map(|v| (v * 65535.0).round() as u16);
+                let sensor = codes.map(|v| f64::from(v) / 65535.0);
+                let mut data = Vec::new();
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let channel = match (x % 2, y % 2) {
+                            (0, 0) => 0,
+                            (1, 1) => 2,
+                            _ => 1,
+                        };
+                        data.extend(codes[channel].to_le_bytes());
+                    }
+                }
+                let frame = CameraFrame {
+                    width: 4,
+                    height: 4,
+                    stride: 8,
+                    format: PixelFormat::BayerRGGB,
+                    data: FrameData::from_owned_vec(data),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        raw_layout: Some(RawLayout::Unpacked16 { bits: 16 }),
+                        colour_gains: Some(gains),
+                        colour_correction_matrix: Some(matrix),
+                        ..Default::default()
+                    }),
+                };
+                let balanced = [
+                    sensor[0] * f64::from(gains[0]),
+                    sensor[1],
+                    sensor[2] * f64::from(gains[1]),
+                ];
+                let peak = sensor.into_iter().fold(0.0_f64, f64::max);
+                let t = ((peak - 0.980) / 0.015).clamp(0.0, 1.0);
+                let blend = t * t * (3.0 - 2.0 * t);
+                let linear: [f64; 3] = std::array::from_fn(|row| {
+                    (0..3)
+                        .map(|c| {
+                            f64::from(matrix[row][c])
+                                * ((1.0 - blend) * balanced[c]
+                                    + blend * balanced[c].clamp(0.0, 1.0))
+                        })
+                        .sum()
+                });
+                let scale = 1.0 / linear.into_iter().fold(1.0_f64, f64::max);
+                let expected = linear.map(|v| {
+                    let v = (v * scale).clamp(0.0, 1.0);
+                    let encoded = if v <= 0.0031308 {
+                        12.92 * v
+                    } else {
+                        1.055 * v.powf(1.0 / 2.4) - 0.055
+                    };
+                    (encoded * 255.0).round() as u8
+                });
+                let out = PostProcessor::new(PostProcessingConfig::default())
+                    .process(Arc::new(frame))
+                    .await
+                    .unwrap();
+                for pixel in out.image.pixels() {
+                    for c in 0..3 {
+                        assert!(
+                            pixel[c].abs_diff(expected[c]) <= 1,
+                            "{sensor:?}: {pixel:?} != {expected:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn normal_photo_float_raw_metadata_policy_and_highlight_reference() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu(
+                "normal_photo_float_raw_metadata_policy_and_highlight_reference",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            let base = CameraFrame {
+                width: 4,
+                height: 4,
+                stride: 4,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec([64, 128, 64, 128, 128, 192, 128, 192].repeat(2)),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: Some(FrameMetadata {
+                    raw_layout: Some(RawLayout::U8),
+                    ..Default::default()
+                }),
+            };
+            let processor = PostProcessor::new(PostProcessingConfig::default());
+            let awb = processor.process(Arc::new(base.clone())).await.unwrap();
+            let mut ccm_only = base.clone();
+            ccm_only
+                .libcamera_metadata
+                .as_mut()
+                .unwrap()
+                .colour_correction_matrix =
+                Some([[0.5, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.5]]);
+            let corrected = processor.process(Arc::new(ccm_only)).await.unwrap();
+            let encode_linear =
+                |v: f32| ((1.055 * v.powf(1.0 / 2.4) - 0.055) * 255.0).round() as u8;
+            let expected = [64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0].map(encode_linear);
+            assert_ne!(
+                awb.image, corrected.image,
+                "Supplied CCM must run with GPU gray-world AWB"
+            );
+            for pixel in corrected.image.pixels() {
+                for c in 0..3 {
+                    assert!(pixel[c].abs_diff(expected[c]) <= 1);
+                }
+            }
+            let mut supplied = base;
+            supplied.libcamera_metadata.as_mut().unwrap().colour_gains = Some([8.0, 1.0]);
+            let out = processor.process(Arc::new(supplied)).await.unwrap();
+            // WB exactly once -> (512,128,192)/255; T=min(max(rgb),1) -> (1,.25,.375).
+            let encode = |v: f32| ((1.055 * v.powf(1.0 / 2.4) - 0.055) * 255.0).round() as u8;
+            let expected = [255, encode(0.25), encode(0.375)];
+            for pixel in out.image.pixels() {
+                for c in 0..3 {
+                    assert!(
+                        pixel[c].abs_diff(expected[c]) <= 1,
+                        "{pixel:?} != {expected:?}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn review_r1_absent_gains_raw12_packing_parity() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("review_r1_absent_gains_raw12_packing_parity");
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            let processor = PostProcessor::new(PostProcessingConfig::default());
+            let mut outputs = Vec::new();
+            for bits in [10u32, 12, 14] {
+                for packed in [false, true] {
+                    let mut data = Vec::new();
+                    for y in 0..4 {
+                        let codes: Vec<u16> = (0..4)
+                            .map(|x| match (x % 2, y % 2) {
+                                (0, 0) => 1u16 << (bits - 4),
+                                (1, 1) => 3u16 << (bits - 4),
+                                _ => 2u16 << (bits - 4),
+                            })
+                            .collect();
+                        if packed {
+                            let group = if bits == 12 { 2 } else { 4 };
+                            for g in codes.chunks(group) {
+                                let low = bits - 8;
+                                data.extend(g.iter().map(|c| (c >> low) as u8));
+                                let tail = g.iter().enumerate().fold(0u32, |a, (i, c)| {
+                                    a | ((u32::from(*c) & ((1 << low) - 1)) << (i as u32 * low))
+                                });
+                                for b in 0..group as u32 * low / 8 {
+                                    data.push((tail >> (b * 8)) as u8);
+                                }
+                            }
+                        } else {
+                            for c in codes {
+                                data.extend(c.to_le_bytes());
+                            }
+                        }
+                    }
+                    let frame = CameraFrame {
+                        width: 4,
+                        height: 4,
+                        stride: if packed { bits / 2 } else { 8 },
+                        format: PixelFormat::BayerRGGB,
+                        data: FrameData::from_owned_vec(data),
+                        yuv_planes: None,
+                        captured_at: std::time::Instant::now(),
+                        sensor_timestamp_ns: None,
+                        libcamera_metadata: Some(FrameMetadata {
+                            raw_layout: Some(if packed {
+                                RawLayout::Csi2 { bits }
+                            } else {
+                                RawLayout::Unpacked16 { bits }
+                            }),
+                            ..Default::default()
+                        }),
+                    };
+                    let out = processor.process(Arc::new(frame)).await.unwrap();
+                    outputs.push(out.image.get_pixel(1, 1).0);
+                }
+                assert_eq!(
+                    outputs[outputs.len() - 2],
+                    outputs[outputs.len() - 1],
+                    "RAW{bits} AWB must not depend on packing"
+                );
+            }
+            assert_eq!(outputs[2], [99, 99, 99]);
+        });
+    }
+
+    #[test]
+    fn review_r5_extreme_finite_metadata_is_not_successful_black() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "review_r5_extreme_finite_metadata_is_not_successful_black",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+            let processor = PostProcessor::new(PostProcessingConfig::default());
+            let mut converter = crate::shaders::GpuConvertPipeline::new().await.unwrap();
+            for (gains, ccm) in [
+                (
+                    [f32::MAX, 1.0],
+                    [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                ),
+                ([1.0, 1.0], [[f32::MAX; 3]; 3]),
+                ([f32::MAX, 1.0], identity),
+            ] {
+                let frame = CameraFrame {
+                    width: 4,
+                    height: 4,
+                    stride: 4,
+                    format: PixelFormat::BayerRGGB,
+                    data: FrameData::from_owned_vec(vec![255; 16]),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        raw_layout: Some(RawLayout::U8),
+                        colour_gains: Some(gains),
+                        colour_correction_matrix: Some(ccm),
+                        ..Default::default()
+                    }),
+                };
+                assert!(
+                    processor.process(Arc::new(frame.clone())).await.is_err(),
+                    "unsafe finite metadata must not return successful black"
+                );
+                let input = crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap();
+                assert_eq!(
+                    converter.convert_bayer(&input).unwrap_err(),
+                    crate::shaders::BayerError::UnsafeArithmetic
+                );
+            }
+            // This is an arithmetic contract, not a practical/calibration gain limit.
+            let mut frame = CameraFrame {
+                width: 4,
+                height: 4,
+                stride: 4,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(vec![255; 16]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: Some(FrameMetadata {
+                    raw_layout: Some(RawLayout::U8),
+                    colour_gains: Some([1e20, 1e20]),
+                    colour_correction_matrix: Some(identity),
+                    ..Default::default()
+                }),
+            };
+            // Fully clipped samples use the camera-space highlight fallback,
+            // even when the supplied gains are very large but safe.
+            let out = processor.process(Arc::new(frame.clone())).await.unwrap();
+            assert_eq!(out.image.get_pixel(1, 1).0, [255, 255, 255]);
+            // Below sensor clipping, extreme over-white float ratios still
+            // survive; the fallback must not become a general RGB clamp.
+            frame.data = FrameData::from_owned_vec(vec![128; 16]);
+            let out = processor.process(Arc::new(frame)).await.unwrap();
+            assert_eq!(out.image.get_pixel(1, 1).0, [255, 0, 255]);
+        });
+    }
+
+    #[test]
+    fn normal_photo_float_raw_explicit_padded_packings() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device_with_compute()
+        else {
+            crate::test_gpu::skip_no_gpu("normal_photo_float_raw_explicit_padded_packings");
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
+            let layouts = [
+                RawLayout::U8,
+                RawLayout::Unpacked16 { bits: 10 },
+                RawLayout::Unpacked16 { bits: 12 },
+                RawLayout::Unpacked16 { bits: 14 },
+                RawLayout::Unpacked16 { bits: 16 },
+                RawLayout::Csi2 { bits: 10 },
+                RawLayout::Csi2 { bits: 12 },
+                RawLayout::Csi2 { bits: 14 },
+            ];
+            for (layout, width) in layouts
+                .into_iter()
+                .rev()
+                .flat_map(|l| [5u32, 513].map(|w| (l, w)))
+            {
+                let bits = match layout {
+                    RawLayout::U8 => 8,
+                    RawLayout::Unpacked16 { bits } | RawLayout::Csi2 { bits } => bits,
+                };
+                let code = ((1u32 << bits) - 1) / 4;
+                let mut row = Vec::new();
+                match layout {
+                    RawLayout::U8 => row.resize(width as usize, code as u8),
+                    RawLayout::Unpacked16 { .. } => {
+                        for _ in 0..width {
+                            row.extend_from_slice(&(code as u16).to_le_bytes());
+                        }
+                    }
+                    RawLayout::Csi2 { .. } => {
+                        let count = if bits == 12 { 2 } else { 4 };
+                        let low_bits = bits - 8;
+                        for _ in 0..width.div_ceil(count) {
+                            row.extend(std::iter::repeat_n(
+                                (code >> low_bits) as u8,
+                                count as usize,
+                            ));
+                            let mut packed = 0u32;
+                            for i in 0..count {
+                                packed |= (code & ((1 << low_bits) - 1)) << (i * low_bits);
+                            }
+                            for b in 0..(count * low_bits / 8) {
+                                row.push((packed >> (b * 8)) as u8);
+                            }
+                        }
+                    }
+                }
+                row.extend_from_slice(&[0xee, 0xdd, 0xcc]);
+                let stride = row.len() as u32;
+                let frame = CameraFrame {
+                    width,
+                    height: 5,
+                    stride,
+                    format: PixelFormat::BayerBGGR,
+                    data: FrameData::from_owned_vec(row.repeat(5)),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        raw_layout: Some(layout),
+                        colour_gains: Some([1.0, 1.0]),
+                        ..Default::default()
+                    }),
+                };
+                let out = PostProcessor::new(PostProcessingConfig::default())
+                    .process(Arc::new(frame))
+                    .await
+                    .unwrap_or_else(|e| panic!("{layout:?}: {e}"));
+                let v = code as f32 / ((1u32 << bits) - 1) as f32;
+                let expected = ((1.055 * v.powf(1.0 / 2.4) - 0.055) * 255.0).round() as u8;
+                for pixel in out.image.pixels() {
+                    for c in pixel.0 {
+                        assert!(
+                            c.abs_diff(expected) <= 1,
+                            "{layout:?}: {pixel:?} != {expected}"
+                        );
+                    }
+                }
+            }
         });
     }
 
@@ -725,5 +1384,73 @@ mod tests {
             compact,
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
         );
+    }
+}
+
+#[cfg(test)]
+mod method_selection_tests {
+    use super::*;
+    use crate::shaders::DemosaicMethod;
+    #[test]
+    fn photo_processor_honours_all_three_selected_methods() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("photo_processor_honours_all_three_selected_methods");
+            return;
+        };
+        pollster::block_on(async {
+            let data: Vec<u8> = (0..19)
+                .flat_map(|y| {
+                    (0..21).map(move |x| {
+                        (25 + (x * 37 + y * 53 + x * y * 7) % 97 + if x > 10 { 40 } else { 0 })
+                            as u8
+                    })
+                })
+                .collect();
+            let frame = Arc::new(CameraFrame {
+                width: 21,
+                height: 19,
+                stride: 21,
+                format: PixelFormat::BayerRGGB,
+                data: crate::backends::camera::types::FrameData::from_owned_vec(data),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: Some(crate::backends::camera::types::FrameMetadata {
+                    colour_gains: Some([1.0, 1.0]),
+                    ..Default::default()
+                }),
+            });
+            let mut outputs = Vec::new();
+            for method in [
+                DemosaicMethod::Rcd,
+                DemosaicMethod::Lmmse,
+                DemosaicMethod::Bilinear,
+            ] {
+                let config = PostProcessingConfig {
+                    demosaic_method: method,
+                    ..Default::default()
+                };
+                outputs.push(
+                    PostProcessor::new(config)
+                        .process(frame.clone())
+                        .await
+                        .unwrap()
+                        .image
+                        .into_raw(),
+                );
+            }
+            assert_ne!(outputs[0], outputs[1]);
+            assert_ne!(outputs[0], outputs[2]);
+            assert_ne!(outputs[1], outputs[2]);
+            assert_eq!(
+                outputs[0],
+                PostProcessor::new(PostProcessingConfig::default())
+                    .process(frame)
+                    .await
+                    .unwrap()
+                    .image
+                    .into_raw()
+            );
+        });
     }
 }

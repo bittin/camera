@@ -522,6 +522,19 @@ impl AppModel {
         Task::none()
     }
 
+    pub(crate) fn handle_set_demosaic_method(
+        &mut self,
+        method: crate::shaders::DemosaicMethod,
+    ) -> Task<cosmic::Action<Message>> {
+        self.config.demosaic_method = method;
+        if let Some(handler) = self.config_handler.as_ref()
+            && let Err(err) = self.config.write_entry(handler)
+        {
+            error!(?err, "Failed to save photo demosaicing setting");
+        }
+        Task::none()
+    }
+
     pub(crate) fn handle_reset_all_settings(&mut self) -> Task<cosmic::Action<Message>> {
         info!("Resetting all settings to defaults");
         // Snapshot the pre-reset animated values so the fit/fill change
@@ -1296,6 +1309,50 @@ fn frame_metadata_to_json(
 #[cfg(test)]
 mod tests {
     use super::{file_manager_dbus_args, portal_gallery_item};
+
+    #[test]
+    fn demosaic_handler_persists_each_method_and_reset_restores_rcd() {
+        use crate::app::state::{AppModel, Message, SettingsPage};
+        use crate::config::Config;
+        use crate::shaders::DemosaicMethod;
+        use cosmic::cosmic_config::{Config as Store, ConfigGet, CosmicConfigEntry};
+        gstreamer::init().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("camera-demosaic-handler-{}", uuid::Uuid::new_v4()));
+        let store =
+            Store::with_custom_path("camera-demosaic-test", Config::VERSION, root.clone()).unwrap();
+        let mut app = AppModel {
+            config_handler: Some(store),
+            settings_page: SettingsPage::Photo,
+            ..AppModel::default()
+        };
+        for method in [
+            DemosaicMethod::Lmmse,
+            DemosaicMethod::Bilinear,
+            DemosaicMethod::Rcd,
+        ] {
+            drop(app.update(Message::SetDemosaicMethod(method)));
+            assert_eq!(app.config.demosaic_method, method);
+            let store = app.config_handler.as_ref().unwrap();
+            assert_eq!(
+                store.get::<DemosaicMethod>("demosaic_method").unwrap(),
+                method
+            );
+            assert_eq!(Config::get_entry(store).unwrap().demosaic_method, method);
+            drop(app.settings_view());
+        }
+        drop(app.update(Message::SetDemosaicMethod(DemosaicMethod::Bilinear)));
+        drop(app.update(Message::ResetAllSettings));
+        assert_eq!(app.config.demosaic_method, DemosaicMethod::Rcd);
+        assert_eq!(
+            Config::get_entry(app.config_handler.as_ref().unwrap())
+                .unwrap()
+                .demosaic_method,
+            DemosaicMethod::Rcd
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn flatpak_gallery_routes_the_latest_video_to_the_portal() {

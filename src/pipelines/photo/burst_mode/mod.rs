@@ -45,6 +45,9 @@ pub mod params;
 use crate::backends::camera::types::{CameraFrame, PixelFormat};
 use crate::gpu::{self, wgpu};
 use crate::shaders::{GpuFrameInput, get_gpu_convert_pipeline};
+#[cfg(test)]
+mod white_level_tests;
+
 use bayer_planes::{BayerPlanes, extract_bayer_planes};
 use std::sync::{Arc, RwLock};
 use tracing::{debug, info, warn};
@@ -66,6 +69,13 @@ enum BufferKind {
     Uniform,
     /// Staging buffer for GPU-to-CPU readback
     Staging,
+}
+
+/// Scene-linear signed RGBA; no quantization or gamma before tone mapping.
+pub struct LinearMergedFrame {
+    pub data: Vec<f32>,
+    pub width: u32,
+    pub height: u32,
 }
 
 // Shader sources
@@ -162,6 +172,8 @@ const ALIGN_LEVEL_CONFIGS: [(u32, u32, bool); PYRAMID_LEVELS] = [
 /// Burst mode processing configuration
 #[derive(Debug, Clone)]
 pub struct BurstModeConfig {
+    /// Photo-only demosaic selection, independent of video.
+    pub demosaic_method: crate::shaders::DemosaicMethod,
     /// Number of frames to capture in burst (4, 6, or 8)
     pub frame_count: usize,
     /// Frame interval in milliseconds (~33ms for 30fps camera)
@@ -190,6 +202,7 @@ pub struct BurstModeConfig {
 impl Default for BurstModeConfig {
     fn default() -> Self {
         Self {
+            demosaic_method: crate::shaders::DemosaicMethod::Rcd,
             frame_count: 8,
             frame_interval_ms: 33,
             robustness: 1.0,
@@ -389,6 +402,7 @@ pub struct BurstModeGpuPipeline {
 
     // Bayer finishing pipeline (HDR+ Section 6: demosaic merged planes + WB + CCM)
     bayer_finish: wgpu::ComputePipeline,
+    demosaic_engine: RwLock<Option<crate::shaders::demosaic_gpu::GpuDemosaic>>,
 
     // Bind group layouts
     pyramid_layout: wgpu::BindGroupLayout,
@@ -807,11 +821,7 @@ impl BurstModeGpuPipeline {
         );
 
         // Bayer finishing pipeline (HDR+ Section 6: demosaic + WB + CCM)
-        let bayer_finish_source = format!(
-            "{}\n{}",
-            crate::shaders::RAW_COLOUR_FUNCTIONS,
-            BAYER_FINISH_SHADER
-        );
+        let bayer_finish_source = crate::shaders::compose_debayer(BAYER_FINISH_SHADER);
         let bayer_finish_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bayer_finish_shader"),
             source: wgpu::ShaderSource::Wgsl(bayer_finish_source.into()),
@@ -856,6 +866,7 @@ impl BurstModeGpuPipeline {
             ca_estimate_offsets,
             ca_fit_model,
             bayer_finish,
+            demosaic_engine: RwLock::new(None),
             pyramid_layout,
             sharpness_layout,
             align_layout,
@@ -1014,13 +1025,42 @@ impl BurstModeGpuPipeline {
     }
 
     fn create_bayer_finish_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
-        use BindingKind::*;
-        // Bindings: bayer_planes(r), output(rw), params(u)
-        gpu_helpers::create_layout(
-            device,
-            "bayer_finish_layout",
-            &[StorageRead, StorageReadWrite, Uniform],
-        )
+        let entries: Vec<_> = (0..4)
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                count: None,
+                ty: if binding == 1 {
+                    wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    }
+                } else if binding == 3 {
+                    wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    }
+                } else {
+                    wgpu::BindingType::Buffer {
+                        ty: if binding == 2 {
+                            wgpu::BufferBindingType::Uniform
+                        } else {
+                            wgpu::BufferBindingType::Storage {
+                                read_only: binding == 0,
+                            }
+                        },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    }
+                },
+            })
+            .collect();
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bayer_finish_layout"),
+            entries: &entries,
+        })
     }
 
     /// Compute sharpness of a frame using GPU
@@ -2130,14 +2170,40 @@ impl BurstModeGpuPipeline {
         merged: &MergedFrame,
         config: &BurstModeConfig,
     ) -> Result<MergedFrame, String> {
-        debug!("Applying tone mapping (GPU)");
+        self.apply_tonemap_linear(
+            &LinearMergedFrame {
+                data: u8_to_f32_normalized(&merged.data),
+                width: merged.width,
+                height: merged.height,
+            },
+            config,
+        )
+        .await
+    }
 
+    pub async fn apply_tonemap_linear(
+        &self,
+        merged: &LinearMergedFrame,
+        config: &BurstModeConfig,
+    ) -> Result<MergedFrame, String> {
+        debug!("Applying tone mapping (GPU)");
+        if merged.width == 0
+            || merged.height == 0
+            || merged.data.len() as u64 != u64::from(merged.width) * u64::from(merged.height) * 4
+            || merged.data.iter().any(|v| !v.is_finite())
+            || !config.shadow_boost.is_finite()
+            || !(0.0..=1.0).contains(&config.shadow_boost)
+            || !config.local_contrast.is_finite()
+            || !(0.0..=1.0).contains(&config.local_contrast)
+        {
+            return Err("Invalid linear tone-map input".into());
+        }
         let width = merged.width;
         let height = merged.height;
         let pixel_count = (width * height) as usize;
 
         // Convert to f32
-        let input_f32 = u8_to_f32_normalized(&merged.data);
+        let input_f32 = &merged.data;
 
         let block_size = 8u32;
         let lum_width = width.div_ceil(block_size);
@@ -2209,7 +2275,7 @@ impl BurstModeGpuPipeline {
 
         // Write data to buffers
         self.queue
-            .write_buffer(&input_buffer, 0, bytemuck::cast_slice(&input_f32));
+            .write_buffer(&input_buffer, 0, bytemuck::cast_slice(input_f32));
         self.queue.write_buffer(
             &local_lum_params_buffer,
             0,
@@ -2398,6 +2464,7 @@ impl BurstModeGpuPipeline {
 
         let data = buffer_slice.get_mapped_range();
         let result_f32: &[f32] = bytemuck::cast_slice(&data);
+        let all_finite = result_f32.iter().all(|value| value.is_finite());
         let result_u8: Vec<u8> = result_f32
             .iter()
             .map(|&x| (x.clamp(0.0, 1.0) * 255.0) as u8)
@@ -2411,6 +2478,9 @@ impl BurstModeGpuPipeline {
             .unwrap()
             .return_large(staging_buffer);
 
+        if !all_finite {
+            return Err("Non-finite GPU tone-map output".into());
+        }
         Ok(MergedFrame {
             data: result_u8,
             width,
@@ -2430,12 +2500,96 @@ impl BurstModeGpuPipeline {
         merged_planes_buffer: &wgpu::Buffer,
         half_width: u32,
         half_height: u32,
+        pattern: u32,
         colour_gains: Option<[f32; 2]>,
         colour_correction_matrix: Option<[[f32; 3]; 3]>,
-    ) -> Result<MergedFrame, String> {
+    ) -> Result<LinearMergedFrame, String> {
+        self.demosaic_bayer_planes_with_method(
+            merged_planes_buffer,
+            half_width,
+            half_height,
+            pattern,
+            colour_gains,
+            colour_correction_matrix,
+            crate::shaders::DemosaicMethod::Rcd,
+        )
+        .await
+    }
+
+    /// Shared GPU RCD/LMMSE/Bilinear on merged normalized CFA planes.
+    /// GPU colour finishing stays scene-linear until tone mapping.
+    // Preserve the existing six-argument public route and add explicit selection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn demosaic_bayer_planes_with_method(
+        &self,
+        merged_planes_buffer: &wgpu::Buffer,
+        half_width: u32,
+        half_height: u32,
+        pattern: u32,
+        colour_gains: Option<[f32; 2]>,
+        colour_correction_matrix: Option<[[f32; 3]; 3]>,
+        method: crate::shaders::DemosaicMethod,
+    ) -> Result<LinearMergedFrame, String> {
+        let samples = u64::from(half_width) * u64::from(half_height) * 4;
+        if half_width == 0
+            || half_height == 0
+            || pattern > 3
+            || half_width > self.device.limits().max_texture_dimension_2d / 2
+            || half_height > self.device.limits().max_texture_dimension_2d / 2
+            || merged_planes_buffer.size() != samples * 4
+            || samples * 4 > u64::from(self.device.limits().max_storage_buffer_binding_size)
+            || u64::from((half_width * 32).next_multiple_of(256)) * u64::from(half_height * 2)
+                > self.device.limits().max_buffer_size
+        {
+            return Err("Invalid merged Bayer lattice dimensions, buffer or pattern".into());
+        }
         let full_width = half_width * 2;
         let full_height = half_height * 2;
         let full_pixel_count = (full_width * full_height) as usize;
+        let rgb_texture = crate::shaders::demosaic_gpu::texture(
+            &self.device,
+            full_width,
+            full_height,
+            "merged GPU camera RGB",
+        );
+        let bound = {
+            let mut cache = self.demosaic_engine.write().unwrap();
+            if cache
+                .as_ref()
+                .is_none_or(|e| !e.matches(full_width, full_height))
+            {
+                *cache = Some(crate::shaders::demosaic_gpu::GpuDemosaic::new(
+                    &self.device,
+                    full_width,
+                    full_height,
+                )?);
+            }
+            let engine = cache.as_ref().unwrap();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("merged GPU demosaic"),
+                });
+            engine.encode_merged(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                merged_planes_buffer,
+                pattern,
+            );
+            engine.encode(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &rgb_texture,
+                pattern,
+                method,
+            );
+            self.queue.submit([encoder.finish()]);
+            engine.validate(&self.device)?
+        };
+        crate::shaders::validate_bayer_colour(colour_gains, colour_correction_matrix, bound)
+            .map_err(str::to_owned)?;
 
         info!(
             half_width,
@@ -2447,17 +2601,19 @@ impl BurstModeGpuPipeline {
             "Demosaicing merged Bayer planes (HDR+ Section 6 finishing)"
         );
 
-        // Create output buffer at full resolution
-        let output_buffer = self.create_storage_buffer(
-            "bayer_finish_output",
-            (full_pixel_count * 4 * std::mem::size_of::<f32>()) as u64,
+        let output_texture = crate::shaders::demosaic_gpu::texture(
+            &self.device,
+            full_width,
+            full_height,
+            "HDR finished linear",
         );
+        let output_view = output_texture.create_view(&Default::default());
 
         // Build params
         let (gain_r, gain_b) = colour_gains.map(|g| (g[0], g[1])).unwrap_or((1.0, 1.0));
 
-        let identity_ccm = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let ccm = colour_correction_matrix.unwrap_or(identity_ccm);
+        // CCM is independent of WB metadata; HDR retains unity missing gains.
+        let ccm = colour_correction_matrix.unwrap_or(crate::shaders::BAYER_IDENTITY_CCM);
 
         let params = BayerFinishParams {
             half_width,
@@ -2471,8 +2627,8 @@ impl BurstModeGpuPipeline {
             ccm_row0: [ccm[0][0], ccm[0][1], ccm[0][2], 0.0],
             ccm_row1: [ccm[1][0], ccm[1][1], ccm[1][2], 0.0],
             ccm_row2: [ccm[2][0], ccm[2][1], ccm[2][2], 0.0],
-            use_colour: if colour_gains.is_some() { 1 } else { 0 },
-            _pad0: 0,
+            _pad0: 1,
+            pattern,
             _pad1: 0,
             _pad2: 0,
         };
@@ -2484,11 +2640,29 @@ impl BurstModeGpuPipeline {
         self.queue
             .write_buffer(&params_buffer, 0, bytemuck::bytes_of(&params));
 
-        let bind_group = self.bind_group(
-            "bayer_finish_bind_group",
-            &self.bayer_finish_layout,
-            &[merged_planes_buffer, &output_buffer, &params_buffer],
-        );
+        let rgb_view = rgb_texture.create_view(&Default::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("merged GPU finishing"),
+            layout: &self.bayer_finish_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: merged_planes_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&output_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&rgb_view),
+                },
+            ],
+        });
 
         // Dispatch demosaic + finishing
         self.dispatch_compute(
@@ -2502,7 +2676,8 @@ impl BurstModeGpuPipeline {
         self.yield_to_compositor().await;
 
         // Read back result
-        let staging_size = (full_pixel_count * 4 * std::mem::size_of::<f32>()) as u64;
+        let padded_row = (full_width * 16).next_multiple_of(256);
+        let staging_size = u64::from(padded_row) * u64::from(full_height);
         let staging_buffer = self
             .staging_pool
             .write()
@@ -2514,7 +2689,22 @@ impl BurstModeGpuPipeline {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("bayer_finish_readback"),
             });
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, staging_size);
+        encoder.copy_texture_to_buffer(
+            output_texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(full_height),
+                },
+            },
+            wgpu::Extent3d {
+                width: full_width,
+                height: full_height,
+                depth_or_array_layers: 1,
+            },
+        );
         self.queue.submit(std::iter::once(encoder.finish()));
 
         let buffer_slice = staging_buffer.slice(..);
@@ -2533,10 +2723,10 @@ impl BurstModeGpuPipeline {
 
         let data = buffer_slice.get_mapped_range();
         let result_f32: &[f32] = bytemuck::cast_slice(&data);
-        let result_u8: Vec<u8> = result_f32
-            .iter()
-            .map(|&x| (x.clamp(0.0, 1.0) * 255.0) as u8)
-            .collect();
+        let mut result_linear = Vec::with_capacity(full_pixel_count * 4);
+        for row in result_f32.chunks_exact(padded_row as usize / 4) {
+            result_linear.extend_from_slice(&row[..full_width as usize * 4]);
+        }
         drop(data);
         staging_buffer.unmap();
         self.staging_pool
@@ -2544,8 +2734,8 @@ impl BurstModeGpuPipeline {
             .unwrap()
             .return_large(staging_buffer);
 
-        Ok(MergedFrame {
-            data: result_u8,
+        Ok(LinearMergedFrame {
+            data: result_linear,
             width: full_width,
             height: full_height,
         })
@@ -2726,12 +2916,10 @@ impl BurstModeGpuPipeline {
             .await?;
         info!(noise_sd, "Bayer noise estimation complete");
 
-        // merge_gpu returns u8 CPU data; we re-upload as f32 for the demosaic step
-        // TODO: add merge_gpu_to_buffer to avoid this GPU→CPU→GPU round-trip
-        let merged_u8 = self
+        let merged_buffer = self
             .fft_pipeline
-            .merge_gpu(
-                &reference_u8,
+            .merge_gpu_to_buffer(
+                &ref_planes.data,
                 aligned,
                 width,
                 height,
@@ -2739,17 +2927,6 @@ impl BurstModeGpuPipeline {
                 config.robustness,
             )
             .await?;
-
-        // Re-upload merged result to GPU buffer for demosaic step
-        // (merge_gpu currently reads back to CPU; we re-upload the f32 version)
-        let pixel_count = (width * height) as usize;
-        let merged_f32 = u8_to_f32_normalized(&merged_u8);
-        let merged_buffer = self.create_storage_buffer(
-            "merged_bayer_planes",
-            (pixel_count * 4 * std::mem::size_of::<f32>()) as u64,
-        );
-        self.queue
-            .write_buffer(&merged_buffer, 0, bytemuck::cast_slice(&merged_f32));
 
         Ok((merged_buffer, width, height))
     }
@@ -2823,6 +3000,13 @@ async fn process_burst_mode_bayer(
             bit_depth = planes.bit_depth,
             "Extracted Bayer planes"
         );
+        if planes_list.first().is_some_and(|reference| {
+            reference.width != planes.width
+                || reference.height != planes.height
+                || reference.pattern != planes.pattern
+        }) {
+            return Err("Burst Bayer frames must share dimensions and CFA phase".into());
+        }
         planes_list.push(planes);
     }
     info!(
@@ -2895,7 +3079,15 @@ async fn process_burst_mode_bayer(
     let colour_gains = ref_planes.colour_gains;
     let ccm = ref_planes.colour_correction_matrix;
     let demosaiced = gpu
-        .demosaic_bayer_planes(&merged_buffer, half_w, half_h, colour_gains, ccm)
+        .demosaic_bayer_planes_with_method(
+            &merged_buffer,
+            half_w,
+            half_h,
+            ref_planes.pattern,
+            colour_gains,
+            ccm,
+            config.demosaic_method,
+        )
         .await?;
     info!(
         elapsed_ms = step_start.elapsed().as_millis(),
@@ -2907,7 +3099,7 @@ async fn process_burst_mode_bayer(
 
     // Step 7: Apply tone mapping (90% - 100%)
     let step_start = std::time::Instant::now();
-    let tonemapped = gpu.apply_tonemap(&demosaiced, &config).await?;
+    let tonemapped = gpu.apply_tonemap_linear(&demosaiced, &config).await?;
     info!(
         elapsed_ms = step_start.elapsed().as_millis(),
         "Tone mapping complete"
@@ -3284,6 +3476,460 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hdr_bayer_honors_ccm_without_supplied_gains() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("hdr_bayer_honors_ccm_without_supplied_gains");
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            let buffer = gpu.create_storage_buffer("ccm_without_gains", 64);
+            gpu.queue.write_buffer(
+                &buffer,
+                0,
+                bytemuck::cast_slice(&[0.2f32, 0.3, 0.4, 0.3].repeat(4)),
+            );
+            let ccm = [[2.0, -1.0, 0.0], [-2.0, 1.0, 0.0], [0.0, 0.0, 1.5]];
+            for pattern in 0..4 {
+                let out = gpu
+                    .demosaic_bayer_planes_with_method(
+                        &buffer,
+                        2,
+                        2,
+                        pattern,
+                        None,
+                        Some(ccm),
+                        crate::shaders::DemosaicMethod::Bilinear,
+                    )
+                    .await
+                    .unwrap();
+                // HDR keeps unity WB (not gray-world) and applies supplied CCM.
+                for pixel in out.data.as_chunks::<4>().0 {
+                    for (actual, expected) in pixel[..3].iter().zip([0.1, -0.1, 0.6]) {
+                        assert!(
+                            (actual - expected).abs() < 1e-6,
+                            "pattern={pattern}, pixel={pixel:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn hdr_ccm_without_gains_rejects_unsafe_arithmetic() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("hdr_ccm_without_gains_rejects_unsafe_arithmetic");
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            let buffer = gpu.create_storage_buffer("ccm_arithmetic_without_gains", 64);
+            gpu.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&[0.3f32; 16]));
+            for ccm in [[[f32::MAX; 3]; 3], [[1e38, -1e38, 0.0]; 3]] {
+                assert!(
+                    gpu.demosaic_bayer_planes(&buffer, 2, 2, 0, None, Some(ccm))
+                        .await
+                        .is_err()
+                );
+            }
+            for ccm in [[[f32::NAN; 3]; 3], [[f32::INFINITY; 3]; 3]] {
+                assert!(
+                    gpu.demosaic_bayer_planes(&buffer, 2, 2, 0, None, Some(ccm))
+                        .await
+                        .is_err()
+                );
+            }
+            // Validate against merged-plane excursions, not just sensor white.
+            gpu.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&[1e10f32; 16]));
+            assert!(
+                gpu.demosaic_bayer_planes(&buffer, 2, 2, 0, None, Some([[1e30, -1e30, 0.0]; 3]))
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn hdr_finish_without_gains_still_uses_shared_sensor_knee() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("hdr_finish_without_gains_still_uses_shared_sensor_knee");
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            let values = [-0.04f32, 1.0, 0.55, 1.0].repeat(4);
+            let buffer = gpu.create_storage_buffer("unity_sensor_knee", 64);
+            gpu.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&values));
+            for pattern in 0..4 {
+                let out = gpu
+                    .demosaic_bayer_planes_with_method(
+                        &buffer,
+                        2,
+                        2,
+                        pattern,
+                        None,
+                        Some([[9.0; 3]; 3]),
+                        crate::shaders::DemosaicMethod::Bilinear,
+                    )
+                    .await
+                    .unwrap();
+                // Unity WB retains the canonical sensor knee: bounded sensor
+                // [0,1,.55] then supplied all-nine CCM gives 9*(1+.55).
+                for pixel in out.data.as_chunks::<4>().0 {
+                    for (actual, expected) in pixel[..3].iter().zip([13.95; 3]) {
+                        assert!(
+                            (actual - expected).abs() < 1e-6,
+                            "pattern={pattern}, pixel={pixel:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn hdr_finish_highlight_knee_and_extremes_match_independent_reference() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "hdr_finish_highlight_knee_and_extremes_match_independent_reference",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            let ccm = [
+                [2.10002, -0.7964949, -0.30352515],
+                [-0.46905, 1.9604946, -0.49144363],
+                [-0.1991288, -0.585788, 1.7849169],
+            ];
+            let gains = [2.1832347, 1.6135153];
+            for pattern in 0..4 {
+                for peak in [0.3f32, 0.980, 0.9875, 0.995, 1.0, 1.2] {
+                    // Constant per-site lattice: different Gr/Gb remain measured at
+                    // their own sites, not averaged at the same plane coordinate.
+                    let plane = [-0.04, peak, 0.55, peak];
+                    let values = plane.repeat(4);
+                    let buffer = gpu.create_storage_buffer("highlight_reference", 64);
+                    gpu.queue
+                        .write_buffer(&buffer, 0, bytemuck::cast_slice(&values));
+                    let out = gpu
+                        .demosaic_bayer_planes(&buffer, 2, 2, pattern, Some(gains), Some(ccm))
+                        .await
+                        .unwrap();
+                    let balanced = [plane[0] * gains[0], peak, plane[2] * gains[1]];
+                    let bounded = balanced.map(|v| v.clamp(0.0, 1.0));
+                    let t = ((peak - 0.980) / 0.015).clamp(0.0, 1.0);
+                    let blend = t * t * (3.0 - 2.0 * t);
+                    let expected: [f32; 3] = std::array::from_fn(|r| {
+                        let a = (0..3).map(|k| ccm[r][k] * balanced[k]).sum::<f32>();
+                        let b = (0..3).map(|k| ccm[r][k] * bounded[k]).sum::<f32>();
+                        (1.0 - blend) * a + blend * b
+                    });
+                    for pixel in out.data.as_chunks::<4>().0 {
+                        for k in 0..3 {
+                            assert!(pixel[k].is_finite());
+                            assert!(
+                                (pixel[k] - expected[k]).abs() < 3e-5,
+                                "pattern={pattern}, peak={peak}, pixel={pixel:?}, expected={expected:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn hdr_finish_rejects_invalid_metadata_and_gpu_samples_before_dispatch() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "hdr_finish_rejects_invalid_metadata_and_gpu_samples_before_dispatch",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            let buffer = gpu.create_storage_buffer("invalid_metadata", 64);
+            gpu.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&[0.3f32; 16]));
+            for gains in [[f32::NAN, 1.0], [-1.0, 1.0], [0.0, 1.0], [f32::MAX, 1.0]] {
+                assert!(
+                    gpu.demosaic_bayer_planes_with_method(
+                        &buffer,
+                        2,
+                        2,
+                        0,
+                        Some(gains),
+                        None,
+                        crate::shaders::DemosaicMethod::Bilinear
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+            assert!(
+                gpu.demosaic_bayer_planes_with_method(
+                    &buffer,
+                    2,
+                    2,
+                    4,
+                    None,
+                    None,
+                    crate::shaders::DemosaicMethod::Bilinear
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                gpu.demosaic_bayer_planes_with_method(
+                    &buffer,
+                    0,
+                    2,
+                    0,
+                    None,
+                    None,
+                    crate::shaders::DemosaicMethod::Bilinear
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                gpu.demosaic_bayer_planes_with_method(
+                    &buffer,
+                    3,
+                    2,
+                    0,
+                    None,
+                    None,
+                    crate::shaders::DemosaicMethod::Bilinear
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                gpu.demosaic_bayer_planes_with_method(
+                    &buffer,
+                    2,
+                    2,
+                    0,
+                    Some([1.0, 1.0]),
+                    Some([[f32::INFINITY; 3]; 3]),
+                    crate::shaders::DemosaicMethod::Bilinear
+                )
+                .await
+                .is_err()
+            );
+            gpu.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&[f32::NAN; 16]));
+            assert!(
+                gpu.demosaic_bayer_planes_with_method(
+                    &buffer,
+                    2,
+                    2,
+                    0,
+                    None,
+                    None,
+                    crate::shaders::DemosaicMethod::Bilinear
+                )
+                .await
+                .is_err()
+            );
+            // A rejected input must not poison subsequent valid GPU work.
+            gpu.queue
+                .write_buffer(&buffer, 0, bytemuck::cast_slice(&[0.3f32; 16]));
+            let out = gpu
+                .demosaic_bayer_planes_with_method(
+                    &buffer,
+                    2,
+                    2,
+                    0,
+                    None,
+                    Some([[9.0; 3]; 3]),
+                    crate::shaders::DemosaicMethod::Bilinear,
+                )
+                .await
+                .unwrap();
+            assert!(
+                out.data
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    // Independent CCM still runs after a rejected input: 27*.3.
+                    .all(|p| p[..3].iter().all(|v| (*v - 8.1).abs() < 2e-6))
+            );
+        });
+    }
+
+    #[test]
+    fn hdr_linear_tonemap_handles_negative_and_overwhite_finitely() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "hdr_linear_tonemap_handles_negative_and_overwhite_finitely",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            for value in [-0.2f32, 1.4] {
+                let frame = LinearMergedFrame {
+                    data: [value, value, value, 1.0].repeat(64),
+                    width: 8,
+                    height: 8,
+                };
+                let result = gpu
+                    .apply_tonemap_linear(&frame, &BurstModeConfig::default())
+                    .await
+                    .unwrap();
+                for pixel in result.data.as_chunks::<4>().0 {
+                    for c in &pixel[..3] {
+                        assert!(
+                            if value < 0.0 { *c <= 1 } else { *c >= 254 },
+                            "value={value}, output={pixel:?}"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn hdr_finish_matches_single_frame_lattice_signed_ccm_all_patterns() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "hdr_finish_matches_single_frame_lattice_signed_ccm_all_patterns",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata};
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            let mut converter = crate::shaders::GpuConvertPipeline::new().await.unwrap();
+            let sites = [[0, 1, 2, 3], [3, 2, 1, 0], [1, 0, 3, 2], [2, 3, 0, 1]];
+            let formats = [
+                PixelFormat::BayerRGGB,
+                PixelFormat::BayerBGGR,
+                PixelFormat::BayerGRBG,
+                PixelFormat::BayerGBRG,
+            ];
+            let ccm = [[1.0, 1.0, 0.0], [-1.0, 1.0, 0.0], [0.0, 0.0, 2.0]];
+            let encode = |v: f32| {
+                let v = v.clamp(0.0, 1.0);
+                let v = if v <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    1.055 * v.powf(1.0 / 2.4) - 0.055
+                };
+                (v * 255.0).round() as u8
+            };
+            for pattern in 0..4 {
+                let site = |x: usize, y: usize| sites[pattern][(y % 2) * 2 + x % 2];
+                let codes: Vec<u8> = (0..64)
+                    .map(|i| {
+                        let x = i % 8;
+                        let y = i / 8;
+                        match site(x, y) {
+                            0 => (8 + x + y) as u8,
+                            1 => (62 + 3 * x + y) as u8,
+                            2 => (110 + x + 4 * y) as u8,
+                            _ => (154 + 2 * x + y) as u8,
+                        }
+                    })
+                    .collect();
+                let frame = CameraFrame {
+                    width: 8,
+                    height: 8,
+                    stride: 8,
+                    format: formats[pattern],
+                    data: FrameData::from_owned_vec(codes.clone()),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: Some(FrameMetadata {
+                        colour_gains: Some([1.2, 1.0]),
+                        black_level: Some(32.0 / 255.0),
+                        colour_correction_matrix: Some(ccm),
+                        ..Default::default()
+                    }),
+                };
+                let planes = extract_bayer_planes(&frame).unwrap();
+                let buffer =
+                    gpu.create_storage_buffer("lattice_regression", (planes.data.len() * 4) as u64);
+                gpu.queue
+                    .write_buffer(&buffer, 0, bytemuck::cast_slice(&planes.data));
+                let finished = gpu
+                    .demosaic_bayer_planes_with_method(
+                        &buffer,
+                        4,
+                        4,
+                        pattern as u32,
+                        Some([1.2, 1.0]),
+                        Some(ccm),
+                        crate::shaders::DemosaicMethod::Bilinear,
+                    )
+                    .await
+                    .unwrap();
+                let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+                converter
+                    .convert_bayer_with_method(&input, crate::shaders::DemosaicMethod::Bilinear)
+                    .unwrap();
+                let single = converter.read_rgba_to_cpu(8, 8).await.unwrap();
+                let single_linear = converter.read_bayer_linear_for_test().await.unwrap();
+                let sample = |x: i32, y: i32| {
+                    let x = x.abs().min(14 - x) as usize;
+                    let y = y.abs().min(14 - y) as usize;
+                    ((codes[y * 8 + x] as f32 - 32.0) / 223.0).clamp(-0.14798465, 1.0)
+                };
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let (ix, iy) = (x as i32, y as i32);
+                        let c = sample(ix, iy);
+                        let h = (sample(ix - 1, iy) + sample(ix + 1, iy)) * 0.5;
+                        let v = (sample(ix, iy - 1) + sample(ix, iy + 1)) * 0.5;
+                        let d = (sample(ix - 1, iy - 1)
+                            + sample(ix + 1, iy - 1)
+                            + sample(ix - 1, iy + 1)
+                            + sample(ix + 1, iy + 1))
+                            * 0.25;
+                        let rgb = match site(x, y) {
+                            0 => [c, (h + v) * 0.5, d],
+                            1 => [h, c, v],
+                            2 => [v, c, h],
+                            _ => [d, (h + v) * 0.5, c],
+                        };
+                        let rgb = [rgb[0] * 1.2, rgb[1], rgb[2]];
+                        for channel in 0..3 {
+                            let expected = (0..3).map(|k| ccm[channel][k] * rgb[k]).sum::<f32>();
+                            let actual = finished.data[(y * 8 + x) * 4 + channel];
+                            assert!(
+                                (actual - single_linear[(y * 8 + x) * 4 + channel]).abs() < 2e-5,
+                                "HDR/single linear mismatch: pattern={pattern}, ({x},{y}), channel={channel}"
+                            );
+                            assert!(
+                                (actual - expected).abs() < 2e-5,
+                                "pattern={pattern} ({x},{y}) ch={channel}: {actual} != {expected}"
+                            );
+                            // Single-frame output uses a hue-preserving peak cap before sRGB;
+                            // HDR intentionally retains the linear over-white value.
+                            let peak = ccm
+                                .iter()
+                                .map(|row| (0..3).map(|k| row[k] * rgb[k]).sum::<f32>())
+                                .fold(1.0f32, f32::max);
+                            assert!(
+                                encode(actual / peak).abs_diff(single[(y * 8 + x) * 4 + channel])
+                                    <= 1
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
     fn test_default_config() {
         let config = BurstModeConfig::default();
         assert_eq!(config.frame_count, 8);
@@ -3376,5 +4022,147 @@ mod tests {
             PYRAMID_SHADER.contains("0.299") && PYRAMID_SHADER.contains("0.587"),
             "pyramid.wgsl should use BT.601 coefficients"
         );
+    }
+}
+
+#[cfg(test)]
+mod demosaic_method_tests {
+    use super::*;
+    use crate::shaders::DemosaicMethod;
+    #[test]
+    fn merged_hdr_routes_three_methods_with_original_cfa_phase() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("merged_hdr_routes_three_methods_with_original_cfa_phase");
+            return;
+        };
+        pollster::block_on(async {
+            let processor = BurstModeGpuPipeline::new().await.unwrap();
+            for pattern in 0..4 {
+                let raw: Vec<f32> = (0..20)
+                    .flat_map(|y| {
+                        (0..22).map(move |x| {
+                            0.05 + ((x * 37 + y * 53 + x * y * 7) % 97) as f32 * 0.003
+                                + if x > 11 { 0.18 } else { 0.0 }
+                        })
+                    })
+                    .collect();
+                let mut planes = vec![0.0f32; 22 * 20];
+                let channels = [0, 1, 3, 2];
+                for y in 0..20 {
+                    for x in 0..22 {
+                        planes[((y / 2) * 11 + x / 2) * 4
+                            + channels[crate::shaders::demosaic::site(x, y, pattern)]] =
+                            raw[y * 22 + x];
+                    }
+                }
+                let buffer =
+                    processor.create_storage_buffer("method_test", (planes.len() * 4) as u64);
+                processor
+                    .queue
+                    .write_buffer(&buffer, 0, bytemuck::cast_slice(&planes));
+                let mut outputs = Vec::new();
+                for method in [
+                    DemosaicMethod::Rcd,
+                    DemosaicMethod::Lmmse,
+                    DemosaicMethod::Bilinear,
+                ] {
+                    let actual = processor
+                        .demosaic_bayer_planes_with_method(
+                            &buffer,
+                            11,
+                            10,
+                            pattern,
+                            Some([1.0, 1.0]),
+                            None,
+                            method,
+                        )
+                        .await
+                        .unwrap();
+                    outputs.push(actual.data);
+                }
+                assert_ne!(outputs[0], outputs[1]);
+                assert_ne!(outputs[0], outputs[2]);
+                assert_ne!(outputs[1], outputs[2]);
+                let default = processor
+                    .demosaic_bayer_planes(&buffer, 11, 10, pattern, Some([1.0, 1.0]), None)
+                    .await
+                    .unwrap();
+                assert_eq!(default.data, outputs[0]);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod method_colour_tests {
+    use super::*;
+    use crate::shaders::DemosaicMethod;
+    #[test]
+    fn hdr_all_methods_reject_extreme_ccm_and_nonfinite_input() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("hdr_all_methods_reject_extreme_ccm_and_nonfinite_input");
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = BurstModeGpuPipeline::new().await.unwrap();
+            let channels = [0, 1, 3, 2];
+            let gains = [1.7, 1.3];
+            for pattern in 0..4 {
+                let raw: Vec<f32> = (0..8)
+                    .flat_map(|y| {
+                        (0..10).map(move |x| {
+                            -0.14 + ((x * 37 + y * 53 + x * y * 7) % 97) as f32 * 0.015
+                        })
+                    })
+                    .collect();
+                let mut planes = vec![0.0; 80];
+                for y in 0..8 {
+                    for x in 0..10 {
+                        planes[((y / 2) * 5 + x / 2) * 4
+                            + channels[crate::shaders::demosaic::site(x, y, pattern)]] =
+                            raw[y * 10 + x];
+                    }
+                }
+                let buffer = gpu.create_storage_buffer("hdr_method_colour", 320);
+                gpu.queue
+                    .write_buffer(&buffer, 0, bytemuck::cast_slice(&planes));
+                for method in [
+                    DemosaicMethod::Rcd,
+                    DemosaicMethod::Lmmse,
+                    DemosaicMethod::Bilinear,
+                ] {
+                    for g in [Some(gains), None] {
+                        assert!(
+                            gpu.demosaic_bayer_planes_with_method(
+                                &buffer,
+                                5,
+                                4,
+                                pattern,
+                                g,
+                                Some([[f32::MAX; 3]; 3]),
+                                method
+                            )
+                            .await
+                            .is_err()
+                        );
+                    }
+                }
+                gpu.queue
+                    .write_buffer(&buffer, 0, bytemuck::cast_slice(&[f32::NAN; 80]));
+                for method in [
+                    DemosaicMethod::Rcd,
+                    DemosaicMethod::Lmmse,
+                    DemosaicMethod::Bilinear,
+                ] {
+                    assert!(
+                        gpu.demosaic_bayer_planes_with_method(
+                            &buffer, 5, 4, pattern, None, None, method
+                        )
+                        .await
+                        .is_err()
+                    );
+                }
+            }
+        });
     }
 }
