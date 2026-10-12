@@ -171,11 +171,10 @@ impl PostProcessor {
                 Ok(rgba) => rgba,
                 Err(e) => {
                     warn!(error = %e, "Integrated debayer+filter failed, falling back");
-                    // Fallback: separate debayer then filter (both optional enhancements)
-                    let rgba = Self::convert_yuv_to_rgba(&frame).await.unwrap_or_else(|e| {
-                        warn!(error = %e, "Bayer→RGBA fallback also failed, using raw data");
-                        frame.data.to_vec()
-                    });
+                    // Fallback: decode Bayer first, then apply the optional filter.
+                    // Decode is mandatory; only the optional filter may fall
+                    // back. Undecoded Bayer bytes must not be passed downstream as RGBA.
+                    let rgba = Self::convert_yuv_to_rgba(&frame).await?;
                     apply_filter_gpu_rgba(&rgba, frame_width, frame_height, config.filter_type)
                         .await
                         .unwrap_or(rgba)
@@ -669,6 +668,37 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn normal_photo_decode_failure_is_not_rendered_as_raw_bytes() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu(
+                "normal_photo_decode_failure_is_not_rendered_as_raw_bytes",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 8,
+                height: 8,
+                stride: 40,
+                format: PixelFormat::BayerRGGB,
+                data: crate::backends::camera::types::FrameData::from_owned_vec(vec![64; 320]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let processor = PostProcessor::new(PostProcessingConfig {
+                filter_type: FilterType::Sepia,
+                ..Default::default()
+            });
+            assert!(
+                processor.process(Arc::new(frame)).await.is_err(),
+                "Decode is required even when a filter is optional"
+            );
+        });
     }
 
     #[test]
