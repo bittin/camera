@@ -42,7 +42,7 @@ struct ConvertParams {
     y_stride: u32,
     uv_stride: u32,
     v_stride: u32,
-    _pad0: u32,
+    color: u32,
     _pad1: u32,
 }
 
@@ -96,6 +96,7 @@ pub struct GpuFrameInput<'a> {
     pub uv_stride: u32,
     /// Active chroma extent, never row padding.
     pub uv_dimensions: Option<(u32, u32)>,
+    pub yuv_color: crate::backends::camera::types::YuvColor,
     /// V plane data (I420 only)
     pub v_data: Option<&'a [u8]>,
     pub v_stride: u32,
@@ -138,6 +139,7 @@ impl<'a> GpuFrameInput<'a> {
             uv_data: None,
             uv_stride: 0,
             uv_dimensions: frame.yuv_planes.map(|p| (p.uv_width, p.uv_height)),
+            yuv_color: frame.yuv_planes.map(|p| p.color).unwrap_or_default(),
             v_data: None,
             v_stride: 0,
             colour_gains: None,
@@ -258,6 +260,7 @@ mod normal_input_tests {
                     128, 255, 255, 128, 128, 0, 0, 128, 128, 0, 0,
                 ]),
                 yuv_planes: Some(YuvPlanes {
+                    color: crate::backends::camera::types::YuvColor::Legacy,
                     y_offset: 0,
                     y_size: 12,
                     uv_offset: 12,
@@ -295,6 +298,7 @@ mod normal_input_tests {
             sensor_timestamp_ns: None,
             libcamera_metadata: None,
             yuv_planes: Some(YuvPlanes {
+                color: Default::default(),
                 y_offset: 0,
                 y_size: 12,
                 uv_offset: 12,
@@ -330,6 +334,7 @@ mod normal_input_tests {
             format: PixelFormat::NV12,
             data: FrameData::from_owned_vec(vec![0; 24]),
             yuv_planes: Some(YuvPlanes {
+                color: crate::backends::camera::types::YuvColor::Legacy,
                 y_offset: usize::MAX,
                 y_size: 12,
                 uv_offset: 12,
@@ -1385,7 +1390,7 @@ impl GpuConvertPipeline {
             y_stride: input.y_stride,
             uv_stride: input.uv_stride,
             v_stride: input.v_stride,
-            _pad0: 0,
+            color: input.yuv_color as u32,
             _pad1: 0,
         };
         self.queue
@@ -1853,6 +1858,12 @@ impl GpuConvertPipeline {
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
         self.output_texture.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn review_chroma_texture_sizes(&self) -> [(u32, u32); 2] {
+        [self.tex_uv.as_ref().unwrap(), self.tex_v.as_ref().unwrap()]
+            .map(|texture| (texture.width(), texture.height()))
     }
 
     pub fn device(&self) -> &Arc<wgpu::Device> {

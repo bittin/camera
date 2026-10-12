@@ -720,8 +720,23 @@ pub struct FrameMetadata {
 ///
 /// - NV12: Y plane (full resolution) + UV plane (half resolution, interleaved)
 /// - I420: Y plane + U plane + V plane (all separate, U/V at half resolution)
+///
+/// Decoder/producer color contract. Unknown retains the historical decoder,
+/// including its limited-luma / unscaled-chroma interpretation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum YuvColor {
+    #[default]
+    Legacy = 0,
+    Full601 = 1,
+    Limited601 = 2,
+    Full709 = 3,
+    Limited709 = 4,
+}
+
 #[derive(Clone, Copy)]
 pub struct YuvPlanes {
+    pub color: YuvColor,
     /// Y plane offset in bytes from start of buffer
     pub y_offset: usize,
     /// Y plane size in bytes

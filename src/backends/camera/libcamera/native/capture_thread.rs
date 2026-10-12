@@ -422,6 +422,7 @@ fn compute_yuv_planes(
             let uv_height = height.div_ceil(2);
             let uv_size = (uv_stride * uv_height) as usize;
             Some(YuvPlanes {
+                color: crate::backends::camera::types::YuvColor::Legacy,
                 y_offset: 0,
                 y_size,
                 uv_offset: y_size,
@@ -440,6 +441,7 @@ fn compute_yuv_planes(
             let uv_height = height.div_ceil(2);
             let uv_size = (uv_stride * uv_height) as usize;
             Some(YuvPlanes {
+                color: crate::backends::camera::types::YuvColor::Legacy,
                 y_offset: 0,
                 y_size,
                 uv_offset: y_size,
@@ -1475,13 +1477,21 @@ fn decode_mjpeg_frame(
         }
     }
 
-    // Compute UV plane dimensions based on subsampling
-    let (uv_w, uv_h) = match header.subsamp {
-        turbojpeg::Subsamp::None => (width, height), // 4:4:4
-        turbojpeg::Subsamp::Sub2x1 => (width.div_ceil(2), height), // 4:2:2
-        turbojpeg::Subsamp::Sub1x2 => (width, height.div_ceil(2)), // 4:4:0
-        turbojpeg::Subsamp::Gray => (0, 0),          // Grayscale
-        _ => (width.div_ceil(2), height.div_ceil(2)), // 4:2:0
+    // Decoder geometry owns both pitches and sampling-group padding.
+    let geometry = turbojpeg::YuvImage {
+        pixels: (),
+        width,
+        height,
+        align,
+        subsamp: header.subsamp,
+    };
+    // Gray has only Y backing; TurboJPEG's UV helpers return hypothetical
+    // geometry even for Gray. Empty spans retain full-range luma metadata,
+    // while consumers bind their existing bounded 1x1 dummy UV textures.
+    let (uv_w, uv_h) = if header.subsamp == turbojpeg::Subsamp::Gray {
+        (0, 0)
+    } else {
+        (geometry.uv_width(), geometry.uv_height())
     };
 
     // Determine standard YUV format name from subsampling
@@ -1490,6 +1500,8 @@ fn decode_mjpeg_frame(
         turbojpeg::Subsamp::Sub2x1 => "I422",
         turbojpeg::Subsamp::None => "I444",
         turbojpeg::Subsamp::Sub1x2 => "I440",
+        turbojpeg::Subsamp::Sub4x1 => "I411",
+        turbojpeg::Subsamp::Sub1x4 => "I441",
         turbojpeg::Subsamp::Gray => "Y800",
         _ => "YUV",
     };
@@ -1535,10 +1547,13 @@ fn decode_mjpeg_frame(
         }
     }
 
-    let y_size = width * height;
+    // TurboJPEG pads the Y plane to complete subsampling groups, even at align=1.
+    let y_stride = geometry.y_width();
+    let y_size = y_stride * geometry.y_height();
     let uv_size = uv_w * uv_h;
 
     let yuv_planes = YuvPlanes {
+        color: crate::backends::camera::types::YuvColor::Full601,
         y_offset: 0,
         y_size,
         uv_offset: y_size,
@@ -1558,12 +1573,13 @@ fn decode_mjpeg_frame(
         height: height as u32,
         data,
         format: match header.subsamp {
+            turbojpeg::Subsamp::Gray => PixelFormat::Gray8,
             turbojpeg::Subsamp::Sub2x2 => PixelFormat::I420,
             // No PixelFormat::I422 variant yet; treat 4:2:2 as I420 for now
             // (plane layout is still correct via yuv_planes, only the enum tag is imprecise)
             _ => PixelFormat::I420,
         },
-        stride: width as u32,
+        stride: y_stride as u32,
         yuv_planes: Some(yuv_planes),
         captured_at,
         sensor_timestamp_ns,
@@ -1604,6 +1620,280 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn review_r2_real_mjpeg_411_441_all_consumers() {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu("review_r2_real_mjpeg_411_441_all_consumers");
+            return;
+        };
+        pollster::block_on(async {
+            for (subsamp, w, h) in [
+                (turbojpeg::Subsamp::Sub4x1, 9, 4),
+                (turbojpeg::Subsamp::Sub1x4, 9, 4),
+                (turbojpeg::Subsamp::Sub1x4, 9, 5),
+            ] {
+                let rgb = [210u8, 50, 80];
+                let pixels = rgb.repeat(w * h);
+                let mut compressor = turbojpeg::Compressor::new().unwrap();
+                compressor.set_quality(100).unwrap();
+                compressor.set_subsamp(subsamp).unwrap();
+                let jpeg = compressor
+                    .compress_to_vec(turbojpeg::Image {
+                        pixels: &pixels[..],
+                        width: w,
+                        height: h,
+                        pitch: w * 3,
+                        format: turbojpeg::PixelFormat::RGB,
+                    })
+                    .unwrap();
+                let frame = super::decode_mjpeg_frame(
+                    &mut turbojpeg::Decompressor::new().unwrap(),
+                    &jpeg,
+                    Instant::now(),
+                    None,
+                    &Default::default(),
+                    1,
+                    &FrameDataPool::new(1),
+                )
+                .unwrap();
+                let p = frame.yuv_planes.unwrap();
+                let expected = if subsamp == turbojpeg::Subsamp::Sub4x1 {
+                    (3, 4)
+                } else {
+                    (9, (h as u32).div_ceil(4))
+                };
+                assert_eq!((p.uv_width, p.uv_height), expected, "{subsamp:?}");
+                let preview = crate::app::review_decoded_preview(&device, &queue, &frame);
+                let recording = crate::pipelines::video::recorder::convert_frame_to_rgba(&frame)
+                    .await
+                    .unwrap();
+                let photo =
+                    crate::pipelines::photo::processing::PostProcessor::new(Default::default())
+                        .process(Arc::new(frame))
+                        .await
+                        .unwrap();
+                for out in [&preview, &recording] {
+                    for pixel in out.as_chunks::<4>().0 {
+                        for c in 0..3 {
+                            assert!(pixel[c].abs_diff(rgb[c]) <= 2, "{subsamp:?}: {pixel:?}");
+                        }
+                    }
+                }
+                for pixel in photo.image.pixels() {
+                    for c in 0..3 {
+                        assert!(pixel[c].abs_diff(rgb[c]) <= 2, "{subsamp:?}: {pixel:?}");
+                    }
+                }
+            }
+        });
+    }
+
+    fn review_n1_gray_frame(w: usize, h: usize) -> crate::backends::camera::types::CameraFrame {
+        let pixels = [83u8; 3].repeat(w * h);
+        let mut compressor = turbojpeg::Compressor::new().unwrap();
+        compressor.set_quality(100).unwrap();
+        compressor.set_subsamp(turbojpeg::Subsamp::Gray).unwrap();
+        let jpeg = compressor
+            .compress_to_vec(turbojpeg::Image {
+                pixels: &pixels[..],
+                width: w,
+                height: h,
+                pitch: w * 3,
+                format: turbojpeg::PixelFormat::RGB,
+            })
+            .unwrap();
+        super::decode_mjpeg_frame(
+            &mut turbojpeg::Decompressor::new().unwrap(),
+            &jpeg,
+            Instant::now(),
+            None,
+            &Default::default(),
+            1,
+            &FrameDataPool::new(1),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn review_n1_real_gray_jpeg_declares_only_backed_luminance() {
+        for (w, h) in [(9, 4), (7, 13)] {
+            let frame = review_n1_gray_frame(w, h);
+            assert_eq!(
+                frame.format,
+                crate::backends::camera::types::PixelFormat::Gray8
+            );
+            let p = frame.yuv_planes.unwrap();
+            assert_eq!(p.color, crate::backends::camera::types::YuvColor::Full601);
+            assert_eq!((p.uv_width, p.uv_height, p.uv_size, p.v_size), (0, 0, 0, 0));
+            assert_eq!((p.uv_stride, p.v_stride), (0, 0));
+            assert_eq!(p.y_offset + p.y_size, frame.data.as_ref().len());
+            assert_eq!(p.uv_offset + p.uv_size, frame.data.as_ref().len());
+            assert_eq!(p.v_offset + p.v_size, frame.data.as_ref().len());
+            assert_eq!(frame.data.as_ref(), vec![83; w * h]);
+            let input = crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap();
+            assert!(input.uv_data.is_none() && input.v_data.is_none());
+        }
+    }
+
+    #[test]
+    fn review_n1_real_gray_jpeg_bounds_still_dummy_chroma() {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu("review_n1_real_gray_jpeg_bounds_still_dummy_chroma");
+            return;
+        };
+        pollster::block_on(async {
+            let mut converter = crate::shaders::GpuConvertPipeline::new().await.unwrap();
+            for (w, h) in [(9, 4), (7, 13)] {
+                let frame = review_n1_gray_frame(w, h);
+                converter
+                    .convert(&crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap())
+                    .unwrap();
+                assert_eq!(converter.review_chroma_texture_sizes(), [(1, 1); 2]);
+                let converted = converter
+                    .read_rgba_to_cpu(w as u32, h as u32)
+                    .await
+                    .unwrap();
+                let preview = crate::app::review_decoded_preview(&device, &queue, &frame);
+                let recording = crate::pipelines::video::recorder::convert_frame_to_rgba(&frame)
+                    .await
+                    .unwrap();
+                let photo =
+                    crate::pipelines::photo::processing::PostProcessor::new(Default::default())
+                        .process(Arc::new(frame))
+                        .await
+                        .unwrap();
+                for out in [converted, preview, recording] {
+                    assert_eq!(out, [83, 83, 83, 255].repeat(w * h));
+                }
+                assert_eq!(photo.image.as_raw(), &[83, 83, 83].repeat(w * h));
+            }
+        });
+    }
+
+    #[test]
+    fn review_n1_real_gray_jpeg_bounds_preview_dummy_chroma() {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu("review_n1_real_gray_jpeg_bounds_preview_dummy_chroma");
+            return;
+        };
+        for (w, h) in [(9, 4), (7, 13)] {
+            let frame = review_n1_gray_frame(w, h);
+            assert_eq!(
+                crate::app::review_decoded_preview(&device, &queue, &frame),
+                [83, 83, 83, 255].repeat(w * h)
+            );
+        }
+    }
+
+    #[test]
+    fn review_r3_real_gray_mjpeg_all_consumers() {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu("review_r3_real_gray_mjpeg_all_consumers");
+            return;
+        };
+        pollster::block_on(async {
+            let pixels = [128u8; 3].repeat(36);
+            let mut compressor = turbojpeg::Compressor::new().unwrap();
+            compressor.set_quality(100).unwrap();
+            compressor.set_subsamp(turbojpeg::Subsamp::Gray).unwrap();
+            let jpeg = compressor
+                .compress_to_vec(turbojpeg::Image {
+                    pixels: &pixels[..],
+                    width: 9,
+                    height: 4,
+                    pitch: 27,
+                    format: turbojpeg::PixelFormat::RGB,
+                })
+                .unwrap();
+            let frame = super::decode_mjpeg_frame(
+                &mut turbojpeg::Decompressor::new().unwrap(),
+                &jpeg,
+                Instant::now(),
+                None,
+                &Default::default(),
+                1,
+                &FrameDataPool::new(1),
+            )
+            .unwrap();
+            assert_eq!(
+                frame.format,
+                crate::backends::camera::types::PixelFormat::Gray8
+            );
+            crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let preview = crate::app::review_decoded_preview(&device, &queue, &frame);
+            let recording = crate::pipelines::video::recorder::convert_frame_to_rgba(&frame)
+                .await
+                .unwrap();
+            let photo = crate::pipelines::photo::processing::PostProcessor::new(Default::default())
+                .process(Arc::new(frame))
+                .await
+                .unwrap();
+            for out in [&preview, &recording] {
+                for pixel in out.as_chunks::<4>().0 {
+                    assert_eq!(*pixel, [128, 128, 128, 255]);
+                }
+            }
+            for pixel in photo.image.pixels() {
+                assert_eq!(pixel.0, [128, 128, 128]);
+            }
+        });
+    }
+
+    #[test]
+    fn normal_mjpeg_photo_uses_decoder_full_range() {
+        let Some((_guard, _device, _queue)) = crate::test_gpu::headless_device() else {
+            crate::test_gpu::skip_no_gpu("normal_mjpeg_photo_uses_decoder_full_range");
+            return;
+        };
+        pollster::block_on(async {
+            let mut converter = crate::shaders::GpuConvertPipeline::new().await.unwrap();
+            for subsamp in [
+                turbojpeg::Subsamp::None,
+                turbojpeg::Subsamp::Sub2x1,
+                turbojpeg::Subsamp::Sub2x2,
+            ] {
+                for rgb in [[32, 32, 32], [128, 128, 128], [210, 50, 80]] {
+                    let pixels = rgb.repeat(9);
+                    let mut compressor = turbojpeg::Compressor::new().unwrap();
+                    compressor.set_quality(100).unwrap();
+                    compressor.set_subsamp(subsamp).unwrap();
+                    let jpeg = compressor
+                        .compress_to_vec(turbojpeg::Image {
+                            pixels: &pixels[..],
+                            width: 3,
+                            height: 3,
+                            pitch: 9,
+                            format: turbojpeg::PixelFormat::RGB,
+                        })
+                        .unwrap();
+                    let mut decoder = turbojpeg::Decompressor::new().unwrap();
+                    let frame = super::decode_mjpeg_frame(
+                        &mut decoder,
+                        &jpeg,
+                        Instant::now(),
+                        None,
+                        &crate::backends::camera::types::FrameMetadata::default(),
+                        1,
+                        &FrameDataPool::new(1),
+                    )
+                    .unwrap();
+                    converter
+                        .convert(&crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap())
+                        .unwrap();
+                    let out = converter.read_rgba_to_cpu(3, 3).await.unwrap();
+                    for pixel in out.as_chunks::<4>().0 {
+                        for c in 0..3 {
+                            assert!(
+                                pixel[c].abs_diff(rgb[c]) <= 2,
+                                "{subsamp:?}: {rgb:?} -> {pixel:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     struct BlockingWorker {
         started: Arc<AtomicUsize>,

@@ -306,6 +306,7 @@ impl PostProcessor {
             uv_data: None,
             uv_stride: 0,
             uv_dimensions: None,
+            yuv_color: Default::default(),
             v_data: None,
             v_stride: 0,
             colour_gains,

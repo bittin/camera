@@ -52,6 +52,8 @@ mod ui;
 mod update;
 mod utils;
 mod video_primitive;
+#[cfg(test)]
+pub(crate) use video_primitive::tests::review_decoded_preview;
 mod video_widget;
 mod view;
 
