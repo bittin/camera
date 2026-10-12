@@ -1036,7 +1036,8 @@ struct YuvConvertParams {
     y_stride: u32,
     uv_stride: u32,
     v_stride: u32,
-    _pad: [u32; 2],
+    color: u32,
+    _pad: u32,
 }
 
 /// YUV textures for a video source (for YUV→RGBA conversion)
@@ -2724,7 +2725,8 @@ impl VideoPipeline {
             y_stride: frame.stride,
             uv_stride: frame.yuv_planes.as_ref().map(|p| p.uv_stride).unwrap_or(0),
             v_stride: frame.yuv_planes.as_ref().map(|p| p.v_stride).unwrap_or(0),
-            _pad: [0, 0],
+            color: frame.yuv_planes.map(|p| p.color as u32).unwrap_or(0),
+            _pad: 0,
         };
         queue.write_buffer(&yuv.uniform_buffer, 0, bytemuck::cast_slice(&[params]));
 
@@ -3777,7 +3779,7 @@ impl VideoPipeline {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_gpu::{headless_device, skip_no_gpu};
 
@@ -3836,6 +3838,7 @@ mod tests {
     #[test]
     fn i420_requires_a_complete_v_plane() {
         let mut layout = YuvPlanes {
+            color: crate::backends::camera::types::YuvColor::Legacy,
             y_offset: 0,
             y_size: 16,
             uv_offset: 16,
@@ -4019,6 +4022,7 @@ mod tests {
             v_stride: 2,
             uv_width: 2,
             uv_height: 2,
+            color: crate::backends::camera::types::YuvColor::Full601,
         };
         preview.upload(
             &device,
@@ -4173,6 +4177,253 @@ mod tests {
             "last odd pixel={:?}, expected={expected}",
             &out[8..12]
         );
+    }
+
+    /// Test adapter only: exercise the real preview upload with decoder-owned bytes.
+    pub(crate) fn review_decoded_preview(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &crate::backends::camera::types::CameraFrame,
+    ) -> Vec<u8> {
+        let mut preview = VideoPipeline::new(device, wgpu::TextureFormat::Rgba8Unorm);
+        preview.upload(
+            device,
+            queue,
+            VideoFrame {
+                id: VIDEO_ID_NORMAL,
+                width: frame.width,
+                height: frame.height,
+                stride: frame.stride,
+                format: frame.format,
+                data: frame.data.clone(),
+                yuv_planes: frame.yuv_planes,
+            },
+        );
+        if frame.format == PixelFormat::Gray8 {
+            let planes = &preview.yuv_textures[&VIDEO_ID_NORMAL];
+            for texture in [&planes.tex_uv, &planes.tex_v] {
+                assert_eq!((texture.width(), texture.height()), (1, 1));
+            }
+        }
+        read_normal_source(device, queue, &preview.textures[&VIDEO_ID_NORMAL].texture)
+    }
+
+    // Broad acceptance characterization after the focused RED/GREEN slices.
+    #[test]
+    fn normal_preview_still_color_matrix_and_layout_agree() {
+        use crate::backends::camera::types::{CameraFrame, FrameMetadata, YuvColor, YuvPlanes};
+        let Some((_guard, device, queue)) = headless_device() else {
+            skip_no_gpu("normal_preview_still_color_matrix_and_layout_agree");
+            return;
+        };
+        pollster::block_on(async {
+            let mut preview = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+            let mut still = crate::shaders::GpuConvertPipeline::new().await.unwrap();
+            // Keep fixture allocations alive: metadata-less pointer identities
+            // must not be spuriously recycled between synthetic uploads.
+            let mut retained_frames = Vec::new();
+            for format in [PixelFormat::I420, PixelFormat::NV12, PixelFormat::NV21] {
+                for color in [
+                    YuvColor::Legacy,
+                    YuvColor::Full601,
+                    YuvColor::Limited601,
+                    YuvColor::Full709,
+                    YuvColor::Limited709,
+                ] {
+                    let mut data = vec![99; 12];
+                    for row in 0..3 {
+                        data[row * 4..row * 4 + 3].fill(100);
+                    }
+                    let mut planes = YuvPlanes {
+                        color,
+                        y_offset: 0,
+                        y_size: 12,
+                        uv_offset: 12,
+                        uv_size: 8,
+                        uv_stride: 4,
+                        v_offset: 20,
+                        v_size: 8,
+                        v_stride: 4,
+                        uv_width: 2,
+                        uv_height: 2,
+                    };
+                    if format == PixelFormat::I420 {
+                        data.extend_from_slice(&[
+                            90, 90, 0xee, 0xee, 90, 90, 0xee, 0xee, 180, 180, 0xdd, 0xdd, 180, 180,
+                        ]);
+                        planes.v_size = 6;
+                    } else {
+                        let pair = if format == PixelFormat::NV12 {
+                            [90, 180]
+                        } else {
+                            [180, 90]
+                        };
+                        data.extend(pair.repeat(4));
+                        planes.v_offset = 0;
+                        planes.v_size = 0;
+                        planes.v_stride = 0;
+                    }
+                    let frame = CameraFrame {
+                        width: 3,
+                        height: 3,
+                        stride: 4,
+                        format,
+                        data: FrameData::from_owned_vec(data),
+                        yuv_planes: Some(planes),
+                        captured_at: std::time::Instant::now(),
+                        sensor_timestamp_ns: None,
+                        // Rendered pixels must never receive RAW gains or CCM a second time.
+                        libcamera_metadata: Some(FrameMetadata {
+                            colour_gains: Some([4.0, 4.0]),
+                            colour_correction_matrix: Some([[3.0; 3]; 3]),
+                            ..Default::default()
+                        }),
+                    };
+                    preview.upload(
+                        &device,
+                        &queue,
+                        VideoFrame {
+                            id: VIDEO_ID_NORMAL,
+                            width: 3,
+                            height: 3,
+                            stride: 4,
+                            format,
+                            data: frame.data.clone(),
+                            yuv_planes: frame.yuv_planes,
+                        },
+                    );
+                    let display = read_normal_source(
+                        &device,
+                        &queue,
+                        &preview.textures[&VIDEO_ID_NORMAL].texture,
+                    );
+                    retained_frames.push(frame.clone());
+                    let input = crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap();
+                    still.convert(&input).unwrap();
+                    let photo = still.read_rgba_to_cpu(3, 3).await.unwrap();
+                    // Preview fixture RADV iGPU and production still NVIDIA dGPU
+                    // differ at one normalized-store rounding boundary. Validate
+                    // both against CPU equations, not a cross-vendor bitexact claim.
+                    for (a, b) in display.iter().zip(&photo) {
+                        assert!(a.abs_diff(*b) <= 1, "{format:?} {color:?}");
+                    }
+                    let mut y = (100.0f32 - 16.0) / 219.0;
+                    let mut u = 90.0 / 255.0 - 0.5;
+                    let mut v = 180.0 / 255.0 - 0.5;
+                    if color != YuvColor::Legacy {
+                        u = (90.0 - 128.0) / 255.0;
+                        v = (180.0 - 128.0) / 255.0;
+                        if matches!(color, YuvColor::Full601 | YuvColor::Full709) {
+                            y = 100.0 / 255.0;
+                        } else {
+                            u *= 255.0 / 224.0;
+                            v *= 255.0 / 224.0;
+                        }
+                    }
+                    let rgb = if matches!(color, YuvColor::Full709 | YuvColor::Limited709) {
+                        [
+                            y + 1.5748 * v,
+                            y - 0.187324 * u - 0.468124 * v,
+                            y + 1.8556 * u,
+                        ]
+                    } else {
+                        [
+                            y + 1.402 * v,
+                            y - 0.344136 * u - 0.714136 * v,
+                            y + 1.772 * u,
+                        ]
+                    };
+                    for pixel in display.as_chunks::<4>().0 {
+                        for c in 0..3 {
+                            let expected = (rgb[c].clamp(0.0, 1.0) * 255.0).round() as u8;
+                            assert!(
+                                pixel[c].abs_diff(expected) <= 1,
+                                "{format:?} {color:?}: {pixel:?} != {rgb:?}"
+                            );
+                        }
+                    }
+                    // Malformed replacement must not invalidate or overwrite last good image.
+                    let old = display;
+                    preview.upload(
+                        &device,
+                        &queue,
+                        VideoFrame {
+                            id: VIDEO_ID_NORMAL,
+                            width: 3,
+                            height: 3,
+                            stride: 4,
+                            format,
+                            data: FrameData::from_owned_vec(vec![0; 2]),
+                            yuv_planes: Some(planes),
+                        },
+                    );
+                    assert_eq!(
+                        old,
+                        read_normal_source(
+                            &device,
+                            &queue,
+                            &preview.textures[&VIDEO_ID_NORMAL].texture
+                        )
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn normal_preview_yuv411_odd_chroma_steps_follow_sampling_groups() {
+        let Some((_guard, device, queue)) = headless_device() else {
+            skip_no_gpu("normal_preview_yuv411_odd_chroma_steps_follow_sampling_groups");
+            return;
+        };
+        let mut pipeline = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let mut data = vec![128; 18];
+        data.extend_from_slice(&[128, 180, 90, 128, 180, 90]);
+        data.extend_from_slice(&[128; 6]);
+        pipeline.upload(
+            &device,
+            &queue,
+            VideoFrame {
+                id: VIDEO_ID_NORMAL,
+                width: 9,
+                height: 2,
+                format: PixelFormat::I420,
+                data: FrameData::from_owned_vec(data),
+                stride: 9,
+                yuv_planes: Some(crate::backends::camera::types::YuvPlanes {
+                    color: crate::backends::camera::types::YuvColor::Full601,
+                    y_offset: 0,
+                    y_size: 18,
+                    uv_offset: 18,
+                    uv_size: 6,
+                    uv_stride: 3,
+                    v_offset: 24,
+                    v_size: 6,
+                    v_stride: 3,
+                    uv_width: 3,
+                    uv_height: 2,
+                }),
+            },
+        );
+        let out = read_normal_source(
+            &device,
+            &queue,
+            &pipeline.textures[&VIDEO_ID_NORMAL].texture,
+        );
+        for x in 0..9 {
+            let u = [128.0f32, 180.0, 90.0][x / 4] / 255.0 - 128.0 / 255.0;
+            let expected = [
+                128,
+                ((128.0 / 255.0 - 0.344136 * u).clamp(0.0, 1.0) * 255.0).round() as u8,
+                ((128.0 / 255.0 + 1.772 * u).clamp(0.0, 1.0) * 255.0).round() as u8,
+            ];
+            for c in 0..3 {
+                assert!(
+                    out[x * 4 + c].abs_diff(expected[c]) <= 1,
+                    "x={x}, out={out:?}"
+                );
+            }
+        }
     }
 
     #[test]

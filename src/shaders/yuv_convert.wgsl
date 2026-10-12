@@ -15,7 +15,7 @@ struct ConvertParams {
     y_stride: u32,    // Y plane stride in texels (for stride-aware sampling)
     uv_stride: u32,   // UV plane stride in texels
     v_stride: u32,    // V plane stride in texels (I420 only)
-    _pad0: u32,       // Padding for 16-byte alignment
+    color: u32,      // 0=legacy, 1=full601, 2=limited601, 3=full709, 4=limited709
     _pad1: u32,
 }
 
@@ -40,11 +40,24 @@ struct ConvertParams {
 fn yuv_to_rgb_bt601(y: f32, u: f32, v: f32) -> vec3<f32> {
     // BT.601 uses limited range Y [16,235] and UV [16,240]
     // Scale Y from [16/255, 235/255] to [0, 1]
-    let y_scaled = (y - 16.0 / 255.0) * (255.0 / 219.0);
-
-    // Shift U/V from [0, 1] to [-0.5, 0.5]
-    let u_shifted = u - 0.5;
-    let v_shifted = v - 0.5;
+    var y_scaled = (y - 16.0 / 255.0) * (255.0 / 219.0);
+    var u_shifted = u - 0.5;
+    var v_shifted = v - 0.5;
+    if params.color != 0u {
+        u_shifted = u - 128.0 / 255.0;
+        v_shifted = v - 128.0 / 255.0;
+        if params.color == 1u || params.color == 3u {
+            y_scaled = y;
+        } else {
+            u_shifted *= 255.0 / 224.0;
+            v_shifted *= 255.0 / 224.0;
+        }
+        if params.color >= 3u {
+            return clamp(vec3(y_scaled + 1.5748*v_shifted,
+                y_scaled - 0.187324*u_shifted - 0.468124*v_shifted,
+                y_scaled + 1.8556*u_shifted), vec3(0.0), vec3(1.0));
+        }
+    }
 
     // BT.601 conversion matrix
     let r = y_scaled + 1.402 * v_shifted;
