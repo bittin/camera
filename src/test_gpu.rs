@@ -67,6 +67,22 @@ pub(crate) fn headless_device() -> Option<(MutexGuard<'static, ()>, wgpu::Device
         .map(|(device, queue)| (guard, device, queue))
 }
 
+/// Exclusive preview device access for tests that also use production compute.
+///
+/// The preview fixture can use GLES on machines without Vulkan, but production
+/// compute requires Vulkan. Check both before entering a mixed-path test so it
+/// follows the same no-adapter skip policy as preview-only tests. Pipeline
+/// creation and conversion errors remain assertions in the caller.
+pub(crate) fn headless_device_with_compute()
+-> Option<(MutexGuard<'static, ()>, wgpu::Device, wgpu::Queue)> {
+    let fixture = headless_device()?;
+    if let Err(error) = pollster::block_on(crate::gpu::get_shared_gpu()) {
+        eprintln!("Production compute device unavailable: {error}");
+        return None;
+    }
+    Some(fixture)
+}
+
 /// Called wherever a GPU test degrades to a skip because there is no adapter.
 ///
 /// A `println!` and a `return` is a PASS, so without this every GPU test in the

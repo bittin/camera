@@ -4220,7 +4220,7 @@ pub(crate) mod tests {
     #[test]
     fn normal_preview_still_color_matrix_and_layout_agree() {
         use crate::backends::camera::types::{CameraFrame, FrameMetadata, YuvColor, YuvPlanes};
-        let Some((_guard, device, queue)) = headless_device() else {
+        let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {
             skip_no_gpu("normal_preview_still_color_matrix_and_layout_agree");
             return;
         };
