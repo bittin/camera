@@ -34,6 +34,7 @@
 //! This allows simultaneous 1080p preview and full-resolution photo capture.
 
 pub(crate) mod native;
+mod stream_negotiation;
 
 pub(crate) use native::{NativeLibcameraPipeline, PipelineSharedState};
 
@@ -58,12 +59,25 @@ static CAMERA_MANAGER_LOCK: Mutex<()> = Mutex::new(());
 ///
 /// The "simple" pipeline handler (Software ISP, used by phone platforms) uses
 /// device-tree paths that start with "/base/" (older libcamera) or "platform/"
-/// (libcamera 0.7+). Anything else — notably USB webcams on `uvcvideo` — is
-/// left unidentified.
+/// (libcamera 0.7+). UVC IDs can also start with a device-tree path, but end
+/// with a USB vendor/product suffix; leave those and other unknown IDs
+/// unidentified. This heuristic is only for hardware-release behavior and
+/// diagnostics; stream support is probed independently through libcamera.
 ///
 /// This is the single source of truth for the check: both enumeration and the
 /// capture thread's hardware-release delay depend on it.
 pub(crate) fn detect_pipeline_handler(camera_id: &str) -> Option<&'static str> {
+    if let Some((_, usb_id)) = camera_id.rsplit_once('-')
+        && let Some((vendor, product)) = usb_id.split_once(':')
+        && vendor.len() == 4
+        && product.len() == 4
+        && vendor
+            .bytes()
+            .chain(product.bytes())
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
     if camera_id.starts_with("/base/") || camera_id.starts_with("platform/") {
         Some("simple")
     } else {
@@ -74,6 +88,30 @@ pub(crate) fn detect_pipeline_handler(camera_id: &str) -> Option<&'static str> {
 /// Cached enumeration result, returned when capture is active and
 /// a new CameraManager cannot be created.
 static CACHED_DEVICES: std::sync::RwLock<Vec<CameraDevice>> = std::sync::RwLock::new(Vec::new());
+
+/// Publish the accepted configuration back to discovery/capture consumers.
+fn record_stream_capability(camera_id: &str, multistream: bool) {
+    if let Ok(mut devices) = CACHED_DEVICES.write()
+        && let Some(device) = devices.iter_mut().find(|d| d.path == camera_id)
+    {
+        device.supports_multistream = multistream;
+    }
+    if !multistream
+        && let Ok(mut cache) = CACHED_FORMATS.write()
+        && let Some(formats) = cache.get_mut(camera_id)
+    {
+        formats.retain(|format| !format.pixel_format.starts_with("Bayer"));
+    }
+}
+
+pub(crate) fn cached_stream_capability(camera_id: &str) -> Option<bool> {
+    CACHED_DEVICES
+        .read()
+        .ok()?
+        .iter()
+        .find(|d| d.path == camera_id)
+        .map(|d| d.supports_multistream)
+}
 
 /// Cached format results per device path, returned when capture is active.
 /// Key: device path, Value: formats
@@ -335,9 +373,8 @@ fn query_camera_formats(
     let mut formats = collect_stream_formats(&config, 0, framerate, true);
 
     // Also probe raw stream formats if multistream is supported
-    if supports_multistream && let Some(raw_config) = cam.generate_configuration(&[StreamRole::Raw])
-    {
-        formats.extend(collect_stream_formats(&raw_config, 0, framerate, false));
+    if supports_multistream && let Ok(raw_config) = stream_negotiation::prepare(cam, true, None) {
+        formats.extend(collect_stream_formats(&raw_config, 1, framerate, false));
     }
 
     // Sort by resolution (highest first), then by pixel format (Bayer formats first)
@@ -422,8 +459,7 @@ impl CameraBackend for LibcameraBackend {
 
             let pipeline_handler = detect_pipeline_handler(&camera_id).map(str::to_string);
 
-            let supports_multistream =
-                v4l2_utils::supports_multistream(pipeline_handler.as_deref());
+            let supports_multistream = stream_negotiation::prepare(&cam, true, None).is_ok();
 
             debug!(
                 camera_id = %camera_id,
@@ -567,7 +603,8 @@ impl CameraBackend for LibcameraBackend {
             }
         };
 
-        let formats = query_camera_formats(&cam, device.supports_multistream, video_mode);
+        let supports_multistream = stream_negotiation::prepare(&cam, true, None).is_ok();
+        let formats = query_camera_formats(&cam, supports_multistream, video_mode);
 
         debug!(count = formats.len(), "Enumerated formats via libcamera-rs");
 
@@ -614,7 +651,7 @@ impl CameraBackend for LibcameraBackend {
         let pipeline = NativeLibcameraPipeline::new(
             &device.path,
             format,
-            device.supports_multistream,
+            false,
             PipelineSharedState {
                 frame_sender: sender,
                 still_requested,
@@ -626,10 +663,13 @@ impl CameraBackend for LibcameraBackend {
             },
         )?;
 
+        let is_multistream = pipeline.is_multistream();
         // Store state
         self.pipeline = Some(pipeline);
         *self.frame_receiver.lock().unwrap() = Some(receiver);
-        self.current_device = Some(device.clone());
+        let mut current_device = device.clone();
+        current_device.supports_multistream = is_multistream;
+        self.current_device = Some(current_device);
         self.current_format = Some(format.clone());
 
         info!("libcamera backend initialized with native pipeline");
@@ -795,7 +835,7 @@ pub fn create_pipeline(
     let pipeline = NativeLibcameraPipeline::new(
         &device.path,
         format,
-        device.supports_multistream,
+        false,
         PipelineSharedState {
             frame_sender: sender,
             still_requested: Arc::new(AtomicBool::new(false)),
@@ -820,6 +860,40 @@ pub fn create_pipeline(
 mod tests {
     use super::detect_pipeline_handler;
 
+    #[test]
+    #[ignore = "requires an idle Logitech C270 webcam"]
+    fn live_uvc_negotiates_single_stream_despite_stale_dual_hint() {
+        use super::super::CameraBackend;
+        use futures::StreamExt;
+        let mut backend = super::LibcameraBackend::new();
+        let mut device = backend
+            .enumerate_cameras()
+            .into_iter()
+            .find(|d| d.path.ends_with("-046d:0825"))
+            .expect("Logitech C270");
+        assert!(
+            !device.supports_multistream,
+            "discovery must probe actual stream support"
+        );
+        let formats = backend.get_formats(&device, false);
+        let format = formats.first().expect("webcam format");
+        device.supports_multistream = true;
+        backend
+            .initialize(&device, format)
+            .expect("single-stream fallback");
+        assert!(!backend.current_device().unwrap().supports_multistream);
+        assert_eq!(super::cached_stream_capability(&device.path), Some(false));
+        let mut receiver = backend.get_preview_receiver().unwrap();
+        let frame = futures::executor::block_on(receiver.next()).expect("live webcam frame");
+        assert_eq!((frame.width, frame.height), (format.width, format.height));
+        assert!(!frame.data.is_empty());
+        println!(
+            "Negotiated single-stream app frame: {}x{} {:?}",
+            frame.width, frame.height, frame.format
+        );
+        backend.shutdown().unwrap();
+    }
+
     /// The hardware-release delay before a new CameraManager is created is
     /// gated on this returning Some("simple"). A false negative would skip a
     /// delay that real hardware needs, so pin both phone path formats.
@@ -838,8 +912,23 @@ mod tests {
     }
 
     #[test]
+    fn device_tree_usb_webcams_are_not_simple_pipeline() {
+        for id in [
+            "/base/soc/usb@702280000-1.2.3:1.0-046d:0825",
+            "/base/soc/usb@b02280000-1.2.3:1.0-046d:0825",
+            "platform/soc/usb@702280000-1.2.3:1.0-046d:0825",
+        ] {
+            let handler = detect_pipeline_handler(id);
+            assert_eq!(
+                handler, None,
+                "USB camera must not use the simple handler: {id}"
+            );
+        }
+    }
+
+    #[test]
     fn usb_webcams_have_no_known_handler() {
-        // uvcvideo IDs are ACPI/USB topology paths, never device-tree paths.
+        // UVC IDs also use ACPI/USB topology paths on non-device-tree hosts.
         assert_eq!(
             detect_pipeline_handler("\\_SB_.PCI0.GPP7.UP00.DP60.XH00.RHUB.POT9-4:1.0-046d:0825"),
             None

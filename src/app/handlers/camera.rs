@@ -313,6 +313,13 @@ impl AppModel {
         // Also clears the crash-recovery state. Issue #410.
         self.commit_pending_camera_if_ready(&frame);
 
+        if let Some(camera) = self.available_cameras.get_mut(self.current_camera_index)
+            && let Some(multistream) =
+                crate::backends::camera::libcamera::cached_stream_capability(&camera.path)
+        {
+            camera.supports_multistream = multistream;
+        }
+
         // When in Virtual mode with file source but NOT streaming, skip camera frames
         // (file source preview is shown via FileSourcePreviewLoaded message)
         // When streaming from file source, accept frames (they come from preview subscription)

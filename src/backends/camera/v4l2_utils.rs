@@ -325,19 +325,6 @@ pub fn detect_csi2_bit_depth(width: u32, packed_stride: u32) -> Option<u32> {
     }
 }
 
-/// Check if a libcamera pipeline handler supports multi-stream capture
-///
-/// With native libcamera-rs bindings, all known pipeline handlers support
-/// ViewFinder + Raw dual-stream configuration:
-/// - "simple" handler: ViewFinder (Software ISP) + Raw (bypass ISP)
-/// - Hardware ISP handlers ("vc4", "ipu3", "rkisp1"): native multi-stream
-pub fn supports_multistream(pipeline_handler: Option<&str>) -> bool {
-    // All known pipeline handlers (both "simple" Software ISP and hardware ISP
-    // handlers like "vc4", "ipu3", "rkisp1") support ViewFinder + Raw dual-stream.
-    // If no handler is known, assume single-stream to be safe.
-    pipeline_handler.is_some()
-}
-
 // ===== V4L2 Format Enumeration =====
 
 /// VIDIOC_ENUM_FMT ioctl number (v4l2_fmtdesc: 64 bytes, nr=2)

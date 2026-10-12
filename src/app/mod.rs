@@ -1204,31 +1204,8 @@ impl cosmic::Application for AppModel {
                                     .strip_prefix("pipewire-serial-")
                                     .unwrap_or(&device.path);
 
-                                // For single-stream cameras the viewfinder IS the
-                                // capture stream, so use full resolution.  Only cap
-                                // the preview for multistream cameras that have a
-                                // separate raw/still stream.
-                                let preview_format = if device.supports_multistream
-                                    && (format.width > 1920 || format.height > 1080)
-                                {
-                                    // Multistream: scale capture format to fit within 1080p,
-                                    // preserving exact aspect ratio so viewfinder FOV matches capture
-                                    let scale_w = 1920.0 / format.width as f64;
-                                    let scale_h = 1080.0 / format.height as f64;
-                                    let scale = scale_w.min(scale_h);
-                                    let w = ((format.width as f64 * scale) as u32) & !1;
-                                    let h = ((format.height as f64 * scale) as u32) & !1;
-                                    CameraFormat {
-                                        width: w,
-                                        height: h,
-                                        framerate: format.framerate,
-                                        hardware_accelerated: format.hardware_accelerated,
-                                        pixel_format: format.pixel_format.clone(),
-                                    }
-                                } else {
-                                    // Single-stream: use full resolution
-                                    format.clone()
-                                };
+                                // Pass capture resolution intact. The native negotiation
+                                // caps preview only if a separate raw stream succeeds.
 
                                 // Use the shared recording sender from the manager,
                                 // or a dummy Arc if no manager is available.
@@ -1238,8 +1215,8 @@ impl cosmic::Application for AppModel {
 
                                 match NativeLibcameraPipeline::new(
                                     camera_name,
-                                    &preview_format,
-                                    device.supports_multistream,
+                                    &format,
+                                    true,
                                     crate::backends::camera::libcamera::PipelineSharedState {
                                         frame_sender: sender,
                                         still_requested: Arc::clone(&still_capture_requested),
