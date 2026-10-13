@@ -84,7 +84,14 @@ fn estimate(q:vec2<i32>,d:vec2<i32>)->f32{
         return raw(q+d)+0.5*(raw(q)-raw(q+2*d));
     }
     if abs(raw(q+d))>1e15{
-        return raw(q+d)*((l+l)/den);
+        // Keep the ratio bounded before multiplying the scene-scale sample.
+        // Scaling also keeps its reciprocal normal on GPUs that flush
+        // subnormals; the clamp prevents reassociation into an overflowing
+        // raw*(l+l) product. l,n are positive here, so the ratio is in [0,2].
+        let sl=l*1e-20;
+        let sn=n*1e-20;
+        let ratio=(sl+sl)/(1e-25+sl+sn);
+        return raw(q+d)*clamp(ratio,0.0,2.0);
     }
     return raw(q+d)*(l+l)/den;
 }

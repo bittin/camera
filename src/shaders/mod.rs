@@ -18,6 +18,9 @@ pub use demosaic::DemosaicMethod;
 mod gpu_convert;
 mod gpu_filter;
 mod histogram_pipeline;
+mod pixel_packing;
+
+pub(crate) use pixel_packing::copy_rgba_pixels_to_rgb;
 
 pub use gpu_convert::{BayerError, GpuConvertPipeline, GpuFrameInput, get_gpu_convert_pipeline};
 pub use gpu_filter::{GpuFilterPipeline, apply_filter_gpu_rgba, get_gpu_filter_pipeline};
