@@ -30,6 +30,7 @@ mod bottom_bar;
 mod camera_ops;
 mod camera_preview;
 mod composition_overlay;
+mod config_persistence;
 mod controls;
 mod dropdowns;
 pub mod exposure_picker;
@@ -435,6 +436,8 @@ impl cosmic::Application for AppModel {
         let initial_aspect_ratio = config.photo_aspect_ratio;
         let initial_preview_fit = config.preview_fit_to_view;
         let virtual_camera_enabled = config.virtual_camera_enabled;
+        let mut config_persistence = config_persistence::ConfigPersistence::default();
+        config_persistence.prepare(&config);
         let mut app = AppModel {
             core,
             context_page: ContextPage::default(),
@@ -444,6 +447,7 @@ impl cosmic::Application for AppModel {
             about,
             config,
             config_handler,
+            config_persistence,
             mode: initial_mode,
             carousel_button_slide: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             quick_record: crate::app::state::QuickRecordState::Idle,

@@ -989,6 +989,7 @@ mod motion_photo_appearance_tests {
                 }
                 let expected = if compatible { !saved } else { saved };
                 assert_eq!(app.config.motion_photo, expected);
+                app.config_persistence.flush();
                 let persisted =
                     crate::config::Config::get_entry(app.config_handler.as_ref().unwrap()).unwrap();
                 assert_eq!(persisted.motion_photo, expected);

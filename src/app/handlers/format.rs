@@ -8,9 +8,8 @@
 use crate::app::state::{AppModel, CameraMode, FileSource, Message, RecordingState};
 use crate::app::utils::{parse_codec, parse_resolution};
 use cosmic::Task;
-use cosmic::cosmic_config::CosmicConfigEntry;
 use std::sync::Arc;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 impl AppModel {
     // =========================================================================
@@ -456,11 +455,7 @@ impl AppModel {
             info!(preset = ?preset, "Selected bitrate preset");
             self.config.bitrate_preset = preset;
 
-            if let Some(handler) = self.config_handler.as_ref()
-                && let Err(err) = self.config.write_entry(handler)
-            {
-                error!(?err, "Failed to save bitrate preset setting");
-            }
+            self.persist_config_async();
         }
         Task::none()
     }

@@ -627,6 +627,7 @@ pub struct AppModel {
     pub config: Config,
     /// Configuration handler for saving settings
     pub config_handler: Option<cosmic_config::Config>,
+    pub(crate) config_persistence: crate::app::config_persistence::ConfigPersistence,
     /// Current camera mode (Photo or Video)
     pub mode: CameraMode,
     /// Shared button inward slide (written by carousel update, read by SlideH draw).
@@ -1777,6 +1778,8 @@ pub enum Message {
     // ===== Settings & Device Selection =====
     /// Configuration updated
     UpdateConfig(Config),
+    /// Authoritative preference read completed off the UI thread.
+    ConfigReloaded(u64, Result<Box<Config>, String>),
     /// Set application theme (System, Dark, Light)
     SetAppTheme(usize),
     /// Set the overlay effect. Index into `OverlayEffect::available()`.
