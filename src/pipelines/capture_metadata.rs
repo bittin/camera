@@ -78,9 +78,18 @@ pub(crate) fn embedded_image_orientation(bytes: &[u8]) -> image::metadata::Orien
     use little_exif::filetype::FileExtension;
     use little_exif::metadata::Metadata;
 
-    let file_type = if bytes.starts_with(&[0xff, 0xd8]) {
-        FileExtension::JPEG
-    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    // little_exif 0.6.23 treats the first APP1 as EXIF even when it is XMP.
+    // Motion Photos prepend XMP; use the JPEG decoder's signature-aware reader
+    // so the subsequent EXIF APP1 still supplies rotation and mirroring.
+    if bytes.starts_with(&[0xff, 0xd8]) {
+        use image::ImageDecoder;
+        return image::codecs::jpeg::JpegDecoder::new(std::io::Cursor::new(bytes))
+            .ok()
+            .and_then(|mut decoder| decoder.orientation().ok())
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
+    }
+
+    let file_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         FileExtension::PNG {
             as_zTXt_chunk: true,
         }
@@ -215,9 +224,15 @@ impl HostDeviceMetadata {
 }
 
 /// Detect the host make/model once for reuse by photo and video captures.
+static HOST_METADATA: OnceLock<HostDeviceMetadata> = OnceLock::new();
+
+/// Nonblocking lookup for UI metadata snapshots. Detection belongs to workers.
+pub fn cached_host_device_metadata() -> Option<&'static HostDeviceMetadata> {
+    HOST_METADATA.get()
+}
+
 pub fn host_device_metadata() -> &'static HostDeviceMetadata {
-    static METADATA: OnceLock<HostDeviceMetadata> = OnceLock::new();
-    METADATA.get_or_init(|| {
+    HOST_METADATA.get_or_init(|| {
         let dt_model = read_text("/sys/firmware/devicetree/base/model");
         let dt_compatible = read_text("/sys/firmware/devicetree/base/compatible");
         let dmi_vendor = read_text("/sys/class/dmi/id/sys_vendor");

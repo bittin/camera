@@ -10,6 +10,7 @@ pub mod capture;
 pub mod color;
 pub mod exposure;
 pub mod format;
+pub mod motion_photo;
 pub mod system;
 pub mod ui;
 pub mod virtual_camera;

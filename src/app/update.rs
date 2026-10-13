@@ -23,12 +23,90 @@ use cosmic::Task;
 use tracing::{debug, info, warn};
 
 impl AppModel {
+    /// Fail closed for queued/synthetic user actions during drain. Keep source
+    /// and accepted-job completions alive; they are not user interactions.
+    fn accepts_during_shutdown(message: &Message) -> bool {
+        matches!(
+            message,
+            Message::WindowClose
+                | Message::WindowFocusChanged(_)
+                | Message::CameraFrame(_)
+                | Message::Noop
+                | Message::FileSourcePreviewLoaded(..)
+                | Message::VideoSeekPreviewLoaded(_)
+                | Message::VideoPreviewPlaybackUpdate(..)
+                | Message::VideoPreviewPlaybackStopped
+                | Message::VideoFileProgress(..)
+                | Message::DisplayOrientationChanged(_)
+                | Message::PortalColorSchemeChanged(_)
+                | Message::CosmicThemeChanged
+                | Message::CamerasInitialized(..)
+                | Message::CameraListChanged(_)
+                | Message::HotplugDeviceRemoved(_)
+                | Message::HotplugDeviceAdded(_)
+                | Message::AudioListChanged(_)
+                | Message::BrokenEncodersDetected(_)
+                | Message::ExposureControlsQueried(..)
+                | Message::ExposureControlApplied
+                | Message::ExposureControlFailed(_)
+                | Message::ExposureBaseTimeCaptured(_)
+                | Message::WhiteBalanceToggled(_)
+                | Message::PhotoSaved(_)
+                | Message::PhotoCaptureSaved(..)
+                | Message::PhotoCaptureFinished(..)
+                | Message::PhotoEncodingWatchdog(_)
+                | Message::ShutdownRecorderStopped(_)
+                | Message::ShutdownDrainWatchdog
+                | Message::BurstModeProgress(_)
+                | Message::BurstModeFramesCollected
+                | Message::BurstModeRawFramesCaptured(_)
+                | Message::BurstModeComplete(_)
+                | Message::PollBurstModeProgress
+                | Message::ResetBurstModeState
+                | Message::RecordingStarted(_)
+                | Message::RecordingStopped { .. }
+                | Message::TimelapseAssemblyComplete(_)
+                | Message::VirtualCameraStarted
+                | Message::VirtualCameraStopped(_)
+                | Message::GalleryPortalOpenCompleted(..)
+                | Message::GalleryThumbnailLoaded(_)
+                | Message::CameraRecoveryStarted { .. }
+                | Message::CameraRecoverySucceeded
+                | Message::CameraRecoveryFailed(_)
+                | Message::AudioRecoveryStarted { .. }
+                | Message::AudioRecoverySucceeded
+                | Message::AudioRecoveryFailed(_)
+                | Message::PrivacyCoverStatusChanged(_)
+                | Message::GpuPipelinesWarmed(_)
+                | Message::BugReportGenerated(_)
+                | Message::InsightsCaptureComplete(_)
+                | Message::QrDetectionsUpdated { .. }
+        )
+    }
+
     /// Main message handler - routes messages to appropriate handler methods.
     ///
     /// This dispatcher pattern keeps the main update function clean and makes
     /// it easy to find the handling code for any message type.
     pub fn update(&mut self, message: Message) -> Task<cosmic::Action<Message>> {
-        match message {
+        if self.pending_close && !Self::accepts_during_shutdown(&message) {
+            return Task::none();
+        }
+        // Async file-preview results are source completions, but may never
+        // reintroduce a frame into the non-interactive shutdown screen.
+        let message = if self.pending_close
+            && matches!(
+                message,
+                Message::FileSourcePreviewLoaded(..)
+                    | Message::VideoSeekPreviewLoaded(_)
+                    | Message::VideoPreviewPlaybackUpdate(..)
+            ) {
+            Message::Noop
+        } else {
+            message
+        };
+        let frame_message = matches!(message, Message::CameraFrame(_));
+        let task = match message {
             Message::AudioLevelTick => self.handle_audio_level_tick(),
             // ===== UI Navigation =====
             Message::LaunchUrl(url) => self.handle_launch_url(url),
@@ -168,6 +246,7 @@ impl AppModel {
             Message::ToggleFlash => self.handle_toggle_flash(),
             Message::DismissFlashError => self.handle_dismiss_flash_error(),
             Message::ToggleBurstMode => self.handle_toggle_burst_mode(),
+            Message::ToggleMotionPhotoCapture => self.handle_toggle_motion_photo_capture(),
             Message::SetBurstModeFrameCount(index) => self.handle_set_burst_mode_frame_count(index),
             Message::BurstModeProgress(progress) => self.handle_burst_mode_progress(progress),
             Message::BurstModeFramesCollected => self.handle_burst_mode_frames_collected(),
@@ -219,7 +298,7 @@ impl AppModel {
             ),
             Message::WindowFocusChanged(focused) => {
                 info!(focused, "WindowFocusChanged");
-                crate::backends::volume_keys::set_focused(focused);
+                crate::backends::volume_keys::set_focused(focused && !self.pending_close);
                 Task::none()
             }
             Message::DisplayOrientationChanged(orientation) => {
@@ -234,6 +313,16 @@ impl AppModel {
             Message::WindowDrag => self.core.drag(None),
             Message::PinchZoom(level) => self.handle_pinch_zoom(level),
             Message::PhotoSaved(result) => self.handle_photo_saved(result),
+            Message::PhotoCaptureSaved(id, result) => self.handle_photo_capture_saved(id, result),
+            Message::PhotoEncodingWatchdog(id) => self.handle_photo_encoding_watchdog(id),
+            Message::PhotoCaptureFinished(id, result) => {
+                self.handle_photo_capture_finished(id, result)
+            }
+            Message::ShutdownRecorderStopped(result) => {
+                self.handle_shutdown_recorder_stopped(result)
+            }
+            Message::ShutdownDrainWatchdog => self.handle_shutdown_drain_watchdog(),
+            Message::DismissMotionPhotoError => self.handle_dismiss_motion_photo_error(),
             Message::ClearCaptureAnimation => self.handle_clear_capture_animation(),
             Message::ToggleRecording => self.handle_toggle_recording(),
             Message::RecordingStarted(path) => self.handle_recording_started(path),
@@ -308,6 +397,7 @@ impl AppModel {
                 self.handle_select_photo_output_format(index)
             }
             Message::SetDemosaicMethod(method) => self.handle_set_demosaic_method(method),
+            Message::ToggleMotionPhoto(enabled) => self.handle_toggle_motion_photo(enabled),
             Message::ToggleRecordAudio => self.handle_toggle_record_audio(),
             Message::SelectAudioEncoder(index) => self.handle_select_audio_encoder(index),
             Message::ToggleSaveBurstRaw => self.handle_toggle_save_burst_raw(),
@@ -433,6 +523,117 @@ impl AppModel {
             }
 
             Message::Noop => Task::none(),
+        };
+        if !frame_message {
+            self.sync_motion_photo_recorder();
         }
+        self.reconcile_shutdown_preview();
+        Task::batch([task, self.maybe_finish_shutdown()])
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_source_events_do_not_restart_camera_or_restore_preview() {
+        let mut model = AppModel::default();
+        model
+            .available_cameras
+            .push(crate::backends::camera::types::CameraDevice {
+                name: "accepted source".into(),
+                path: "accepted-source".into(),
+                ..Default::default()
+            });
+        model.pending_close = true;
+        model.photo_jobs.insert(
+            1,
+            crate::app::handlers::motion_photo::PhotoJob {
+                live: None,
+                still_path: None,
+            },
+        );
+        let generation = model.camera_cancel_flag.clone();
+        for message in [
+            Message::CamerasInitialized(Vec::new(), 0, Vec::new()),
+            Message::CameraListChanged(Vec::new()),
+            Message::HotplugDeviceAdded(vec![("/dev/new-camera".into(), "new camera".into())]),
+        ] {
+            let _ = model.update(message);
+            assert_eq!(
+                model.available_cameras.len(),
+                1,
+                "freeze subscription identity during drain"
+            );
+            assert_eq!(model.available_cameras[0].path, "accepted-source");
+            assert!(std::sync::Arc::ptr_eq(
+                &generation,
+                &model.camera_cancel_flag
+            ));
+            assert!(model.current_frame.is_none());
+        }
+        assert!(AppModel::accepts_during_shutdown(
+            &Message::CameraRecoverySucceeded
+        ));
+        assert!(AppModel::accepts_during_shutdown(
+            &Message::BurstModeRawFramesCaptured(Err("source error".into()))
+        ));
+        assert!(AppModel::accepts_during_shutdown(
+            &Message::RecordingStopped {
+                session: 1,
+                result: Err("source error".into()),
+            }
+        ));
+    }
+
+    #[test]
+    fn shutdown_rejects_queued_ui_keyboard_and_config_interactions() {
+        gstreamer::init().unwrap();
+        let mut model = AppModel::default();
+        model.pending_close = true;
+        model.photo_jobs.insert(
+            1,
+            crate::app::handlers::motion_photo::PhotoJob {
+                live: None,
+                still_path: None,
+            },
+        );
+        let mode = model.mode;
+        let mirror = model.config.mirror_preview;
+        let zoom = model.zoom_level;
+        for message in [
+            Message::ToggleContextPage(ContextPage::Settings),
+            Message::ToggleToolsMenu,
+            Message::ToggleFormatPicker,
+            Message::OpenKeyBindingsPage,
+            Message::ToggleMirrorPreview,
+            Message::ZoomIn,
+            Message::PinchZoom(3.0),
+            Message::NextMode,
+            Message::Capture,
+            Message::CaptureButtonReleased,
+            Message::WindowMinimize,
+            Message::WindowToggleMaximize,
+            Message::WindowDrag,
+            Message::Escape,
+            Message::ResetAllSettings,
+            Message::UpdateConfig(crate::config::Config::default()),
+        ] {
+            assert!(cosmic::iced::runtime::task::into_stream(model.update(message)).is_none());
+        }
+        assert!(!model.core.window.show_context);
+        assert!(!model.tools_menu_visible);
+        assert!(!model.format_picker_visible);
+        assert_eq!(model.mode, mode);
+        assert_eq!(model.config.mirror_preview, mirror);
+        assert_eq!(model.zoom_level, zoom);
+        assert_eq!(model.shutdown_pending_saves(), 1);
+        let _ = model.update(Message::PhotoCaptureFinished(
+            1,
+            Err("synthetic completion".into()),
+        ));
+        assert_eq!(model.shutdown_pending_saves(), 0);
+        assert!(model.shutdown_waiting_for_recorder);
     }
 }

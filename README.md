@@ -27,6 +27,7 @@ A modern camera application for Linux, built for desktops and phones alike.
 - **QR code scanner** that opens links and connects to WiFi through NetworkManager
 - **Virtual camera** over PipeWire, so other apps see your filtered feed in video calls
 - **JPEG, PNG and DNG** output, including true sensor raw where libcamera exposes a raw stream
+- **Motion Photo** captures in JPEG or AVIF, with an embedded short video
 - **Multi-camera and multi-microphone** switching with hotplug support
 - **Rebindable keyboard shortcuts**, plus an insights panel and bug report generator for diagnostics
 
@@ -114,7 +115,7 @@ camera photo [OPTIONS]
 
 **Options:**
 - `-c, --camera <INDEX>` - Camera index from `camera list` (default: 0)
-- `-o, --output <PATH>` - Output file path (default: ~/Pictures/Camera/IMG_TIMESTAMP.jpg)
+- `-o, --output <PATH>` - Output file path (default: ~/Pictures/Camera/IMG_YYYYMMDD_HHMMSS_mmm.jpg)
 
 **Examples:**
 ```bash

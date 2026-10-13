@@ -485,11 +485,15 @@ pub struct Config {
     pub bitrate_preset: BitratePreset,
     /// Virtual camera feature enabled (disabled by default)
     pub virtual_camera_enabled: bool,
-    /// Photo output format (JPEG, PNG, or DNG)
+    /// Photo output format (JPEG, PNG, DNG, or AVIF)
     pub photo_output_format: PhotoOutputFormat,
     /// Demosaicing algorithm for RAW photos, independent of video processing.
     #[serde(default)]
     pub demosaic_method: crate::shaders::DemosaicMethod,
+    /// Save a short video with JPEG/AVIF photos using the selected video encoder.
+    /// Retained when an incompatible photo format is selected.
+    #[serde(default)]
+    pub motion_photo: bool,
     /// Save raw burst frames as DNG files (for debugging burst mode pipeline)
     pub save_burst_raw: bool,
     /// Burst mode setting (Off, Auto, or fixed frame count)
@@ -540,6 +544,7 @@ impl Default for Config {
             virtual_camera_enabled: false, // Disabled by default
             photo_output_format: PhotoOutputFormat::default(), // Default to JPEG
             demosaic_method: crate::shaders::DemosaicMethod::default(),
+            motion_photo: false,
             save_burst_raw: false,  // Disabled by default (debugging feature)
             burst_mode_setting: BurstModeSetting::default(), // Default to Auto
             record_audio: true,     // Enable audio recording by default
@@ -557,6 +562,31 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_config_without_motion_photo_preserves_existing_preferences() {
+        let mut legacy = serde_json::to_value(Config {
+            photo_output_format: PhotoOutputFormat::Avif,
+            mirror_captures: true,
+            ..Config::default()
+        })
+        .unwrap();
+        legacy.as_object_mut().unwrap().remove("motion_photo");
+        let restored: Config =
+            serde_json::from_value(legacy).expect("legacy config must remain readable");
+        assert!(!restored.motion_photo);
+        assert_eq!(restored.photo_output_format, PhotoOutputFormat::Avif);
+        assert!(restored.mirror_captures);
+    }
+
+    #[test]
+    fn motion_photo_defaults_to_disabled() {
+        let config = serde_json::to_value(Config::default()).unwrap();
+        assert_eq!(
+            config.get("motion_photo"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
 
     #[test]
     fn controls_position_defaults_to_bottom() {

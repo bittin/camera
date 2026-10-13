@@ -39,5 +39,8 @@
 pub mod audio_level;
 pub mod audio_probe;
 pub mod capture_metadata;
+pub mod motion_photo;
+pub mod motion_photo_encoder;
+pub(crate) mod motion_photo_ring;
 pub mod photo;
 pub mod video;

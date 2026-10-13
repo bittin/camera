@@ -601,10 +601,13 @@ impl AppModel {
     }
 
     pub(crate) fn handle_camera_recovery_failed(
-        &self,
+        &mut self,
         error: String,
     ) -> Task<cosmic::Action<Message>> {
         error!(error = %error, "Camera backend recovery failed");
+        self.camera_cancel_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.fail_unfinished_viewfinder_hdr(&error);
         Task::none()
     }
 

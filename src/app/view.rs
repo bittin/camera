@@ -104,6 +104,9 @@ fn fit_zoom_axis(sideways: bool) -> FitZoomAxis {
 
 /// Flash icon SVG (lightning bolt)
 const FLASH_ICON: &[u8] = include_bytes!("../../resources/button_icons/flash.svg");
+const MOTION_PHOTO_ICON: &[u8] = include_bytes!("../../resources/button_icons/motion-photo.svg");
+const MOTION_PHOTO_OFF_ICON: &[u8] =
+    include_bytes!("../../resources/button_icons/motion-photo-off.svg");
 /// Flash off icon SVG (lightning bolt with strike-through)
 const FLASH_OFF_ICON: &[u8] = include_bytes!("../../resources/button_icons/flash-off.svg");
 /// Timer off icon SVG
@@ -503,8 +506,8 @@ fn overlay_icon_button<'a, M: Clone + 'static>(
 /// Symbolic icons read `icon_color`, not `text_color`; the top bar now publishes
 /// an ambient `icon_color` of its own (accent while focused), so the dimming has
 /// to override that channel or the disabled icons come out fully accented.
-fn disabled_top_bar_icon_style(_theme: &cosmic::Theme) -> widget::container::Style {
-    let dimmed = Color::from_rgba(1.0, 1.0, 1.0, 0.3);
+fn disabled_top_bar_icon_style(theme: &cosmic::Theme) -> widget::container::Style {
+    let dimmed = Color::from(theme.cosmic().button.on_disabled);
     widget::container::Style {
         icon_color: Some(dimmed),
         text_color: Some(dimmed),
@@ -646,6 +649,24 @@ impl AppModel {
         }
     }
 
+    /// The startup spinner, also used by the non-interactive drain screen.
+    pub(crate) fn loading_indicator(&self, status: Option<String>) -> Element<'_, Message> {
+        let mut content = widget::column(Vec::new())
+            .push(widget::progress_bar::indeterminate_circular())
+            .align_x(Alignment::Center)
+            .spacing(cosmic::theme::spacing().space_s);
+        if let Some(status) = status {
+            content = content.push(widget::text(status));
+        }
+        widget::container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(cosmic::iced::alignment::Horizontal::Center)
+            .align_y(cosmic::iced::alignment::Vertical::Center)
+            .style(window_bg_style)
+            .into()
+    }
+
     /// Build the main application view
     ///
     /// Composes all UI components into a layered layout with overlays.
@@ -653,6 +674,15 @@ impl AppModel {
         static HAS_RENDERED: AtomicBool = AtomicBool::new(false);
         if !HAS_RENDERED.swap(true, Ordering::Relaxed) {
             info!("first UI render");
+        }
+
+        // Do not construct a video primitive or any interactive chrome while
+        // draining. This also removes the custom header and context drawer.
+        if self.pending_close {
+            return self.loading_indicator(Some(fl!(
+                "shutdown-pending-saves",
+                count = (self.shutdown_pending_saves() as i64)
+            )));
         }
 
         // Camera preview from camera_preview module
@@ -1109,6 +1139,20 @@ impl AppModel {
             main_stack = main_stack.push(self.build_tools_menu());
         }
 
+        if let Some(error) = self.motion_photo_error.as_deref() {
+            main_stack = main_stack.push(build_overlay_popup(
+                self,
+                icon::from_name("dialog-warning-symbolic").size(32).into(),
+                &fl!("motion-photo-error-title"),
+                error,
+                Some(
+                    widget::button::suggested(fl!("motion-photo-error-dismiss"))
+                        .on_press(Message::DismissMotionPhotoError)
+                        .into(),
+                ),
+            ));
+        }
+
         // Context drawer (Settings, Filters, Insights, Shortcuts) last, so it
         // sits above every other overlay.
         if self.core.window.show_context {
@@ -1345,6 +1389,31 @@ impl AppModel {
 
             // 5px spacing
             cells.push(axis_gap(5.0));
+
+            if self.should_show_motion_photo_button() {
+                let motion_photo_active = self.motion_photo_enabled();
+                let motion_photo_icon = widget::icon::from_svg_bytes(if motion_photo_active {
+                    MOTION_PHOTO_ICON
+                } else {
+                    MOTION_PHOTO_OFF_ICON
+                })
+                .symbolic(true);
+                if is_disabled || !self.motion_photo_format_compatible() {
+                    cells.push(
+                        widget::container(widget::icon(motion_photo_icon).size(20))
+                            .style(disabled_top_bar_icon_style)
+                            .padding([4, 8])
+                            .into(),
+                    );
+                } else {
+                    cells.push(overlay_icon_button(
+                        motion_photo_icon,
+                        Some(Message::ToggleMotionPhotoCapture),
+                        motion_photo_active,
+                    ));
+                }
+                cells.push(axis_gap(5.0));
+            }
 
             if self.should_show_burst_button() {
                 // Show moon-off icon when HDR+ is disabled (by override or setting)
@@ -2528,5 +2597,25 @@ mod bar_insets_tests {
         assert_eq!(layout.top_bar, crate::app::bar_layout::Edge::Right);
         assert_eq!(insets.left, m.bottom_ui_height());
         assert_eq!(insets.right, m.top_ui_height());
+    }
+}
+
+#[cfg(test)]
+mod motion_photo_disabled_icon_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_motion_photo_icon_uses_theme_disabled_foreground_not_white() {
+        for theme in [
+            cosmic::Theme::dark(),
+            cosmic::Theme::light(),
+            cosmic::Theme::dark_hc(),
+            cosmic::Theme::light_hc(),
+        ] {
+            let style = disabled_top_bar_icon_style(&theme);
+            let expected = Some(Color::from(theme.cosmic().button.on_disabled));
+            assert_eq!(style.icon_color, expected);
+            assert_eq!(style.text_color, expected);
+        }
     }
 }

@@ -472,7 +472,18 @@ impl cosmic::Application for AppModel {
             video_preview_control_tx: None,
             video_preview_stop_tx: None,
             file_source_preview_receiver: None,
+            photo_jobs: std::collections::BTreeMap::new(),
+            next_photo_id: 1,
+            hardware_photo_id: None,
+            last_published_photo_id: 0,
+            shutdown_waiting_for_recorder: false,
+            recording_jobs: std::collections::BTreeSet::new(),
             is_capturing: false,
+            motion_photo_recorder: None,
+            motion_photo_retiring: None,
+            motion_photo_capture: None,
+            motion_photo_error: None,
+            motion_photo_override_disabled: false,
             format_picker_visible: false,
             exposure_picker_visible: false,
             color_picker_visible: false,
@@ -931,6 +942,9 @@ impl cosmic::Application for AppModel {
 
     /// Handle escape key - close any open drawers or pickers
     fn on_escape(&mut self) -> Task<cosmic::Action<Self::Message>> {
+        if self.pending_close {
+            return Task::none();
+        }
         // Defensive: the subscription switches to `capture_subscription` while
         // recording, which routes Esc to `CancelKeyBindRecording` directly, so
         // this branch is normally unreachable. Kept so any other code path
@@ -1722,7 +1736,9 @@ impl cosmic::Application for AppModel {
             Subscription::none()
         };
 
-        let keybind_sub = if self.recording_keybind.is_some() {
+        let keybind_sub = if self.pending_close {
+            Subscription::none()
+        } else if self.recording_keybind.is_some() {
             keybind::capture_subscription()
         } else {
             keybind::subscription(
@@ -1781,6 +1797,9 @@ impl cosmic::Application for AppModel {
                 return None;
             };
             match event {
+                cosmic::iced::Event::Window(cosmic::iced::window::Event::CloseRequested) => {
+                    Some(Message::WindowClose)
+                }
                 cosmic::iced::Event::Window(cosmic::iced::window::Event::Focused) => {
                     Some(Message::WindowFocusChanged(true))
                 }
@@ -1791,7 +1810,18 @@ impl cosmic::Application for AppModel {
             }
         });
 
+        // Lifecycle reconciliation keeps running even when a source has stopped
+        // producing frames; retired encoder workers never overlap replacements.
+        let motion_photo_lifecycle = if self.pending_close
+            || self.config.motion_photo
+            || self.motion_photo_retiring.is_some()
+        {
+            cosmic::iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::Noop)
+        } else {
+            Subscription::none()
+        };
         Subscription::batch([
+            motion_photo_lifecycle,
             config_sub,
             camera_sub,
             hotplug_sub,
@@ -1811,6 +1841,10 @@ impl cosmic::Application for AppModel {
         ])
     }
 
+    fn on_app_exit(&mut self) -> Option<Self::Message> {
+        Some(Message::WindowClose)
+    }
+
     /// Handles messages emitted by the application and its widgets.
     fn update(&mut self, message: Self::Message) -> Task<cosmic::Action<Self::Message>> {
         self.update(message)
@@ -1820,6 +1854,15 @@ impl cosmic::Application for AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn framework_exit_is_routed_through_media_drain() {
+        let mut model = AppModel::default();
+        assert!(matches!(
+            cosmic::Application::on_app_exit(&mut model),
+            Some(Message::WindowClose)
+        ));
+    }
 
     #[test]
     fn window_title_uses_localized_app_name() {

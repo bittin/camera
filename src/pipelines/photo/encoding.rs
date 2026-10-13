@@ -134,6 +134,16 @@ struct MetadataFallback<'a> {
 }
 
 impl PhotoEncoder {
+    fn complete_host_metadata(metadata: &mut CameraMetadata) {
+        let host = crate::pipelines::capture_metadata::host_device_metadata();
+        if metadata.device_make.is_none() {
+            metadata.device_make.clone_from(&host.make);
+        }
+        if metadata.device_model.is_none() {
+            metadata.device_model.clone_from(&host.model);
+        }
+    }
+
     /// Create a new encoder with JPEG format and high quality
     pub fn new() -> Self {
         Self {
@@ -176,11 +186,12 @@ impl PhotoEncoder {
             "Encoding raw Bayer DNG"
         );
 
-        let camera_metadata = self.camera_metadata.clone();
+        let mut camera_metadata = self.camera_metadata.clone();
         let width = raw.width;
         let height = raw.height;
 
         tokio::task::spawn_blocking(move || {
+            Self::complete_host_metadata(&mut camera_metadata);
             let data = Self::encode_dng_raw(&raw, &camera_metadata)?;
             debug!(size = data.len(), "Raw DNG encoding complete");
             Ok(EncodedImage {
@@ -215,10 +226,11 @@ impl PhotoEncoder {
 
         let format = self.format;
         let quality = self.quality;
-        let camera_metadata = self.camera_metadata.clone();
+        let mut camera_metadata = self.camera_metadata.clone();
 
         // Run encoding in background task (CPU-bound)
         tokio::task::spawn_blocking(move || {
+            Self::complete_host_metadata(&mut camera_metadata);
             let image = processed.image;
             let data = match format {
                 EncodingFormat::Jpeg => {
@@ -328,27 +340,17 @@ impl PhotoEncoder {
             ));
         }
 
-        // Generate filename with timestamp (millisecond precision so two rapid captures don't collide).
-        let timestamp = encoded
-            .captured_at
-            .unwrap_or_else(|| chrono::Local::now().fixed_offset())
-            .format("%Y%m%d_%H%M%S_%3f");
-        let filename = format!("IMG_{}.{}", timestamp, encoded.format.extension());
-        let filepath = output_dir.join(&filename);
-
-        info!(path = %filepath.display(), "Saving photo");
-
-        // Write to disk in background task (I/O-bound)
-        let filepath_clone = filepath.clone();
-        let filepath_for_error = filepath.clone();
-        let write_result =
-            tokio::task::spawn_blocking(move || std::fs::write(&filepath_clone, &encoded.data))
-                .await;
+        // Write to disk in a background task (I/O-bound).
+        let filepath_for_error = output_dir.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            Self::save_encoded_to_directory(encoded, output_dir)
+        })
+        .await;
 
         match write_result {
-            Ok(Ok(())) => {
-                info!(path = %filepath.display(), "Photo saved successfully");
-                Ok(filepath)
+            Ok(Ok(saved_path)) => {
+                info!(path = %saved_path.display(), "Photo saved successfully");
+                Ok(saved_path)
             }
             Ok(Err(io_err)) => {
                 error!(
@@ -371,6 +373,51 @@ impl PhotoEncoder {
                 Err(format!("Save task error: {}", join_err))
             }
         }
+    }
+
+    /// Synchronous counterpart for terminal captures; allocation uses create_new,
+    /// never an existence check followed by a truncating write.
+    pub(crate) fn save_encoded_to_directory(
+        encoded: EncodedImage,
+        output_dir: PathBuf,
+    ) -> std::io::Result<PathBuf> {
+        use std::io::Write;
+        std::fs::create_dir_all(&output_dir)?;
+        let timestamp = encoded
+            .captured_at
+            .unwrap_or_else(|| chrono::Local::now().fixed_offset())
+            .format("%Y%m%d_%H%M%S_%3f");
+        let filepath = output_dir.join(format!("IMG_{}.{}", timestamp, encoded.format.extension()));
+        for collision in 0..=u32::MAX {
+            let path = if collision == 0 {
+                filepath.clone()
+            } else {
+                output_dir.join(format!(
+                    "IMG_{}_{collision}.{}",
+                    timestamp,
+                    encoded.format.extension()
+                ))
+            };
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            };
+            if let Err(error) = file.write_all(&encoded.data).and_then(|_| file.sync_all()) {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            return Ok(path);
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Photo collision suffixes exhausted",
+        ))
     }
 
     /// Encode image as JPEG
@@ -1007,6 +1054,120 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Timelike};
+
+    #[tokio::test]
+    async fn ordinary_photo_names_use_shutter_milliseconds_without_uuid() {
+        let root = std::env::temp_dir().join(format!("photo-names-{}", uuid::Uuid::new_v4()));
+        let timestamp = FixedOffset::east_opt(7200)
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, 8, 14, 5, 6)
+            .unwrap()
+            .with_nanosecond(123_000_000)
+            .unwrap();
+        for format in [
+            EncodingFormat::Jpeg,
+            EncodingFormat::Avif,
+            EncodingFormat::Png,
+            EncodingFormat::Dng,
+        ] {
+            let path = PhotoEncoder::new()
+                .save(
+                    EncodedImage {
+                        data: vec![1, 2, 3],
+                        format,
+                        width: 1,
+                        height: 1,
+                        captured_at: Some(timestamp),
+                    },
+                    root.clone(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                path,
+                root.join(format!("IMG_20261008_140506_123.{}", format.extension()))
+            );
+            assert_eq!(std::fs::read(path).unwrap(), [1, 2, 3]);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_timestamp_photos_use_short_collision_suffixes() {
+        let root = std::env::temp_dir().join(format!("photo-collisions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let timestamp = FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, 8, 14, 5, 6)
+            .unwrap()
+            .with_nanosecond(123_000_000)
+            .unwrap();
+        let base = root.join("IMG_20261008_140506_123.jpg");
+        std::fs::write(&base, b"existing photo").unwrap();
+        let mut tasks = Vec::new();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(16));
+        for value in 0..16u8 {
+            let root = root.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let path = PhotoEncoder::new()
+                    .save(
+                        EncodedImage {
+                            data: vec![value; 4096],
+                            format: EncodingFormat::Jpeg,
+                            width: 1,
+                            height: 1,
+                            captured_at: Some(timestamp),
+                        },
+                        root,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), vec![value; 4096]);
+                path
+            }));
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for task in tasks {
+            assert!(paths.insert(task.await.unwrap()));
+        }
+        let expected: std::collections::BTreeSet<_> = (1..=16)
+            .map(|i| root.join(format!("IMG_20261008_140506_123_{i}.jpg")))
+            .collect();
+        assert_eq!(paths, expected);
+        assert_eq!(std::fs::read(base).unwrap(), b"existing photo");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_timestamp_photos_never_overwrite_each_other() {
+        let root = std::env::temp_dir().join(format!("same-shutter-{}", uuid::Uuid::new_v4()));
+        let timestamp = chrono::Local::now().fixed_offset();
+        let encoded = |data| EncodedImage {
+            data,
+            format: EncodingFormat::Jpeg,
+            width: 1,
+            height: 1,
+            captured_at: Some(timestamp),
+        };
+        let encoder = PhotoEncoder::new();
+        let first = encoder
+            .save(encoded(vec![1, 2]), root.clone())
+            .await
+            .unwrap();
+        let second = encoder
+            .save(encoded(vec![3, 4]), root.clone())
+            .await
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "distinct capture jobs require collision-safe paths"
+        );
+        assert_eq!(std::fs::read(first).unwrap(), vec![1, 2]);
+        assert_eq!(std::fs::read(second).unwrap(), vec![3, 4]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn avif_workers_leave_two_cpus_with_at_least_one_worker() {

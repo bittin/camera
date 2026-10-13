@@ -60,13 +60,7 @@ impl AppModel {
     }
 
     fn preview_loading_indicator(&self) -> Element<'_, Message> {
-        widget::container(widget::progress_bar::indeterminate_circular())
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .align_x(cosmic::iced::alignment::Horizontal::Center)
-            .align_y(cosmic::iced::alignment::Vertical::Center)
-            .style(crate::app::overlay_style::window_bg_style)
-            .into()
+        self.loading_indicator(None)
     }
 
     /// Whether the preview should be mirrored (front cameras only, not file sources)

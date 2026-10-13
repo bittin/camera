@@ -291,6 +291,15 @@ impl AppModel {
         &mut self,
         frame: Arc<crate::backends::camera::types::CameraFrame>,
     ) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            // Feed accepted post-roll / HDR acquisition only, never the view,
+            // QR detection, virtual output or new control discovery.
+            self.forward_motion_photo_frame(&frame);
+            if self.burst_mode.is_collecting_frames() && self.burst_mode.add_frame(frame) {
+                return Task::done(cosmic::Action::App(Message::BurstModeFramesCollected));
+            }
+            return Task::none();
+        }
         static FIRST_FRAME: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
         crate::startup::milestone_once("first_frame_updated_in_ui", &FIRST_FRAME);
@@ -354,8 +363,12 @@ impl AppModel {
             return Task::none();
         }
 
-        // Track whether this frame is from a file source (for mirror handling)
+        // File-source eligibility must be known before forwarding any frame.
         let is_file_source = self.virtual_camera.is_file_source();
+        self.current_frame_is_file_source = is_file_source;
+        // Continuous motion recording also needs frames while HDR freezes only
+        // the displayed preview below; the memory recorder remains independent.
+        self.forward_motion_photo_frame(&frame);
 
         // V4L2 control discovery opens the same device that libcamera is about
         // to start. Defer it until the preview has produced a frame so it cannot
@@ -435,6 +448,10 @@ impl AppModel {
         camera_index: usize,
         formats: Vec<crate::backends::camera::types::CameraFormat>,
     ) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            // Freeze subscription identity: no source can start during drain.
+            return Task::none();
+        }
         crate::startup::milestone("cameras_initialized_in_ui");
         info!(
             count = cameras.len(),
@@ -528,6 +545,17 @@ impl AppModel {
         &mut self,
         new_cameras: Vec<crate::backends::camera::types::CameraDevice>,
     ) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            if let Some(current) = self.available_cameras.get(self.current_camera_index)
+                && !new_cameras
+                    .iter()
+                    .any(|c| c.path == current.path && c.name == current.name)
+            {
+                self.camera_cancel_flag
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            return Task::none();
+        }
         info!(
             old_count = self.available_cameras.len(),
             new_count = new_cameras.len(),
@@ -660,6 +688,16 @@ impl AppModel {
             .map(|path| removed_paths.iter().any(|r| r == path))
             .unwrap_or(false);
 
+        if current_camera_removed {
+            self.fail_unfinished_viewfinder_hdr("Camera disconnected during HDR acquisition");
+        }
+        if self.pending_close {
+            if current_camera_removed {
+                self.camera_cancel_flag
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            return Task::none();
+        }
         if !current_camera_removed {
             // Current camera is fine — just remove the unplugged camera(s)
             let before = self.available_cameras.len();
@@ -698,6 +736,9 @@ impl AppModel {
         &mut self,
         new_devices: Vec<(String, String)>,
     ) -> Task<cosmic::Action<Message>> {
+        if self.pending_close {
+            return Task::none();
+        }
         if new_devices.is_empty() {
             info!("Hotplug device added but no new capture devices found");
             return Task::none();
