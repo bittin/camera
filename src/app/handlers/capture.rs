@@ -2845,10 +2845,25 @@ mod tests {
         model.preview_fit_to_view = true;
         model.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Native;
         model.sync_motion_photo_recorder();
-        for _ in 0..18 {
+        // As in the encoder-ring tests, wait for encoded output rather than
+        // assuming pipeline startup has completed after a fixed frame count.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
             let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
             frame.captured_at = std::time::Instant::now();
             model.forward_motion_photo_frame(&Arc::new(frame));
+            if model
+                .motion_photo_recorder
+                .as_ref()
+                .unwrap()
+                .pre_roll_ready()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Motion Photo recorder did not produce a decodable pre-roll"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
@@ -4156,20 +4171,31 @@ mod tests {
             hdr_override_disabled: true,
             ..AppModel::default()
         };
+        model.config.motion_photo = false;
         model.config.save_folder_name = save_dir.to_string_lossy().into_owned();
 
         let task = model.capture_photo();
         let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
-        let mut saved_path = None;
-        while let Some(action) = stream.next().await {
-            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                Message::PhotoSaved(result),
-            )) = action
-            {
-                saved_path = Some(result.expect("photo must save"));
+        // Follow the per-capture completion path used by the other still tests,
+        // without draining the unrelated encoding-watchdog timer.
+        let saved_path = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(action) = stream.next().await {
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::PhotoCaptureSaved(id, result),
+                )) = action
+                {
+                    let path = result.as_ref().expect("photo must save").clone();
+                    let _ = model.handle_photo_capture_saved(id, result);
+                    return path;
+                }
             }
-        }
-        let image = image::open(saved_path.expect("capture must report the saved photo")).unwrap();
+            panic!("capture must report the saved photo");
+        })
+        .await
+        .expect("photo capture task timed out");
+        assert!(model.photo_jobs.is_empty());
+        assert_eq!(model.last_media_path.as_deref(), Some(saved_path.as_str()));
+        let image = image::open(&saved_path).unwrap();
         std::fs::remove_dir_all(save_dir).unwrap();
         assert_eq!(
             (image.width(), image.height()),

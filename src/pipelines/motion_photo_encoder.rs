@@ -153,6 +153,14 @@ impl ClipEncoder {
         };
         let encoder = make(&info.element_name)?;
         configure_clip_video_encoder(&encoder, info, width, height, bitrate)?;
+        // Match MemoryEncoder's intra-only, zero-latency x264 configuration.
+        // Reordering in this short fixture would test MP4 edit-list behavior,
+        // rather than the continuous recorder's shared capture timeline.
+        if info.element_name == "x264enc" {
+            encoder.set_property_from_str("tune", "zerolatency");
+            encoder.set_property("bframes", 0u32);
+            encoder.set_property("key-int-max", 1u32);
+        }
         let input = prepare_video_encoder_input(
             &encoder,
             &info.element_name,
@@ -422,6 +430,12 @@ mod tests {
             std::env::temp_dir().join(format!("motion-photo-clock-{}.mp4", uuid::Uuid::new_v4()));
         let mut encoder =
             ClipEncoder::new(&path, &software_encoder(), 64, 48, 10, 800, None, origin).unwrap();
+        // This finite clock fixture asserts that every submitted frame survives.
+        // Bound its queue to all six frames plus the optional buffered frame,
+        // instead of using the separately tested live-preview dropping policy.
+        // Keep push nonblocking so preroll negotiation cannot stall the feeder.
+        encoder.source.set_property_from_str("leaky-type", "none");
+        encoder.source.set_property("max-buffers", 7u64);
         let muxer = encoder
             .pipeline
             .iterate_elements()
@@ -472,7 +486,13 @@ mod tests {
             .arg(&path)
             .output()
             .unwrap();
-        assert!(probe.status.success());
+        assert!(
+            probe.status.success(),
+            "ffprobe failed for {} ({}): {}",
+            path.display(),
+            probe.status,
+            String::from_utf8_lossy(&probe.stderr)
+        );
         let data: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
         let packets = data["packets"].as_array().unwrap();
         let times = |stream| {
