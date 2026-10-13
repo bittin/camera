@@ -13,7 +13,9 @@
 
 use crate::app::FilterType;
 use crate::backends::camera::types::{CameraFrame, PixelFormat};
-use crate::shaders::{GpuFrameInput, apply_filter_gpu_rgba, get_gpu_convert_pipeline};
+use crate::shaders::{
+    GpuFrameInput, apply_filter_gpu_rgba, copy_rgba_pixels_to_rgb, get_gpu_convert_pipeline,
+};
 use image::RgbImage;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -234,6 +236,7 @@ impl PostProcessor {
 
         // Step 4: Convert filtered RGBA to RGB (drop alpha channel)
         let rgb_image = Self::convert_rgba_to_rgb(&final_rgba, final_width, final_height)?;
+        drop(final_rgba);
 
         // Step 5 & 6: Apply adjustments and sharpening (CPU-bound)
         let needs_adjustments =
@@ -369,11 +372,14 @@ impl PostProcessor {
             ));
         }
 
-        let rgb_data: Vec<u8> = rgba_data
-            .chunks(4)
-            .take((width * height) as usize)
-            .flat_map(|rgba| [rgba[0], rgba[1], rgba[2]])
-            .collect();
+        // Fixed-size chunks give LLVM a stride-4 -> stride-3 loop instead of
+        // per-channel flat_map iterator state. Keep the exact byte values and
+        // ignore any trailing bytes beyond the active image.
+        let mut rgb_data = vec![0u8; width as usize * height as usize * 3];
+        copy_rgba_pixels_to_rgb(
+            &rgba_data[..width as usize * height as usize * 4],
+            &mut rgb_data,
+        );
 
         RgbImage::from_raw(width, height, rgb_data)
             .ok_or_else(|| "Failed to create RGB image from converted data".to_string())

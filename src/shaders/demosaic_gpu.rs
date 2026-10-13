@@ -316,6 +316,12 @@ impl GpuDemosaic {
         };
         // LMMSE needs full-image extrema, never tile-local bounds.
         dispatch(0, 0, 1, &views[2], &self.uniform, self.width, self.height);
+        if method == DemosaicMethod::Bilinear {
+            // No tile intermediates are needed for full-frame bilinear.
+            dispatch(5, 2, 3, &output, &self.uniform, self.width, self.height);
+            encoder.copy_buffer_to_buffer(&self.status, 0, &self.staging.buffer(), 0, 16);
+            return;
+        }
         // Reuse exactly four fixed-size surfaces in submission order. Origins
         // are even, preserving both CFA phase and RCD's paired-column HP phase.
         for y in (0..self.height).step_by(TILE_EDGE as usize) {
