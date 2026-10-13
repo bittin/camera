@@ -32,6 +32,7 @@ struct SpatialDenoiseParams {
     tile_offset_x: i32,      // Tile offset for 4-pass processing
     tile_offset_y: i32,      // Tile offset for 4-pass processing
     frame_count: u32,        // Number of frames merged (for noise variance scaling)
+    preserve_linear: u32,
 }
 
 // Input image (RGBA f32)
@@ -588,6 +589,7 @@ fn spatial_denoise_normalize(@builtin(global_invocation_id) global_id: vec3<u32>
 
     // With WOLA synthesis, overlapping windows sum to 1.0
     // No normalization needed - just clamp to valid range
+    if params.preserve_linear != 0u {return;}
     output_image[idx] = clamp(output_image[idx], 0.0, 1.0);
     output_image[idx + 1u] = clamp(output_image[idx + 1u], 0.0, 1.0);
     output_image[idx + 2u] = clamp(output_image[idx + 2u], 0.0, 1.0);

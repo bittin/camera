@@ -487,6 +487,9 @@ pub struct Config {
     pub virtual_camera_enabled: bool,
     /// Photo output format (JPEG, PNG, or DNG)
     pub photo_output_format: PhotoOutputFormat,
+    /// Demosaicing algorithm for RAW photos, independent of video processing.
+    #[serde(default)]
+    pub demosaic_method: crate::shaders::DemosaicMethod,
     /// Save raw burst frames as DNG files (for debugging burst mode pipeline)
     pub save_burst_raw: bool,
     /// Burst mode setting (Off, Auto, or fixed frame count)
@@ -536,6 +539,7 @@ impl Default for Config {
             bitrate_preset: BitratePreset::default(), // Default to Medium
             virtual_camera_enabled: false, // Disabled by default
             photo_output_format: PhotoOutputFormat::default(), // Default to JPEG
+            demosaic_method: crate::shaders::DemosaicMethod::default(),
             save_burst_raw: false,  // Disabled by default (debugging feature)
             burst_mode_setting: BurstModeSetting::default(), // Default to Auto
             record_audio: true,     // Enable audio recording by default

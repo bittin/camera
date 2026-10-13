@@ -52,6 +52,28 @@ fn controls_position_index(position: crate::config::ControlsPosition) -> usize {
         .unwrap_or(0)
 }
 
+const DEMOSAIC_METHODS: [crate::shaders::DemosaicMethod; 3] = [
+    crate::shaders::DemosaicMethod::Rcd,
+    crate::shaders::DemosaicMethod::Lmmse,
+    crate::shaders::DemosaicMethod::Bilinear,
+];
+const DEMOSAIC_LABELS: [&str; 3] = ["RCD", "LMMSE", "Bilinear"];
+
+fn demosaic_method_index(method: crate::shaders::DemosaicMethod) -> usize {
+    DEMOSAIC_METHODS
+        .iter()
+        .position(|candidate| *candidate == method)
+        .unwrap_or(0)
+}
+
+fn select_demosaic_method(index: usize) -> Message {
+    DEMOSAIC_METHODS
+        .get(index)
+        .copied()
+        .map(Message::SetDemosaicMethod)
+        .unwrap_or(Message::Noop)
+}
+
 impl AppModel {
     /// Build the Settings context drawer for the current sub-page.
     ///
@@ -331,6 +353,15 @@ impl AppModel {
                         &self.photo_output_format_dropdown_options,
                         Some(current_photo_format_index),
                         Message::SelectPhotoOutputFormat,
+                    )),
+            )
+            .add(
+                widget::settings::item::builder(fl!("settings-demosaicing"))
+                    .description(fl!("settings-demosaicing-description"))
+                    .control(widget::dropdown(
+                        &DEMOSAIC_LABELS,
+                        Some(demosaic_method_index(self.config.demosaic_method)),
+                        select_demosaic_method,
                     )),
             )
             .add(
@@ -706,6 +737,25 @@ impl AppModel {
 mod tests {
     use super::*;
     use crate::config::ControlsPosition;
+
+    #[test]
+    fn photo_demosaic_selection_tracks_every_option() {
+        use crate::shaders::DemosaicMethod;
+        for (index, method) in [
+            DemosaicMethod::Rcd,
+            DemosaicMethod::Lmmse,
+            DemosaicMethod::Bilinear,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(demosaic_method_index(method), index);
+            assert!(
+                matches!(select_demosaic_method(index), Message::SetDemosaicMethod(selected) if selected == method)
+            );
+        }
+        assert!(matches!(select_demosaic_method(usize::MAX), Message::Noop));
+    }
 
     #[test]
     fn overlay_controls_position_index_tracks_every_option() {

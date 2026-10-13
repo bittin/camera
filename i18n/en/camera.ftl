@@ -382,6 +382,9 @@ hdr-plus-frames-50 = 50 frames
 
 # Settings row, page title and section title for photo options.
 settings-photo = Photo
+# RAW photo color reconstruction algorithm.
+settings-demosaicing = Demosaicing
+settings-demosaicing-description = Algorithm used to reconstruct color in RAW photos
 # Dropdown label for the file format photos are saved in.
 settings-photo-format = Output format
 # Description under the output format dropdown. The format names are not

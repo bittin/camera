@@ -529,6 +529,7 @@ impl FftMergePipeline {
     /// Apply spatial denoising (HDR+ Section 5 post-processing)
     ///
     /// Uses 4-pass overlapped processing with raised cosine windows.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_spatial_denoise(
         &self,
         output_buffer: &wgpu::Buffer,
@@ -537,6 +538,7 @@ impl FftMergePipeline {
         height: u32,
         noise_sd: f32,
         frame_count: u32,
+        preserve_linear: bool,
     ) {
         let pixel_count = (width * height) as usize;
 
@@ -601,6 +603,7 @@ impl FftMergePipeline {
             tile_offset_x: 0,
             tile_offset_y: 0,
             frame_count,
+            preserve_linear: u32::from(preserve_linear),
         };
 
         self.queue.write_buffer(
@@ -660,6 +663,7 @@ impl FftMergePipeline {
         buffer_size: u64,
         width: u32,
         height: u32,
+        preserve_linear: bool,
     ) {
         let chroma_output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("chroma_output_buffer"),
@@ -681,6 +685,7 @@ impl FftMergePipeline {
             height,
             strength: 0.25,       // Reduced to preserve color saturation
             edge_threshold: 0.15, // Raised to better preserve edges
+            preserve_linear: u32::from(preserve_linear),
         };
 
         let chroma_params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -763,6 +768,118 @@ impl FftMergePipeline {
         noise_sd: f32,
         robustness: f32,
     ) -> Result<Vec<u8>, String> {
+        let reference = super::u8_to_f32_normalized(reference);
+        let output_buffer = self
+            .merge_resident(
+                &reference,
+                aligned_frames,
+                width,
+                height,
+                noise_sd,
+                robustness,
+                false,
+            )
+            .await?;
+        let pixel_count = (width * height) as usize;
+        let buffer_size = (pixel_count * 16) as u64;
+        let staging_buffer = self.create_rgba_buffer(
+            "FFT encoded readback",
+            pixel_count,
+            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        );
+        let merge_total_start = std::time::Instant::now();
+        // Yield to compositor before readback
+        self.yield_to_compositor().await;
+
+        // Read back result
+        let readback_start = std::time::Instant::now();
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("readback_encoder"),
+                });
+            encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, buffer_size);
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+        debug!(
+            elapsed_ms = readback_start.elapsed().as_millis(),
+            "Copy to staging"
+        );
+
+        // Map and convert
+        let map_start = std::time::Instant::now();
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            staging_buffer,
+            "burst readback",
+        );
+        let data = readback.read_async().await?;
+
+        debug!(
+            elapsed_ms = map_start.elapsed().as_millis(),
+            "Map staging buffer"
+        );
+
+        let convert_start = std::time::Instant::now();
+        let output_f32: &[f32] = bytemuck::cast_slice(&data);
+        let output_u8: Vec<u8> = output_f32
+            .iter()
+            .map(|&x| (x.clamp(0.0, 1.0) * 255.0) as u8)
+            .collect();
+
+        drop(data);
+
+        debug!(
+            elapsed_ms = convert_start.elapsed().as_millis(),
+            "Convert f32 to u8"
+        );
+
+        info!(
+            total_elapsed_ms = merge_total_start.elapsed().as_millis(),
+            "FFT merge complete (GPU-only)"
+        );
+        Ok(output_u8)
+    }
+    /// Keep normalized Bayer planes resident and linear through the unchanged FFT stages.
+    pub async fn merge_gpu_to_buffer(
+        &self,
+        reference: &[f32],
+        aligned_frames: &[GpuAlignedFrame],
+        width: u32,
+        height: u32,
+        noise_sd: f32,
+        robustness: f32,
+    ) -> Result<wgpu::Buffer, String> {
+        self.merge_resident(
+            reference,
+            aligned_frames,
+            width,
+            height,
+            noise_sd,
+            robustness,
+            true,
+        )
+        .await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn merge_resident(
+        &self,
+        reference: &[f32],
+        aligned_frames: &[GpuAlignedFrame],
+        width: u32,
+        height: u32,
+        noise_sd: f32,
+        robustness: f32,
+        preserve_linear: bool,
+    ) -> Result<wgpu::Buffer, String> {
+        if width == 0
+            || height == 0
+            || reference.len() != width as usize * height as usize * 4
+            || reference.iter().any(|v| !v.is_finite())
+        {
+            return Err("Invalid FFT reference planes".into());
+        }
         let tile_size = TILE_SIZE;
         let pipelines = &self.pipelines;
         let merge_total_start = std::time::Instant::now();
@@ -798,14 +915,6 @@ impl FftMergePipeline {
         let n_tiles_x = width.div_ceil(tile_size) + 1;
         let n_tiles_y = height.div_ceil(tile_size) + 1;
         let tile_count = (n_tiles_x * n_tiles_y) as usize;
-
-        // Convert reference to normalized f32 and upload (only CPU->GPU transfer needed)
-        let convert_start = std::time::Instant::now();
-        let ref_f32 = super::u8_to_f32_normalized(reference);
-        debug!(
-            elapsed_ms = convert_start.elapsed().as_millis(),
-            "Convert reference to f32"
-        );
 
         // Create GPU buffers
         let buffer_create_start = std::time::Instant::now();
@@ -858,12 +967,6 @@ impl FftMergePipeline {
         let weight_buffer =
             self.create_tile_buffer("weight_buffer", pixel_count, wgpu::BufferUsages::STORAGE);
 
-        let staging_buffer = self.create_rgba_buffer(
-            "staging_buffer",
-            pixel_count,
-            wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        );
-
         debug!(
             elapsed_ms = buffer_create_start.elapsed().as_millis(),
             "Created GPU buffers"
@@ -872,8 +975,7 @@ impl FftMergePipeline {
         // Upload reference frame
         let upload_start = std::time::Instant::now();
         self.queue
-            .write_buffer(&ref_buffer, 0, bytemuck::cast_slice(&ref_f32));
-        drop(ref_f32); // Free CPU memory immediately
+            .write_buffer(&ref_buffer, 0, bytemuck::cast_slice(reference));
         debug!(
             elapsed_ms = upload_start.elapsed().as_millis(),
             "Uploaded reference frame"
@@ -941,7 +1043,7 @@ impl FftMergePipeline {
             tile_offset_y: 0,
             tile_row_offset: 0,
             exposure_factor: 1.0, // TODO: Read from frame metadata for HDR brackets
-            _padding: 0,
+            _padding: u32::from(preserve_linear),
         };
 
         self.queue
@@ -1123,6 +1225,7 @@ impl FftMergePipeline {
             height,
             noise_sd,
             frame_count,
+            preserve_linear,
         )
         .await;
         debug!(
@@ -1132,72 +1235,17 @@ impl FftMergePipeline {
 
         // Chroma denoising
         let chroma_start = std::time::Instant::now();
-        self.apply_chroma_denoise(&output_buffer, buffer_size, width, height);
+        self.apply_chroma_denoise(&output_buffer, buffer_size, width, height, preserve_linear);
         debug!(
             elapsed_ms = chroma_start.elapsed().as_millis(),
             "Chroma denoise"
         );
 
-        // Yield to compositor before readback
-        self.yield_to_compositor().await;
-
-        // Read back result
-        let readback_start = std::time::Instant::now();
-        {
-            let mut encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("readback_encoder"),
-                });
-            encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, buffer_size);
-            self.queue.submit(std::iter::once(encoder.finish()));
-        }
-        debug!(
-            elapsed_ms = readback_start.elapsed().as_millis(),
-            "Copy to staging"
-        );
-
-        // Map and convert
-        let map_start = std::time::Instant::now();
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        receiver
-            .await
-            .map_err(|_| "Failed to receive map result")?
-            .map_err(|e| format!("Failed to map buffer: {:?}", e))?;
-        debug!(
-            elapsed_ms = map_start.elapsed().as_millis(),
-            "Map staging buffer"
-        );
-
-        let convert_start = std::time::Instant::now();
-        let data = buffer_slice.get_mapped_range();
-        let output_f32: &[f32] = bytemuck::cast_slice(&data);
-        let output_u8: Vec<u8> = output_f32
-            .iter()
-            .map(|&x| (x.clamp(0.0, 1.0) * 255.0) as u8)
-            .collect();
-
-        drop(data);
-        staging_buffer.unmap();
-        debug!(
-            elapsed_ms = convert_start.elapsed().as_millis(),
-            "Convert f32 to u8"
-        );
-
         info!(
             total_elapsed_ms = merge_total_start.elapsed().as_millis(),
-            "FFT merge complete (GPU-only)"
+            "Resident FFT merge complete"
         );
-        Ok(output_u8)
+        Ok(output_buffer)
     }
 }
 
@@ -1251,5 +1299,77 @@ mod tests {
     #[test]
     fn test_guided_filter_shader_validates() {
         validate_shader("guided_filter", GUIDED_FILTER_SHADER);
+    }
+}
+
+#[cfg(test)]
+mod resident_bayer_contract_tests {
+    #[test]
+    fn bayer_fft_merge_keeps_normalized_float_planes_gpu_resident() {
+        let source = include_str!("mod.rs");
+        let merge = source
+            .split("async fn merge_bayer_frames_gpu(")
+            .nth(1)
+            .unwrap()
+            .split("/// Process burst mode capture")
+            .next()
+            .unwrap();
+        assert!(
+            !merge.contains("merged_u8"),
+            "Bayer FFT full-plane u8 readback loses signed samples"
+        );
+        assert!(
+            merge.contains("merge_gpu_to_buffer"),
+            "Bayer FFT requires a resident float result"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resident_bayer_gpu_tests {
+    #[test]
+    fn normalized_signed_overwhite_fft_output_reaches_production_hdr_engines() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "normalized_signed_overwhite_fft_output_reaches_production_hdr_engines",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let gpu = super::super::BurstModeGpuPipeline::new().await.unwrap();
+            let data: Vec<f32> = (0..32 * 32).flat_map(|_| [-0.1, 1.4, 0.3, 1.8]).collect();
+            let buffer = gpu
+                .fft_pipeline
+                .merge_gpu_to_buffer(&data, &[], 32, 32, 0.001, 1.0)
+                .await
+                .unwrap();
+            let merged = gpu.read_buffer::<f32>(&buffer, data.len()).await.unwrap();
+            assert!(merged.iter().all(|v| v.is_finite()));
+            assert!(merged.iter().any(|v| *v < -0.05), "signed FFT samples lost");
+            assert!(
+                merged.iter().any(|v| *v > 1.1),
+                "overwhite FFT samples lost"
+            );
+            for pattern in 0..4 {
+                for method in [
+                    crate::shaders::DemosaicMethod::Rcd,
+                    crate::shaders::DemosaicMethod::Lmmse,
+                ] {
+                    let result = gpu
+                        .demosaic_bayer_planes_with_method(
+                            &buffer,
+                            32,
+                            32,
+                            pattern,
+                            Some([1.0, 1.0]),
+                            None,
+                            method,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(result.data.iter().all(|v| v.is_finite()));
+                }
+            }
+        });
     }
 }

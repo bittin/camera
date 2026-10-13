@@ -920,6 +920,10 @@ fn normalize_output(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // frame_count = number of alternate frames + 1 (reference)
     let norm = 1.0 / f32(params.frame_count);
 
+    if params._padding != 0u {
+        for(var c=0u;c<4u;c++){output[idx+c]*=norm;}
+        return;
+    }
     output[idx] = clamp(output[idx] * norm, 0.0, 1.0);
     output[idx + 1u] = clamp(output[idx + 1u] * norm, 0.0, 1.0);
     output[idx + 2u] = clamp(output[idx + 2u] * norm, 0.0, 1.0);
@@ -1231,6 +1235,7 @@ fn calculate_highlights_norm(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(16, 16)
 fn reduce_tile_artifacts(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if params._padding != 0u { return; }
     let x = gid.x;
     let y = gid.y;
 

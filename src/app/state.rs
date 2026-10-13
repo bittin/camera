@@ -394,6 +394,8 @@ pub struct BurstModeState {
     frame_buffer: Vec<Arc<CameraFrame>>,
     /// Target frame count for current capture (set from config at capture start)
     pub target_frame_count: usize,
+    /// Photo algorithm snapshotted when the burst starts, not when processing begins.
+    pub demosaic_method: crate::shaders::DemosaicMethod,
     /// Shared atomic for processing progress updates (progress * 1000 for 0.1% precision)
     /// Only present during Processing stage
     progress_atomic: Option<Arc<std::sync::atomic::AtomicU32>>,
@@ -580,6 +582,7 @@ impl Default for BurstModeState {
             processing_progress: 0.0,
             frame_buffer: Vec::new(),
             target_frame_count: 8, // Will be overwritten when capture starts
+            demosaic_method: crate::shaders::DemosaicMethod::default(),
             progress_atomic: None,
             result_rx: None,
         }
@@ -1766,6 +1769,8 @@ pub enum Message {
     SelectVideoEncoder(usize),
     /// Select photo output format (JPEG, PNG, DNG)
     SelectPhotoOutputFormat(usize),
+    /// Set the RAW photo demosaicing algorithm.
+    SetDemosaicMethod(crate::shaders::DemosaicMethod),
     /// Toggle recording audio with video
     ToggleRecordAudio,
     /// Fired by the 100 ms subscription whenever a level source is active.

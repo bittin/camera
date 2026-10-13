@@ -55,6 +55,14 @@ fn should_use_jpeg_recording_pipeline(
 }
 
 impl AppModel {
+    /// Snapshot photo-only processing preferences before dispatching a save job.
+    fn photo_processing_config(&self) -> crate::pipelines::photo::PostProcessingConfig {
+        crate::pipelines::photo::PostProcessingConfig {
+            demosaic_method: self.config.demosaic_method,
+            ..Default::default()
+        }
+    }
+
     // =========================================================================
     // Flash Hardware Helpers
     // =========================================================================
@@ -307,6 +315,7 @@ impl AppModel {
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
 
+        let photo_config = self.photo_processing_config();
         let mut camera_metadata = self.build_camera_metadata();
         camera_metadata.orientation =
             crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
@@ -323,7 +332,7 @@ impl AppModel {
                     filter_type,
                     crop_rect,
                     zoom_level,
-                    ..Default::default()
+                    ..photo_config
                 };
                 let mut pipeline =
                     PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
@@ -381,6 +390,7 @@ impl AppModel {
         let encoding_format: crate::pipelines::photo::EncodingFormat =
             self.config.photo_output_format.into();
 
+        let photo_config = self.photo_processing_config();
         let mut camera_metadata = self.build_camera_metadata();
         camera_metadata.orientation =
             crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
@@ -388,6 +398,7 @@ impl AppModel {
                 mirror_horizontal,
             );
 
+        let raw_photo_config = photo_config.clone();
         let raw_save_dir = save_dir.clone();
         let raw_camera_metadata = camera_metadata.clone();
         let save_task = Task::perform(
@@ -451,7 +462,7 @@ impl AppModel {
                         filter_type,
                         crop_rect,
                         zoom_level,
-                        ..Default::default()
+                        ..raw_photo_config
                     };
                     let mut pipeline =
                         PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
@@ -514,7 +525,7 @@ impl AppModel {
                         filter_type,
                         crop_rect,
                         zoom_level,
-                        ..Default::default()
+                        ..photo_config
                     };
                     let mut pipeline =
                         PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
@@ -562,6 +573,7 @@ impl AppModel {
 
         self.is_capturing = true;
         self.burst_mode.start_capture(frame_count);
+        self.burst_mode.demosaic_method = self.config.demosaic_method;
 
         // If flash is enabled, turn it on for the entire burst capture duration
         if self.flash.enabled {
@@ -775,6 +787,7 @@ impl AppModel {
         config.encoding_format = encoding_format;
         config.camera_metadata = camera_metadata;
         config.save_burst_raw_dng = self.config.save_burst_raw;
+        config.demosaic_method = self.burst_mode.demosaic_method;
 
         // Calculate adaptive processing parameters based on scene brightness
         // estimate_scene_brightness assumes RGBA data, so skip for raw Bayer frames
@@ -2489,6 +2502,27 @@ mod tests {
     use super::{capture_with_preview_fallback, should_use_jpeg_recording_pipeline};
     use crate::backends::camera::types::SensorRotation;
     use std::cell::Cell;
+
+    #[test]
+    fn photo_jobs_snapshot_demosaicing_at_capture_start() {
+        use crate::app::state::AppModel;
+        use crate::shaders::DemosaicMethod;
+        gstreamer::init().unwrap();
+        let mut app = AppModel::default();
+        for method in [
+            DemosaicMethod::Rcd,
+            DemosaicMethod::Lmmse,
+            DemosaicMethod::Bilinear,
+        ] {
+            app.config.demosaic_method = method;
+            let photo_config = app.photo_processing_config();
+            drop(app.capture_burst_mode_photo());
+            app.config.demosaic_method = DemosaicMethod::Rcd;
+            assert_eq!(photo_config.demosaic_method, method);
+            assert_eq!(app.burst_mode.demosaic_method, method);
+            app.burst_mode.reset();
+        }
+    }
 
     #[tokio::test]
     async fn fit_photo_capture_keeps_the_preview_aspect_in_a_tall_desktop_window() {

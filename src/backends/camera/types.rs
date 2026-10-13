@@ -682,6 +682,44 @@ pub enum RawLayout {
     Csi2 { bits: u32 },
 }
 
+/// Validated linear sensor endpoints, in [R, Gr, Gb, B] site order.
+/// Consumers normalize exactly once, before demosaic/WB/CCM.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BayerLevels {
+    pub black: [f32; 4],
+    pub white: [f32; 4],
+}
+
+pub(crate) fn validate_bayer_levels(
+    scalar_black: Option<f32>,
+    site_black: Option<[f32; 4]>,
+    site_white: Option<[f32; 4]>,
+) -> Result<BayerLevels, &'static str> {
+    let scalar = scalar_black.unwrap_or(0.0);
+    let valid_black = |v: f32| v.is_finite() && (0.0..1.0).contains(&v);
+    let black = site_black.unwrap_or([scalar; 4]);
+    let white = site_white.unwrap_or([1.0; 4]);
+    if !valid_black(scalar)
+        || black.iter().any(|v| !valid_black(*v))
+        || white
+            .iter()
+            .zip(black)
+            .any(|(w, b)| !w.is_finite() || !(0.0..=1.0).contains(w) || *w <= b)
+    {
+        return Err("Invalid Bayer sensor levels");
+    }
+    // Subnormal denominators may flush to zero on GPU; normal intervals also
+    // bound the division of any normalized source code to finite f32 arithmetic.
+    if white
+        .iter()
+        .zip(black)
+        .any(|(w, b)| *w - b < f32::MIN_POSITIVE)
+    {
+        return Err("Unsafe Bayer sensor normalization arithmetic");
+    }
+    Ok(BayerLevels { black, white })
+}
+
 /// Frame metadata extracted from libcamera completed requests
 ///
 /// This struct contains the actual values applied by the ISP for a given frame,
@@ -692,6 +730,10 @@ pub struct FrameMetadata {
     pub raw_layout: Option<RawLayout>,
     /// Per-site [R, Gr, Gb, B] black levels in normalized 16-bit control units.
     pub sensor_black_levels: Option<[f32; 4]>,
+    /// Optional per-site saturation [R, Gr, Gb, B], in linear sensor code units
+    /// divided by the negotiated RAW maximum (same normalized domain as black),
+    /// before black subtraction, WB or CCM. None means nominal unity, not calibration.
+    pub sensor_white_levels: Option<[f32; 4]>,
     /// Actual exposure time applied (microseconds)
     pub exposure_time: Option<u64>,
     /// Actual analogue gain applied

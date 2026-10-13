@@ -48,7 +48,7 @@ pub struct GpuFilterPipeline {
     // Intermediate texture for pre-blur output (storage texture, same dimensions as input)
     preblur_texture: Option<wgpu::Texture>,
     output_buffer: Option<wgpu::Buffer>,
-    staging_buffer: Option<wgpu::Buffer>,
+    staging_buffer: Option<crate::gpu::readback::ReadbackBuffer>,
 }
 
 impl GpuFilterPipeline {
@@ -311,12 +311,16 @@ impl GpuFilterPipeline {
         }));
 
         // Create staging buffer for CPU readback
-        self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("filter_staging_buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        }));
+        self.staging_buffer = Some(crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("filter_staging_buffer"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            "filter_staging_buffer",
+        ));
 
         self.cached_width = width;
         self.cached_height = height;
@@ -348,10 +352,11 @@ impl GpuFilterPipeline {
             .output_buffer
             .as_ref()
             .ok_or("Output buffer not allocated")?;
-        let staging_buffer = self
+        let readback = self
             .staging_buffer
             .as_ref()
             .ok_or("Staging buffer not allocated")?;
+        let staging_buffer = readback.buffer();
 
         // Upload RGBA data to input texture
         self.queue.write_texture(
@@ -494,33 +499,15 @@ impl GpuFilterPipeline {
 
         // Copy output buffer to staging buffer
         let buffer_size = (width * height * 4) as u64;
-        encoder.copy_buffer_to_buffer(output_buffer, 0, staging_buffer, 0, buffer_size);
+        encoder.copy_buffer_to_buffer(output_buffer, 0, &staging_buffer, 0, buffer_size);
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Map staging buffer and read back result
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-
-        receiver
-            .await
-            .map_err(|_| "Failed to receive buffer mapping result")?
-            .map_err(|e| format!("Failed to map buffer: {:?}", e))?;
-
-        // Read RGBA data directly from buffer
-        let data = buffer_slice.get_mapped_range();
+        let data = readback.read_async().await?;
         let output = data.to_vec();
 
         drop(data);
-        staging_buffer.unmap();
 
         Ok(output)
     }
@@ -569,4 +556,37 @@ pub async fn apply_filter_gpu_rgba(
     pipeline
         .apply_filter_rgba(rgba_data, width, height, filter)
         .await
+}
+
+#[cfg(test)]
+mod readback_owner_tests {
+    use super::*;
+    #[test]
+    fn filter_failed_cached_map_then_public_filter_recovers_same_pixels() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "filter_failed_cached_map_then_public_filter_recovers_same_pixels",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let mut pipeline = GpuFilterPipeline::new().await.unwrap();
+            let pixels = [96, 96, 96, 255].repeat(16);
+            let expected = pipeline
+                .apply_filter_rgba(&pixels, 4, 4, FilterType::Mono)
+                .await
+                .unwrap();
+            let cache = pipeline.staging_buffer.as_ref().unwrap();
+            cache.buffer().destroy();
+            let error = cache.read_async().await.err().unwrap();
+            assert!(error.contains("destroyed"), "{error}");
+            assert_eq!(
+                pipeline
+                    .apply_filter_rgba(&pixels, 4, 4, FilterType::Mono)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        });
+    }
 }

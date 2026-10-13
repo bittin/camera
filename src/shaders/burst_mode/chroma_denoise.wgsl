@@ -15,6 +15,7 @@ struct ChromaDenoiseParams {
     height: u32,
     strength: f32,        // Denoising strength (0.0 - 1.0)
     edge_threshold: f32,  // Edge preservation threshold
+    preserve_linear: u32,
 }
 
 // Input image (RGBA f32)
@@ -218,9 +219,11 @@ fn chroma_denoise_vertical(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Output clamped RGB
     let idx = get_pixel_idx(x, y);
-    output_image[idx] = clamp(final_rgb.r, 0.0, 1.0);
-    output_image[idx + 1u] = clamp(final_rgb.g, 0.0, 1.0);
-    output_image[idx + 2u] = clamp(final_rgb.b, 0.0, 1.0);
+    var bounded=final_rgb;
+    if params.preserve_linear==0u {bounded=clamp(final_rgb,vec3(0.0),vec3(1.0));}
+    output_image[idx]=bounded.r;
+    output_image[idx+1u]=bounded.g;
+    output_image[idx+2u]=bounded.b;
     output_image[idx + 3u] = center.w;  // Preserve alpha
 }
 
@@ -284,8 +287,10 @@ fn chroma_denoise_single(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Output clamped RGB
     let idx = get_pixel_idx(x, y);
-    output_image[idx] = clamp(final_rgb.r, 0.0, 1.0);
-    output_image[idx + 1u] = clamp(final_rgb.g, 0.0, 1.0);
-    output_image[idx + 2u] = clamp(final_rgb.b, 0.0, 1.0);
+    var bounded=final_rgb;
+    if params.preserve_linear==0u {bounded=clamp(final_rgb,vec3(0.0),vec3(1.0));}
+    output_image[idx]=bounded.r;
+    output_image[idx+1u]=bounded.g;
+    output_image[idx+2u]=bounded.b;
     output_image[idx + 3u] = center_rgb.a;
 }

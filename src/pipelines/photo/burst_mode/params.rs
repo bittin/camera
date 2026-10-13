@@ -162,6 +162,7 @@ pub struct SpatialDenoiseParams {
     pub tile_offset_y: i32,
     /// Number of frames merged (for noise variance scaling per HDR+ paper)
     pub frame_count: u32,
+    pub preserve_linear: u32,
 }
 
 /// Parameters for chroma denoising shader
@@ -172,6 +173,7 @@ pub struct ChromaDenoiseParams {
     pub height: u32,
     pub strength: f32,
     pub edge_threshold: f32,
+    pub preserve_linear: u32,
 }
 
 /// Parameters for Bayer finishing shader (demosaic merged planes + WB + CCM).
@@ -204,9 +206,9 @@ pub struct BayerFinishParams {
     pub ccm_row1: [f32; 4], // offset 48
     /// Colour correction matrix row 2
     pub ccm_row2: [f32; 4], // offset 64
-    /// Whether to apply WB+CCM (1=yes, 0=no)
-    pub use_colour: u32, // offset 80
-    pub _pad0: u32,       // offset 84
+    /// Reserved; the shared colour/highlight core always runs.
+    pub _pad0: u32, // offset 80
+    pub pattern: u32,     // offset 84: original CFA phase
     pub _pad1: u32,       // offset 88
     pub _pad2: u32,       // offset 92
 } // total: 96 bytes
@@ -221,7 +223,7 @@ const _: () = assert!(std::mem::size_of::<AlignParams>() == 48);
 const _: () = assert!(std::mem::size_of::<WarpParams>() == 64);
 const _: () = assert!(std::mem::size_of::<CAEstimateParams>() == 32);
 const _: () = assert!(std::mem::size_of::<MergeParams>() == 56);
-const _: () = assert!(std::mem::size_of::<SpatialDenoiseParams>() == 40);
-const _: () = assert!(std::mem::size_of::<ChromaDenoiseParams>() == 16);
+const _: () = assert!(std::mem::size_of::<SpatialDenoiseParams>() == 44);
+const _: () = assert!(std::mem::size_of::<ChromaDenoiseParams>() == 20);
 // BayerFinishParams: 4*u32(16) + 2*f32(8) + 2*pad(8) + 3*vec4(48) + u32(4) + 3*pad(12) = 96
 const _: () = assert!(std::mem::size_of::<BayerFinishParams>() == 96);

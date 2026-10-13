@@ -1,49 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
-// GPU compute shader for Bayer to RGBA conversion (demosaicing/debayering)
-//
-// Supports all four Bayer patterns:
-// - RGGB (0): Row 0: R G R G..., Row 1: G B G B...
-// - BGGR (1): Row 0: B G B G..., Row 1: G R G R...
-// - GRBG (2): Row 0: G R G R..., Row 1: B G B G...
-// - GBRG (3): Row 0: G B G B..., Row 1: R G R G...
-//
-// Algorithm: Bilinear interpolation
-// - Each pixel directly measures one color (R, G, or B based on position)
-// - The other two colors are interpolated from neighboring pixels
-//
-// White balance gains are read from a storage buffer (binding 3).
-// When ISP provides gains, the CPU writes them directly to the buffer.
-// When ISP gains are absent, the GPU AWB shader computes and writes them.
-
-struct DebayerParams {
-    width: u32,
-    height: u32,
-    pattern: u32,           // 0=RGGB, 1=BGGR, 2=GRBG, 3=GBRG
-    use_isp_colour: u32,    // 1 = apply gains+CCM, 0 = raw output
-    black_level: f32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-    ccm_row0: vec4<f32>,
-    ccm_row1: vec4<f32>,
-    ccm_row2: vec4<f32>,
-}
-
-struct AwbGains {
-    gain_r: f32,
-    gain_b: f32,
-}
-
-@group(0) @binding(0) var tex_bayer: texture_2d<f32>;
-@group(0) @binding(1) var output: texture_storage_2d<rgba8unorm, write>;
-@group(0) @binding(2) var<uniform> params: DebayerParams;
-@group(0) @binding(3) var<storage, read> awb_gains: AwbGains;
-
-// Get pixel value with bounds checking (clamp to edge)
-fn sample_bayer(x: i32, y: i32) -> f32 {
-    let cx = clamp(x, 0i, i32(params.width) - 1i);
-    let cy = clamp(y, 0i, i32(params.height) - 1i);
-    return textureLoad(tex_bayer, vec2(u32(cx), u32(cy)), 0).r;
+// Shared signed-float CFA demosaic and WB/CCM/highlight core.
+// Adapters provide normalized sample_bayer(x,y); no bindings or output encoding here.
+fn reflect_bayer_coordinate(x: i32, extent: u32) -> i32 {
+    if extent <= 1u { return 0i; }
+    let period = 2i * (i32(extent) - 1i);
+    let folded = abs(x) % period;
+    return min(folded, period - folded);
 }
 
 // Determine what color channel this pixel position measures based on Bayer pattern
@@ -66,9 +28,9 @@ fn get_pixel_type(x: u32, y: u32, pattern: u32) -> u32 {
         }
     } else if (pattern == 1u) { // BGGR
         if (even_y) {
-            return select(1u, 3u, even_x); // even_x=B, odd_x=G
+            return select(2u, 3u, even_x); // B, Gb
         } else {
-            return select(0u, 2u, even_x); // even_x=G, odd_x=R
+            return select(0u, 1u, even_x); // Gr, R
         }
     } else if (pattern == 2u) { // GRBG
         if (even_y) {
@@ -78,26 +40,20 @@ fn get_pixel_type(x: u32, y: u32, pattern: u32) -> u32 {
         }
     } else { // GBRG (pattern == 3)
         if (even_y) {
-            return select(3u, 1u, even_x); // even_x=G, odd_x=B
+            return select(3u, 2u, even_x); // Gb, B
         } else {
-            return select(2u, 0u, even_x); // even_x=R, odd_x=G
+            return select(1u, 0u, even_x); // R, Gr
         }
     }
 }
 
-@compute @workgroup_size(16, 16)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let x = global_id.x;
-    let y = global_id.y;
+struct DemosaicResult { rgb: vec3<f32>, sensor_peak: f32, }
 
-    if (x >= params.width || y >= params.height) {
-        return;
-    }
-
+fn demosaic(x: u32, y: u32, pattern: u32) -> DemosaicResult {
     let ix = i32(x);
     let iy = i32(y);
 
-    let pixel_type = get_pixel_type(x, y, params.pattern);
+    let pixel_type = get_pixel_type(x, y, pattern);
 
     var r: f32;
     var g: f32;
@@ -163,48 +119,35 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         );
     }
 
-    // Apply white balance and colour correction (in linear space, before gamma)
-    if (params.use_isp_colour == 1u) {
-        // Subtract sensor black level so gains don't amplify the DC offset per-channel
-        let bl = params.black_level;
-        let scale = 1.0 / (1.0 - bl);
-        r = max(r - bl, 0.0) * scale;
-        g = max(g - bl, 0.0) * scale;
-        b = max(b - bl, 0.0) * scale;
-        let sensor_peak = clamp(max(sensor_peak_raw - bl, 0.0) * scale, 0.0, 1.0);
-
-        // White balance, clipped-highlight reconstruction, and sensor RGB -> sRGB CCM.
-        let corrected = apply_raw_colour(
-            vec3(r, g, b),
-            sensor_peak,
-            awb_gains.gain_r,
-            awb_gains.gain_b,
-            params.ccm_row0.xyz,
-            params.ccm_row1.xyz,
-            params.ccm_row2.xyz,
-        );
-        r = corrected.r;
-        g = corrected.g;
-        b = corrected.b;
-    }
-
-    // Clamp to [0,1] range
-    let rgb = clamp(vec3(r, g, b), vec3(0.0), vec3(1.0));
-
-    // Apply sRGB gamma only when ISP colour processing is active (data is linear).
-    // Without ISP colour, the data is in sensor-native space where gamma is meaningless.
-    if (params.use_isp_colour == 1u) {
-        let srgb = vec3(linear_to_srgb(rgb.r), linear_to_srgb(rgb.g), linear_to_srgb(rgb.b));
-        textureStore(output, vec2(x, y), vec4(srgb, 1.0));
-    } else {
-        textureStore(output, vec2(x, y), vec4(rgb, 1.0));
-    }
+    return DemosaicResult(vec3(r,g,b), sensor_peak_raw);
 }
 
-// Convert linear light to sRGB gamma-corrected value
-fn linear_to_srgb(c: f32) -> f32 {
-    if (c <= 0.0031308) {
-        return c * 12.92;
+fn apply_bayer_colour(rgb: vec3<f32>, sensor_peak_raw: f32, gains: vec2<f32>, row0: vec3<f32>, row1: vec3<f32>, row2: vec3<f32>) -> vec3<f32> {
+    // Supplied gains or the unchanged GPU gray-world producer. CCM metadata
+    // is independent of gains; identity is used only when the CCM is absent.
+    let balanced = rgb * vec3(gains.x, 1.0, gains.y);
+    let linear = vec3(dot(row0, balanced),
+        dot(row1, balanced), dot(row2, balanced));
+    // Sensor-clipped samples have lost their channel ratios. White balance can
+    // turn them magenta; scaling display RGB afterward preserves that false hue.
+    // Use a camera-space highlight cap only near sensor saturation,
+    // then apply the CCM to both candidates before blending. This is a bounded
+    // fallback, not spatial reconstruction of lost sensor detail. Adapters
+    // supply black-to-white normalized samples: the knee follows supplied
+    // sensor white, or nominal unity when metadata is absent.
+    let clipped_balanced = clamp(balanced, vec3(0.0), vec3(1.0));
+    let reconstructed = vec3(dot(row0, clipped_balanced),
+        dot(row1, clipped_balanced),
+        dot(row2, clipped_balanced));
+    let transition = clamp((sensor_peak_raw - 0.980) / (0.995 - 0.980), 0.0, 1.0);
+    let blend = transition * transition * (3.0 - 2.0 * transition);
+    // Avoid mixing extreme candidates at zero weight: preserve signed and
+    // over-white values exactly outside the sensor-clipping knee.
+    var corrected = linear;
+    if blend >= 1.0 {
+        corrected = reconstructed;
+    } else if blend > 0.0 {
+        corrected = (1.0 - blend) * linear + blend * reconstructed;
     }
-    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    return corrected;
 }

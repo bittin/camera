@@ -27,6 +27,7 @@ use tracing::{debug, info};
 
 /// Re-export wgpu types from cosmic for use in compute pipelines
 pub use iced_wgpu::wgpu;
+pub(crate) mod readback;
 
 /// Information about the created GPU device
 #[derive(Debug, Clone)]
