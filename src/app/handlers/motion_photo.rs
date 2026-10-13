@@ -116,6 +116,8 @@ struct ShutterRequest {
     result: tokio::sync::oneshot::Sender<Result<TemporaryClip, String>>,
 }
 pub(crate) struct MotionPhotoRecorder {
+    #[cfg(test)]
+    pre_roll_ready: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
     postroll_requests: Arc<AtomicUsize>,
     recipe: RecorderRecipe,
@@ -126,6 +128,11 @@ pub(crate) struct MotionPhotoRecorder {
     source_cancel: Arc<AtomicBool>,
 }
 impl MotionPhotoRecorder {
+    #[cfg(test)]
+    pub(crate) fn pre_roll_ready(&self) -> bool {
+        self.pre_roll_ready.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn stop_and_wait(mut self) -> Result<(), String> {
         self.cancel.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
@@ -442,6 +449,10 @@ impl AppModel {
         let audio = recipe.audio.clone();
         let rotation = recipe.rotation;
         let mirror = recipe.mirror;
+        #[cfg(test)]
+        let pre_roll_ready = Arc::new(AtomicBool::new(false));
+        #[cfg(test)]
+        let worker_pre_roll_ready = pre_roll_ready.clone();
         let job = std::thread::Builder::new()
             .name("motion-photo-memory".into())
             .spawn(move || {
@@ -458,6 +469,8 @@ impl AppModel {
                     job_cancel.clone(),
                     job_source_cancel,
                     worker_draining,
+                    #[cfg(test)]
+                    worker_pre_roll_ready,
                 );
                 job_cancel.store(true, Ordering::Release);
             });
@@ -469,6 +482,8 @@ impl AppModel {
             }
         };
         self.motion_photo_recorder = Some(MotionPhotoRecorder {
+            #[cfg(test)]
+            pre_roll_ready,
             draining,
             postroll_requests,
             recipe,
@@ -599,6 +614,7 @@ fn run_memory_recorder(
     cancel: Arc<AtomicBool>,
     source_cancel: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
+    #[cfg(test)] pre_roll_ready: Arc<AtomicBool>,
 ) {
     let origin = Instant::now();
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -617,6 +633,13 @@ fn run_memory_recorder(
         if cancel.load(Ordering::Acquire) || source_cancel.load(Ordering::Acquire) {
             break;
         }
+        #[cfg(test)]
+        pre_roll_ready.store(
+            encoder
+                .as_ref()
+                .is_some_and(|encoder| encoder.pre_roll_ready(origin.elapsed().as_nanos() as u64)),
+            Ordering::Release,
+        );
         while pending.len() < 8 {
             match shutters.try_recv() {
                 Ok(p) => pending.push(p),

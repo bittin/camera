@@ -311,6 +311,23 @@ impl MemoryEncoder {
         })
     }
     #[cfg(test)]
+    pub(crate) fn pre_roll_ready(&self, shutter: u64) -> bool {
+        let packets = self.ring.lock().unwrap();
+        let lower = shutter.saturating_sub(PRE_ROLL_NS);
+        // Allow two 100ms fixture-frame intervals for asynchronous encoding.
+        // Require both an early keyframe and recent video, not just raw input.
+        shutter >= PRE_ROLL_NS
+            && packets
+                .packets
+                .iter()
+                .any(|p| !p.audio && p.key && p.pts >= lower && p.pts <= lower + 200_000_000)
+            && packets
+                .packets
+                .iter()
+                .any(|p| !p.audio && p.pts >= shutter.saturating_sub(200_000_000))
+    }
+
+    #[cfg(test)]
     fn write_window(&self, path: &std::path::Path, shutter: u64) -> Result<u64, String> {
         self.snapshot_window(shutter)?.write(path)
     }
@@ -857,6 +874,42 @@ mod tests {
         assert!(
             encoder.snapshot_window(2_500_000_000).is_err(),
             "a stopped source must preserve the still and report missing AFTER content"
+        );
+    }
+
+    #[test]
+    fn pre_roll_readiness_requires_an_early_keyframe_and_recent_video() {
+        use crate::media::encoders::video::VideoCodec;
+        let info = EncoderInfo {
+            element_name: "x264enc".into(),
+            display_name: "H264".into(),
+            codec: VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        };
+        let encoder =
+            MemoryEncoder::new(&info, 64, 48, 10, 800, None, std::time::Instant::now()).unwrap();
+        let shutter = 2_500_000_000;
+        assert!(!encoder.pre_roll_ready(shutter));
+        for (pts, audio, key, ready) in [
+            (1_300_000_000, false, false, false),
+            (2_400_000_000, false, false, false),
+            (1_300_000_000, true, true, false),
+            (1_300_000_000, false, true, true),
+        ] {
+            encoder.ring.lock().unwrap().push(Packet {
+                buffer: gst::Buffer::from_mut_slice(vec![0; 10]),
+                caps: gst::Caps::new_empty(),
+                pts,
+                audio,
+                key,
+            });
+            assert_eq!(encoder.pre_roll_ready(shutter), ready);
+        }
+        assert!(!encoder.pre_roll_ready(1_000_000_000));
+        assert!(
+            !encoder.pre_roll_ready(3_000_000_000),
+            "stale output must not satisfy the warm-up barrier"
         );
     }
 
