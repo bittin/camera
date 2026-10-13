@@ -484,7 +484,11 @@ fn overlay_icon_button<'a, M: Clone + 'static>(
     message: Option<M>,
     highlighted: bool,
 ) -> Element<'a, M> {
-    let mut button = widget::button::icon(handle).extra_small();
+    // Match the disabled top-bar icons so camera switches do not resize the controls.
+    let mut button = widget::button::icon(handle)
+        .extra_small()
+        .icon_size(20)
+        .padding([4, 8]);
     if highlighted {
         button = button.class(cosmic::theme::Button::Suggested);
     }
@@ -1377,7 +1381,9 @@ impl AppModel {
             let has_file = self.virtual_camera_file_source.is_some();
             if is_disabled {
                 let file_button =
-                    widget::button::icon(icon::from_name("document-open-symbolic").symbolic(true));
+                    widget::button::icon(icon::from_name("document-open-symbolic").symbolic(true))
+                        .icon_size(20)
+                        .padding([4, 8]);
                 cells.push(
                     widget::container(file_button)
                         .style(disabled_top_bar_icon_style)
