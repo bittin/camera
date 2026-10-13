@@ -1385,7 +1385,7 @@ impl cosmic::Application for AppModel {
 
         // Reconcile discovery snapshots, including PipeWire node creation/removal
         // without /dev changes (session-manager restart, monitor availability).
-        // Native enumeration uses its cache during capture; PipeWire is always fresh.
+        // Native discovery is cached until video nodes change; PipeWire is always fresh.
         let initial_camera_paths: std::collections::BTreeSet<String> = self
             .available_cameras
             .iter()
@@ -1422,7 +1422,8 @@ impl cosmic::Application for AppModel {
                         break;
                     }
                     let mut cameras = match tokio::task::spawn_blocking(|| {
-                        crate::backends::camera::create_backend().enumerate_cameras()
+                        crate::backends::camera::libcamera::LibcameraBackend::new()
+                            .enumerate_cameras_for_hotplug()
                     })
                     .await
                     {

@@ -33,6 +33,7 @@
 //!
 //! This allows simultaneous 1080p preview and full-resolution photo capture.
 
+mod discovery_cache;
 pub(crate) mod native;
 mod stream_negotiation;
 
@@ -86,14 +87,15 @@ pub(crate) fn detect_pipeline_handler(camera_id: &str) -> Option<&'static str> {
     }
 }
 
-/// Cached enumeration result, returned when capture is active and
-/// a new CameraManager cannot be created.
-static CACHED_DEVICES: std::sync::RwLock<Vec<CameraDevice>> = std::sync::RwLock::new(Vec::new());
+/// Native discovery snapshot, reused during capture and unchanged hotplug polls.
+static CACHED_DEVICES: std::sync::LazyLock<
+    std::sync::RwLock<discovery_cache::NativeDiscoveryCache>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(Default::default()));
 
 /// Publish the accepted configuration back to discovery/capture consumers.
 fn record_stream_capability(camera_id: &str, multistream: bool) {
     if let Ok(mut devices) = CACHED_DEVICES.write()
-        && let Some(device) = devices.iter_mut().find(|d| d.path == camera_id)
+        && let Some(device) = devices.devices.iter_mut().find(|d| d.path == camera_id)
     {
         device.supports_multistream = multistream;
     }
@@ -109,6 +111,7 @@ pub(crate) fn cached_stream_capability(camera_id: &str) -> Option<bool> {
     CACHED_DEVICES
         .read()
         .ok()?
+        .devices
         .iter()
         .find(|d| d.path == camera_id)
         .map(|d| d.supports_multistream)
@@ -395,8 +398,14 @@ fn query_camera_formats(
     formats
 }
 
-impl CameraBackend for LibcameraBackend {
-    fn enumerate_cameras(&self) -> Vec<CameraDevice> {
+impl LibcameraBackend {
+    /// Refresh PipeWire on every poll, but only reprobe native devices after
+    /// the kernel video-node topology changes. Explicit enumeration stays fresh.
+    pub(crate) fn enumerate_cameras_for_hotplug(&self) -> Vec<CameraDevice> {
+        self.discover_cameras(false)
+    }
+
+    fn discover_cameras(&self, force_native: bool) -> Vec<CameraDevice> {
         debug!("Enumerating cameras via libcamera-rs");
 
         let _lock = CAMERA_MANAGER_LOCK
@@ -407,8 +416,26 @@ impl CameraBackend for LibcameraBackend {
         if native::is_capture_active() {
             debug!("Capture active, returning cached camera list");
             return super::pipewire::append_fallbacks(
-                CACHED_DEVICES.read().map(|g| g.clone()).unwrap_or_default(),
+                CACHED_DEVICES
+                    .read()
+                    .map(|g| g.devices.clone())
+                    .unwrap_or_default(),
             );
+        }
+
+        let video_nodes = discovery_cache::scan_video_topology().ok();
+        if !force_native {
+            let cached = CACHED_DEVICES.read().ok().and_then(|cache| {
+                video_nodes
+                    .as_ref()
+                    .filter(|nodes| cache.matches(nodes))
+                    .map(|_| cache.devices.clone())
+            });
+            // Release the cache guard before external PipeWire discovery so
+            // capture can publish updated stream capabilities independently.
+            if let Some(devices) = cached {
+                return super::pipewire::append_fallbacks(devices);
+            }
         }
 
         let mgr = match CameraManager::new() {
@@ -522,9 +549,12 @@ impl CameraBackend for LibcameraBackend {
         // Sort by path for consistent ordering
         devices.sort_by(|a, b| a.path.cmp(&b.path));
 
-        // Cache for use when capture is active
-        if let Ok(mut cache) = CACHED_DEVICES.write() {
-            *cache = devices.clone();
+        // Record only successful native discovery. In particular, a failed
+        // CameraManager creation must leave the topology invalidated for retry.
+        if let Some(video_nodes) = video_nodes
+            && let Ok(mut cache) = CACHED_DEVICES.write()
+        {
+            cache.update(video_nodes, devices.clone());
         }
 
         // Pre-populate format cache for all cameras while we have the CameraManager open.
@@ -546,6 +576,12 @@ impl CameraBackend for LibcameraBackend {
 
         debug!(count = devices.len(), "Enumerated libcamera cameras");
         super::pipewire::append_fallbacks(devices)
+    }
+}
+
+impl CameraBackend for LibcameraBackend {
+    fn enumerate_cameras(&self) -> Vec<CameraDevice> {
+        self.discover_cameras(true)
     }
 
     fn get_formats(&self, device: &CameraDevice, video_mode: bool) -> Vec<CameraFormat> {
@@ -872,6 +908,56 @@ pub fn create_pipeline(
 #[cfg(test)]
 mod tests {
     use super::detect_pipeline_handler;
+
+    #[test]
+    #[ignore = "requires an idle PipeWire fallback camera"]
+    fn live_pipewire_hotplug_polls_reuse_native_discovery() {
+        use super::super::CameraBackend;
+        use futures::StreamExt;
+
+        let backend = super::LibcameraBackend::new();
+        let devices = backend.enumerate_cameras();
+        let device = devices
+            .iter()
+            .find(|d| d.path.starts_with("pipewire:"))
+            .expect("PipeWire fallback camera");
+        let formats = backend.get_formats(device, true);
+        let format = formats
+            .iter()
+            .find(|f| f.width == 640 && f.height == 480)
+            .unwrap_or(&formats[0]);
+        let (_handle, mut receiver) =
+            super::create_pipeline(device, format).expect("fallback pipeline");
+        assert!(!super::native::is_capture_active());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // Settle the bounded native readiness retries before measuring the
+        // steady-state polls. PipeWire continues streaming throughout.
+        for _ in 0..2 {
+            backend.enumerate_cameras_for_hotplug();
+        }
+        println!("HOTPLUG_CACHE_BEGIN");
+        for _ in 0..3 {
+            let frame = runtime
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(8), receiver.next()).await
+                })
+                .expect("preview frame within eight seconds")
+                .expect("live preview");
+            assert!(!frame.data.is_empty());
+            let cameras = super::LibcameraBackend::new().enumerate_cameras_for_hotplug();
+            assert!(cameras.iter().any(|d| d.path == device.path));
+        }
+        println!("HOTPLUG_CACHE_END");
+        // An explicit refresh must still create a fresh native manager even
+        // while the PipeWire fallback is streaming.
+        let cameras = backend.enumerate_cameras();
+        assert!(cameras.iter().any(|d| d.path == device.path));
+        println!("EXPLICIT_REFRESH_END");
+    }
 
     #[test]
     #[ignore = "requires an idle Logitech C270 webcam"]
