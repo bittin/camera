@@ -590,8 +590,10 @@ mod shutdown_tests {
     #[test]
     fn shutdown_rejects_queued_ui_keyboard_and_config_interactions() {
         gstreamer::init().unwrap();
-        let mut model = AppModel::default();
-        model.pending_close = true;
+        let mut model = AppModel {
+            pending_close: true,
+            ..Default::default()
+        };
         model.photo_jobs.insert(
             1,
             crate::app::handlers::motion_photo::PhotoJob {

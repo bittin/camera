@@ -656,37 +656,6 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
     (r, g, b)
 }
 
-#[cfg(test)]
-mod photo_filename_tests {
-    use super::*;
-    use chrono::{TimeZone, Timelike};
-
-    #[test]
-    fn terminal_photos_use_short_collision_suffixes_without_overwriting() {
-        let root = std::env::temp_dir().join(format!("terminal-names-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let timestamp = chrono::FixedOffset::east_opt(0)
-            .unwrap()
-            .with_ymd_and_hms(2026, 10, 8, 14, 5, 6)
-            .unwrap()
-            .with_nanosecond(123_000_000)
-            .unwrap();
-        let original = root.join("IMG_20261008_140506_123.jpg");
-        std::fs::write(&original, b"existing photo").unwrap();
-        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([180, 20, 30]));
-        for collision in 1..=2 {
-            let output = save_rgb_photo(&img, root.clone(), timestamp).unwrap();
-            assert_eq!(
-                output,
-                root.join(format!("IMG_20261008_140506_123_{collision}.jpg"))
-            );
-            assert!(image::open(output).is_ok());
-        }
-        assert_eq!(std::fs::read(original).unwrap(), b"existing photo");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
 /// Status bar widget
 struct StatusBar<'a> {
     message: &'a str,
@@ -717,5 +686,36 @@ impl Widget for StatusBar<'_> {
                 .fg(Color::White)
                 .bg(Color::DarkGray),
         );
+    }
+}
+
+#[cfg(test)]
+mod photo_filename_tests {
+    use super::*;
+    use chrono::{TimeZone, Timelike};
+
+    #[test]
+    fn terminal_photos_use_short_collision_suffixes_without_overwriting() {
+        let root = std::env::temp_dir().join(format!("terminal-names-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let timestamp = chrono::FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, 8, 14, 5, 6)
+            .unwrap()
+            .with_nanosecond(123_000_000)
+            .unwrap();
+        let original = root.join("IMG_20261008_140506_123.jpg");
+        std::fs::write(&original, b"existing photo").unwrap();
+        let img = image::RgbImage::from_pixel(16, 16, image::Rgb([180, 20, 30]));
+        for collision in 1..=2 {
+            let output = save_rgb_photo(&img, root.clone(), timestamp).unwrap();
+            assert_eq!(
+                output,
+                root.join(format!("IMG_20261008_140506_123_{collision}.jpg"))
+            );
+            assert!(image::open(output).is_ok());
+        }
+        assert_eq!(std::fs::read(original).unwrap(), b"existing photo");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

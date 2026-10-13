@@ -606,12 +606,8 @@ mod tests {
             "{name}: full decode failed: {}",
             String::from_utf8_lossy(&decode.stderr)
         );
-        let frames = decode.stdout.chunks_exact(64 * 48 * 3);
-        assert!(
-            frames.remainder().is_empty(),
-            "{name}: truncated decoded frame"
-        );
-        let frames: Vec<_> = frames.collect();
+        let (frames, remainder) = decode.stdout.as_chunks::<{ 64 * 48 * 3 }>();
+        assert!(remainder.is_empty(), "{name}: truncated decoded frame");
         assert_eq!(
             frames.len(),
             times.len(),
@@ -619,7 +615,7 @@ mod tests {
         );
         for (frame, time) in frames.iter().zip(&times) {
             let mut sums = [0u64; 3];
-            for pixel in frame.chunks_exact(3) {
+            for pixel in frame.as_chunks::<3>().0 {
                 for channel in 0..3 {
                     sums[channel] += u64::from(pixel[channel]);
                 }
@@ -707,7 +703,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&decode.stderr)
         );
-        let frames: Vec<_> = decode.stdout.chunks_exact(64 * 48 * 3).collect();
+        let frames = decode.stdout.as_chunks::<{ 64 * 48 * 3 }>().0;
         assert!(
             frames.len() >= 23,
             "nominal clip should span 2.5 seconds, got {} frames",

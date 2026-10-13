@@ -3418,7 +3418,7 @@ mod tests {
         let existing = root.join("IMG_20261008_140506_123.jpg");
         std::fs::write(&existing, b"existing photo").unwrap();
         let frame = MergedFrame {
-            data: vec![180, 20, 30, 255].repeat(16 * 16),
+            data: [180, 20, 30, 255].repeat(16 * 16),
             width: 16,
             height: 16,
         };
