@@ -3712,7 +3712,12 @@ mod tests {
                 "{}",
                 String::from_utf8_lossy(&decode.stderr)
             );
-            let frames: Vec<_> = decode.stdout.chunks_exact(64 * 48 * 3).collect();
+            let frames: Vec<_> = decode
+                .stdout
+                .as_chunks::<{ 64 * 48 * 3 }>()
+                .0
+                .iter()
+                .collect();
             assert!(
                 frames.len() >= 23,
                 "10fps synthetic source should span the nominal 2.5s window, got {} frames",
