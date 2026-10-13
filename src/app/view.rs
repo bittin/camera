@@ -1421,7 +1421,18 @@ impl AppModel {
         }
 
         // Settings button (normally in header_end)
-        if !is_disabled {
+        if is_disabled {
+            cells.push(
+                widget::container(
+                    widget::button::icon(
+                        icon::from_name("preferences-system-symbolic").symbolic(true),
+                    )
+                    .extra_small(),
+                )
+                .style(disabled_top_bar_icon_style)
+                .into(),
+            );
+        } else {
             cells.push(
                 widget::button::icon(icon::from_name("preferences-system-symbolic").symbolic(true))
                     .extra_small()
