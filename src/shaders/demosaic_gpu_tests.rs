@@ -13,12 +13,18 @@ fn run(
     method: DemosaicMethod,
 ) -> Result<Vec<[f32; 4]>, String> {
     let rgba: Vec<[f32; 4]> = input.iter().map(|&v| [v, 0.0, 0.0, 0.0]).collect();
+    let scalar = engine.raw.format() == wgpu::TextureFormat::R32Float;
+    let bytes: &[u8] = if scalar {
+        bytemuck::cast_slice(input)
+    } else {
+        bytemuck::cast_slice(&rgba)
+    };
     queue.write_texture(
         engine.raw.as_image_copy(),
-        bytemuck::cast_slice(&rgba),
+        bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(w * 16),
+            bytes_per_row: Some(w * if scalar { 4 } else { 16 }),
             rows_per_image: Some(h),
         },
         wgpu::Extent3d {
@@ -78,6 +84,66 @@ fn run(
     buffer.unmap();
     Ok(out)
 }
+#[test]
+fn normalized_cfa_uses_one_float_component_without_precision_loss() {
+    let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {
+        crate::test_gpu::skip_no_gpu(
+            "normalized_cfa_uses_one_float_component_without_precision_loss",
+        );
+        return;
+    };
+    let engine = GpuDemosaic::new(&device, 2, 2).unwrap();
+    assert_eq!(
+        engine.raw.format().block_copy_size(None),
+        Some(4),
+        "scalar CFA wastes unused float components"
+    );
+    // No FP16/normalized narrowing: a one-ULP distinction must survive upload
+    // and the unchanged GPU sensor-peak output channel.
+    let value = f32::from_bits(0.5f32.to_bits() + 1);
+    let out = run(
+        &device,
+        &queue,
+        &engine,
+        &[value; 4],
+        2,
+        2,
+        0,
+        DemosaicMethod::Bilinear,
+    )
+    .unwrap();
+    assert!(out.iter().all(|p| p[3].to_bits() == value.to_bits()));
+}
+
+#[test]
+fn photo_scratch_is_bounded_independently_of_sensor_geometry() {
+    let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {
+        crate::test_gpu::skip_no_gpu("photo_scratch_is_bounded_independently_of_sensor_geometry");
+        return;
+    };
+    let (w, h) = (1057, 1031);
+    let engine = GpuDemosaic::new(&device, w, h).unwrap();
+    let bytes: u64 = engine
+        .scratch
+        .iter()
+        .map(|t| u64::from(t.width()) * u64::from(t.height()) * 16)
+        .sum();
+    assert!(
+        bytes <= 4 * 544 * 544 * 16,
+        "photo scratch must be tile-bounded, allocated {bytes} bytes"
+    );
+    let raw = vec![0.2; (w * h) as usize];
+    for method in [
+        DemosaicMethod::Rcd,
+        DemosaicMethod::Lmmse,
+        DemosaicMethod::Bilinear,
+    ] {
+        let out = run(&device, &queue, &engine, &raw, w, h, 0, method).unwrap();
+        assert_eq!(out.len(), raw.len());
+        assert!(out.iter().all(|v| v.iter().all(|c| c.is_finite())));
+    }
+}
+
 #[test]
 fn gpu_reduction_rejects_nan_infinity_and_overflow_without_clamping() {
     let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {

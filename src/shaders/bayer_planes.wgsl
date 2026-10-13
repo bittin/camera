@@ -2,7 +2,7 @@
 // Merged normalized R,Gr,B,Gb -> spatial CFA, without clamping or renormalizing.
 struct Params { width:u32, height:u32, pattern:u32, method:u32 }
 @group(0) @binding(0) var<storage,read> planes:array<vec4<f32>>;
-@group(0) @binding(1) var dst:texture_storage_2d<rgba32float,write>;
+@group(0) @binding(1) var dst:texture_storage_2d<r32float,write>;
 @group(0) @binding(2) var<uniform> p:Params;
 @compute @workgroup_size(16,16)
 fn main(@builtin(global_invocation_id) id:vec3<u32>){

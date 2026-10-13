@@ -55,7 +55,7 @@ pub struct HistogramPipeline {
     input_texture: Option<wgpu::Texture>,
     histogram_buffer: Option<wgpu::Buffer>,
     metrics_buffer: Option<wgpu::Buffer>,
-    staging_buffer: Option<wgpu::Buffer>,
+    staging_buffer: Option<crate::gpu::readback::ReadbackBuffer>,
 }
 
 impl HistogramPipeline {
@@ -223,12 +223,16 @@ impl HistogramPipeline {
         }));
 
         // Staging buffer for readback
-        self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("metrics_staging_buffer"),
-            size: metrics_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        }));
+        self.staging_buffer = Some(crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("metrics_staging_buffer"),
+                size: metrics_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            "metrics_staging_buffer",
+        ));
 
         self.cached_width = width;
         self.cached_height = height;
@@ -252,7 +256,8 @@ impl HistogramPipeline {
             .as_ref()
             .ok_or("No histogram buffer")?;
         let metrics_buffer = self.metrics_buffer.as_ref().ok_or("No metrics buffer")?;
-        let staging_buffer = self.staging_buffer.as_ref().ok_or("No staging buffer")?;
+        let readback = self.staging_buffer.as_ref().ok_or("No staging buffer")?;
+        let staging_buffer = readback.buffer();
 
         // Upload texture
         self.queue.write_texture(
@@ -351,7 +356,7 @@ impl HistogramPipeline {
         encoder.copy_buffer_to_buffer(
             metrics_buffer,
             0,
-            staging_buffer,
+            &staging_buffer,
             0,
             std::mem::size_of::<BrightnessMetrics>() as u64,
         );
@@ -359,26 +364,9 @@ impl HistogramPipeline {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Map staging buffer and read results
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-
-        receiver
-            .recv()
-            .map_err(|e| format!("Buffer map channel closed: {e}"))?
-            .map_err(|e| format!("Buffer map failed: {e}"))?;
-
-        let metrics: BrightnessMetrics = {
-            let data = buffer_slice.get_mapped_range();
-            *bytemuck::from_bytes(&data)
-        };
-        staging_buffer.unmap();
+        let data = readback.read()?;
+        let metrics: BrightnessMetrics = { *bytemuck::from_bytes(&data) };
+        drop(data);
 
         debug!(
             mean = metrics.mean_luminance,
@@ -450,5 +438,28 @@ mod tests {
         )
         .validate(&module)
         .unwrap_or_else(|e| panic!("histogram_compute.wgsl validation failed: {e:?}"));
+    }
+}
+
+#[cfg(test)]
+mod readback_owner_tests {
+    use super::*;
+    #[test]
+    fn histogram_failed_cached_map_then_public_analysis_recovers_same_metrics() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "histogram_failed_cached_map_then_public_analysis_recovers_same_metrics",
+            );
+            return;
+        };
+        let mut pipeline = pollster::block_on(HistogramPipeline::new()).unwrap();
+        let pixels = [96, 96, 96, 255].repeat(16);
+        let expected = pipeline.analyze(&pixels, 4, 4).unwrap();
+        let cache = pipeline.staging_buffer.as_ref().unwrap();
+        cache.buffer().destroy();
+        let error = cache.read().err().unwrap();
+        assert!(error.contains("destroyed"), "{error}");
+        let actual = pipeline.analyze(&pixels, 4, 4).unwrap();
+        assert_eq!(bytemuck::bytes_of(&actual), bytemuck::bytes_of(&expected));
     }
 }

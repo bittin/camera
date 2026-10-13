@@ -5,7 +5,8 @@
 // All neighbor reads use completed, separate textures. A 16-pixel even halo
 // retains the scalar reference's fictitious CFA phase at reflected borders.
 struct Params {
-    width:u32, height:u32, pattern:u32, method:u32
+    width:u32, height:u32, pattern:u32, method:u32,
+    origin_x:u32, origin_y:u32, tile_width:u32, tile_height:u32
 }
 struct Status {
     negative:atomic<u32>, positive:atomic<u32>, peak:atomic<u32>, invalid:atomic<u32>
@@ -29,10 +30,10 @@ fn raw(q:vec2<i32>)->f32 {
     return textureLoad(raw_tex,vec2(mirror(c.x,p.width),mirror(c.y,p.height)),0).r;
 }
 fn a(q:vec2<i32>)->vec4<f32>{
-    return textureLoad(a_tex,q,0);
+    return textureLoad(a_tex,q-vec2<i32>(i32(p.origin_x),i32(p.origin_y)),0);
 }
 fn b(q:vec2<i32>)->vec4<f32>{
-    return textureLoad(b_tex,q,0);
+    return textureLoad(b_tex,q-vec2<i32>(i32(p.origin_x),i32(p.origin_y)),0);
 }
 fn channel(q:vec2<i32>)->u32 {
     let i=u32(q.y&1)*2u+u32(q.x&1);
@@ -138,7 +139,8 @@ fn bounds(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_
 // RCD: vertical/horizontal highpass discrimination + lowpass.
 // LMMSE: horizontal/vertical green-colour differences with global bounds.
 fn first(@builtin(global_invocation_id) id:vec3<u32>){
-    let q=vec2<i32>(id.xy);
+    if id.x>=p.tile_width+32u || id.y>=p.tile_height+32u {return;}
+    let q=vec2<i32>(id.xy)+vec2<i32>(i32(p.origin_x),i32(p.origin_y));
     if !inside(q,0){
         return;
     }
@@ -182,13 +184,14 @@ fn first(@builtin(global_invocation_id) id:vec3<u32>){
     for(var component=0u;component<4u;component++){
         if !finite(v[component]) {atomicOr(&status.invalid,8u);}
     }
-    textureStore(dst,q,v);
+    textureStore(dst,id.xy,v);
 }
 @compute @workgroup_size(16,16)
 // RCD: ratio-corrected directional green estimates.
 // LMMSE: separable nine-tap Gaussian smoothing of directional differences.
 fn second(@builtin(global_invocation_id) id:vec3<u32>){
-    let q=vec2<i32>(id.xy);
+    if id.x>=p.tile_width+32u || id.y>=p.tile_height+32u {return;}
+    let q=vec2<i32>(id.xy)+vec2<i32>(i32(p.origin_x),i32(p.origin_y));
     if !inside(q,0){
         return;
     }
@@ -217,13 +220,14 @@ fn second(@builtin(global_invocation_id) id:vec3<u32>){
     for(var component=0u;component<4u;component++){
         if !finite(v[component]) {atomicOr(&status.invalid,8u);}
     }
-    textureStore(dst,q,v);
+    textureStore(dst,id.xy,v);
 }
 @compute @workgroup_size(16,16)
 // RCD: paired-column diagonal discrimination (upstream HP phase).
 // LMMSE: local signal/noise variance and minimum-MSE green fusion.
 fn third(@builtin(global_invocation_id) id:vec3<u32>){
-    let q=vec2<i32>(id.xy);
+    if id.x>=p.tile_width+32u || id.y>=p.tile_height+32u {return;}
+    let q=vec2<i32>(id.xy)+vec2<i32>(i32(p.origin_x),i32(p.origin_y));
     if !inside(q,0){
         return;
     }
@@ -269,13 +273,14 @@ fn third(@builtin(global_invocation_id) id:vec3<u32>){
     for(var component=0u;component<4u;component++){
         if !finite(v[component]) {atomicOr(&status.invalid,8u);}
     }
-    textureStore(dst,q,v);
+    textureStore(dst,id.xy,v);
 }
 @compute @workgroup_size(16,16)
 // RCD: opposite chroma at R/B using diagonal colour differences.
 // LMMSE: missing chroma at green sites along each colour CFA axis.
 fn fourth(@builtin(global_invocation_id) id:vec3<u32>){
-    let q=vec2<i32>(id.xy);
+    if id.x>=p.tile_width+32u || id.y>=p.tile_height+32u {return;}
+    let q=vec2<i32>(id.xy)+vec2<i32>(i32(p.origin_x),i32(p.origin_y));
     if !inside(q,0){
         return;
     }
@@ -302,15 +307,16 @@ fn fourth(@builtin(global_invocation_id) id:vec3<u32>){
     for(var component=0u;component<4u;component++){
         if !finite(v[component]) {atomicOr(&status.invalid,8u);}
     }
-    textureStore(dst,q,v);
+    textureStore(dst,id.xy,v);
 }
 @compute @workgroup_size(16,16)
 // RCD: axial chroma at green. LMMSE: opposite chroma from completed green.
 // Crop the even halo, retain sensor peak, and reduce output safety/colour bound.
 fn final_pass(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_index) lane:u32){
     var peak=0u;
-    if id.x<p.width && id.y<p.height {
-        let q=vec2<i32>(id.xy)+vec2(16);
+    if id.x<p.tile_width && id.y<p.tile_height {
+        let output_id=id.xy+vec2(p.origin_x,p.origin_y);
+        let q=vec2<i32>(output_id)+vec2(16);
         var v=b(q);
         let c0=channel(q);
         if p.method==0u&&c0==1u{
@@ -359,7 +365,7 @@ fn final_pass(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocat
                 peak=max(peak,bitcast<u32>(abs(v[c])));
             }
         }
-        textureStore(dst,id.xy,v);
+        textureStore(dst,output_id,v);
     }
     let global=group_max(vec2(peak,0u),lane);
     if lane==0u {

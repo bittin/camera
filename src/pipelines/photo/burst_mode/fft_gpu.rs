@@ -809,27 +809,19 @@ impl FftMergePipeline {
 
         // Map and convert
         let map_start = std::time::Instant::now();
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            staging_buffer,
+            "burst readback",
+        );
+        let data = readback.read_async().await?;
 
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        receiver
-            .await
-            .map_err(|_| "Failed to receive map result")?
-            .map_err(|e| format!("Failed to map buffer: {:?}", e))?;
         debug!(
             elapsed_ms = map_start.elapsed().as_millis(),
             "Map staging buffer"
         );
 
         let convert_start = std::time::Instant::now();
-        let data = buffer_slice.get_mapped_range();
         let output_f32: &[f32] = bytemuck::cast_slice(&data);
         let output_u8: Vec<u8> = output_f32
             .iter()
@@ -837,7 +829,7 @@ impl FftMergePipeline {
             .collect();
 
         drop(data);
-        staging_buffer.unmap();
+
         debug!(
             elapsed_ms = convert_start.elapsed().as_millis(),
             "Convert f32 to u8"

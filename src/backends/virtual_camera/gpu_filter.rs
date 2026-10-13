@@ -47,7 +47,7 @@ pub struct GpuFilterRenderer {
     // RGBA output buffer (storage buffer for compute shader output)
     output_buffer: Option<wgpu::Buffer>,
     // Staging buffer for CPU readback
-    staging_buffer: Option<wgpu::Buffer>,
+    staging_buffer: Option<crate::gpu::readback::ReadbackBuffer>,
     // Compute pipeline
     pipeline: wgpu::ComputePipeline,
     // Pre-blur compute pipeline
@@ -324,12 +324,16 @@ impl GpuFilterRenderer {
         }));
 
         // Staging buffer for readback
-        self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging_rgba_buffer"),
-            size: rgba_size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        }));
+        self.staging_buffer = Some(crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("staging_rgba_buffer"),
+                size: rgba_size,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }),
+            "virtual filter staging",
+        ));
 
         self.width = width;
         self.height = height;
@@ -493,7 +497,7 @@ impl GpuFilterRenderer {
         encoder.copy_buffer_to_buffer(
             self.output_buffer.as_ref().unwrap(),
             0,
-            self.staging_buffer.as_ref().unwrap(),
+            &self.staging_buffer.as_ref().unwrap().buffer(),
             0,
             buffer_size,
         );
@@ -502,28 +506,11 @@ impl GpuFilterRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Read back results
-        let staging = self.staging_buffer.as_ref().unwrap();
-        let slice = staging.slice(..);
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-
-        rx.recv()
-            .map_err(|e| BackendError::Other(format!("Failed to map buffer: {}", e)))?
-            .map_err(|e| BackendError::Other(format!("Buffer map error: {:?}", e)))?;
-
-        let data = slice.get_mapped_range();
+        let readback = self.staging_buffer.as_ref().unwrap();
+        let data = readback.read().map_err(BackendError::Other)?;
         let output = data.to_vec();
 
         drop(data);
-        staging.unmap();
 
         Ok(output)
     }
@@ -550,5 +537,42 @@ impl GpuFilterRenderer {
         }
 
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod readback_owner_tests {
+    use super::*;
+    #[test]
+    fn virtual_filter_failed_cached_map_then_public_filter_recovers_same_pixels() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "virtual_filter_failed_cached_map_then_public_filter_recovers_same_pixels",
+            );
+            return;
+        };
+        let mut pipeline = pollster::block_on(GpuFilterRenderer::new()).unwrap();
+        let frame = crate::backends::camera::types::CameraFrame {
+            width: 4,
+            height: 4,
+            stride: 16,
+            format: crate::backends::camera::types::PixelFormat::RGBA,
+            data: crate::backends::camera::types::FrameData::from_owned_vec(
+                [96, 96, 96, 255].repeat(16),
+            ),
+            yuv_planes: None,
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        };
+        let expected = pipeline.apply_filter(&frame, FilterType::Mono).unwrap();
+        let cache = pipeline.staging_buffer.as_ref().unwrap();
+        cache.buffer().destroy();
+        let error = cache.read().err().unwrap();
+        assert!(error.contains("destroyed"), "{error}");
+        assert_eq!(
+            pipeline.apply_filter(&frame, FilterType::Mono).unwrap(),
+            expected
+        );
     }
 }

@@ -142,9 +142,10 @@ async fn convert_frame_to_rgba(frame: &CameraFrame) -> Result<Vec<u8>, String> {
         .await
         .map_err(|e| format!("Failed to get GPU convert pipeline: {}", e))?;
 
-    let pipeline = pipeline_guard
+    let mut pipeline = pipeline_guard
         .as_mut()
-        .ok_or("GPU convert pipeline not initialized")?;
+        .ok_or("GPU convert pipeline not initialized")?
+        .photo_workspace();
 
     // Run GPU conversion (synchronous, just dispatches compute shader)
     pipeline
@@ -550,24 +551,15 @@ impl BurstModeGpuPipeline {
         encoder.copy_buffer_to_buffer(src_buffer, 0, &staging, 0, size);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        let buffer_slice = staging.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        receiver
-            .await
-            .map_err(|_| "Failed to receive map result")?
-            .map_err(|e| format!("{:?}", e))?;
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            staging,
+            "burst readback",
+        );
+        let data = readback.read_async().await?;
 
-        let data = buffer_slice.get_mapped_range();
         let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
-        staging.unmap();
 
         Ok(result)
     }
@@ -1168,26 +1160,17 @@ impl BurstModeGpuPipeline {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            staging_buffer,
+            "burst readback",
+        );
+        let data = readback.read_async().await?;
 
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        receiver
-            .await
-            .map_err(|_| "Failed to receive map result")?
-            .map_err(|e| format!("{:?}", e))?;
-
-        let data = buffer_slice.get_mapped_range();
         // Only read the first 4 bytes (f32) - pooled buffer may be larger
         let result: f32 = *bytemuck::from_bytes(&data[..std::mem::size_of::<f32>()]);
         drop(data);
-        staging_buffer.unmap();
+        let staging_buffer = readback.buffer();
 
         // Return staging buffer to pool for reuse
         self.staging_pool
@@ -2343,26 +2326,19 @@ impl BurstModeGpuPipeline {
 
         // Read back global brightness to compute adaptive shadow_boost
         info!("Reading brightness accumulator from GPU");
-        let brightness_slice = brightness_staging.slice(..);
-        let (tx, rx) = futures::channel::oneshot::channel();
-        brightness_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        rx.await
-            .map_err(|_| "Failed to receive brightness map result")?
-            .map_err(|e| format!("Failed to map brightness buffer: {:?}", e))?;
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            brightness_staging,
+            "burst readback",
+        );
+        let brightness_data = readback.read_async().await?;
+
         info!("Brightness buffer mapped successfully");
 
-        let brightness_data = brightness_slice.get_mapped_range();
         let brightness_vals: &[u32] = bytemuck::cast_slice(&brightness_data);
         let sum_fixed = brightness_vals[0] as f64;
         let count = brightness_vals[1] as f64;
         drop(brightness_data);
-        brightness_staging.unmap();
 
         // Compute average brightness (convert from fixed-point)
         let avg_brightness = if count > 0.0 {
@@ -2447,22 +2423,13 @@ impl BurstModeGpuPipeline {
 
         self.queue.submit(std::iter::once(tonemap_encoder.finish()));
 
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            staging_buffer,
+            "burst readback",
+        );
+        let data = readback.read_async().await?;
 
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        receiver
-            .await
-            .map_err(|_| "Failed to receive map result")?
-            .map_err(|e| format!("{:?}", e))?;
-
-        let data = buffer_slice.get_mapped_range();
         let result_f32: &[f32] = bytemuck::cast_slice(&data);
         let all_finite = result_f32.iter().all(|value| value.is_finite());
         let result_u8: Vec<u8> = result_f32
@@ -2470,7 +2437,7 @@ impl BurstModeGpuPipeline {
             .map(|&x| (x.clamp(0.0, 1.0) * 255.0) as u8)
             .collect();
         drop(data);
-        staging_buffer.unmap();
+        let staging_buffer = readback.buffer();
 
         // Return staging buffer to pool for reuse
         self.staging_pool
@@ -2707,28 +2674,20 @@ impl BurstModeGpuPipeline {
         );
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-        receiver
-            .await
-            .map_err(|_| "Failed to receive bayer finish map result")?
-            .map_err(|e| format!("Failed to map bayer finish buffer: {:?}", e))?;
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            staging_buffer,
+            "burst readback",
+        );
+        let data = readback.read_async().await?;
 
-        let data = buffer_slice.get_mapped_range();
         let result_f32: &[f32] = bytemuck::cast_slice(&data);
         let mut result_linear = Vec::with_capacity(full_pixel_count * 4);
         for row in result_f32.chunks_exact(padded_row as usize / 4) {
             result_linear.extend_from_slice(&row[..full_width as usize * 4]);
         }
         drop(data);
-        staging_buffer.unmap();
+        let staging_buffer = readback.buffer();
         self.staging_pool
             .write()
             .unwrap()
@@ -4163,6 +4122,42 @@ mod method_colour_tests {
                     );
                 }
             }
+        });
+    }
+}
+
+#[cfg(test)]
+mod photo_workspace_memory_tests {
+    use super::*;
+    #[test]
+    fn burst_photo_conversion_does_not_retain_singleton_frame_workspace() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "burst_photo_conversion_does_not_retain_singleton_frame_workspace",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 21,
+                height: 19,
+                stride: 21,
+                format: PixelFormat::BayerRGGB,
+                data: crate::backends::camera::types::FrameData::from_owned_vec(vec![64; 21 * 19]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let before = convert_frame_to_rgba(&frame).await.unwrap();
+            {
+                let guard = get_gpu_convert_pipeline().await.unwrap();
+                assert!(
+                    guard.as_ref().unwrap().output_texture().is_none(),
+                    "burst photo export retained global frame resources"
+                );
+            }
+            assert_eq!(before, convert_frame_to_rgba(&frame).await.unwrap());
         });
     }
 }

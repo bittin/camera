@@ -281,6 +281,310 @@ mod bayer_input_tests {
     use crate::backends::camera::types::{FrameData, YuvPlanes};
 
     #[test]
+    fn completed_photo_releases_global_frame_workspace() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("completed_photo_releases_global_frame_workspace");
+            return;
+        };
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 21,
+                height: 19,
+                stride: 21,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(vec![64; 21 * 19]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            for method in [
+                super::super::DemosaicMethod::Rcd,
+                super::super::DemosaicMethod::Lmmse,
+                super::super::DemosaicMethod::Bilinear,
+            ] {
+                let output =
+                    crate::pipelines::photo::PostProcessor::memory_photo_for_test(&frame, method)
+                        .await
+                        .unwrap();
+                assert_eq!(output.len(), 21 * 19 * 4);
+                let guard = get_gpu_convert_pipeline().await.unwrap();
+                let p = guard.as_ref().unwrap();
+                assert!(
+                    p.demosaic_engine.is_none(),
+                    "completed photo retained demosaic workspace"
+                );
+                assert!(p.bayer_linear_texture.is_none() && p.bayer_demosaic_texture.is_none());
+                assert!(p.tex_y.is_none() && p.output_texture.is_none() && p.output_view.is_none());
+                assert!(
+                    p.readback_staging_buffer.is_none()
+                        && p.packed_input_buffer.is_none()
+                        && p.unpack_output_buffer.is_none()
+                );
+                assert!(
+                    p.debayer_pipeline.is_some(),
+                    "lightweight programs should remain reusable"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn bilinear_switch_releases_inactive_demosaic_workspace() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("bilinear_switch_releases_inactive_demosaic_workspace");
+            return;
+        };
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 21,
+                height: 19,
+                stride: 21,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(vec![64; 21 * 19]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let mut p = GpuConvertPipeline::new().await.unwrap();
+            p.convert_bayer_with_method(&input, super::super::DemosaicMethod::Rcd)
+                .unwrap();
+            let programs = p.demosaic_programs.clone().unwrap();
+            let before = p.read_rgba_to_cpu(21, 19).await.unwrap();
+            p.convert_bayer_with_method(&input, super::super::DemosaicMethod::Bilinear)
+                .unwrap();
+            assert!(
+                p.demosaic_engine.is_none(),
+                "Bilinear retained inactive RAW/scratch engine"
+            );
+            p.convert_bayer_with_method(&input, super::super::DemosaicMethod::Rcd)
+                .unwrap();
+            assert!(Arc::ptr_eq(
+                &programs,
+                p.demosaic_programs.as_ref().unwrap()
+            ));
+            assert_eq!(before, p.read_rgba_to_cpu(21, 19).await.unwrap());
+        });
+    }
+
+    #[test]
+    fn photo_scope_error_and_cancel_drop_frame_handles_before_unlock() {
+        use std::future::Future;
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "photo_scope_error_and_cancel_drop_frame_handles_before_unlock",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 513,
+                height: 517,
+                stride: 513,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(vec![64; 513 * 517]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let mut p = GpuConvertPipeline::new().await.unwrap();
+            // Real early Err after allocating and completing GPU conversion.
+            let result: Result<(), BayerError> = (|| {
+                let mut photo = p.photo_workspace();
+                photo.convert_bayer(&input)?;
+                let mut bad = GpuFrameInput::from_camera_frame(&frame).unwrap();
+                bad.colour_gains = Some([f32::NAN, 1.0]);
+                photo.convert_bayer(&bad)?;
+                Ok(())
+            })();
+            assert_eq!(result, Err(BayerError::InvalidMetadata));
+            assert!(p.demosaic_engine.is_none() && p.output_texture.is_none() && p.tex_y.is_none());
+            let programs = p.demosaic_programs.clone().unwrap();
+            // A genuinely polled future owns the same production photo lease.
+            // Cancellation is dropping that future while its scope is live.
+            let mut future = Box::pin(async {
+                let mut photo = p.photo_workspace();
+                photo.convert_bayer(&input).unwrap();
+                let _output = photo.read_rgba_to_cpu(513, 517).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+            let waker = futures::task::noop_waker();
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut std::task::Context::from_waker(&waker))
+                    .is_pending()
+            );
+            drop(future);
+            assert!(
+                p.demosaic_engine.is_none()
+                    && p.bayer_linear_texture.is_none()
+                    && p.bayer_demosaic_texture.is_none()
+            );
+            assert!(p.output_texture.is_none() && p.output_view.is_none() && p.tex_y.is_none());
+            assert!(
+                p.readback_staging_buffer.is_none()
+                    && p.packed_input_buffer.is_none()
+                    && p.unpack_output_buffer.is_none()
+            );
+            assert_eq!(
+                (
+                    p.packed_input_buffer_size,
+                    p.unpack_output_buffer_size,
+                    p.readback_staging_buffer_size,
+                    p.cached_width,
+                    p.cached_height
+                ),
+                (0, 0, 0, 0, 0)
+            );
+            assert!(Arc::ptr_eq(
+                &programs,
+                p.demosaic_programs.as_ref().unwrap()
+            ));
+            // Resource recreation must be valid immediately after cancellation.
+            let mut photo = p.photo_workspace();
+            photo.convert_bayer(&input).unwrap();
+            assert_eq!(
+                photo.read_rgba_to_cpu(513, 517).await.unwrap().len(),
+                513 * 517 * 4
+            );
+        });
+    }
+
+    #[test]
+    fn photo_scope_retires_previous_frame_before_allocating_another() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "photo_scope_retires_previous_frame_before_allocating_another",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 21,
+                height: 19,
+                stride: 21,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(vec![64; 21 * 19]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let mut p = GpuConvertPipeline::new().await.unwrap();
+            p.convert_bayer(&input).unwrap();
+            let programs = p.demosaic_programs.clone().unwrap();
+            let mut photo = p.photo_workspace();
+            assert!(
+                photo.demosaic_engine.is_none(),
+                "old frame overlaps the new photo workspace"
+            );
+            assert!(
+                photo.bayer_linear_texture.is_none()
+                    && photo.output_texture.is_none()
+                    && photo.tex_y.is_none()
+            );
+            photo.convert_bayer(&input).unwrap();
+            assert!(Arc::ptr_eq(
+                &programs,
+                photo.demosaic_programs.as_ref().unwrap()
+            ));
+        });
+    }
+
+    #[test]
+    fn captured_geometry_memory_census_releases_all_frame_resources() {
+        use crate::backends::camera::types::{FrameMetadata, RawLayout};
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "captured_geometry_memory_census_releases_all_frame_resources",
+            );
+            return;
+        };
+        fn bytes(p: &GpuConvertPipeline) -> u64 {
+            [
+                &p.tex_y,
+                &p.tex_uv,
+                &p.tex_v,
+                &p.output_texture,
+                &p.bayer_linear_texture,
+                &p.bayer_demosaic_texture,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                u64::from(t.width())
+                    * u64::from(t.height())
+                    * u64::from(t.format().block_copy_size(None).unwrap())
+            })
+            .sum::<u64>()
+                + [&p.packed_input_buffer, &p.unpack_output_buffer]
+                    .into_iter()
+                    .flatten()
+                    .map(wgpu::Buffer::size)
+                    .sum::<u64>()
+                + p.readback_staging_buffer
+                    .as_ref()
+                    .map_or(0, |buffer| buffer.size())
+                + p.demosaic_engine
+                    .as_ref()
+                    .map_or(0, |e| e.resource_bytes_for_test())
+        }
+        pollster::block_on(async {
+            let frame = CameraFrame {
+                width: 3280,
+                height: 2464,
+                stride: 4112,
+                format: PixelFormat::BayerRGGB,
+                data: FrameData::from_owned_vec(vec![255; 4112 * 2464]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: Some(FrameMetadata {
+                    raw_layout: Some(RawLayout::Csi2 { bits: 10 }),
+                    colour_gains: Some([1.0, 1.0]),
+                    ..Default::default()
+                }),
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            let mut p = GpuConvertPipeline::new().await.unwrap();
+            for method in [
+                super::super::DemosaicMethod::Rcd,
+                super::super::DemosaicMethod::Lmmse,
+                super::super::DemosaicMethod::Bilinear,
+            ] {
+                let mut photo = p.photo_workspace();
+                photo.convert_bayer_with_method(&input, method).unwrap();
+                drop(photo.read_rgba_to_cpu(3280, 2464).await.unwrap());
+                let active = bytes(&photo);
+                let engine = photo
+                    .demosaic_engine
+                    .as_ref()
+                    .map_or(0, |e| e.resource_bytes_for_test());
+                let fixed = photo.uniform_buffer.size()
+                    + photo.unpack_uniform_buffer.size()
+                    + photo.awb_gains_buffer.size()
+                    + photo.awb_sums_buffer.size();
+                println!(
+                    "MEMORY_CENSUS method={method:?} active_frame_bytes={active} engine_bytes={engine} fixed_buffer_bytes={fixed}"
+                );
+                assert!(engine <= 16 * 3280 * 2464 + 4 * 544 * 544 * 16 + 64);
+                drop(photo);
+                assert_eq!(bytes(&p), 0, "completed photo retained frame allocations");
+                println!(
+                    "MEMORY_CENSUS method={method:?} retained_frame_bytes={} fixed_buffer_bytes={fixed}",
+                    bytes(&p)
+                );
+            }
+        });
+    }
+
+    #[test]
     fn bilinear_resources_do_not_allocate_full_cpu_rgb_texture() {
         let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
             crate::test_gpu::skip_no_gpu("bilinear_resources_do_not_allocate_full_cpu_rgb_texture");
@@ -727,6 +1031,7 @@ enum BindingSpec {
     Texture,
     StorageTexture,
     FloatStorageTexture,
+    ScalarFloatStorageTexture,
     StorageBuffer,
     ReadOnlyStorageBuffer,
     Uniform,
@@ -742,6 +1047,11 @@ impl BindingSpec {
                     sample_type: wgpu::TextureSampleType::Float { filterable: false },
                     view_dimension: wgpu::TextureViewDimension::D2,
                     multisampled: false,
+                },
+                BindingSpec::ScalarFloatStorageTexture => wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::R32Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
                 },
                 BindingSpec::FloatStorageTexture => wgpu::BindingType::StorageTexture {
                     access: wgpu::StorageTextureAccess::WriteOnly,
@@ -795,6 +1105,7 @@ pub struct GpuConvertPipeline {
     bayer_linear_texture: Option<wgpu::Texture>,
     bayer_demosaic_texture: Option<wgpu::Texture>,
     demosaic_engine: Option<super::demosaic_gpu::GpuDemosaic>,
+    demosaic_programs: Option<Arc<super::demosaic_gpu::DemosaicPrograms>>,
     normalize_pipeline: Option<FormatPipeline>,
     /// GPU AWB accumulation pipeline
     awb_pipeline: Option<FormatPipeline>,
@@ -826,11 +1137,68 @@ pub struct GpuConvertPipeline {
     output_texture: Option<wgpu::Texture>,
     output_view: Option<wgpu::TextureView>,
     /// Cached staging buffer for `read_rgba_to_cpu` readback
-    readback_staging_buffer: Option<wgpu::Buffer>,
+    readback_staging_buffer: Option<crate::gpu::readback::ReadbackBuffer>,
     readback_staging_buffer_size: u64,
 }
 
+/// A still-photo lease over the reusable converter. Dropping the lease, including
+/// a cancelled future or an early error, releases frame-sized handles while the
+/// caller still owns the converter mutex. Pipelines and small uniforms survive.
+#[must_use]
+pub struct PhotoWorkspace<'a> {
+    pipeline: &'a mut GpuConvertPipeline,
+}
+impl std::ops::Deref for PhotoWorkspace<'_> {
+    type Target = GpuConvertPipeline;
+    fn deref(&self) -> &Self::Target {
+        self.pipeline
+    }
+}
+impl std::ops::DerefMut for PhotoWorkspace<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.pipeline
+    }
+}
+impl Drop for PhotoWorkspace<'_> {
+    fn drop(&mut self) {
+        self.pipeline.release_frame_workspace();
+    }
+}
+
 impl GpuConvertPipeline {
+    /// Use around conversion AND readback; do not return a borrowed GPU texture
+    /// from the photo scope. Preview users keep the ordinary reusable API.
+    pub fn photo_workspace(&mut self) -> PhotoWorkspace<'_> {
+        self.release_frame_workspace();
+        PhotoWorkspace { pipeline: self }
+    }
+
+    fn release_frame_workspace(&mut self) {
+        self.demosaic_engine = None;
+        self.bayer_linear_texture = None;
+        self.bayer_demosaic_texture = None;
+        self.output_view = None;
+        self.output_texture = None;
+        self.tex_y = None;
+        self.tex_uv = None;
+        self.tex_v = None;
+        self.packed_input_buffer = None;
+        self.unpack_output_buffer = None;
+        self.readback_staging_buffer = None;
+        self.packed_input_buffer_size = 0;
+        self.unpack_output_buffer_size = 0;
+        self.readback_staging_buffer_size = 0;
+        self.cached_width = 0;
+        self.cached_height = 0;
+        self.cached_uv_dims = None;
+        // Submitted commands may retain resources until completion. Poll drives
+        // retirement without blocking cancellation; allocator slack is NOT an
+        // application-owned frame cache and is not guaranteed to return to OS.
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            warn!(%error, "Photo workspace retirement poll failed");
+        }
+    }
+
     /// Create a new conversion pipeline
     pub async fn new() -> Result<Self, String> {
         info!("Initializing format conversion pipelines");
@@ -887,6 +1255,7 @@ impl GpuConvertPipeline {
             bayer_linear_texture: None,
             bayer_demosaic_texture: None,
             demosaic_engine: None,
+            demosaic_programs: None,
             normalize_pipeline: None,
             awb_pipeline: None,
             awb_finalize_pipeline: None,
@@ -1460,17 +1829,22 @@ impl GpuConvertPipeline {
     ) -> Result<(wgpu::CommandEncoder, bool, bool), String> {
         // All &mut self calls first (before immutable texture borrows)
         self.ensure_resources(input.width, input.height, input.format, None);
+        if method == super::DemosaicMethod::Bilinear {
+            self.demosaic_engine = None;
+        }
         if method != super::DemosaicMethod::Bilinear
             && self
                 .demosaic_engine
                 .as_ref()
                 .is_none_or(|e| !e.matches(input.width, input.height))
         {
-            self.demosaic_engine = Some(super::demosaic_gpu::GpuDemosaic::new(
+            self.demosaic_engine = Some(super::demosaic_gpu::GpuDemosaic::with_programs(
                 &self.device,
                 input.width,
                 input.height,
+                self.demosaic_programs.clone(),
             )?);
+            self.demosaic_programs = self.demosaic_engine.as_ref().map(|e| e.programs.clone());
         }
         if method != super::DemosaicMethod::Bilinear && self.normalize_pipeline.is_none() {
             self.normalize_pipeline = Some(self.create_pipeline(
@@ -1478,7 +1852,7 @@ impl GpuConvertPipeline {
                 "bayer_normalize",
                 &[
                     (0, BindingSpec::Texture),
-                    (1, BindingSpec::FloatStorageTexture),
+                    (1, BindingSpec::ScalarFloatStorageTexture),
                     (2, BindingSpec::Uniform),
                 ],
             ));
@@ -2189,27 +2563,17 @@ impl GpuConvertPipeline {
             },
         );
         self.queue.submit([encoder.finish()]);
-        let slice = staging.slice(..);
-        let (tx, rx) = futures::channel::oneshot::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = tx.send(result);
-        });
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| e.to_string())?;
-        rx.await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-        let data = slice.get_mapped_range();
+        let readback = crate::gpu::readback::ReadbackBuffer::from_buffer(
+            &self.device,
+            staging,
+            "bayer linear test readback",
+        );
+        let data = readback.read_async().await?;
         let mut result = Vec::with_capacity((width * height * 4) as usize);
         for bytes in data.chunks_exact(row as usize) {
             result.extend_from_slice(bytemuck::cast_slice(&bytes[..(width * 16) as usize]));
         }
         drop(data);
-        staging.unmap();
         Ok(result)
     }
 
@@ -2225,17 +2589,21 @@ impl GpuConvertPipeline {
 
         // Reuse cached staging buffer if it matches, otherwise allocate and cache
         if self.readback_staging_buffer_size != required_size {
-            self.readback_staging_buffer =
-                Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            self.readback_staging_buffer = Some(crate::gpu::readback::ReadbackBuffer::from_buffer(
+                &self.device,
+                self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("convert_staging"),
                     size: required_size,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
-                }));
+                }),
+                "convert_staging",
+            ));
             self.readback_staging_buffer_size = required_size;
         }
 
-        let staging_buffer = self.readback_staging_buffer.as_ref().unwrap();
+        let readback = self.readback_staging_buffer.as_ref().unwrap();
+        let staging_buffer = readback.buffer();
 
         let mut encoder = self
             .device
@@ -2251,7 +2619,7 @@ impl GpuConvertPipeline {
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: staging_buffer,
+                buffer: &staging_buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded_bytes_per_row),
@@ -2267,23 +2635,7 @@ impl GpuConvertPipeline {
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        let buffer_slice = staging_buffer.slice(..);
-        let (sender, receiver) = futures::channel::oneshot::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-
-        let _ = self.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        });
-
-        receiver
-            .await
-            .map_err(|_| "Failed to receive buffer mapping result")?
-            .map_err(|e| format!("Failed to map buffer: {:?}", e))?;
-
-        let data = buffer_slice.get_mapped_range();
+        let data = readback.read_async().await?;
         let mut output_data = Vec::with_capacity((width * height * 4) as usize);
 
         if padded_bytes_per_row == width * 4 {
@@ -2297,7 +2649,6 @@ impl GpuConvertPipeline {
         }
 
         drop(data);
-        staging_buffer.unmap();
 
         Ok(output_data)
     }
@@ -2549,5 +2900,42 @@ mod fully_gpu_contract_tests {
             !finish.contains("read_buffer::<f32>(merged_planes_buffer"),
             "HDR full-plane readback"
         );
+    }
+}
+
+#[cfg(test)]
+mod readback_owner_tests {
+    use super::*;
+    #[test]
+    fn converter_failed_cached_map_then_public_readback_recovers_same_pixels() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "converter_failed_cached_map_then_public_readback_recovers_same_pixels",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let mut pipeline = GpuConvertPipeline::new().await.unwrap();
+            let frame = crate::backends::camera::types::CameraFrame {
+                width: 4,
+                height: 4,
+                stride: 4,
+                format: PixelFormat::Gray8,
+                data: crate::backends::camera::types::FrameData::from_owned_vec(vec![96; 16]),
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+            pipeline.convert(&input).unwrap();
+            let expected = pipeline.read_rgba_to_cpu(4, 4).await.unwrap();
+            let cache = pipeline.readback_staging_buffer.as_ref().unwrap();
+            cache.buffer().destroy();
+            let error = cache.read_async().await.err().unwrap();
+            assert!(error.contains("destroyed"), "{error}");
+            assert_eq!(pipeline.read_rgba_to_cpu(4, 4).await.unwrap(), expected);
+            assert_eq!(pipeline.read_rgba_to_cpu(4, 4).await.unwrap(), expected);
+        });
     }
 }

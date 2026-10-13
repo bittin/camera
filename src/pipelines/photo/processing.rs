@@ -269,13 +269,24 @@ impl PostProcessor {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) async fn memory_photo_for_test(
+        frame: &CameraFrame,
+        method: crate::shaders::DemosaicMethod,
+    ) -> Result<Vec<u8>, String> {
+        Self::convert_bayer_to_rgba(frame, method).await
+    }
+
     async fn convert_bayer_to_rgba(
         frame: &CameraFrame,
         method: crate::shaders::DemosaicMethod,
     ) -> Result<Vec<u8>, String> {
         let input = GpuFrameInput::from_camera_frame(frame).map_err(|e| e.to_string())?;
         let mut guard = get_gpu_convert_pipeline().await?;
-        let pipeline = guard.as_mut().ok_or("Convert pipeline not initialized")?;
+        let mut pipeline = guard
+            .as_mut()
+            .ok_or("Convert pipeline not initialized")?
+            .photo_workspace();
         pipeline
             .convert_bayer_with_method(&input, method)
             .map_err(|e| e.to_string())?;
@@ -298,9 +309,10 @@ impl PostProcessor {
             .await
             .map_err(|e| format!("Failed to get YUV convert pipeline: {}", e))?;
 
-        let pipeline = pipeline_guard
+        let mut pipeline = pipeline_guard
             .as_mut()
-            .ok_or("YUV convert pipeline not initialized")?;
+            .ok_or("YUV convert pipeline not initialized")?
+            .photo_workspace();
 
         // Run GPU conversion (synchronous, just dispatches compute shader)
         pipeline

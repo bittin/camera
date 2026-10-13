@@ -4,70 +4,27 @@
 use super::DemosaicMethod;
 use crate::gpu::wgpu;
 
+/// Even output origins preserve CFA and paired-column highpass phase.
+const TILE_EDGE: u32 = 512;
+
 pub(crate) struct GpuDemosaic {
     pub raw: wgpu::Texture,
     scratch: [wgpu::Texture; 4],
-    pipelines: Vec<wgpu::ComputePipeline>,
-    layout: wgpu::BindGroupLayout,
+    pub(crate) programs: std::sync::Arc<DemosaicPrograms>,
     uniform: wgpu::Buffer,
     status: wgpu::Buffer,
-    staging: wgpu::Buffer,
+    staging: crate::gpu::readback::ReadbackBuffer,
     width: u32,
     height: u32,
 }
 
-pub(crate) fn texture(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-    label: &str,
-) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::STORAGE_BINDING
-            | wgpu::TextureUsages::COPY_SRC
-            | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    })
+/// Device-bound shader state; no frame-sized allocations or source handles.
+pub(crate) struct DemosaicPrograms {
+    pipelines: Vec<wgpu::ComputePipeline>,
+    layout: wgpu::BindGroupLayout,
 }
-impl GpuDemosaic {
-    pub fn matches(&self, width: u32, height: u32) -> bool {
-        self.width == width && self.height == height
-    }
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self, String> {
-        let limits = device.limits();
-        let w = width
-            .checked_add(32)
-            .ok_or("Demosaic dimensions overflow")?;
-        let h = height
-            .checked_add(32)
-            .ok_or("Demosaic dimensions overflow")?;
-        if width < 2
-            || height < 2
-            || w > limits.max_texture_dimension_2d
-            || h > limits.max_texture_dimension_2d
-            || w.div_ceil(16) > limits.max_compute_workgroups_per_dimension
-            || h.div_ceil(16) > limits.max_compute_workgroups_per_dimension
-            || limits.max_sampled_textures_per_shader_stage < 3
-            || limits.max_storage_textures_per_shader_stage < 1
-            || limits.max_storage_buffer_binding_size < 16
-            || limits.max_compute_invocations_per_workgroup < 256
-            || limits.max_compute_workgroup_storage_size < 2048
-            || limits.max_compute_workgroup_size_x < 16
-            || limits.max_compute_workgroup_size_y < 16
-        {
-            return Err("GPU limits cannot admit demosaic halo textures or dispatch".into());
-        }
+impl DemosaicPrograms {
+    fn new(device: &wgpu::Device) -> Self {
         let entries: Vec<_> = (0..6)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding,
@@ -122,19 +79,133 @@ impl GpuDemosaic {
                 })
             })
             .collect();
-        let buffer = |label, usage| {
+        Self { pipelines, layout }
+    }
+}
+
+pub(crate) fn texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::Texture {
+    texture_format(
+        device,
+        width,
+        height,
+        label,
+        wgpu::TextureFormat::Rgba32Float,
+    )
+}
+fn texture_format(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::STORAGE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+impl GpuDemosaic {
+    #[cfg(test)]
+    pub(crate) fn resource_bytes_for_test(&self) -> u64 {
+        std::iter::once(&self.raw)
+            .chain(self.scratch.iter())
+            .map(|t| {
+                u64::from(t.width())
+                    * u64::from(t.height())
+                    * u64::from(t.format().block_copy_size(None).unwrap())
+            })
+            .sum::<u64>()
+            + self.uniform.size()
+            + self.status.size()
+            + self.staging.size()
+    }
+
+    pub fn matches(&self, width: u32, height: u32) -> bool {
+        self.width == width && self.height == height
+    }
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Result<Self, String> {
+        Self::with_programs(device, width, height, None)
+    }
+    pub(crate) fn with_programs(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        programs: Option<std::sync::Arc<DemosaicPrograms>>,
+    ) -> Result<Self, String> {
+        let limits = device.limits();
+        let w = width
+            .checked_add(32)
+            .ok_or("Demosaic dimensions overflow")?;
+        let h = height
+            .checked_add(32)
+            .ok_or("Demosaic dimensions overflow")?;
+        if width < 2
+            || height < 2
+            || w > limits.max_texture_dimension_2d
+            || h > limits.max_texture_dimension_2d
+            || w.div_ceil(16) > limits.max_compute_workgroups_per_dimension
+            || h.div_ceil(16) > limits.max_compute_workgroups_per_dimension
+            || limits.max_sampled_textures_per_shader_stage < 3
+            || limits.max_storage_textures_per_shader_stage < 1
+            || limits.max_storage_buffer_binding_size < 16
+            || limits.max_compute_invocations_per_workgroup < 256
+            || limits.max_compute_workgroup_storage_size < 2048
+            || limits.max_compute_workgroup_size_x < 16
+            || limits.max_compute_workgroup_size_y < 16
+        {
+            return Err("GPU limits cannot admit demosaic halo textures or dispatch".into());
+        }
+        let programs =
+            programs.unwrap_or_else(|| std::sync::Arc::new(DemosaicPrograms::new(device)));
+        let buffer = |label, usage: wgpu::BufferUsages| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
-                size: 16,
+                size: if usage.contains(wgpu::BufferUsages::UNIFORM) {
+                    32
+                } else {
+                    16
+                },
                 usage,
                 mapped_at_creation: false,
             })
         };
         Ok(Self {
-            raw: texture(device, width, height, "normalized CFA"),
-            scratch: std::array::from_fn(|_| texture(device, w, h, "demosaic halo")),
-            pipelines,
-            layout,
+            raw: texture_format(
+                device,
+                width,
+                height,
+                "normalized CFA",
+                wgpu::TextureFormat::R32Float,
+            ),
+            // One even-origin tile plus the unchanged 16-pixel halo on each side.
+            // Full-frame RAW/output remain exact; intermediate storage is bounded.
+            scratch: std::array::from_fn(|_| {
+                texture(
+                    device,
+                    w.min(TILE_EDGE + 32),
+                    h.min(TILE_EDGE + 32),
+                    "demosaic tile halo",
+                )
+            }),
+            programs,
             uniform: buffer(
                 "demosaic params",
                 wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -145,9 +216,13 @@ impl GpuDemosaic {
                     | wgpu::BufferUsages::COPY_SRC
                     | wgpu::BufferUsages::COPY_DST,
             ),
-            staging: buffer(
+            staging: crate::gpu::readback::ReadbackBuffer::from_buffer(
+                device,
+                buffer(
+                    "demosaic compact readback",
+                    wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                ),
                 "demosaic compact readback",
-                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             ),
             width,
             height,
@@ -162,6 +237,12 @@ impl GpuDemosaic {
         pattern: u32,
         method: DemosaicMethod,
     ) {
+        use wgpu::util::DeviceExt;
+        let method_code = match method {
+            DemosaicMethod::Rcd => 0u32,
+            DemosaicMethod::Lmmse => 1,
+            DemosaicMethod::Bilinear => 2,
+        };
         queue.write_buffer(
             &self.uniform,
             0,
@@ -169,11 +250,11 @@ impl GpuDemosaic {
                 self.width,
                 self.height,
                 pattern,
-                match method {
-                    DemosaicMethod::Rcd => 0u32,
-                    DemosaicMethod::Lmmse => 1,
-                    DemosaicMethod::Bilinear => 2,
-                },
+                method_code,
+                0,
+                0,
+                self.width,
+                self.height,
             ]),
         );
         queue.write_buffer(
@@ -188,21 +269,16 @@ impl GpuDemosaic {
             .map(|t| t.create_view(&Default::default()))
             .collect();
         let output = output.create_view(&Default::default());
-        for (stage, ai, bi, oi) in [
-            (0, 0, 1, 2),
-            (1, 1, 2, 0),
-            (2, 0, 2, 1),
-            (3, 0, 1, 2),
-            (4, 2, if method == DemosaicMethod::Rcd { 1 } else { 2 }, 3),
-            (5, 2, 3, 4),
-        ] {
-            if method == DemosaicMethod::Bilinear && stage > 0 && stage < 5 {
-                continue;
-            }
-            let out = if oi == 4 { &output } else { &views[oi] };
+        let mut dispatch = |stage: usize,
+                            ai: usize,
+                            bi: usize,
+                            out: &wgpu::TextureView,
+                            params: &wgpu::Buffer,
+                            width: u32,
+                            height: u32| {
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("demosaic stage"),
-                layout: &self.layout,
+                layout: &self.programs.layout,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -222,7 +298,7 @@ impl GpuDemosaic {
                     },
                     wgpu::BindGroupEntry {
                         binding: 4,
-                        resource: self.uniform.as_entire_binding(),
+                        resource: params.as_entire_binding(),
                     },
                     wgpu::BindGroupEntry {
                         binding: 5,
@@ -234,16 +310,48 @@ impl GpuDemosaic {
                 label: Some("GPU demosaic stage"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipelines[stage]);
+            pass.set_pipeline(&self.programs.pipelines[stage]);
             pass.set_bind_group(0, &bg, &[]);
-            let halo = if stage == 0 || stage == 5 { 0 } else { 32 };
-            pass.dispatch_workgroups(
-                (self.width + halo).div_ceil(16),
-                (self.height + halo).div_ceil(16),
-                1,
-            );
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        };
+        // LMMSE needs full-image extrema, never tile-local bounds.
+        dispatch(0, 0, 1, &views[2], &self.uniform, self.width, self.height);
+        // Reuse exactly four fixed-size surfaces in submission order. Origins
+        // are even, preserving both CFA phase and RCD's paired-column HP phase.
+        for y in (0..self.height).step_by(TILE_EDGE as usize) {
+            for x in (0..self.width).step_by(TILE_EDGE as usize) {
+                let w = (self.width - x).min(TILE_EDGE);
+                let h = (self.height - y).min(TILE_EDGE);
+                // Immutable per-tile uniforms: queue writes to one shared buffer
+                // would all become visible before this encoder is submitted.
+                let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("demosaic tile params"),
+                    contents: bytemuck::cast_slice(&[
+                        self.width,
+                        self.height,
+                        pattern,
+                        method_code,
+                        x,
+                        y,
+                        w,
+                        h,
+                    ]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                if method != DemosaicMethod::Bilinear {
+                    for (stage, ai, bi, oi) in [
+                        (1, 1, 2, 0),
+                        (2, 0, 2, 1),
+                        (3, 0, 1, 2),
+                        (4, 2, if method == DemosaicMethod::Rcd { 1 } else { 2 }, 3),
+                    ] {
+                        dispatch(stage, ai, bi, &views[oi], &params, w + 32, h + 32);
+                    }
+                }
+                dispatch(5, 2, 3, &output, &params, w, h);
+            }
         }
-        encoder.copy_buffer_to_buffer(&self.status, 0, &self.staging, 0, 16);
+        encoder.copy_buffer_to_buffer(&self.status, 0, &self.staging.buffer(), 0, 16);
     }
     pub fn encode_merged(
         &self,
@@ -297,24 +405,14 @@ impl GpuDemosaic {
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(self.width.div_ceil(16), self.height.div_ceil(16), 1);
     }
+    #[cfg(test)]
+    fn staging_for_test(&self) -> wgpu::Buffer {
+        self.staging.buffer()
+    }
+
     /// Submit first; validate only a compact GPU reduction before colour dispatch.
-    pub fn validate(&self, device: &wgpu::Device) -> Result<f64, String> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.staging
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })
-            .map_err(|e| e.to_string())?;
-        rx.recv()
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-        let data = self.staging.slice(..).get_mapped_range();
+    pub fn validate(&self, _device: &wgpu::Device) -> Result<f64, String> {
+        let data = self.staging.read()?;
         let s: &[u32] = bytemuck::cast_slice(&data);
         let result = if s[3] != 0 {
             Err("Unsafe GPU demosaic arithmetic".into())
@@ -322,7 +420,6 @@ impl GpuDemosaic {
             Ok(f64::from(f32::from_bits(s[2])))
         };
         drop(data);
-        self.staging.unmap();
         result
     }
 }
@@ -361,3 +458,7 @@ mod arithmetic_contract_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "readback_lifecycle_tests.rs"]
+mod readback_lifecycle_tests;

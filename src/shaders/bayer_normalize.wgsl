@@ -16,7 +16,7 @@ struct DebayerParams {
 }
 
 @group(0) @binding(0) var tex_bayer: texture_2d<f32>;
-@group(0) @binding(1) var output: texture_storage_2d<rgba32float,write>;
+@group(0) @binding(1) var output: texture_storage_2d<r32float,write>;
 @group(0) @binding(2) var<uniform> params:DebayerParams;
 // Get a normalized sensor sample with CFA-parity-preserving edge reflection.
 fn sample_bayer(x: i32, y: i32) -> f32 {
