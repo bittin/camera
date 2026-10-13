@@ -149,17 +149,11 @@ impl AppModel {
     /// doesn't stall on filesystem I/O.  Used by settings toggles (fit/fill,
     /// aspect ratio, etc.) where the visible state has already been updated
     /// in-memory and the on-disk write just needs to follow eventually.
-    pub(crate) fn persist_config_async(&self) {
-        use cosmic::cosmic_config::CosmicConfigEntry;
-        let Some(handler) = self.config_handler.clone() else {
+    pub(crate) fn persist_config_async(&mut self) {
+        let Some(handler) = self.config_handler.as_ref() else {
             return;
         };
-        let config = self.config.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(err) = config.write_entry(&handler) {
-                tracing::error!(?err, "Failed to persist config");
-            }
-        });
+        self.config_persistence.save(handler, &self.config);
     }
 
     /// Check if burst mode would be triggered based on current scene brightness
@@ -1060,7 +1054,6 @@ impl AppModel {
 
     pub(crate) fn handle_toggle_burst_mode(&mut self) -> Task<cosmic::Action<Message>> {
         use crate::config::BurstModeSetting;
-        use cosmic::cosmic_config::CosmicConfigEntry;
 
         // Track if config changed (need to save)
         let mut config_changed = false;
@@ -1107,11 +1100,8 @@ impl AppModel {
         );
 
         // Save config only if setting changed
-        if config_changed
-            && let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save HDR+ setting");
+        if config_changed {
+            self.persist_config_async();
         }
         Task::none()
     }
@@ -1120,8 +1110,6 @@ impl AppModel {
         &mut self,
         index: usize,
     ) -> Task<cosmic::Action<Message>> {
-        use cosmic::cosmic_config::CosmicConfigEntry;
-
         // Don't allow changing frame count during active capture
         if self.burst_mode.is_active() {
             warn!("Cannot change frame count during active capture");
@@ -1148,11 +1136,7 @@ impl AppModel {
             "HDR+ setting changed (override cleared)"
         );
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save burst mode frame count setting");
-        }
+        self.persist_config_async();
         Task::none()
     }
 
@@ -1535,8 +1519,10 @@ impl AppModel {
         self.shutdown_waiting_for_recorder = true;
         let recorder = self.motion_photo_recorder.take();
         let retired = self.motion_photo_retiring.take();
+        let preferences = std::mem::take(&mut self.config_persistence);
         Task::perform(
             async move {
+                preferences.finish().await?;
                 if let Some(recorder) = recorder {
                     recorder.stop_and_wait().await?;
                 }
@@ -2557,14 +2543,9 @@ impl AppModel {
         &mut self,
         index: usize,
     ) -> Task<cosmic::Action<Message>> {
-        use cosmic::cosmic_config::CosmicConfigEntry;
         if let Some(&interval) = crate::config::TimelapseInterval::ALL.get(index) {
             self.config.timelapse_interval = interval;
-            if let Some(handler) = self.config_handler.as_ref()
-                && let Err(err) = self.config.write_entry(handler)
-            {
-                error!(?err, "Failed to save timelapse interval");
-            }
+            self.persist_config_async();
         }
         Task::none()
     }

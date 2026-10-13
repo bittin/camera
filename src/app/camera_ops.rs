@@ -83,10 +83,10 @@ impl AppModel {
     /// Save current camera and format settings to config
     /// Saves settings for both photo and video modes per camera
     pub fn save_settings(&mut self) {
-        let Some(handler) = self.config_handler.as_ref() else {
+        if self.config_handler.is_none() {
             error!("Cannot save settings - no config handler");
             return;
-        };
+        }
 
         // Get current camera path and format
         let Some(camera) = self.available_cameras.get(self.current_camera_index) else {
@@ -114,57 +114,37 @@ impl AppModel {
         // Store in per-camera settings based on current mode.
         // Virtual / Timelapse / View share Photo's per-camera format slot
         // (View is a passive viewer with no format choice of its own).
-        let (mode_name, settings_key) = match self.mode {
+        let mode_name = match self.mode {
             CameraMode::Photo | CameraMode::Virtual | CameraMode::Timelapse | CameraMode::View => {
                 self.config
                     .photo_settings
                     .insert(camera.path.clone(), format_settings);
-                let name = match self.mode {
+                match self.mode {
                     CameraMode::Photo => "Photo",
                     CameraMode::Virtual => "Virtual",
                     CameraMode::Timelapse => "Timelapse",
                     CameraMode::View => "View",
                     _ => unreachable!(),
-                };
-                (name, "photo_settings")
+                }
             }
             CameraMode::Video => {
                 self.config
                     .video_settings
                     .insert(camera.path.clone(), format_settings);
-                ("Video", "video_settings")
+                "Video"
             }
         };
 
-        // Save to disk. Only the one settings map that changed is written —
-        // `write_entry` would rewrite all 27 Config fields (~230 ms) on the
-        // camera-switch critical path.
-        let write_result = match settings_key {
-            "video_settings" => cosmic::cosmic_config::ConfigSet::set(
-                handler,
-                settings_key,
-                &self.config.video_settings,
-            ),
-            _ => cosmic::cosmic_config::ConfigSet::set(
-                handler,
-                settings_key,
-                &self.config.photo_settings,
-            ),
-        };
-
-        if let Err(err) = write_result {
-            error!(?err, "Failed to save {} settings", mode_name);
-        } else {
-            info!(
-                mode = mode_name,
-                camera_path = %camera.path,
-                width = format.width,
-                height = format.height,
-                framerate = ?format.framerate,
-                pixel_format = %format.pixel_format,
-                "{} settings saved to config", mode_name
-            );
-        }
+        info!(
+            mode = mode_name,
+            camera_path = %camera.path,
+            width = format.width,
+            height = format.height,
+            framerate = ?format.framerate,
+            pixel_format = %format.pixel_format,
+            "Camera format preference queued"
+        );
+        self.persist_config_async();
     }
 
     /// Restore format from saved settings for a camera, given a settings map.
@@ -310,6 +290,7 @@ impl AppModel {
         // disk *before* the pipeline starts, or a crash during pipeline
         // creation leaves nothing for the next launch to skip (issue #410).
         if self.config.pending_camera_path.as_ref() != Some(&camera_path) {
+            self.config_persistence.invalidate_reload();
             self.config.pending_camera_path = Some(camera_path);
             if let Some(handler) = self.config_handler.as_ref()
                 && let Err(err) = cosmic::cosmic_config::ConfigSet::set(

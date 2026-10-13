@@ -99,6 +99,7 @@ impl AppModel {
         self.config.pending_camera_path = None;
         let had_failed = !self.config.failed_camera_paths.is_empty();
         self.config.failed_camera_paths.clear();
+        self.config_persistence.invalidate_reload();
 
         // Write only the three keys that changed rather than all 27 Config
         // fields. This runs on the first frame of every switch, i.e. while the
@@ -802,59 +803,39 @@ impl AppModel {
     }
 
     pub(crate) fn handle_toggle_mirror_preview(&mut self) -> Task<cosmic::Action<Message>> {
-        use cosmic::cosmic_config::CosmicConfigEntry;
-
         self.config.mirror_preview = !self.config.mirror_preview;
         info!(
             mirror_preview = self.config.mirror_preview,
             "Mirror preview toggled"
         );
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save mirror preview setting");
-        }
+        self.persist_config_async();
         Task::none()
     }
 
     pub(crate) fn handle_toggle_mirror_captures(&mut self) -> Task<cosmic::Action<Message>> {
-        use cosmic::cosmic_config::CosmicConfigEntry;
-
         self.config.mirror_captures = !self.config.mirror_captures;
         info!(
             mirror_captures = self.config.mirror_captures,
             "Mirror captures toggled"
         );
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save mirror captures setting");
-        }
+        self.persist_config_async();
         Task::none()
     }
 
     pub(crate) fn handle_toggle_haptic_feedback(&mut self) -> Task<cosmic::Action<Message>> {
-        use cosmic::cosmic_config::CosmicConfigEntry;
-
         self.config.haptic_feedback = !self.config.haptic_feedback;
         info!(
             haptic_feedback = self.config.haptic_feedback,
             "Haptic feedback toggled"
         );
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save haptic feedback setting");
-        }
+        self.persist_config_async();
         Task::none()
     }
 
     pub(crate) fn handle_toggle_virtual_camera_enabled(&mut self) -> Task<cosmic::Action<Message>> {
-        use cosmic::cosmic_config::CosmicConfigEntry;
-
         self.config.virtual_camera_enabled = !self.config.virtual_camera_enabled;
         info!(
             virtual_camera_enabled = self.config.virtual_camera_enabled,
@@ -888,11 +869,7 @@ impl AppModel {
         // Update dropdown to show/hide Virtual option
         self.update_default_mode_dropdown();
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save virtual camera setting");
-        }
+        self.persist_config_async();
         fit_anim_task
     }
 

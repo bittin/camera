@@ -106,6 +106,7 @@ impl AppModel {
             message
         };
         let frame_message = matches!(message, Message::CameraFrame(_));
+        self.config_persistence.prepare(&self.config);
         let task = match message {
             Message::AudioLevelTick => self.handle_audio_level_tick(),
             // ===== UI Navigation =====
@@ -383,6 +384,9 @@ impl AppModel {
 
             // ===== Settings =====
             Message::UpdateConfig(config) => self.handle_update_config(config),
+            Message::ConfigReloaded(revision, result) => {
+                self.handle_config_reloaded(revision, result)
+            }
             Message::SetAppTheme(index) => self.handle_set_app_theme(index),
             Message::SetOverlayEffect(index) => self.handle_set_overlay_effect(index),
             Message::SetControlsPosition(index) => self.handle_set_controls_position(index),

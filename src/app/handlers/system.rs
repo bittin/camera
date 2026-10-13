@@ -7,7 +7,6 @@
 
 use crate::app::state::{AppModel, FilterType, Message, RecordingState};
 use cosmic::Task;
-use cosmic::cosmic_config::CosmicConfigEntry;
 use tracing::{error, info};
 
 fn file_manager_dbus_args(file_uri: &str) -> Vec<String> {
@@ -170,12 +169,29 @@ impl AppModel {
 
     pub(crate) fn handle_update_config(
         &mut self,
-        config: crate::config::Config,
+        _config: crate::config::Config,
     ) -> Task<cosmic::Action<Message>> {
-        info!("UpdateConfig received");
-        self.config = config;
-        // Keep the draw-time global in step with an externally-changed config.
-        crate::app::overlay_style::init_overlay_effect(self.config.overlay_effect);
+        // The subscription snapshot can be older than a queued local save.
+        // Re-read off-thread after ordered writes and fence stale results.
+        match self.config_handler.clone() {
+            Some(store) => self.config_persistence.reload(store),
+            None => Task::none(),
+        }
+    }
+
+    pub(crate) fn handle_config_reloaded(
+        &mut self,
+        revision: u64,
+        result: Result<Box<crate::config::Config>, String>,
+    ) -> Task<cosmic::Action<Message>> {
+        match result {
+            Ok(config) if self.config_persistence.accept_reload(revision, &config) => {
+                self.config = *config;
+                crate::app::overlay_style::init_overlay_effect(self.config.overlay_effect);
+            }
+            Err(error) => error!(%error, "Failed to reload config"),
+            _ => {}
+        }
         Task::none()
     }
 
@@ -192,11 +208,7 @@ impl AppModel {
         info!(?app_theme, "Setting application theme");
         self.config.app_theme = app_theme;
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save app theme setting");
-        }
+        self.persist_config_async();
 
         cosmic::command::set_theme(app_theme.theme())
     }
@@ -221,11 +233,7 @@ impl AppModel {
         // The draw-time colour roots read the global, not `self.config`.
         crate::app::overlay_style::init_overlay_effect(effect);
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save overlay effect setting");
-        }
+        self.persist_config_async();
 
         Task::none()
     }
@@ -241,11 +249,7 @@ impl AppModel {
         info!(?position, "Setting controls panel position");
         self.config.controls_position = position;
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save controls panel position");
-        }
+        self.persist_config_async();
 
         Task::none()
     }
@@ -270,11 +274,7 @@ impl AppModel {
         info!(?mode, "Setting default launch mode");
         self.config.default_mode = mode;
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save default mode setting");
-        }
+        self.persist_config_async();
 
         Task::none()
     }
@@ -417,11 +417,7 @@ impl AppModel {
             self.current_video_encoder_index = index;
 
             self.config.last_video_encoder_index = Some(index);
-            if let Some(handler) = self.config_handler.as_ref()
-                && let Err(err) = self.config.write_entry(handler)
-            {
-                error!(?err, "Failed to save encoder selection");
-            }
+            self.persist_config_async();
         }
         Task::none()
     }
@@ -437,11 +433,7 @@ impl AppModel {
             info!(?format, "Selected photo output format");
             self.config.photo_output_format = format;
 
-            if let Some(handler) = self.config_handler.as_ref()
-                && let Err(err) = self.config.write_entry(handler)
-            {
-                error!(?err, "Failed to save photo output format selection");
-            }
+            self.persist_config_async();
         }
         Task::none()
     }
@@ -451,19 +443,13 @@ impl AppModel {
             return Task::none();
         }
 
-        use cosmic::cosmic_config::CosmicConfigEntry;
-
         self.config.record_audio = !self.config.record_audio;
         info!(
             record_audio = self.config.record_audio,
             "Toggled record audio"
         );
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save record audio setting");
-        }
+        self.persist_config_async();
         self.sync_audio_probe();
         Task::none()
     }
@@ -473,18 +459,13 @@ impl AppModel {
         index: usize,
     ) -> Task<cosmic::Action<Message>> {
         use crate::config::AudioEncoder;
-        use cosmic::cosmic_config::CosmicConfigEntry;
 
         if index < AudioEncoder::ALL.len() {
             let encoder = AudioEncoder::ALL[index];
             info!(?encoder, "Selected audio encoder");
             self.config.audio_encoder = encoder;
 
-            if let Some(handler) = self.config_handler.as_ref()
-                && let Err(err) = self.config.write_entry(handler)
-            {
-                error!(?err, "Failed to save audio encoder selection");
-            }
+            self.persist_config_async();
         }
         Task::none()
     }
@@ -496,11 +477,7 @@ impl AppModel {
             "Toggled save burst raw frames"
         );
 
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save burst raw setting");
-        }
+        self.persist_config_async();
         Task::none()
     }
 
@@ -513,11 +490,7 @@ impl AppModel {
             self.config.composition_guide = guide;
             info!(?guide, "Selected composition guide");
 
-            if let Some(handler) = self.config_handler.as_ref()
-                && let Err(err) = self.config.write_entry(handler)
-            {
-                error!(?err, "Failed to save composition guide setting");
-            }
+            self.persist_config_async();
         }
         Task::none()
     }
@@ -527,11 +500,7 @@ impl AppModel {
         method: crate::shaders::DemosaicMethod,
     ) -> Task<cosmic::Action<Message>> {
         self.config.demosaic_method = method;
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save photo demosaicing setting");
-        }
+        self.persist_config_async();
         Task::none()
     }
 
@@ -542,13 +511,25 @@ impl AppModel {
         // (or drops out of View mode).
         let from_fit = self.capture_fit_state();
 
-        self.config = crate::config::Config::default();
-
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            error!(?err, "Failed to save reset settings");
+        let previous = std::mem::take(&mut self.config);
+        self.config_persistence.invalidate_reload();
+        // Recovery markers are intentionally synchronous. Only clear markers
+        // that were set; ordinary defaults go through the preference worker.
+        if let Some(store) = self.config_handler.as_ref() {
+            use cosmic::cosmic_config::ConfigSet;
+            macro_rules! clear_recovery {
+                ($($field:ident),* $(,)?) => { $(
+                    if previous.$field != self.config.$field
+                        && let Err(error) = store.set(stringify!($field), &self.config.$field)
+                    {
+                        error!(?error, "Failed to clear recovery marker");
+                    }
+                )* };
+            }
+            clear_recovery!(last_camera_path, pending_camera_path, failed_camera_paths);
         }
+
+        self.persist_config_async();
 
         // Reset UI state that shadows config values
         self.current_video_encoder_index = 0;
@@ -1233,11 +1214,7 @@ impl AppModel {
     }
 
     pub(crate) fn persist_config(&mut self) {
-        if let Some(handler) = self.config_handler.as_ref()
-            && let Err(err) = self.config.write_entry(handler)
-        {
-            tracing::warn!("Failed to persist config: {err}");
-        }
+        self.persist_config_async();
     }
 }
 
@@ -1335,6 +1312,7 @@ mod tests {
             DemosaicMethod::Rcd,
         ] {
             drop(app.update(Message::SetDemosaicMethod(method)));
+            app.config_persistence.flush();
             assert_eq!(app.config.demosaic_method, method);
             let store = app.config_handler.as_ref().unwrap();
             assert_eq!(
@@ -1346,6 +1324,7 @@ mod tests {
         }
         drop(app.update(Message::SetDemosaicMethod(DemosaicMethod::Bilinear)));
         drop(app.update(Message::ResetAllSettings));
+        app.config_persistence.flush();
         assert_eq!(app.config.demosaic_method, DemosaicMethod::Rcd);
         assert_eq!(
             Config::get_entry(app.config_handler.as_ref().unwrap())
