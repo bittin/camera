@@ -16,6 +16,7 @@ struct UnpackParams {
     packed_stride: u32,
     bit_depth: u32,         // 10, 12, or 14
     output_stride_u32: u32, // padded row stride in u32 units
+    row_offset: u32,        // zero for generic callers; photo band sensor origin
 }
 
 @group(0) @binding(0) var<storage, read> packed_data: array<u32>;
@@ -32,7 +33,7 @@ fn read_byte(offset: u32) -> u32 {
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let pair_index = global_id.x; // Which pixel pair (0, 1, 2, ...)
-    let y = global_id.y;          // Row
+    let y = global_id.y + params.row_offset; // Sensor row
 
     // Each thread handles 2 pixels (one u32 output word)
     let x0 = pair_index * 2u;

@@ -203,7 +203,7 @@ pub struct BurstModeConfig {
 impl Default for BurstModeConfig {
     fn default() -> Self {
         Self {
-            demosaic_method: crate::shaders::DemosaicMethod::Rcd,
+            demosaic_method: crate::shaders::DemosaicMethod::default(),
             frame_count: 8,
             frame_interval_ms: 33,
             robustness: 1.0,
@@ -2478,7 +2478,7 @@ impl BurstModeGpuPipeline {
             pattern,
             colour_gains,
             colour_correction_matrix,
-            crate::shaders::DemosaicMethod::Rcd,
+            crate::shaders::DemosaicMethod::default(),
         )
         .await
     }
@@ -3571,12 +3571,8 @@ mod tests {
         };
         pollster::block_on(async {
             let gpu = BurstModeGpuPipeline::new().await.unwrap();
-            let ccm = [
-                [2.10002, -0.7964949, -0.30352515],
-                [-0.46905, 1.9604946, -0.49144363],
-                [-0.1991288, -0.585788, 1.7849169],
-            ];
-            let gains = [2.1832347, 1.6135153];
+            let ccm = [[2.0, -0.75, -0.25], [-0.5, 2.0, -0.5], [-0.25, -0.5, 1.75]];
+            let gains = [2.0, 1.5];
             for pattern in 0..4 {
                 for peak in [0.3f32, 0.980, 0.9875, 0.995, 1.0, 1.2] {
                     // Constant per-site lattice: different Gr/Gb remain measured at
@@ -3592,7 +3588,9 @@ mod tests {
                         .unwrap();
                     let balanced = [plane[0] * gains[0], peak, plane[2] * gains[1]];
                     let bounded = balanced.map(|v| v.clamp(0.0, 1.0));
-                    let t = ((peak - 0.980) / 0.015).clamp(0.0, 1.0);
+                    // Independent analytic shoulder: top tenth of reconstructed
+                    // sensor RGB, not the legacy neighbourhood support peak.
+                    let t = ((peak.max(plane[0]).max(plane[2]) - 0.9) / 0.1).clamp(0.0, 1.0);
                     let blend = t * t * (3.0 - 2.0 * t);
                     let expected: [f32; 3] = std::array::from_fn(|r| {
                         let a = (0..3).map(|k| ccm[r][k] * balanced[k]).sum::<f32>();
@@ -4057,7 +4055,7 @@ mod demosaic_method_tests {
                     .demosaic_bayer_planes(&buffer, 11, 10, pattern, Some([1.0, 1.0]), None)
                     .await
                     .unwrap();
-                assert_eq!(default.data, outputs[0]);
+                assert_eq!(default.data, outputs[2]);
             }
         });
     }

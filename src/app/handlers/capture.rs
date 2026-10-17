@@ -53,6 +53,19 @@ fn should_use_jpeg_recording_pipeline(
         && !live_filters_required
 }
 
+/// Keep synchronous GPU waits and photo-sized CPU work off libcosmic's single
+/// async worker so preview subscriptions and animation tasks can keep running.
+/// Once started, the blocking job survives cancellation of this outer future
+/// and may finish writing the photo; its workspaces retire when the job ends.
+async fn run_photo_save(
+    job: impl std::future::Future<Output = Result<String, String>> + Send + 'static,
+) -> Result<String, String> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || runtime.block_on(job))
+        .await
+        .map_err(|error| format!("Photo save task failed: {error}"))?
+}
+
 impl AppModel {
     /// Snapshot photo-only processing preferences before dispatching a save job.
     fn photo_processing_config(&self) -> crate::pipelines::photo::PostProcessingConfig {
@@ -353,6 +366,7 @@ impl AppModel {
             self.config.photo_output_format.into();
 
         let photo_config = self.photo_processing_config();
+        let photo_session = crate::shaders::current_photo_session();
         let mut camera_metadata = self.build_camera_metadata();
         camera_metadata.orientation =
             crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
@@ -361,7 +375,7 @@ impl AppModel {
             );
 
         let save_task = Task::perform(
-            async move {
+            run_photo_save(async move {
                 use crate::pipelines::photo::{
                     EncodingQuality, PhotoPipeline, PostProcessingConfig,
                 };
@@ -373,12 +387,13 @@ impl AppModel {
                 };
                 let mut pipeline =
                     PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
+                pipeline.set_photo_session(photo_session);
                 pipeline.set_camera_metadata(camera_metadata);
                 pipeline
                     .capture_and_save(frame_arc, save_dir)
                     .await
                     .map(|p| p.display().to_string())
-            },
+            }),
             move |result| cosmic::Action::App(Message::PhotoCaptureSaved(capture_id, result)),
         );
 
@@ -440,10 +455,11 @@ impl AppModel {
             );
 
         let raw_photo_config = photo_config.clone();
+        let raw_photo_session = crate::shaders::current_photo_session();
         let raw_save_dir = save_dir.clone();
         let raw_camera_metadata = camera_metadata.clone();
         let save_task = Task::perform(
-            capture_with_preview_fallback(
+            run_photo_save(capture_with_preview_fallback(
                 move || async move {
                     use crate::pipelines::photo::{
                         EncodingQuality, PhotoPipeline, PostProcessingConfig,
@@ -507,6 +523,7 @@ impl AppModel {
                     };
                     let mut pipeline =
                         PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
+                    pipeline.set_photo_session(raw_photo_session);
                     pipeline.set_camera_metadata(raw_camera_metadata);
                     pipeline
                         .capture_and_save(Arc::new(frame), raw_save_dir)
@@ -576,7 +593,7 @@ impl AppModel {
                         .await
                         .map(|p| p.display().to_string())
                 },
-            ),
+            )),
             |result| cosmic::Action::App(Message::PhotoSaved(result)),
         );
 
@@ -4104,6 +4121,85 @@ mod tests {
             model.photo_jobs.len() == 1,
             "Missing prebuffer/encoder must never delay or reject the still shutter"
         );
+    }
+
+    #[tokio::test]
+    async fn photo_save_does_not_block_the_async_executor() {
+        use crate::app::state::{AppModel, Message};
+        use crate::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
+        use futures::StreamExt;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        struct UiWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for UiWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let save_dir =
+            std::env::temp_dir().join(format!("camera-ui-photo-test-{}", uuid::Uuid::new_v4()));
+        let mut model = AppModel {
+            current_frame: Some(Arc::new(CameraFrame {
+                width: 16,
+                height: 16,
+                data: FrameData::from_owned_vec(vec![128; 16 * 16 * 4]),
+                format: PixelFormat::RGBA,
+                stride: 16 * 4,
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            })),
+            hdr_override_disabled: true,
+            ..AppModel::default()
+        };
+        model.config.save_folder_name = save_dir.to_string_lossy().into_owned();
+        let mut stream = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&events);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || UiWriter(Arc::clone(&writer)))
+            .finish();
+        {
+            // The first poll is iced's initial yield. The next runs the save
+            // job on its single async worker; heavy processing must not run
+            // inline there and starve preview subscriptions and animations.
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(stream.poll_next_unpin(&mut context).is_pending());
+            assert!(stream.poll_next_unpin(&mut context).is_pending());
+        }
+        let ui_events = String::from_utf8(events.lock().unwrap().clone()).unwrap();
+        assert!(
+            !ui_events.contains("Starting post-processing"),
+            "photo processing ran inline on the async executor: {ui_events}"
+        );
+
+        let mut saved = None;
+        while let Some(action) = stream.next().await {
+            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                Message::PhotoCaptureSaved(_, result),
+            )) = action
+            {
+                saved = Some(result.unwrap());
+                // Encoding completion is the readiness signal; do not wait
+                // for the independent animation/watchdog timers to drain.
+                break;
+            }
+        }
+        let image = image::open(saved.expect("save task must still finish")).unwrap();
+        std::fs::remove_dir_all(save_dir).unwrap();
+        assert_eq!((image.width(), image.height()), (16, 16));
     }
 
     #[test]

@@ -70,6 +70,11 @@ impl PhotoPipeline {
         }
     }
 
+    /// Use the negotiated camera session snapshotted at shutter dispatch.
+    pub(crate) fn set_photo_session(&mut self, session: Option<Arc<crate::shaders::PhotoSession>>) {
+        self.post_processor.set_photo_session(session);
+    }
+
     /// Capture and save a photo asynchronously
     ///
     /// This runs the complete pipeline:

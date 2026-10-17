@@ -5,11 +5,19 @@
 use camera::Config;
 
 #[test]
-fn demosaic_default_is_rcd() {
+fn demosaic_default_is_bilinear() {
     let value = serde_json::to_value(Config::default()).unwrap();
     assert_eq!(
         value.get("demosaic_method"),
-        Some(&serde_json::json!("rcd"))
+        Some(&serde_json::json!("bilinear"))
+    );
+    assert_eq!(
+        camera::pipelines::photo::PostProcessingConfig::default().demosaic_method,
+        camera::shaders::DemosaicMethod::Bilinear
+    );
+    assert_eq!(
+        camera::pipelines::photo::burst_mode::BurstModeConfig::default().demosaic_method,
+        camera::shaders::DemosaicMethod::Bilinear
     );
 }
 
@@ -45,7 +53,7 @@ fn demosaic_preferences_round_trip_through_cosmic_config() {
 }
 
 #[test]
-fn old_config_without_demosaic_method_defaults_to_rcd() {
+fn old_config_without_demosaic_method_defaults_to_bilinear() {
     use camera::shaders::DemosaicMethod;
     use cosmic::cosmic_config::{Config as Store, CosmicConfigEntry};
     let mut json = serde_json::to_value(Config::default()).unwrap();
@@ -54,7 +62,7 @@ fn old_config_without_demosaic_method_defaults_to_rcd() {
         serde_json::from_value::<Config>(json)
             .unwrap()
             .demosaic_method,
-        DemosaicMethod::Rcd
+        DemosaicMethod::Bilinear
     );
 
     let root = std::env::temp_dir().join(format!(
@@ -79,7 +87,7 @@ fn old_config_without_demosaic_method_defaults_to_rcd() {
     assert_eq!(files.len(), 1);
     std::fs::remove_file(&files[0]).unwrap();
     let restored = Config::get_entry(&store).unwrap_or_else(|(_, recovered)| recovered);
-    assert_eq!(restored.demosaic_method, DemosaicMethod::Rcd);
+    assert_eq!(restored.demosaic_method, DemosaicMethod::Bilinear);
     std::fs::remove_dir_all(root).unwrap();
 }
 

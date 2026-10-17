@@ -237,6 +237,36 @@ impl GpuDemosaic {
         pattern: u32,
         method: DemosaicMethod,
     ) {
+        // The generic/HDR path only encodes; it never enters the fallible fence.
+        self.encode_impl(device, queue, encoder, output, pattern, method, false)
+            .expect("unpaced demosaic encoding cannot fail");
+    }
+
+    pub(crate) fn encode_photo(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        output: &wgpu::Texture,
+        pattern: u32,
+        method: DemosaicMethod,
+    ) -> Result<(), String> {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        self.encode_impl(device, queue, &mut encoder, output, pattern, method, true)?;
+        // A compact, aggregated status copy only; no remaining image work.
+        super::photo_scheduling::submit_photo_batch(device, queue, encoder, "demosaic-status")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn encode_impl(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        output: &wgpu::Texture,
+        pattern: u32,
+        method: DemosaicMethod,
+        paced: bool,
+    ) -> Result<(), String> {
         use wgpu::util::DeviceExt;
         let method_code = match method {
             DemosaicMethod::Rcd => 0u32,
@@ -313,14 +343,58 @@ impl GpuDemosaic {
             pass.set_pipeline(&self.programs.pipelines[stage]);
             pass.set_bind_group(0, &bg, &[]);
             pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+            drop(pass);
+            if paced {
+                let batch =
+                    std::mem::replace(encoder, device.create_command_encoder(&Default::default()));
+                let label = [
+                    "bounds",
+                    "demosaic-first",
+                    "demosaic-second",
+                    "demosaic-third",
+                    "demosaic-fourth",
+                    "demosaic-final",
+                ][stage];
+                // One stage of one fixed 512x512 tile (+16px halo per side).
+                // A 544x544 intermediate is the fixed maximum, not a frame.
+                super::photo_scheduling::submit_photo_batch(device, queue, batch, label)?;
+                tracing::debug!(
+                    stage = label,
+                    width,
+                    height,
+                    "Photo demosaic stage completed"
+                );
+            }
+            Ok::<(), String>(())
         };
-        // LMMSE needs full-image extrema, never tile-local bounds.
-        dispatch(0, 0, 1, &views[2], &self.uniform, self.width, self.height);
+        // LMMSE needs full-image extrema, never tile-local bounds. Status is
+        // initialized once above and all bounds bands finish before first().
+        if paced {
+            for (row, height) in super::photo_scheduling::photo_bands(self.width, self.height, 16) {
+                let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("demosaic global bounds band"),
+                    contents: bytemuck::cast_slice(&[
+                        self.width,
+                        self.height,
+                        pattern,
+                        method_code,
+                        0,
+                        row,
+                        self.width,
+                        height,
+                    ]),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+                dispatch(0, 0, 1, &views[2], &params, self.width, height)?;
+            }
+        } else {
+            dispatch(0, 0, 1, &views[2], &self.uniform, self.width, self.height)?;
+        }
         if method == DemosaicMethod::Bilinear {
             // No tile intermediates are needed for full-frame bilinear.
-            dispatch(5, 2, 3, &output, &self.uniform, self.width, self.height);
+            dispatch(5, 2, 3, &output, &self.uniform, self.width, self.height)?;
             encoder.copy_buffer_to_buffer(&self.status, 0, &self.staging.buffer(), 0, 16);
-            return;
+            return Ok(());
         }
         // Reuse exactly four fixed-size surfaces in submission order. Origins
         // are even, preserving both CFA phase and RCD's paired-column HP phase.
@@ -351,13 +425,14 @@ impl GpuDemosaic {
                         (3, 0, 1, 2),
                         (4, 2, if method == DemosaicMethod::Rcd { 1 } else { 2 }, 3),
                     ] {
-                        dispatch(stage, ai, bi, &views[oi], &params, w + 32, h + 32);
+                        dispatch(stage, ai, bi, &views[oi], &params, w + 32, h + 32)?;
                     }
                 }
-                dispatch(5, 2, 3, &output, &params, w, h);
+                dispatch(5, 2, 3, &output, &params, w, h)?;
             }
         }
         encoder.copy_buffer_to_buffer(&self.status, 0, &self.staging.buffer(), 0, 16);
+        Ok(())
     }
     pub fn encode_merged(
         &self,

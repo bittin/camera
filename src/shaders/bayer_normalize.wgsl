@@ -13,6 +13,7 @@ struct DebayerParams {
     ccm_row1: vec4<f32>,
     ccm_row2: vec4<f32>,
     white_levels: vec4<f32>, // [R, Gr, Gb, B], normalized sensor codes
+    region: vec4<u32>,
 }
 
 @group(0) @binding(0) var tex_bayer: texture_2d<f32>;
@@ -33,4 +34,8 @@ fn sample_bayer(x: i32, y: i32) -> f32 {
 }
 
 @compute @workgroup_size(16,16)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>){if gid.x>=params.width||gid.y>=params.height{return;}textureStore(output,gid.xy,vec4(sample_bayer(i32(gid.x),i32(gid.y)),0.0,0.0,0.0));}
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+    if any(gid.xy>=params.region.zw){return;}
+    let q=gid.xy+params.region.xy;
+    textureStore(output,q,vec4(sample_bayer(i32(q.x),i32(q.y)),0.0,0.0,0.0));
+}

@@ -18,33 +18,51 @@ pub use demosaic::DemosaicMethod;
 mod gpu_convert;
 mod gpu_filter;
 mod histogram_pipeline;
+pub(crate) mod photo_scheduling;
 mod pixel_packing;
+
+#[cfg(test)]
+mod gpu_warmup_tests;
+
+#[cfg(test)]
+mod highlight_tests;
+
+#[cfg(test)]
+mod still_sdr_tests;
 
 pub(crate) use pixel_packing::copy_rgba_pixels_to_rgb;
 
 pub use gpu_convert::{BayerError, GpuConvertPipeline, GpuFrameInput, get_gpu_convert_pipeline};
+pub(crate) use gpu_convert::{BayerRenderingIntent, PhotoSession, current_photo_session};
 pub use gpu_filter::{GpuFilterPipeline, apply_filter_gpu_rgba, get_gpu_filter_pipeline};
 pub use histogram_pipeline::{BrightnessMetrics, analyze_brightness_gpu};
 
-/// Precompile all GPU shader pipelines so the first capture doesn't pay compilation cost.
+/// Precompile conversion and filter shaders, including the fused Bilinear photo path.
 ///
-/// Triggers device creation and pipeline compilation for both the convert and filter
-/// pipelines. Safe to call from an async task at startup.
+/// Driver compilation is synchronous, so keep it off the async executor. Call
+/// from the Tokio-backed startup task after the renderer has offered its device.
+/// This retains compiled programs and small uniforms, not frame-sized resources.
 pub async fn warmup_gpu_pipelines() -> Result<(), String> {
-    // 1. Warm up the convert pipeline (debayer, finish, yuv, awb, unpack)
-    {
-        let mut guard = get_gpu_convert_pipeline().await?;
-        if let Some(pipeline) = guard.as_mut() {
-            pipeline.warmup_pipelines();
-        }
-    } // Drop convert lock before acquiring filter lock
-
-    // 2. Warm up the standalone filter pipeline (triggers device + pipeline creation)
-    {
-        let _guard = get_gpu_filter_pipeline().await?;
-    }
-
-    Ok(())
+    let runtime = tokio::runtime::Handle::current();
+    let subscriber = tracing::dispatcher::get_default(Clone::clone);
+    tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&subscriber, || {
+            runtime.block_on(async {
+                {
+                    let mut guard = get_gpu_convert_pipeline().await?;
+                    if let Some(pipeline) = guard.as_mut() {
+                        pipeline.warmup_pipelines();
+                    }
+                } // Drop convert lock before acquiring filter lock.
+                {
+                    let _guard = get_gpu_filter_pipeline().await?;
+                }
+                Ok(())
+            })
+        })
+    })
+    .await
+    .map_err(|error| format!("GPU warmup task failed: {error}"))?
 }
 
 /// Shared filter functions (WGSL)
@@ -56,6 +74,15 @@ pub const FILTER_FUNCTIONS: &str = include_str!("filters.wgsl");
 pub const DEBAYER_CORE: &str = include_str!("debayer.wgsl");
 pub fn compose_debayer(adapter: &str) -> String {
     format!("{DEBAYER_CORE}\n{adapter}")
+}
+
+pub(crate) const BAYER_FINISH_FUNCTIONS: &str = include_str!("bayer_finish_functions.wgsl");
+
+pub(crate) fn compose_bayer_texture(adapter: &str) -> String {
+    compose_debayer(&format!(
+        "{}\n{BAYER_FINISH_FUNCTIONS}\n{adapter}",
+        include_str!("debayer_texture_functions.wgsl")
+    ))
 }
 
 pub(crate) const BAYER_IDENTITY_CCM: [[f32; 3]; 3] =
@@ -147,13 +174,10 @@ pub(crate) fn apply_bayer_colour_reference(
             .map(|column| clipped_balanced[column] * ccm[row][column])
             .sum::<f32>()
     });
-    let peak = if sensor_peak.is_finite() {
-        sensor_peak
-    } else {
-        0.0
-    }
-    .clamp(0.0, 1.0);
-    let transition = ((peak - 0.980) / (0.995 - 0.980)).clamp(0.0, 1.0);
+    // Caller supplies the maximum of bilinear reconstructed channels, not the
+    // old CFA-dependent support maximum; refined RGB does not select recovery.
+    let peak = sensor_peak;
+    let transition = ((peak - 0.9) / (1.0 - 0.9)).clamp(0.0, 1.0);
     let blend = transition * transition * (3.0 - 2.0 * transition);
 
     std::array::from_fn(|channel| {
@@ -169,6 +193,8 @@ mod tests {
     use super::{apply_bayer_colour_reference, compose_debayer};
 
     const IDENTITY_CCM: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    const SYNTHETIC_CCM: [[f32; 3]; 3] =
+        [[2., -0.75, -0.25], [-0.5, 2., -0.5], [-0.25, -0.5, 1.75]];
 
     fn assert_near(actual: [f32; 3], expected: [f32; 3]) {
         for channel in 0..3 {
@@ -192,16 +218,12 @@ mod tests {
     }
 
     #[test]
-    fn clipped_pixel_front_camera_highlight_is_neutral() {
-        let sensor_rgb = [0.7296, 0.9954, 0.9771];
-        let gains = [2.1832347, 1.6135153];
-        let ccm = [
-            [2.100_02, -0.7964949, -0.30352515],
-            [-0.469_05, 1.9604946, -0.49144363],
-            [-0.1991288, -0.585788, 1.7849169],
-        ];
+    fn clipped_synthetic_highlight_is_neutral() {
+        let sensor_rgb = [0.75, 0.99, 0.95];
+        let gains = [2., 1.5];
+        let ccm = SYNTHETIC_CCM;
 
-        let output = apply_bayer_colour_reference(sensor_rgb, 0.99509333, gains, ccm);
+        let output = apply_bayer_colour_reference(sensor_rgb, 0.99, gains, ccm);
 
         assert!(output.iter().all(|channel| channel.is_finite()));
         assert!(
@@ -217,18 +239,16 @@ mod tests {
     }
 
     #[test]
-    fn clipped_pixel_matches_preview_colour() {
-        let sensor_rgb = [0.7296, 0.9954, 0.9771];
-        let gains = [2.1832347, 1.6135153];
-        let ccm = [
-            [2.100_02, -0.7964949, -0.30352515],
-            [-0.469_05, 1.9604946, -0.49144363],
-            [-0.1991288, -0.585788, 1.7849169],
-        ];
+    fn nearly_clipped_pixel_has_smooth_recovery_residual() {
+        let sensor_rgb = [0.75, 0.99, 0.95];
+        let gains = [2., 1.5];
+        let ccm = SYNTHETIC_CCM;
 
-        let output = apply_bayer_colour_reference(sensor_rgb, 0.99509333, gains, ccm);
+        let output = apply_bayer_colour_reference(sensor_rgb, 0.99, gains, ccm);
 
-        assert_near(output, [1.0036639, 0.9909827, 1.0026946]);
+        // At .99, smoothstep leaves a small, continuous original-colour
+        // residual rather than declaring a clipped neighbourhood fully white.
+        assert_near(output, [1.032_525, 0.967_05, 1.022_325]);
     }
 
     #[test]
@@ -247,31 +267,21 @@ mod tests {
 
     #[test]
     fn unclipped_out_of_gamut_colour_preserves_signed_float() {
-        let ccm = [
-            [2.100_02, -0.7964949, -0.30352515],
-            [-0.469_05, 1.9604946, -0.49144363],
-            [-0.1991288, -0.585788, 1.7849169],
-        ];
-        let output =
-            apply_bayer_colour_reference([0.6, 0.6, 0.55], 0.6, [2.1832347, 1.6135153], ccm);
+        let ccm = SYNTHETIC_CCM;
+        let output = apply_bayer_colour_reference([0.6, 0.6, 0.55], 0.6, [2., 1.5], ccm);
 
-        assert_near(output, [2.0036466, 0.12574552, 0.97167516]);
+        assert_near(output, [1.74375, 0.1875, 0.84375]);
     }
 
     #[test]
-    fn highlight_knee_has_exact_original_and_recovered_endpoints() {
-        let ccm = [
-            [2.100_02, -0.7964949, -0.30352515],
-            [-0.469_05, 1.9604946, -0.49144363],
-            [-0.1991288, -0.585788, 1.7849169],
-        ];
-        let original =
-            apply_bayer_colour_reference([0.6, 0.6, 0.55], 0.980, [2.1832347, 1.6135153], ccm);
-        let recovered =
-            apply_bayer_colour_reference([0.6, 0.6, 0.55], 0.995, [2.1832347, 1.6135153], ccm);
-
-        assert_near(original, [2.0036466, 0.12574552, 0.97167516]);
-        assert_near(recovered, [1.3527647, 0.27112326, 1.0333933]);
+    fn highlight_shoulder_has_exact_original_and_recovered_endpoints() {
+        let ccm = SYNTHETIC_CCM;
+        let original = apply_bayer_colour_reference([0.6, 0.9, 0.55], 0.9, [2., 1.5], ccm);
+        let recovered = apply_bayer_colour_reference([0.6, 1.0, 0.55], 1.0, [2., 1.5], ccm);
+        let transform =
+            |v: [f32; 3]| std::array::from_fn(|r| (0..3).map(|k| ccm[r][k] * v[k]).sum::<f32>());
+        assert_near(original, transform([0.6 * 2., 0.9, 0.55 * 1.5]));
+        assert_near(recovered, transform([1.0, 1.0, 0.55 * 1.5]));
     }
 
     #[test]
@@ -296,15 +306,20 @@ mod tests {
         assert!(!core.contains("@binding"));
         assert!(core.contains("var corrected = linear;"));
         for adapter in [
-            include_str!("debayer_texture.wgsl"),
+            include_str!("debayer_texture_functions.wgsl"),
             include_str!("burst_mode/bayer_finish.wgsl"),
         ] {
             assert!(adapter.contains("demosaic("));
             assert!(adapter.contains("apply_bayer_colour("));
             assert!(!adapter.contains("fn demosaic("));
             assert!(!adapter.contains("dot("));
-            validate_shader(&compose_debayer(adapter));
         }
+        validate_shader(&super::compose_bayer_texture(include_str!(
+            "debayer_texture.wgsl"
+        )));
+        validate_shader(&compose_debayer(include_str!(
+            "burst_mode/bayer_finish.wgsl"
+        )));
     }
 
     #[test]
@@ -380,8 +395,17 @@ mod tests {
 
     #[test]
     fn composed_raw_shaders_validate() {
-        validate_shader(&compose_debayer(include_str!("debayer_texture.wgsl")));
-        validate_shader(include_str!("debayer_finish.wgsl"));
+        validate_shader(&super::compose_bayer_texture(include_str!(
+            "debayer_texture.wgsl"
+        )));
+        validate_shader(&super::compose_bayer_texture(include_str!(
+            "debayer_photo.wgsl"
+        )));
+        validate_shader(&format!(
+            "{}\n{}",
+            super::BAYER_FINISH_FUNCTIONS,
+            include_str!("debayer_finish.wgsl")
+        ));
         validate_shader(&compose_debayer(include_str!(
             "burst_mode/bayer_finish.wgsl"
         )));

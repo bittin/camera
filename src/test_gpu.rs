@@ -9,7 +9,92 @@
 //! instead of standing up its own.
 
 use iced_wgpu::wgpu;
-use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+use std::collections::BTreeMap;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
+
+pub(crate) type PhotoEvents = Arc<Mutex<Vec<BTreeMap<String, String>>>>;
+
+/// Generated RAW10 highlight with deliberately signed, out-of-gamut CCM candidates.
+pub(crate) fn synthetic_highlight_frame() -> Arc<crate::backends::camera::types::CameraFrame> {
+    use crate::backends::camera::types::{
+        CameraFrame, FrameData, FrameMetadata, PixelFormat, RawLayout,
+    };
+    let mut data = vec![0xa5; 44 * 32];
+    for y in 0..32 {
+        for group in 0..8 {
+            let base = y * 44 + group * 5;
+            data[base + 4] = 0;
+            for k in 0..4 {
+                let code: u16 = match (k % 2, y % 2) {
+                    (0, 0) => 409,
+                    (1, 1) => 511,
+                    _ => 972,
+                };
+                data[base + k] = (code >> 2) as u8;
+                data[base + 4] |= ((code & 3) as u8) << (k * 2);
+            }
+        }
+    }
+    Arc::new(CameraFrame {
+        width: 32,
+        height: 32,
+        stride: 44,
+        format: PixelFormat::BayerRGGB,
+        data: FrameData::from_owned_vec(data),
+        yuv_planes: None,
+        captured_at: std::time::Instant::now(),
+        sensor_timestamp_ns: None,
+        libcamera_metadata: Some(FrameMetadata {
+            raw_layout: Some(RawLayout::Csi2 { bits: 10 }),
+            colour_gains: Some([3., 3.]),
+            colour_correction_matrix: Some([[0., -1., 1.5], [3., 0., -2.5], [0., 1., 0.]]),
+            black_level: Some(0.),
+            ..Default::default()
+        }),
+    })
+}
+
+/// Thread-local subscribers use this to observe completed production GPU work.
+#[derive(Clone, Default)]
+pub(crate) struct PhotoTrace(pub(crate) PhotoEvents);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PhotoTrace {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Fields(BTreeMap<String, String>);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().into(), value.into());
+            }
+        }
+        let mut fields = Fields(BTreeMap::new());
+        event.record(&mut fields);
+        if fields
+            .0
+            .get("message")
+            .is_some_and(|m| m.starts_with("Photo "))
+        {
+            self.0.lock().unwrap().push(fields.0);
+        }
+    }
+}
+
+impl PhotoTrace {
+    pub(crate) fn completed_stages(&self) -> Vec<String> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.get("message")
+                    .is_some_and(|m| m == "Photo GPU batch completed")
+            })
+            .map(|e| e["stage"].trim_matches('"').to_owned())
+            .collect()
+    }
+}
 
 /// The ONE headless wgpu device the GPU tests share, or `None` when the
 /// machine has no usable adapter.

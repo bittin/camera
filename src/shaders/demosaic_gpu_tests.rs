@@ -12,6 +12,21 @@ fn run(
     pattern: u32,
     method: DemosaicMethod,
 ) -> Result<Vec<[f32; 4]>, String> {
+    run_mode(device, queue, engine, input, w, h, pattern, method, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_mode(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    engine: &GpuDemosaic,
+    input: &[f32],
+    w: u32,
+    h: u32,
+    pattern: u32,
+    method: DemosaicMethod,
+    paced: bool,
+) -> Result<Vec<[f32; 4]>, String> {
     let rgba: Vec<[f32; 4]> = input.iter().map(|&v| [v, 0.0, 0.0, 0.0]).collect();
     let scalar = engine.raw.format() == wgpu::TextureFormat::R32Float;
     let bytes: &[u8] = if scalar {
@@ -34,9 +49,13 @@ fn run(
         },
     );
     let output = texture(device, w, h, "test camera RGB");
-    let mut encoder = device.create_command_encoder(&Default::default());
-    engine.encode(device, queue, &mut encoder, &output, pattern, method);
-    queue.submit([encoder.finish()]);
+    if paced {
+        engine.encode_photo(device, queue, &output, pattern, method)?;
+    } else {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        engine.encode(device, queue, &mut encoder, &output, pattern, method);
+        queue.submit([encoder.finish()]);
+    }
     engine.validate(device)?;
     let row = (w * 16).next_multiple_of(256);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -192,6 +211,53 @@ fn gpu_reduction_rejects_nan_infinity_and_overflow_without_clamping() {
         .is_ok()
     );
 }
+#[test]
+fn photo_global_bounds_halos_and_finite_status_match_unpaced_bits() {
+    let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+        crate::test_gpu::skip_no_gpu(
+            "photo_global_bounds_halos_and_finite_status_match_unpaced_bits",
+        );
+        return;
+    };
+    let (w, h) = (515, 517);
+    let engine = GpuDemosaic::new(&device, w, h).unwrap();
+    // Neither extreme appears in the first bounds band or output tile. Most
+    // pixels are negative: a per-band reset would change LMMSE's transform.
+    let mut input: Vec<f32> = (0..w * h)
+        .map(|i| ((i * 977 % 1021) as f32 / 1021.0 - 0.9) * 0.2)
+        .collect();
+    input[(w * h - 2) as usize] = -0.14798465;
+    input[(w * h - 1) as usize] = 1.0;
+    for method in [DemosaicMethod::Rcd, DemosaicMethod::Lmmse] {
+        for pattern in 0..4 {
+            let expected = run(&device, &queue, &engine, &input, w, h, pattern, method).unwrap();
+            let actual = run_mode(
+                &device, &queue, &engine, &input, w, h, pattern, method, true,
+            )
+            .unwrap();
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&actual),
+                bytemuck::cast_slice::<_, u8>(&expected),
+                "{method:?} CFA {pattern}: float bits changed"
+            );
+        }
+        for index in [0, (w * h - 1) as usize] {
+            for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+                let mut bad = input.clone();
+                bad[index] = invalid;
+                assert!(
+                    run_mode(&device, &queue, &engine, &bad, w, h, 0, method, true).is_err(),
+                    "{method:?} index={index} value={invalid}"
+                );
+            }
+        }
+        assert!(
+            run_mode(&device, &queue, &engine, &input, w, h, 0, method, true).is_ok(),
+            "status must reset between photos"
+        );
+    }
+}
+
 #[test]
 fn halo_dimensions_are_rejected_before_gpu_allocation() {
     let Some((_guard, device, _queue)) = crate::test_gpu::headless_device_with_compute() else {

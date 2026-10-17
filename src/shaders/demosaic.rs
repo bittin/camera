@@ -3,9 +3,9 @@
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DemosaicMethod {
-    #[default]
     Rcd,
     Lmmse,
+    #[default]
     Bilinear,
 }
 
@@ -19,8 +19,8 @@ pub(crate) fn site(x: usize, y: usize, pattern: u32) -> usize {
 mod tests {
     use super::*;
     #[test]
-    fn rcd_is_default_and_all_methods_roundtrip() {
-        assert_eq!(DemosaicMethod::default(), DemosaicMethod::Rcd);
+    fn bilinear_is_default_and_all_methods_roundtrip() {
+        assert_eq!(DemosaicMethod::default(), DemosaicMethod::Bilinear);
         for method in [
             DemosaicMethod::Rcd,
             DemosaicMethod::Lmmse,

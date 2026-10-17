@@ -165,14 +165,12 @@ fn explicit_white_levels_all_packing_cfa_gpu_hdr_reference() {
                             } else {
                                 (normalized[1] + normalized[2]) * 0.5
                             };
-                            let peak = if s == 1 || s == 2 {
-                                normalized[0].max(green).max(normalized[3])
-                            } else {
-                                normalized.into_iter().fold(f32::NEG_INFINITY, f32::max)
-                            };
+                            // Reconstructed bilinear sensor channels select the
+                            // common shoulder, not a phase-dependent support max.
+                            let peak = normalized[0].max(green).max(normalized[3]);
                             let rgb = [normalized[0] * 1.7, green, normalized[3] * 1.3];
                             let clipped = rgb.map(|v| v.clamp(0.0, 1.0));
-                            let t = ((peak - 0.980) / 0.015).clamp(0.0, 1.0);
+                            let t = ((peak - 0.9) / 0.1).clamp(0.0, 1.0);
                             let blend = t * t * (3.0 - 2.0 * t);
                             let ccm = frame
                                 .libcamera_metadata

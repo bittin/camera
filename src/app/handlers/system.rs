@@ -1291,7 +1291,7 @@ mod tests {
     use super::{file_manager_dbus_args, portal_gallery_item};
 
     #[test]
-    fn demosaic_handler_persists_each_method_and_reset_restores_rcd() {
+    fn demosaic_handler_persists_each_method_and_reset_restores_bilinear() {
         use crate::app::state::{AppModel, Message, SettingsPage};
         use crate::config::Config;
         use crate::shaders::DemosaicMethod;
@@ -1322,15 +1322,15 @@ mod tests {
             assert_eq!(Config::get_entry(store).unwrap().demosaic_method, method);
             drop(app.settings_view());
         }
-        drop(app.update(Message::SetDemosaicMethod(DemosaicMethod::Bilinear)));
+        drop(app.update(Message::SetDemosaicMethod(DemosaicMethod::Rcd)));
         drop(app.update(Message::ResetAllSettings));
         app.config_persistence.flush();
-        assert_eq!(app.config.demosaic_method, DemosaicMethod::Rcd);
+        assert_eq!(app.config.demosaic_method, DemosaicMethod::Bilinear);
         assert_eq!(
             Config::get_entry(app.config_handler.as_ref().unwrap())
                 .unwrap()
                 .demosaic_method,
-            DemosaicMethod::Rcd
+            DemosaicMethod::Bilinear
         );
         drop(app);
         std::fs::remove_dir_all(root).unwrap();

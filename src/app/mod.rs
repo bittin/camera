@@ -846,7 +846,7 @@ impl cosmic::Application for AppModel {
             |_| cosmic::Action::App(Message::Noop),
         );
 
-        // Precompile GPU shader pipelines in background (eliminates ~270ms first-capture penalty).
+        // Precompile conversion/photo/filter shaders on a background blocking worker.
         //
         // Wait for the iced renderer to seed the shared GPU device first so warmup
         // binds its pipelines to the renderer's device (no second wgpu::Instance).

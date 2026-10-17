@@ -585,6 +585,12 @@ async fn await_clip_result(
     }
 }
 
+fn continuous_processor(processing: PostProcessingConfig) -> PostProcessor {
+    PostProcessor::new(processing)
+        .for_continuous_frames()
+        .without_gpu_pacing()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_memory_recorder(
     frames: std::sync::mpsc::Receiver<Arc<CameraFrame>>,
@@ -608,7 +614,7 @@ fn run_memory_recorder(
         Ok(r) => r,
         Err(_) => return,
     };
-    let processor = PostProcessor::new(processing);
+    let processor = continuous_processor(processing);
     let mut encoder: Option<MemoryEncoder> = None;
     let mut pending: Vec<ShutterRequest> = Vec::new();
     let mut failure: Option<String> = None;
@@ -751,6 +757,10 @@ fn run_memory_recorder(
         let _ = p.result.send(Err("Motion Photo recorder stopped".into()));
     }
 }
+
+#[cfg(test)]
+#[path = "motion_photo_pacing_tests.rs"]
+mod pacing_tests;
 
 #[cfg(test)]
 mod tests {

@@ -799,6 +799,35 @@ fn capture_thread_setup_and_run(
         None
     };
 
+    // Reserve one RAW photo workspace in the background using negotiated, not
+    // requested, dimensions. The guard retires it on every capture-thread exit.
+    let _photo_session = if is_multistream {
+        formats
+            .raw_pixel_format
+            .zip(normal_raw_layout(&formats.raw_format_name))
+            .and_then(|(format, layout)| {
+                crate::shaders::PhotoSession::start(
+                    formats.raw_size.width,
+                    formats.raw_size.height,
+                    format,
+                    layout,
+                    formats.raw_stride,
+                )
+            })
+    } else if formats.vf_pixel_format.is_bayer() {
+        normal_raw_layout(&formats.vf_format_name).and_then(|layout| {
+            crate::shaders::PhotoSession::start(
+                formats.vf_size.width,
+                formats.vf_size.height,
+                formats.vf_pixel_format,
+                layout,
+                formats.vf_stride,
+            )
+        })
+    } else {
+        None
+    };
+
     // Report successful initialization (after all fallible init steps)
     init_tx
         .send(Ok(CaptureThreadInitResult { is_multistream }))
