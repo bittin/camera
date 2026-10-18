@@ -32,13 +32,11 @@ pub(crate) struct CaptureThreadParams {
     pub(crate) preview_height: u32,
     pub(crate) limit_preview: bool,
     pub(crate) stop_flag: Arc<AtomicBool>,
-    pub(crate) latest_preview: Arc<Mutex<Option<CameraFrame>>>,
     pub(crate) still_capture: Arc<StillCapture>,
     pub(crate) preview_frame_count: Arc<AtomicU64>,
     pub(crate) still_frame_count: Arc<AtomicU64>,
     pub(crate) frame_sender: FrameSender,
     pub(crate) recording_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<RecordingFrame>>>>,
-    pub(crate) jpeg_recording_mode: Arc<AtomicBool>,
     /// Cancel flag — checked before creating CameraManager to abort if a newer
     /// mode switch has superseded this one.
     pub(crate) cancel_flag: Arc<AtomicBool>,
@@ -137,14 +135,12 @@ struct MjpegDecodeJob {
     metadata: FrameMetadata,
     frame_num: u64,
     dispatch_context: FrameDispatchContext<RecordingFrame>,
-    skip_recording: bool,
 }
 
 struct MjpegDecodeOutput {
     frame_num: u64,
     frame: Option<CameraFrame>,
     dispatch_context: FrameDispatchContext<RecordingFrame>,
-    skip_recording: bool,
     decode_time_us: u64,
 }
 
@@ -177,7 +173,6 @@ impl QueueWorker<MjpegDecodeJob, CaptureEvent> for MjpegDecodeWorker {
             frame_num: job.frame_num,
             frame,
             dispatch_context: job.dispatch_context,
-            skip_recording: job.skip_recording,
             decode_time_us: decode_start.elapsed().as_micros() as u64,
         })
     }
@@ -1061,7 +1056,6 @@ fn dispatch_mjpeg_frame(
             params,
             is_multistream,
             output.dispatch_context,
-            output.skip_recording,
         );
     }
 }
@@ -1180,43 +1174,6 @@ fn run_capture_loop(
                 );
                 if let Some(queue) = jpeg_decode_queue.as_ref() {
                     let jpeg_data = captured_data;
-                    let jpeg_sent_to_recorder = if params
-                        .jpeg_recording_mode
-                        .load(Ordering::Relaxed)
-                    {
-                        if let Some(ref tx) = dispatch_context.recording_sender {
-                            let seq = metadata.sequence;
-                            let send_result = tx.try_send(RecordingFrame::Jpeg {
-                                data: jpeg_data.clone(),
-                                width: formats.vf_size.width,
-                                height: formats.vf_size.height,
-                                sensor_timestamp_ns,
-                                sequence: seq,
-                            });
-                            if send_result.is_err() {
-                                crate::pipelines::video::stats::rec_stats_capture_dropped();
-                                if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-                                    warn!(frame = frame_num, seq = ?seq, "JPEG recording frame dropped (channel full)");
-                                }
-                            } else {
-                                crate::pipelines::video::stats::rec_stats_capture_sent();
-                            }
-                            if frame_num.is_multiple_of(LOG_EVERY_N_FRAMES) {
-                                debug!(
-                                    frame = frame_num,
-                                    seq = ?seq,
-                                    sensor_ts_ms = ?sensor_timestamp_ns.map(|t| t / 1_000_000),
-                                    "Sent JPEG to recorder"
-                                );
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
                     if queue
                         .try_submit_preview(
                             MjpegDecodeJob {
@@ -1226,7 +1183,6 @@ fn run_capture_loop(
                                 metadata: metadata.clone(),
                                 frame_num,
                                 dispatch_context,
-                                skip_recording: jpeg_sent_to_recorder,
                             },
                             &params.preview_metrics,
                         )
@@ -1267,7 +1223,6 @@ fn run_capture_loop(
                         params,
                         is_multistream,
                         dispatch_context,
-                        false,
                     );
                 }
             } else {
@@ -1332,25 +1287,18 @@ fn run_capture_loop(
 }
 
 /// Dispatch a completed viewfinder frame to all consumers:
-/// 1. Store as latest preview (for still capture fallback)
-/// 2. Handle single-stream still capture
-/// 3. Send to recording (VF→encoder via appsrc)
-/// 4. Send to UI preview channel
+/// 1. Handle ticketed single-stream still capture
+/// 2. Send to recording (VF→encoder via appsrc)
+/// 3. Send to UI preview channel
 fn dispatch_viewfinder_frame(
     frame: CameraFrame,
     frame_num: u64,
     params: &mut CaptureThreadParams,
     is_multistream: bool,
     dispatch_context: FrameDispatchContext<RecordingFrame>,
-    skip_recording: bool,
 ) {
     static FIRST_FRAME: AtomicBool = AtomicBool::new(false);
     crate::startup::milestone_once("first_frame_captured", &FIRST_FRAME);
-
-    // Store latest preview frame
-    if let Ok(mut latest) = params.latest_preview.lock() {
-        *latest = Some(frame.clone());
-    }
 
     // In single-stream mode, also handle still capture from preview.
     if !is_multistream && let Some(ticket) = dispatch_context.capture_still {
@@ -1364,10 +1312,9 @@ fn dispatch_viewfinder_frame(
     }
 
     // Send ViewFinder frames to recording (via appsrc encoder pipeline).
-    // Skip if raw JPEG was already sent to the recorder in JPEG mode.
-    if !skip_recording && let Some(ref tx) = dispatch_context.recording_sender {
+    if let Some(ref tx) = dispatch_context.recording_sender {
         let seq = frame.libcamera_metadata.as_ref().and_then(|m| m.sequence);
-        let send_result = tx.try_send(RecordingFrame::Decoded(Arc::new(frame.clone())));
+        let send_result = tx.try_send(Arc::new(frame.clone()));
         if send_result.is_err() {
             crate::pipelines::video::stats::rec_stats_capture_dropped();
         } else {
@@ -1981,13 +1928,11 @@ mod tests {
             preview_height: 1,
             limit_preview: false,
             stop_flag: Arc::new(AtomicBool::new(false)),
-            latest_preview: Arc::new(Mutex::new(None)),
             still_capture: Default::default(),
             preview_frame_count: Arc::new(super::AtomicU64::new(0)),
             still_frame_count: Arc::new(super::AtomicU64::new(0)),
             frame_sender,
             recording_sender: Arc::new(Mutex::new(None)),
-            jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -2008,6 +1953,83 @@ mod tests {
     }
 
     #[test]
+    fn native_dispatch_delivers_owned_still_recording_and_preview_without_cache() {
+        let metrics = super::PreviewMetrics::start("native-dispatch-consumers-test");
+        let (sender, mut preview) = cosmic::iced::futures::channel::mpsc::channel(1);
+        let mut params = dispatch_test_params(sender, metrics);
+        let (tx, mut recording) = tokio::sync::mpsc::channel(1);
+        *params.recording_sender.lock().unwrap() = Some(tx);
+        let request = params.still_capture.request();
+        let frame = dispatch_test_frame();
+        let identity = frame.data.as_ptr();
+        let captured_at = frame.captured_at;
+        let context =
+            snapshot_frame_dispatch_context(false, &params.still_capture, &params.recording_sender);
+        super::dispatch_viewfinder_frame(frame, 1, &mut params, false, context);
+        let still = request.take().expect("ticketed still");
+        let preview = preview.try_recv().expect("preview channel");
+        let recording = recording.try_recv().unwrap();
+        drop(params);
+        for frame in [&still, &preview, recording.as_ref()] {
+            assert_eq!(frame.data.as_ref(), &[1; 8]);
+            assert_eq!(frame.data.as_ptr(), identity);
+            assert_eq!(frame.captured_at, captured_at);
+        }
+    }
+
+    #[test]
+    fn mjpeg_decode_dispatch_keeps_capture_time_recording_sender() {
+        let metrics = super::PreviewMetrics::start("mjpeg-decoded-recording-test");
+        let (sender, mut preview) = cosmic::iced::futures::channel::mpsc::channel(1);
+        let mut params = dispatch_test_params(sender, metrics);
+        let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
+        let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(1);
+        *params.recording_sender.lock().unwrap() = Some(old_tx);
+        let request = params.still_capture.request();
+        let context =
+            snapshot_frame_dispatch_context(false, &params.still_capture, &params.recording_sender);
+        *params.recording_sender.lock().unwrap() = Some(new_tx);
+        // Real JPEG decode feeds the same completed-event path as the worker.
+        let frame = review_n1_gray_frame(9, 4, 83);
+        let expected = frame.clone();
+        let mut watermark = None;
+        super::dispatch_mjpeg_frame(
+            super::MjpegDecodeOutput {
+                frame_num: 1,
+                frame: Some(frame),
+                dispatch_context: context,
+                decode_time_us: 1,
+            },
+            &mut params,
+            false,
+            &mut watermark,
+        );
+        let recorded = old_rx
+            .try_recv()
+            .expect("recording destination captured before decode");
+        assert_eq!(recorded.format, super::PixelFormat::Gray8);
+        assert_eq!(recorded.data.as_ref(), expected.data.as_ref());
+        assert_eq!(recorded.data.as_ptr(), expected.data.as_ptr());
+        assert_eq!(
+            request.take().unwrap().data.as_ref(),
+            expected.data.as_ref()
+        );
+        assert_eq!(
+            preview.try_recv().unwrap().data.as_ref(),
+            expected.data.as_ref()
+        );
+        assert_eq!(watermark, Some(1));
+        assert!(matches!(
+            old_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
+        assert!(matches!(
+            new_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
     fn delayed_viewfinder_publication_cannot_satisfy_new_still_request() {
         let metrics = super::PreviewMetrics::start("delayed-still-ticket-test");
         let (sender, _receiver) = cosmic::iced::futures::channel::mpsc::channel(4);
@@ -2018,26 +2040,12 @@ mod tests {
         drop(a);
         let b = params.still_capture.request();
         let ticket_b = params.still_capture.pending().unwrap();
-        super::dispatch_viewfinder_frame(
-            dispatch_test_frame(),
-            1,
-            &mut params,
-            false,
-            context_a,
-            false,
-        );
+        super::dispatch_viewfinder_frame(dispatch_test_frame(), 1, &mut params, false, context_a);
         assert!(b.take().is_none());
         assert_eq!(params.still_capture.pending(), Some(ticket_b));
         let context_b =
             snapshot_frame_dispatch_context(false, &params.still_capture, &params.recording_sender);
-        super::dispatch_viewfinder_frame(
-            dispatch_test_frame(),
-            2,
-            &mut params,
-            false,
-            context_b,
-            false,
-        );
+        super::dispatch_viewfinder_frame(dispatch_test_frame(), 2, &mut params, false, context_b);
         assert!(b.take().is_some());
     }
 
@@ -2059,7 +2067,6 @@ mod tests {
                     capture_still: None,
                     recording_sender: None,
                 },
-                false,
             );
         }
         let snapshot = metrics.snapshot();
@@ -2070,7 +2077,6 @@ mod tests {
             (2, 1, 8)
         );
         assert_eq!(snapshot.output_format, Some(super::PixelFormat::ABGR));
-        assert!(params.latest_preview.lock().unwrap().is_some());
     }
 
     #[test]
@@ -2088,7 +2094,6 @@ mod tests {
                         capture_still: None,
                         recording_sender: None,
                     },
-                    skip_recording: false,
                     decode_time_us: 100,
                 },
                 &mut params,
@@ -2099,7 +2104,6 @@ mod tests {
         assert_eq!(metrics.snapshot().dropped_frames, 3);
         assert_eq!(metrics.snapshot().frame_count, 0);
         assert_eq!(watermark, Some(2));
-        assert!(params.latest_preview.lock().unwrap().is_none());
     }
 
     #[test]

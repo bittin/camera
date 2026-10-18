@@ -14,8 +14,6 @@ pub struct MuxerConfig {
     pub muxer: gst::Element,
     /// File sink element
     pub filesink: gst::Element,
-    /// Output file path
-    pub output_path: std::path::PathBuf,
 }
 
 /// Create muxer and filesink
@@ -29,7 +27,7 @@ pub struct MuxerConfig {
 /// * `Err(String)` - Error message
 pub fn create_muxer(
     muxer: gst::Element,
-    output_path: std::path::PathBuf,
+    output_path: &std::path::Path,
 ) -> Result<MuxerConfig, String> {
     info!(path = %output_path.display(), "Creating muxer");
 
@@ -72,11 +70,7 @@ pub fn create_muxer(
 
     debug!(muxer = %muxer_name, "Muxer and filesink created");
 
-    Ok(MuxerConfig {
-        muxer,
-        filesink,
-        output_path,
-    })
+    Ok(MuxerConfig { muxer, filesink })
 }
 
 /// Link video encoder to muxer

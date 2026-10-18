@@ -5,7 +5,7 @@
 //! Handles photo capture, video recording, flash, zoom, and timer functionality.
 
 use crate::app::state::{AppModel, CameraMode, Message, RecordingState, TimelapseState};
-use crate::backends::camera::types::RecordingFrame;
+
 use crate::pipelines::capture_metadata::CaptureMetadata;
 use crate::pipelines::photo::burst_mode::BurstModeConfig;
 use crate::pipelines::photo::burst_mode::burst::{
@@ -35,24 +35,6 @@ struct AppsrcRecordingConfig {
 const BURST_MODE_SUCCESS_DISPLAY_MS: u64 = 2000;
 /// Delay in ms before resetting burst mode state after an error
 const BURST_MODE_ERROR_DISPLAY_MS: u64 = 3000;
-
-/// Decide whether the zero-copy JPEG recorder can be used.
-///
-/// The JPEG path bypasses the decoded-frame pusher, so it cannot apply a
-/// filter selected after recording starts. Keep the live-filter requirement in
-/// this decision so that a future JPEG filter implementation can re-enable the
-/// fast path deliberately rather than silently regressing recording behavior.
-fn should_use_jpeg_recording_pipeline(
-    is_mjpeg: bool,
-    has_jpeg_decoder: bool,
-    sensor_rotation: crate::backends::camera::types::SensorRotation,
-    live_filters_required: bool,
-) -> bool {
-    is_mjpeg
-        && has_jpeg_decoder
-        && sensor_rotation == crate::backends::camera::types::SensorRotation::None
-        && !live_filters_required
-}
 
 /// Keep synchronous GPU waits and photo-sized CPU work off libcosmic's single
 /// async worker so preview subscriptions and animation tasks can keep running.
@@ -2022,46 +2004,9 @@ impl AppModel {
                 PixelFormat::from_gst_format(&format.pixel_format).unwrap_or(PixelFormat::I420)
             });
 
-        // Check if we can use the VA-API JPEG zero-copy path:
-        // - Camera outputs MJPEG
-        // - A VA-API JPEG decoder is available that handles this camera's
-        //   chroma subsampling (e.g. 4:2:0 → I420, 4:2:2 → Y42B)
-        // - No sensor rotation needed (GPU JPEG decode → encoder is direct)
-        let is_mjpeg = format.pixel_format == "MJPEG" || format.pixel_format.contains("MJPG");
-        let decoded_yuv_format = self
-            .current_frame
-            .as_ref()
-            .map(|f| f.gst_format_string())
-            .unwrap_or("I420");
-        let va_jpeg_dec = if is_mjpeg {
-            crate::media::encoders::detection::detect_va_jpeg_decoder(decoded_yuv_format)
-        } else {
-            None
-        };
-        let use_jpeg_pipeline = should_use_jpeg_recording_pipeline(
-            is_mjpeg,
-            va_jpeg_dec.is_some(),
-            sensor_rotation,
-            true,
-        );
-
-        if use_jpeg_pipeline {
-            info!(
-                va_jpeg_dec = ?va_jpeg_dec,
-                "Using VA-API JPEG zero-copy recording pipeline"
-            );
-        } else {
-            info!(
-                pixel_format = ?pixel_format,
-                is_mjpeg,
-                va_jpeg_dec = ?va_jpeg_dec,
-                rotation = %sensor_rotation,
-                "Using appsrc recording pipeline (libcamera backend)"
-            );
-        }
-
-        let channel_size = if use_jpeg_pipeline { 30 } else { 15 };
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(channel_size);
+        // Recording always consumes decoded frames so filters can change live.
+        info!(?pixel_format, rotation = %sensor_rotation, "Using appsrc recording pipeline");
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(15);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
 
         let path_for_message = output_path.display().to_string();
@@ -2071,18 +2016,14 @@ impl AppModel {
         // into the recording channel at the configured framerate.
         if self.current_frame_is_file_source {
             if let Some(ref frame) = self.current_frame {
-                let frame = Arc::new(frame.as_ref().clone());
+                let frame = Arc::clone(frame);
                 let tx = frame_tx;
                 let interval = std::time::Duration::from_millis(1000 / framerate.max(1) as u64);
                 tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
                     loop {
                         ticker.tick().await;
-                        if tx
-                            .send(RecordingFrame::Decoded(Arc::clone(&frame)))
-                            .await
-                            .is_err()
-                        {
+                        if tx.send(Arc::clone(&frame)).await.is_err() {
                             break;
                         }
                     }
@@ -2092,14 +2033,12 @@ impl AppModel {
                 let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
                 if let Some(ref manager) = self.recording_bridge {
                     manager.set_recording_sender(Some(dummy_tx));
-                    manager.set_jpeg_recording_mode(false);
                 }
             }
         } else {
             // Direct path: capture thread → appsrc (bypasses UI thread entirely)
             if let Some(ref manager) = self.recording_bridge {
                 manager.set_recording_sender(Some(frame_tx));
-                manager.set_jpeg_recording_mode(use_jpeg_pipeline);
             }
         }
 
@@ -2117,7 +2056,7 @@ impl AppModel {
         );
 
         let recording_bridge = self.recording_bridge.clone();
-        let va_jpeg_dec_name = va_jpeg_dec.map(|s| s.to_string());
+
         let live_filter = self.recording_filter_code.clone();
         let record_audio = self.config.record_audio;
 
@@ -2126,9 +2065,6 @@ impl AppModel {
                 // Capture runtime handle — spawn_blocking doesn't propagate the
                 // tokio context, but the appsrc pusher needs it for tokio::spawn.
                 let rt_handle = tokio::runtime::Handle::current();
-
-                // Clone for use inside spawn_blocking's fallback path
-                let recording_bridge_inner = recording_bridge.clone();
 
                 let recorder = tokio::task::spawn_blocking(move || {
                     // Enter the runtime context so tokio::spawn works inside
@@ -2176,40 +2112,8 @@ impl AppModel {
                             }
                         };
 
-                    // Try VA-API JPEG pipeline first, fall back to legacy
-                    let recorder = if use_jpeg_pipeline {
-                        let dec = va_jpeg_dec_name.as_deref().unwrap();
-                        match VideoRecorder::new_from_appsrc_jpeg(
-                            make_appsrc_config(audio_levels.clone()),
-                            dec,
-                            frame_rx,
-                        ) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    "VA-API JPEG pipeline failed, falling back to legacy"
-                                );
-                                // Clear jpeg mode so capture thread sends decoded frames
-                                if let Some(ref manager) = recording_bridge_inner {
-                                    manager.set_jpeg_recording_mode(false);
-                                }
-                                // Need a new channel since the old rx was consumed
-                                // This is a rare error path — the recording will start
-                                // without any buffered frames, which is acceptable.
-                                let (fallback_tx, fallback_rx) = tokio::sync::mpsc::channel(15);
-                                if let Some(ref manager) = recording_bridge_inner {
-                                    manager.set_recording_sender(Some(fallback_tx));
-                                }
-                                VideoRecorder::new_from_appsrc(
-                                    make_appsrc_config(audio_levels),
-                                    fallback_rx,
-                                )?
-                            }
-                        }
-                    } else {
-                        VideoRecorder::new_from_appsrc(make_appsrc_config(audio_levels), frame_rx)?
-                    };
+                    let recorder =
+                        VideoRecorder::new_from_appsrc(make_appsrc_config(audio_levels), frame_rx)?;
 
                     recorder.start()?;
                     let path = output_path.display().to_string();
@@ -2227,7 +2131,6 @@ impl AppModel {
                 // the channel so the appsrc pusher sees None and sends EOS.
                 if let Some(ref manager) = recording_bridge {
                     manager.set_recording_sender(None);
-                    manager.set_jpeg_recording_mode(false);
                 }
 
                 // Give a brief moment for EOS to propagate before stopping the pipeline.
@@ -2774,7 +2677,7 @@ pub(super) async fn wait_for_still_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_with_preview_fallback, should_use_jpeg_recording_pipeline};
+    use super::capture_with_preview_fallback;
     use crate::backends::camera::types::SensorRotation;
     use std::cell::Cell;
     use std::sync::Arc;
@@ -5290,12 +5193,39 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_recording_pipeline_is_not_selected_when_live_filters_are_required() {
-        assert!(!should_use_jpeg_recording_pipeline(
-            true,
-            true,
-            SensorRotation::None,
-            true,
-        ));
+    fn app_recording_uses_decoded_frames_and_a_bounded_channel_for_live_filters() {
+        use crate::backends::camera::recording::RecordingBridge;
+
+        let mut model = live_model();
+        let bridge = RecordingBridge::default();
+
+        model.recording_bridge = Some(bridge.clone());
+        let config = super::AppsrcRecordingConfig {
+            width: 64,
+            height: 48,
+            framerate: 30,
+            format: crate::backends::camera::types::CameraFormat {
+                width: 64,
+                height: 48,
+                framerate: Some(Default::default()),
+                hardware_accelerated: true,
+                pixel_format: "MJPEG".into(),
+            },
+            output_path: "unused-recording.mp4".into(),
+            sensor_rotation: SensorRotation::None,
+            audio_device: None,
+            audio_source_rate_hz: 0,
+            selected_encoder: None,
+            bitrate_kbps: 1000,
+        };
+
+        // Construction must configure the real producer bridge without polling
+        // the task, starting an encoder, or opening a camera/microphone.
+        let task = model.start_appsrc_recording(config);
+
+        let sender = bridge.recording_sender();
+        assert_eq!(sender.lock().unwrap().as_ref().unwrap().max_capacity(), 15);
+        assert_eq!(model.recording_jobs.len(), 1);
+        drop(task);
     }
 }

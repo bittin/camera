@@ -1025,11 +1025,6 @@ impl cosmic::Application for AppModel {
         // Get the shared recording sender Arc so the capture thread can forward
         // frames directly to the appsrc recording pipeline (libcamera only).
         let recording_sender = self.recording_bridge.as_ref().map(|s| s.recording_sender());
-        let jpeg_recording_mode = self
-            .recording_bridge
-            .as_ref()
-            .map(|m| m.jpeg_recording_mode())
-            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
 
         // Check if file source is active - if so, don't run camera subscription
         // This applies in Virtual mode OR when --preview-source was used (any mode)
@@ -1173,7 +1168,7 @@ impl cosmic::Application for AppModel {
                                         frame_sender: sender,
                                         still_capture: Arc::clone(&still_capture),
                                         recording_sender: rec_sender,
-                                        jpeg_recording_mode: Arc::clone(&jpeg_recording_mode),
+
                                         cancel_flag: Arc::clone(&cancel_flag),
                                     },
                                 ) {

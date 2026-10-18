@@ -43,37 +43,6 @@ pub fn detect_audio_encoders() -> Vec<String> {
     available
 }
 
-/// Detect a working hardware JPEG decoder element.
-///
-/// Tries `vajpegdec` (VA-API) and
-/// `nvjpegdec` (NVIDIA NVDEC) in order. Each candidate is probed with a
-/// `jpegenc ! decoder ! fakesink` pipeline using the camera's actual YUV
-/// chroma subsampling (e.g. I420 for 4:2:0, Y42B for 4:2:2) to verify
-/// the decoder works on this hardware. Some GPUs advertise a decoder but
-/// fail at runtime with specific subsampling modes.
-pub fn detect_va_jpeg_decoder(yuv_format: &str) -> Option<&'static str> {
-    let candidates = ["vajpegdec", "nvjpegdec"];
-
-    for candidate in candidates {
-        if !is_element_available(candidate) {
-            continue;
-        }
-        if probe_hw_jpeg_decoder_format(candidate, yuv_format) {
-            info!(
-                decoder = candidate,
-                yuv_format, "Hardware JPEG decoder probe OK"
-            );
-            return Some(candidate);
-        }
-        warn!(
-            decoder = candidate,
-            yuv_format, "Hardware JPEG decoder found but failed probe — skipping"
-        );
-    }
-
-    None
-}
-
 /// Timeout for GStreamer probe pipelines (EOS or Error).
 const PROBE_TIMEOUT_SECS: u64 = 5;
 
@@ -110,20 +79,6 @@ fn probe_gst_pipeline(pipeline_desc: &str) -> bool {
 
     let _ = pipeline.set_state(gst::State::Null);
     ok
-}
-
-/// Probe a hardware JPEG decoder with a specific input format.
-fn probe_hw_jpeg_decoder_format(decoder_name: &str, format: &str) -> bool {
-    let pipeline_desc = format!(
-        "videotestsrc num-buffers=3 \
-         ! video/x-raw,format={format},width=320,height=240,framerate=10/1 \
-         ! jpegenc \
-         ! {decoder} \
-         ! fakesink",
-        format = format,
-        decoder = decoder_name,
-    );
-    probe_gst_pipeline(&pipeline_desc)
 }
 
 /// Test whether a video encoder actually works by building a short pipeline
