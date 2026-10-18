@@ -2,6 +2,9 @@
 
 //! Custom primitive for rendering gallery thumbnails with rounded corners
 
+use super::video_primitive::rendering::{
+    encode_screen_triangle, fullscreen_pipeline, sampled_texture_layout,
+};
 use std::sync::Arc;
 
 use cosmic::iced::Rectangle;
@@ -153,54 +156,24 @@ impl PrimitiveTrait for GalleryPrimitive {
     }
 }
 
+fn gallery_shader() -> String {
+    format!(
+        "{}\n{}\n{}",
+        super::video_primitive::rendering::FULLSCREEN_VERTEX,
+        crate::shaders::GEOMETRY_FUNCTIONS,
+        include_str!("gallery_rounded_shader.wgsl")
+    )
+}
+
 impl GalleryPipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
-        // Load shader
-        let shader_source = format!(
-            "{}\n{}",
-            crate::shaders::GEOMETRY_FUNCTIONS,
-            include_str!("gallery_rounded_shader.wgsl")
-        );
+        let shader_source = gallery_shader();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gallery rounded shader"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
-        // Create bind group layout
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("gallery bind group layout"),
-            entries: &[
-                // Texture
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // Sampler
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // Viewport size uniform
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+        let bind_group_layout = sampled_texture_layout(device, "gallery bind group layout");
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gallery pipeline layout"),
@@ -208,35 +181,15 @@ impl GalleryPipeline {
             immediate_size: 0,
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("gallery pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = fullscreen_pipeline(
+            device,
+            "gallery pipeline",
+            &pipeline_layout,
+            &shader,
+            "fs_main",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("gallery sampler"),
@@ -454,44 +407,15 @@ impl GalleryPipeline {
                 clip_bounds.height as f32,
             ));
 
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gallery render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-
-            // Use full widget bounds for viewport (prevents distortion in scrollables)
-            render_pass.set_viewport(
-                widget_bounds.0,
-                widget_bounds.1,
-                widget_bounds.2,
-                widget_bounds.3,
-                0.0,
-                1.0,
+            encode_screen_triangle(
+                encoder,
+                target,
+                clip_bounds,
+                widget_bounds,
+                &self.pipeline,
+                &gallery_texture.bind_group,
+                "gallery render pass",
             );
-
-            // Use clip bounds for scissor (clips to visible portion)
-            render_pass.set_scissor_rect(
-                clip_bounds.x,
-                clip_bounds.y,
-                clip_bounds.width,
-                clip_bounds.height,
-            );
-
-            render_pass.set_pipeline(&self.pipeline);
-            render_pass.set_bind_group(0, Some(&gallery_texture.bind_group), &[]);
-            render_pass.draw(0..3, 0..1);
         }
     }
 }
@@ -552,6 +476,7 @@ mod tests {
     /// the prelude defines it.
     #[test]
     fn the_gallery_shader_takes_its_sdf_from_the_prelude() {
+        crate::test_gpu::validate_shader("gallery", &gallery_shader());
         let shader = include_str!("gallery_rounded_shader.wgsl");
         assert!(
             shader.contains("rounded_box_sdf("),

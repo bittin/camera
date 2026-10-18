@@ -62,11 +62,9 @@
 
 use crate::app::preview_geometry::{BarInsets, frame_rect_on_screen, scrim_bars};
 use crate::app::state::Message;
-use crate::app::video_primitive::{
-    VIDEO_ID_FROSTED, VideoFrame, VideoPrimitive, compositor_blur_params,
-};
+use crate::app::video_primitive::{VIDEO_ID_FROSTED, VideoPrimitive, compositor_blur_params};
 use crate::app::video_widget::VideoWidgetConfig;
-use crate::backends::camera::types::{CameraFrame, PixelFormat};
+use crate::backends::camera::types::CameraFrame;
 use cosmic::iced::advanced::widget::{Operation, Tree};
 use cosmic::iced::advanced::{Clipboard, Layout, Shell, Widget, layout};
 use cosmic::iced::mouse;
@@ -104,58 +102,11 @@ fn make_primitive(
     config: &VideoWidgetConfig,
     corner_radius: f32,
 ) -> VideoPrimitive {
-    let mut primitive = VideoPrimitive::new(VIDEO_ID_FROSTED);
-    // Match the preview's transforms exactly — the colour filter among them. The
-    // filter is not a transform the tint can stand in for: with Sketch active the
-    // preview is a black-and-white pencil drawing, and a Standard backdrop blurs
-    // the raw colour scene, so the scrim bars read as a colour smear butted
-    // against a monochrome preview (found on device). `video_shader_blur.wgsl`
-    // applies it in pass 0, the one pass that samples the source frame.
-    //
-    // The radius is in logical px; `prepare()` scales it into physical px and the
-    // blur shader cuts the rounded silhouette with an antialiased SDF.
+    // Keep exactly the preview's source storage/filter/transform. Only the consumer
+    // identity, panel silhouette and material parameters differ.
+    let mut primitive = config.primitive(VIDEO_ID_FROSTED, frame);
     primitive.corner_radius = corner_radius;
-    primitive.filter_type = config.filter_type;
-    // Run the compositor's own blur, at the compositor's own parameters for the
-    // theme's frost setting (see `frost_blur_params`).
     primitive.blur_params = frost_blur_params();
-    primitive.mirror_horizontal = config.mirror_horizontal;
-    primitive.rotation = config.rotation;
-    primitive.crop_uv = config.crop_uv;
-    primitive.zoom_level = config.zoom_level;
-    primitive.letterbox_color = config.letterbox_color;
-
-    if frame.width > 0 && frame.height > 0 {
-        let stride = if frame.stride > 0 {
-            frame.stride
-        } else {
-            match frame.format {
-                PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA => frame.width * 4,
-                PixelFormat::RGB24 => frame.width * 3,
-                PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
-                    frame.width * 2
-                }
-                _ => frame.width,
-            }
-        };
-
-        // Must be the same `current_frame` the preview mints its own VideoFrame
-        // from: the pipeline maps VIDEO_ID_FROSTED onto VIDEO_ID_NORMAL's source
-        // texture and dedups the second upload by frame-data pointer, so feeding
-        // the backdrop a *different* frame would leave whichever consumer uploads
-        // first to win and the other to render the wrong pixels, silently. Give
-        // the backdrop its own frame only by giving it its own video_id.
-        let video_frame = VideoFrame {
-            id: VIDEO_ID_FROSTED,
-            width: frame.width,
-            height: frame.height,
-            data: frame.data.clone(), // refcount increment, no pixel copy
-            format: frame.format,
-            stride,
-            yuv_planes: frame.yuv_planes,
-        };
-        primitive.update_frame(video_frame);
-    }
     primitive
 }
 
@@ -468,6 +419,7 @@ mod tests {
     use crate::app::video_primitive::compositor_blur_params;
     use crate::app::video_widget::VideoContentFit;
     use crate::backends::camera::types::FrameData;
+    use crate::backends::camera::types::PixelFormat;
 
     fn frame(format: PixelFormat, stride: u32) -> Arc<CameraFrame> {
         Arc::new(CameraFrame {
@@ -574,12 +526,44 @@ mod tests {
             (PixelFormat::VYUY, 64 * 2),
             // Planar / greyscale: one byte per pixel on the first plane.
             (PixelFormat::NV12, 64),
+            (PixelFormat::NV21, 64),
+            (PixelFormat::Gray8, 64),
+            (PixelFormat::BayerRGGB, 64),
+            (PixelFormat::BayerBGGR, 64),
+            (PixelFormat::BayerGRBG, 64),
+            (PixelFormat::BayerGBRG, 64),
             (PixelFormat::I420, 64),
         ] {
             let p = make_primitive(&frame(format, 0), &config(), 0.0);
             let guard = p.data.lock().unwrap();
             let got = guard.frame.as_ref().unwrap().stride;
             assert_eq!(got, want, "{format:?} with no reported stride");
+        }
+    }
+
+    #[test]
+    fn shared_preview_adapter_keeps_odd_packed_stride_policy() {
+        for format in [
+            PixelFormat::YUYV,
+            PixelFormat::UYVY,
+            PixelFormat::YVYU,
+            PixelFormat::VYUY,
+        ] {
+            let mut f = frame(format, 0);
+            Arc::get_mut(&mut f).unwrap().width = 3;
+            let cfg = config();
+            let preview = cfg.primitive(cfg.video_id, &f);
+            let backdrop = make_primitive(&f, &cfg, 0.0);
+            for p in [preview, backdrop] {
+                let guard = p.data.lock().unwrap();
+                let video = guard.frame.as_ref().unwrap();
+                assert_eq!(video.stride, 6); // Preserve width*2, not ceil(width/2)*4.
+                assert_eq!(video.data.as_ptr(), f.data.as_ptr());
+                assert_eq!(video.id, p.video_id);
+                assert_eq!(p.crop_uv, cfg.crop_uv);
+                assert_eq!(p.rotation, cfg.rotation);
+                assert_eq!(p.zoom_level, cfg.zoom_level);
+            }
         }
     }
 
@@ -601,10 +585,13 @@ mod tests {
     /// a zero-dimension upload.
     #[test]
     fn make_primitive_skips_an_empty_frame() {
-        let mut f = frame(PixelFormat::RGBA, 0);
-        Arc::get_mut(&mut f).unwrap().width = 0;
-        let p = make_primitive(&f, &config(), 0.0);
-        assert!(p.data.lock().unwrap().frame.is_none());
+        for (width, height) in [(0, 48), (64, 0)] {
+            let mut f = frame(PixelFormat::RGBA, 0);
+            Arc::get_mut(&mut f).unwrap().width = width;
+            Arc::get_mut(&mut f).unwrap().height = height;
+            let p = make_primitive(&f, &config(), 0.0);
+            assert!(p.data.lock().unwrap().frame.is_none());
+        }
     }
 
     /// `frost_blur_params` must hand back cosmic-comp's own entry for the theme's

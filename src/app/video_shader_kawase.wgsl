@@ -61,46 +61,6 @@ var sampler_blur: sampler;
 // * `uv_scale` — `src_sub_size / tex_size`, the full-texture normalization.
 // * `kawase_offset` — upstream's `offset / 2^i` (down) or `offset / 2^(passes-i)`
 //   (up), already divided down by the Rust side.
-struct ViewportUniform {
-    viewport_size: vec2<f32>,
-    content_fit_mode: f32,
-    filter_mode: u32,
-    corner_radius: f32,
-    mirror_horizontal: u32,
-    uv_offset: vec2<f32>,
-    uv_scale: vec2<f32>,
-    crop_uv_min: vec2<f32>,
-    crop_uv_max: vec2<f32>,
-    zoom_level: f32,
-    rotation: u32,
-    bar_top_height: f32,
-    bar_bottom_height: f32,
-    kawase_offset: f32,
-    dim_factor: f32,
-    letterbox_color: vec4<f32>,
-    panel_rect: vec4<f32>,
-}
-
-@group(0) @binding(2)
-var<uniform> viewport: ViewportUniform;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-}
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-
-    let x = f32((vertex_index & 1u) << 2u) - 1.0;
-    let y = f32((vertex_index & 2u) << 1u) - 1.0;
-
-    out.position = vec4<f32>(x, -y, 0.0, 1.0);
-    out.tex_coords = vec2<f32>((x + 1.0) * 0.5, (y + 1.0) * 0.5);
-
-    return out;
-}
 
 // blur_downsample.frag: a centre tap of weight 4 plus four diagonal taps of
 // weight 1 at (±u, ±u). Total weight 8.
