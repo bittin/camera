@@ -2,11 +2,9 @@
 
 //! Format selection handlers
 //!
-//! Handles mode switching, resolution selection, framerate selection,
-//! codec/pixel format selection, and format picker interactions.
+//! Handles capture-mode switching and live format picker interactions.
 
 use crate::app::state::{AppModel, CameraMode, FileSource, Message, RecordingState};
-use crate::app::utils::{parse_codec, parse_resolution};
 use cosmic::Task;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -292,87 +290,6 @@ impl AppModel {
         }
 
         Task::batch([fit_anim_task, zoom_anim_task])
-    }
-
-    pub(crate) fn handle_select_mode(&mut self, index: usize) -> Task<cosmic::Action<Message>> {
-        if let Some(format) = self.mode_list.get(index).cloned() {
-            info!(
-                width = format.width,
-                height = format.height,
-                framerate = ?format.framerate,
-                pixel_format = %format.pixel_format,
-                "Switching to mode from consolidated dropdown"
-            );
-            self.change_format(format);
-            self.start_blur_transition();
-
-            // Re-query exposure controls to reset to defaults for new format
-            return self.query_exposure_controls_task();
-        }
-        Task::none()
-    }
-
-    pub(crate) fn handle_select_pixel_format(
-        &mut self,
-        pixel_format: String,
-    ) -> Task<cosmic::Action<Message>> {
-        info!(pixel_format = %pixel_format, "Switching to pixel format");
-        self.change_pixel_format(pixel_format);
-        self.start_blur_transition();
-
-        // Re-query exposure controls to get fresh defaults for new format
-        self.query_exposure_controls_task()
-    }
-
-    pub(crate) fn handle_select_resolution(
-        &mut self,
-        resolution_str: String,
-    ) -> Task<cosmic::Action<Message>> {
-        if let Some((width, height)) = parse_resolution(&resolution_str) {
-            info!(width, height, "Switching to resolution");
-            self.change_resolution(width, height);
-            self.zoom_level = 1.0; // Reset zoom when changing resolution
-            self.start_blur_transition();
-
-            // Re-query exposure controls to get fresh defaults for new resolution
-            return self.query_exposure_controls_task();
-        }
-        Task::none()
-    }
-
-    pub(crate) fn handle_select_framerate(
-        &mut self,
-        framerate_str: String,
-    ) -> Task<cosmic::Action<Message>> {
-        // Handle "Auto" for VFR (variable framerate) - libcamera manages dynamically
-        if framerate_str == "Auto" {
-            info!("Switching to VFR (Auto framerate - libcamera managed)");
-            self.change_framerate_optional(None);
-            self.start_blur_transition();
-            return self.query_exposure_controls_task();
-        }
-
-        if let Ok(fps) = framerate_str.parse::<u32>() {
-            info!(fps, "Switching to framerate");
-            self.change_framerate_optional(Some(fps));
-            self.start_blur_transition();
-
-            // Re-query exposure controls to get fresh defaults for new framerate
-            return self.query_exposure_controls_task();
-        }
-        Task::none()
-    }
-
-    pub(crate) fn handle_select_codec(
-        &mut self,
-        codec_str: String,
-    ) -> Task<cosmic::Action<Message>> {
-        let pixel_format = parse_codec(&codec_str);
-        info!(pixel_format = %pixel_format, "Switching to codec");
-        self.change_pixel_format(pixel_format);
-
-        // Re-query exposure controls to get fresh defaults for new codec
-        self.query_exposure_controls_task()
     }
 
     pub(crate) fn handle_picker_select_resolution(

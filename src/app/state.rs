@@ -840,17 +840,10 @@ pub struct AppModel {
     pub available_video_encoders: Vec<EncoderInfo>,
     /// Current video encoder index
     pub current_video_encoder_index: usize,
-    /// Cached mode information (for consolidated dropdown)
-    pub mode_list: Vec<crate::backends::camera::types::CameraFormat>,
     /// Dropdown options (cached for UI)
     pub camera_dropdown_options: Vec<String>,
     pub audio_dropdown_options: Vec<String>,
     pub video_encoder_dropdown_options: Vec<String>,
-    pub mode_dropdown_options: Vec<String>,
-    pub pixel_format_dropdown_options: Vec<String>,
-    pub resolution_dropdown_options: Vec<String>,
-    pub framerate_dropdown_options: Vec<String>,
-    pub codec_dropdown_options: Vec<String>,
     /// Bitrate preset dropdown options
     pub bitrate_preset_dropdown_options: Vec<String>,
     /// Theme dropdown options (Match Desktop, Dark, Light)
@@ -1611,16 +1604,6 @@ pub enum Message {
     // ===== Format Selection =====
     /// Switch between Photo/Video mode
     SetMode(CameraMode),
-    /// Select mode from dropdown by index
-    SelectMode(usize),
-    /// Select pixel format from dropdown
-    SelectPixelFormat(String),
-    /// Select resolution from dropdown
-    SelectResolution(String),
-    /// Select framerate from dropdown
-    SelectFramerate(String),
-    /// Select codec from dropdown
-    SelectCodec(String),
     /// Select resolution in picker (grouped view)
     PickerSelectResolution(u32),
     /// Select specific format in picker

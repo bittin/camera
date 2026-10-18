@@ -15,7 +15,7 @@
 //! - `format_picker`: Format/resolution picker UI and logic
 //! - `dropdowns`: Dropdown management
 //! - `camera_ops`: Camera operations (switching cameras, changing formats)
-//! - `ui`: UI widget building (legacy)
+//! - `ui`: Shared UI helpers
 //! - `view`: Main view rendering
 //! - `update`: Message handling
 //!
@@ -51,7 +51,6 @@ pub mod settings;
 mod state;
 mod ui;
 mod update;
-mod utils;
 mod video_primitive;
 #[cfg(test)]
 pub(crate) use video_primitive::tests::review_decoded_preview;
@@ -562,15 +561,9 @@ impl cosmic::Application for AppModel {
             current_audio_device_index,
             available_video_encoders,
             current_video_encoder_index,
-            mode_list: Vec::new(), // Will be updated below
             camera_dropdown_options,
             audio_dropdown_options,
             video_encoder_dropdown_options,
-            mode_dropdown_options: Vec::new(), // Will be updated below
-            pixel_format_dropdown_options: Vec::new(), // Will be updated below
-            resolution_dropdown_options: Vec::new(), // Will be updated below
-            framerate_dropdown_options: Vec::new(), // Will be updated below
-            codec_dropdown_options: Vec::new(), // Will be updated below
             bitrate_preset_dropdown_options: crate::constants::BitratePreset::ALL
                 .iter()
                 .map(|p| p.display_name().to_string())
@@ -700,13 +693,6 @@ impl cosmic::Application for AppModel {
             (false, Task::none())
         };
 
-        // Update all dropdown options based on initial format
-        app.update_mode_options();
-        app.update_resolution_options();
-        app.update_pixel_format_options();
-        app.update_framerate_options();
-        app.update_codec_options();
-
         // Preview harness only (`--preview-spoof-recording`): enter Video mode
         // with a spoofed active recording so the "recording in progress" shot can
         // be captured without running the encoder. `recording` is set to
@@ -724,7 +710,6 @@ impl cosmic::Application for AppModel {
                 stop_tx,
                 Some(Default::default()),
             );
-            app.update_mode_options();
         }
 
         // Initialize cameras — camera enum thread was started before the event loop

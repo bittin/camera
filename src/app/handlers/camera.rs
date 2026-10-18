@@ -471,12 +471,6 @@ impl AppModel {
         // Restore aspect ratio from config (or default for frame dimensions if not set)
         self.photo_aspect_ratio = self.config.photo_aspect_ratio;
 
-        self.update_mode_options();
-        self.update_resolution_options();
-        self.update_pixel_format_options();
-        self.update_framerate_options();
-        self.update_codec_options();
-
         info!("Camera initialization complete, preview will start");
 
         // Camera is now usable — request idle/suspend inhibit so the screen
@@ -604,11 +598,6 @@ impl AppModel {
                 self.current_camera_index = 0;
                 self.available_formats.clear();
                 self.active_format = None;
-                self.update_mode_options();
-                self.update_resolution_options();
-                self.update_pixel_format_options();
-                self.update_framerate_options();
-                self.update_codec_options();
                 self.camera_cancel_flag
                     .store(true, std::sync::atomic::Ordering::Release);
             } else {
