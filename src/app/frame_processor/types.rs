@@ -296,13 +296,9 @@ impl QrAction {
     fn parse_geo(content: &str) -> Option<Self> {
         let (coords, params) = content.split_once('?').unwrap_or((content, ""));
 
-        let parts: Vec<&str> = coords.split(',').collect();
-        if parts.len() < 2 {
-            return None;
-        }
-
-        let latitude = parts[0].parse::<f64>().ok()?;
-        let longitude = parts[1].parse::<f64>().ok()?;
+        let mut parts = coords.split(',');
+        let latitude = parts.next()?.parse::<f64>().ok()?;
+        let longitude = parts.next()?.parse::<f64>().ok()?;
 
         let mut label = None;
         for param in params.split('&') {
@@ -480,6 +476,30 @@ mod tests {
                 assert_eq!(body, Some("World".to_string()));
             }
             _ => panic!("Expected Email action"),
+        }
+    }
+
+    #[test]
+    fn geo_parsing_preserves_optional_altitude_and_malformed_fallbacks() {
+        for content in ["geo:12,34", "geo:12,34,56", "geo:12,34,ignored,extra"] {
+            assert_eq!(
+                QrAction::parse(content),
+                QrAction::Location {
+                    latitude: 12.0,
+                    longitude: 34.0,
+                    label: None,
+                }
+            );
+        }
+        for content in [
+            "geo:",
+            "geo:12",
+            "geo:,34",
+            "geo:12,",
+            "geo:no,34",
+            "geo:12,no",
+        ] {
+            assert_eq!(QrAction::parse(content), QrAction::Text(content.into()));
         }
     }
 
