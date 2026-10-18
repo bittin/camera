@@ -8,7 +8,6 @@
 //!
 //! - **YUV Convert**: Converts YUV frames (NV12, I420, YUYV) to RGBA on GPU
 //! - **GPU Filter**: Applies visual filters (sepia, mono, etc.) to RGBA frames
-//! - **Histogram**: Analyzes brightness distribution for exposure metering
 //!
 //! All pipelines operate on RGBA textures for uniform downstream processing.
 
@@ -17,7 +16,6 @@ pub(crate) mod demosaic_gpu;
 pub use demosaic::DemosaicMethod;
 mod gpu_convert;
 mod gpu_filter;
-mod histogram_pipeline;
 pub(crate) mod photo_scheduling;
 mod pixel_packing;
 
@@ -35,7 +33,6 @@ pub(crate) use pixel_packing::copy_rgba_pixels_to_rgb;
 pub use gpu_convert::{BayerError, GpuConvertPipeline, GpuFrameInput, get_gpu_convert_pipeline};
 pub(crate) use gpu_convert::{BayerRenderingIntent, PhotoSession, current_photo_session};
 pub use gpu_filter::{GpuFilterPipeline, apply_filter_gpu_rgba, get_gpu_filter_pipeline};
-pub use histogram_pipeline::{BrightnessMetrics, analyze_brightness_gpu};
 
 /// Precompile conversion and filter shaders, including the fused Bilinear photo path.
 ///

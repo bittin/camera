@@ -118,7 +118,6 @@ pub fn query_exposure_controls(
     // Focus controls: query on separate focus device if available
     let focus_path = focus_device_path.unwrap_or(device_path);
     controls.has_focus_auto = query_bool_control(focus_path, v4l2_controls::V4L2_CID_FOCUS_AUTO);
-    controls.focus_device_path = focus_device_path.map(String::from);
 
     // Query range controls
     controls.backlight_compensation =
@@ -146,8 +145,6 @@ pub fn query_exposure_controls(
         query_bool_control(device_path, v4l2_controls::V4L2_CID_PAN_RELATIVE);
     controls.has_tilt_relative =
         query_bool_control(device_path, v4l2_controls::V4L2_CID_TILT_RELATIVE);
-    controls.has_pan_reset = query_bool_control(device_path, v4l2_controls::V4L2_CID_PAN_RESET);
-    controls.has_tilt_reset = query_bool_control(device_path, v4l2_controls::V4L2_CID_TILT_RESET);
 
     if controls.has_any_ptz() {
         debug!(

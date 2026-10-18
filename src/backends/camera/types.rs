@@ -3,8 +3,6 @@
 
 //! Shared types for camera backends
 
-use gstreamer::buffer::{MappedBuffer, Readable};
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -150,7 +148,7 @@ impl Drop for PooledFrameData {
 /// Shared frame bytes with an opaque storage representation.
 ///
 /// Callers can clone and read frame data without depending on whether the bytes
-/// are copied, Vec-backed, pooled, or mapped from GStreamer.
+/// are copied, Vec-backed, or pooled.
 #[derive(Clone)]
 pub struct FrameData {
     storage: FrameDataStorage,
@@ -161,7 +159,6 @@ enum FrameDataStorage {
     Copied(Arc<[u8]>),
     Owned(Arc<Vec<u8>>),
     Pooled(Arc<PooledFrameData>),
-    Mapped(Arc<MappedBuffer<Readable>>),
 }
 
 impl FrameData {
@@ -179,13 +176,6 @@ impl FrameData {
         }
     }
 
-    /// Create FrameData from a mapped GStreamer buffer (zero-copy).
-    pub fn from_mapped_buffer(buffer: MappedBuffer<Readable>) -> Self {
-        Self {
-            storage: FrameDataStorage::Mapped(Arc::new(buffer)),
-        }
-    }
-
     fn from_pooled(data: PooledFrameData) -> Self {
         Self {
             storage: FrameDataStorage::Pooled(Arc::new(data)),
@@ -197,9 +187,7 @@ impl FrameData {
             pointer: self.as_ptr() as usize,
             generation: match &self.storage {
                 FrameDataStorage::Pooled(data) => data.generation,
-                FrameDataStorage::Copied(_)
-                | FrameDataStorage::Owned(_)
-                | FrameDataStorage::Mapped(_) => 0,
+                FrameDataStorage::Copied(_) | FrameDataStorage::Owned(_) => 0,
             },
         }
     }
@@ -213,21 +201,6 @@ impl FrameData {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-
-    fn clone_for_background(&self) -> Self {
-        match &self.storage {
-            FrameDataStorage::Copied(data) => Self::from_copied(Arc::clone(data)),
-            FrameDataStorage::Owned(data) => Self {
-                storage: FrameDataStorage::Owned(Arc::clone(data)),
-            },
-            FrameDataStorage::Pooled(data) => Self {
-                storage: FrameDataStorage::Pooled(Arc::clone(data)),
-            },
-            FrameDataStorage::Mapped(buffer) => {
-                Self::from_copied(Arc::from(buffer.as_ref() as &[u8]))
-            }
-        }
-    }
 }
 
 impl std::fmt::Debug for FrameData {
@@ -236,7 +209,6 @@ impl std::fmt::Debug for FrameData {
             FrameDataStorage::Copied(_) => "Copied",
             FrameDataStorage::Owned(_) => "Owned",
             FrameDataStorage::Pooled(_) => "Pooled",
-            FrameDataStorage::Mapped(_) => "Mapped",
         };
         write!(f, "FrameData::{kind}({} bytes)", self.len())
     }
@@ -248,7 +220,6 @@ impl AsRef<[u8]> for FrameData {
             FrameDataStorage::Copied(data) => data.as_ref(),
             FrameDataStorage::Owned(data) => data.as_slice(),
             FrameDataStorage::Pooled(data) => data.as_slice(),
-            FrameDataStorage::Mapped(buffer) => buffer.as_slice(),
         }
     }
 }
@@ -304,23 +275,6 @@ impl SensorRotation {
             180 => SensorRotation::Rotate180,
             270 => SensorRotation::Rotate270,
             _ => SensorRotation::None,
-        }
-    }
-
-    /// Parse rotation from a string value (degrees)
-    pub fn from_degrees(degrees: &str) -> Self {
-        match degrees.trim() {
-            "90" => SensorRotation::Rotate90,
-            "180" => SensorRotation::Rotate180,
-            "270" => SensorRotation::Rotate270,
-            "0" | "" => SensorRotation::None,
-            other => {
-                if let Ok(deg) = other.parse::<i32>() {
-                    Self::from_degrees_int(deg)
-                } else {
-                    SensorRotation::None
-                }
-            }
         }
     }
 
@@ -408,11 +362,6 @@ impl Framerate {
     /// Get the rounded integer framerate (for backwards compatibility)
     pub fn as_int(&self) -> u32 {
         self.num / self.denom
-    }
-
-    /// Format as GStreamer fraction string (e.g., "60000/1001")
-    pub fn as_gst_fraction(&self) -> String {
-        format!("{}/{}", self.num, self.denom)
     }
 
     /// Check if this framerate matches an integer fps (for config compatibility)
@@ -1009,18 +958,15 @@ impl CameraFrame {
         self.format.to_gst_format_string()
     }
 
-    /// Convert to a frame with copied data (safe for background processing)
+    /// Clone a frame for background processing, sharing its owned pixel storage.
     ///
-    /// Mapped GStreamer buffers become invalid when the pipeline is destroyed.
-    /// Use this method before sending frames to background tasks that may outlive
-    /// the pipeline.
+    /// Frame bytes remain valid independently of the capture pipeline; pooled
+    /// buffers are returned only after the last frame clone is dropped.
     pub fn to_copied(&self) -> Self {
-        let copied_data = self.data.clone_for_background();
-
         Self {
             width: self.width,
             height: self.height,
-            data: copied_data,
+            data: self.data.clone(),
             format: self.format,
             stride: self.stride,
             yuv_planes: self.yuv_planes,

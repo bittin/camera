@@ -43,8 +43,6 @@ pub mod dynamics {
 /// Live audio level data shared between a GStreamer pipeline and the UI.
 #[derive(Debug, Clone)]
 pub struct AudioLevels {
-    /// Per-input-channel peak levels in dB (before mono mix).
-    pub input_peak_db: Vec<f64>,
     /// Per-input-channel RMS levels in dB (before mono mix).
     pub input_rms_db: Vec<f64>,
     /// Mono output peak level in dB (after mix).
@@ -56,7 +54,6 @@ pub struct AudioLevels {
 impl Default for AudioLevels {
     fn default() -> Self {
         Self {
-            input_peak_db: Vec::new(),
             input_rms_db: Vec::new(),
             output_peak_db: -100.0,
             output_rms_db: -100.0,
@@ -90,7 +87,7 @@ pub fn install_level_sync_handler(pipeline: &gst::Pipeline, levels: &SharedAudio
 
         let src_name = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
 
-        let peak_db = structure
+        let peak_db: Vec<f64> = structure
             .get::<gst::glib::ValueArray>("peak")
             .ok()
             .map(|list| list.iter().filter_map(|v| v.get::<f64>().ok()).collect())
@@ -103,7 +100,6 @@ pub fn install_level_sync_handler(pipeline: &gst::Pipeline, levels: &SharedAudio
 
         if let Ok(mut lock) = levels.lock() {
             if src_name == "audio-level-input" {
-                lock.input_peak_db = peak_db;
                 lock.input_rms_db = rms_db;
             } else if src_name == "audio-level-output" {
                 lock.output_peak_db = peak_db.first().copied().unwrap_or(-100.0);

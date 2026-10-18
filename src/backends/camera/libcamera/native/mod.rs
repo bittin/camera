@@ -76,7 +76,8 @@ pub(crate) struct NativeLibcameraPipeline {
     still_frame_count: Arc<AtomicU64>,
     /// Dynamically-settable sender for direct recording path (bypasses UI thread).
     /// Set to Some(tx) when recording starts, None when recording stops.
-    /// Kept alive here so the Arc is not dropped while the capture thread holds a clone.
+    /// Retain channel ownership for the pipeline's lifetime, including after an
+    /// unexpected capture-thread exit.
     _recording_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<RecordingFrame>>>>,
 }
 

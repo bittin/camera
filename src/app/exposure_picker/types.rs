@@ -240,8 +240,6 @@ pub struct AvailableExposureControls {
     // === Focus ===
     pub has_focus_auto: bool,
     pub focus: ControlRange,
-    /// Separate V4L2 subdevice path for focus control (lens actuator)
-    pub focus_device_path: Option<String>,
 
     // === Privacy ===
     /// Whether privacy control is available (hardware privacy switch)
@@ -258,10 +256,6 @@ pub struct AvailableExposureControls {
     pub has_pan_relative: bool,
     /// Whether tilt relative control is available
     pub has_tilt_relative: bool,
-    /// Whether pan reset control is available
-    pub has_pan_reset: bool,
-    /// Whether tilt reset control is available
-    pub has_tilt_reset: bool,
 }
 
 impl AvailableExposureControls {

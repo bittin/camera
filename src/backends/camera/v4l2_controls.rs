@@ -126,7 +126,6 @@ const V4L2_CTRL_TYPE_INTEGER_MENU: u32 = 9;
 
 // ===== V4L2 Control Flags =====
 const V4L2_CTRL_FLAG_DISABLED: u32 = 0x0001;
-const V4L2_CTRL_FLAG_INACTIVE: u32 = 0x0010;
 
 // ===== V4L2 ioctl Numbers =====
 // Calculated as: (dir << 30) | (size << 16) | ('V' << 8) | nr
@@ -214,11 +213,6 @@ impl ControlInfo {
     /// Check if control is disabled
     pub fn is_disabled(&self) -> bool {
         self.flags & V4L2_CTRL_FLAG_DISABLED != 0
-    }
-
-    /// Check if control is inactive (value cannot be changed)
-    pub fn is_inactive(&self) -> bool {
-        self.flags & V4L2_CTRL_FLAG_INACTIVE != 0
     }
 }
 
@@ -393,58 +387,6 @@ pub fn query_menu_items(device_path: &str, control_id: u32, max_index: i32) -> V
     }
 
     items
-}
-
-/// Check if a control is available on the device
-pub fn has_control(device_path: &str, control_id: u32) -> bool {
-    query_control(device_path, control_id)
-        .map(|info| !info.is_disabled())
-        .unwrap_or(false)
-}
-
-/// Exposure metadata read from camera
-#[derive(Debug, Clone, Default)]
-pub struct ExposureMetadata {
-    /// Exposure time in seconds
-    pub exposure_time: Option<f64>,
-    /// ISO sensitivity
-    pub iso: Option<u32>,
-    /// Gain value (camera-specific units)
-    pub gain: Option<i32>,
-}
-
-/// Read current exposure metadata from camera
-///
-/// Reads exposure time, ISO, and gain from V4L2 controls.
-/// Returns None for values that aren't available on the device.
-pub fn read_exposure_metadata(device_path: &str) -> ExposureMetadata {
-    let mut metadata = ExposureMetadata::default();
-
-    // Read exposure time (V4L2 reports in 100µs units)
-    if let Some(exposure_100us) = get_control(device_path, V4L2_CID_EXPOSURE_ABSOLUTE) {
-        // Convert from 100µs units to seconds
-        metadata.exposure_time = Some(exposure_100us as f64 * 0.0001);
-        debug!(
-            device_path,
-            exposure_100us,
-            exposure_seconds = metadata.exposure_time,
-            "Read exposure time"
-        );
-    }
-
-    // Read ISO sensitivity
-    if let Some(iso) = get_control(device_path, V4L2_CID_ISO_SENSITIVITY) {
-        metadata.iso = Some(iso as u32);
-        debug!(device_path, iso, "Read ISO sensitivity");
-    }
-
-    // Read gain
-    if let Some(gain) = get_control(device_path, V4L2_CID_GAIN) {
-        metadata.gain = Some(gain);
-        debug!(device_path, gain, "Read gain");
-    }
-
-    metadata
 }
 
 #[cfg(test)]

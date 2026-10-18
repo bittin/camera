@@ -51,19 +51,6 @@ fn get_luminance(x: i32, y: i32) -> f32 {
     return input_frame[idx + 1u];
 }
 
-// COMMON UTILITY: BT.601 RGB to luminance conversion
-// Keep in sync across all shaders that use this.
-// Formula: Y = 0.299*R + 0.587*G + 0.114*B
-fn get_luminance_rgb(x: i32, y: i32) -> f32 {
-    let cx = clamp(x, 0, i32(params.width) - 1);
-    let cy = clamp(y, 0, i32(params.height) - 1);
-    let idx = get_pixel_idx(u32(cx), u32(cy));
-    let r = input_frame[idx];
-    let g = input_frame[idx + 1u];
-    let b = input_frame[idx + 2u];
-    return 0.299 * r + 0.587 * g + 0.114 * b;
-}
-
 //=============================================================================
 // COMMON UTILITY: Laplacian operator for edge/sharpness detection
 // Keep in sync with: noise_estimate.wgsl (compute_laplacian)

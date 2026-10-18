@@ -87,11 +87,6 @@ pub enum BurstModeSetting {
 }
 
 impl BurstModeSetting {
-    /// Check if burst mode is enabled (not Off)
-    pub fn is_enabled(&self) -> bool {
-        !matches!(self, BurstModeSetting::Off)
-    }
-
     /// Get the fixed frame count, if any
     pub fn frame_count(&self) -> Option<usize> {
         match self {

@@ -187,7 +187,6 @@ impl AppModel {
             }
             Message::ExposureBaseTimeCaptured(base_time) => {
                 info!(base_time, "Captured base exposure time for EV slider");
-                self.base_exposure_time = Some(base_time);
                 Task::none()
             }
             Message::SetBacklightCompensation(value) => {

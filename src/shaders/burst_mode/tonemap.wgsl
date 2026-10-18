@@ -115,12 +115,6 @@ fn hash12(p: vec2<f32>) -> f32 {
     return fract((p3.x + p3.y) * p3.z);
 }
 
-fn hash13(p: vec3<f32>) -> f32 {
-    var p3 = fract(p * 0.1031);
-    p3 += dot(p3, p3.zyx + 31.32);
-    return fract((p3.x + p3.y) * p3.z);
-}
-
 // Generate blue noise value at pixel position
 // Uses spatial hashing with different seeds per channel for RGB decorrelation
 fn blue_noise(x: u32, y: u32, channel: u32) -> f32 {
@@ -228,14 +222,6 @@ fn linear_to_srgb(x: f32) -> f32 {
         return x * 12.92;
     }
     return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
-}
-
-// sRGB to linear (for reference)
-fn srgb_to_linear(x: f32) -> f32 {
-    if (x <= 0.04045) {
-        return x / 12.92;
-    }
-    return pow((x + 0.055) / 1.055, 2.4);
 }
 
 //=============================================================================

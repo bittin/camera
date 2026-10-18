@@ -233,12 +233,6 @@ impl VirtualCameraPipeline {
             }
         }
     }
-
-    /// Get the pipeline's current state
-    pub fn state(&self) -> gstreamer::State {
-        let (_success, state, _pending) = self.pipeline.state(gstreamer::ClockTime::ZERO);
-        state
-    }
 }
 
 impl Drop for VirtualCameraPipeline {

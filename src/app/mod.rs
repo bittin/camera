@@ -504,7 +504,6 @@ impl cosmic::Application for AppModel {
                 model.activate_position(0); // Start with Auto
                 model
             },
-            base_exposure_time: None,
             burst_mode: BurstModeState::default(),
             auto_detected_frame_count: 1, // Start with 1 (no HDR+) until first brightness evaluation
             hdr_override_disabled: false,
@@ -583,10 +582,7 @@ impl cosmic::Application for AppModel {
                 fl!("controls-position-left"),
                 fl!("controls-position-right"),
             ],
-            burst_mode_merge_dropdown_options: vec![
-                fl!("burst-mode-quality"),
-                fl!("burst-mode-fast"),
-            ],
+
             burst_mode_frame_count_dropdown_options: vec![
                 fl!("hdr-plus-off"),
                 fl!("hdr-plus-auto"),

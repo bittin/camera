@@ -212,20 +212,6 @@ impl Default for BurstModeConfig {
     }
 }
 
-/// Burst mode processing stages (internal to pipeline)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BurstModePipelineStage {
-    #[default]
-    Idle,
-    Capturing,
-    SelectingReference,
-    Aligning,
-    Merging,
-    ToneMapping,
-    Complete,
-    Error,
-}
-
 /// GPU-resident aligned frame - stays on GPU to avoid CPU round-trips
 /// This eliminates ~192MB per frame of CPU memory and avoids GPU-CPU-GPU transfers
 pub struct GpuAlignedFrame {

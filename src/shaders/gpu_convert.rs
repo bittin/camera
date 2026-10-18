@@ -3114,14 +3114,6 @@ impl GpuConvertPipeline {
         [self.tex_uv.as_ref().unwrap(), self.tex_v.as_ref().unwrap()]
             .map(|texture| (texture.width(), texture.height()))
     }
-
-    pub fn device(&self) -> &Arc<wgpu::Device> {
-        &self.device
-    }
-
-    pub fn queue(&self) -> &Arc<wgpu::Queue> {
-        &self.queue
-    }
 }
 
 /// Cached global pipeline instance

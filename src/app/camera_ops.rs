@@ -70,16 +70,6 @@ impl AppModel {
         let _ = self.transition_state.start();
     }
 
-    /// Start a blur transition with custom duration
-    pub fn start_blur_transition_with_duration(&mut self, duration_ms: u64, disable_ui: bool) {
-        self.blur_frame_rotation = self.current_frame_rotation;
-        self.blur_frame_mirror = self.should_mirror_preview();
-        self.blur_frame_zoom = self.current_zoom_level();
-        let _ = self
-            .transition_state
-            .start_with_duration(duration_ms, disable_ui);
-    }
-
     /// Save current camera and format settings to config
     /// Saves settings for both photo and video modes per camera
     pub fn save_settings(&mut self) {

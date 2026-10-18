@@ -60,10 +60,7 @@ pub struct VirtualCameraManager {
     current_filter: FilterType,
     /// Whether currently streaming
     streaming: bool,
-    /// Output resolution (width, height)
-    output_size: (u32, u32),
-    /// Whether GPU acceleration is available
-    gpu_available: bool,
+
     /// Whether to horizontally flip output (for file sources, to counteract app auto-mirroring)
     flip_horizontal: bool,
 }
@@ -75,8 +72,7 @@ impl VirtualCameraManager {
             pipeline: None,
             current_filter: FilterType::Standard,
             streaming: false,
-            output_size: (1280, 720),
-            gpu_available: false,
+
             flip_horizontal: false,
         }
     }
@@ -108,7 +104,7 @@ impl VirtualCameraManager {
         pipeline.start()?;
 
         self.pipeline = Some(pipeline);
-        self.output_size = (width, height);
+
         self.streaming = true;
 
         info!("Virtual camera started successfully");
@@ -204,7 +200,6 @@ impl VirtualCameraManager {
                 if let Some(renderer) = guard.as_mut() {
                     match renderer.apply_filter(frame, self.current_filter) {
                         Ok(mut rgba_data) => {
-                            self.gpu_available = true;
                             // Apply horizontal flip if needed (for file sources)
                             if self.flip_horizontal {
                                 Self::flip_horizontal_rgba(
@@ -218,7 +213,6 @@ impl VirtualCameraManager {
                         }
                         Err(e) => {
                             warn!(error = ?e, "GPU filter failed, using passthrough");
-                            self.gpu_available = false;
                         }
                     }
                 }
@@ -290,21 +284,6 @@ impl VirtualCameraManager {
                 }
             }
         }
-    }
-
-    /// Get the current filter
-    pub fn current_filter(&self) -> FilterType {
-        self.current_filter
-    }
-
-    /// Get the output size
-    pub fn output_size(&self) -> (u32, u32) {
-        self.output_size
-    }
-
-    /// Check if GPU filtering is being used
-    pub fn is_gpu_accelerated(&self) -> bool {
-        self.gpu_available
     }
 }
 

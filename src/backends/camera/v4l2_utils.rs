@@ -352,26 +352,6 @@ pub fn scan_video_device_nodes() -> std::collections::BTreeSet<std::ffi::OsStrin
         .collect()
 }
 
-/// Detect CSI-2 bit depth from packed stride relative to image width.
-///
-/// Returns `Some(10)`, `Some(12)`, or `Some(14)` for recognized CSI-2 packed formats.
-/// Returns `None` if the stride doesn't match any known packing ratio.
-pub fn detect_csi2_bit_depth(width: u32, packed_stride: u32) -> Option<u32> {
-    let min_stride_10 = (width * 5).div_ceil(4);
-    let min_stride_12 = (width * 3).div_ceil(2);
-    let min_stride_14 = (width * 7).div_ceil(4);
-
-    if packed_stride >= min_stride_10 && packed_stride < min_stride_12 {
-        Some(10)
-    } else if packed_stride >= min_stride_12 && packed_stride < min_stride_14 {
-        Some(12)
-    } else if packed_stride >= min_stride_14 && packed_stride < width * 2 {
-        Some(14)
-    } else {
-        None
-    }
-}
-
 // ===== V4L2 Format Enumeration =====
 
 /// VIDIOC_ENUM_FMT ioctl number (v4l2_fmtdesc: 64 bytes, nr=2)

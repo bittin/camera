@@ -6,7 +6,6 @@
 //! hotplug events, and mirror/virtual camera settings.
 
 use crate::app::state::{AppModel, CameraMode, Message, RecordingState, VirtualCameraState};
-use crate::backends::camera::v4l2_controls;
 use cosmic::Task;
 use std::sync::Arc;
 use tracing::{debug, error, info};
@@ -879,28 +878,5 @@ impl AppModel {
             self.privacy_cover_closed = is_closed;
         }
         Task::none()
-    }
-
-    /// Check privacy cover status for the current camera
-    ///
-    /// Returns a task that sends PrivacyCoverStatusChanged if camera has privacy control.
-    pub fn check_privacy_status(&self) -> Option<Task<cosmic::Action<Message>>> {
-        // Only check if camera has privacy control
-        if !self.available_exposure_controls.has_privacy {
-            return None;
-        }
-
-        let device_path = self.get_v4l2_device_path()?;
-        let path = device_path.clone();
-
-        Some(Task::perform(
-            async move {
-                // Read the privacy control value (1 = closed/blocked, 0 = open)
-                v4l2_controls::get_control(&path, v4l2_controls::V4L2_CID_PRIVACY)
-                    .map(|v| v != 0)
-                    .unwrap_or(false)
-            },
-            |is_closed| cosmic::Action::App(Message::PrivacyCoverStatusChanged(is_closed)),
-        ))
     }
 }

@@ -747,9 +747,6 @@ pub struct AppModel {
     pub available_exposure_controls: AvailableExposureControls,
     /// Segmented button model for exposure mode (Auto/Manual)
     pub exposure_mode_model: cosmic::widget::segmented_button::SingleSelectModel,
-    /// Base exposure time (in 100µs units) captured when entering manual mode
-    /// Used to calculate EV-based adjustments in non-advanced mode
-    pub base_exposure_time: Option<i32>,
     /// Burst mode state (enabled, capture/processing progress)
     pub burst_mode: BurstModeState,
     /// Auto-detected frame count based on current scene brightness (1-8)
@@ -854,8 +851,7 @@ pub struct AppModel {
     pub overlay_effect_dropdown_options: Vec<String>,
     /// Capture-controls position dropdown options (Bottom, Left, Right).
     pub controls_position_dropdown_options: Vec<String>,
-    /// Burst mode merge mode dropdown options (Quality FFT, Fast Spatial)
-    pub burst_mode_merge_dropdown_options: Vec<String>,
+
     /// Burst mode frame count dropdown options (Auto, 4, 6, 8 frames)
     pub burst_mode_frame_count_dropdown_options: Vec<String>,
     /// Photo output format dropdown options (JPEG, PNG, DNG)
@@ -1171,37 +1167,6 @@ pub enum PhotoAspectRatio {
 }
 
 impl PhotoAspectRatio {
-    /// Tolerance for aspect ratio matching (allows for minor pixel rounding differences)
-    const RATIO_TOLERANCE: f32 = 0.02;
-
-    /// Detect which defined aspect ratio matches the given frame dimensions
-    /// Returns None if the native ratio doesn't match any defined ratio
-    pub fn from_frame_dimensions(width: u32, height: u32) -> Option<Self> {
-        if height == 0 {
-            return None;
-        }
-        let frame_ratio = width as f32 / height as f32;
-
-        // Check each defined ratio
-        if (frame_ratio - 4.0 / 3.0).abs() < Self::RATIO_TOLERANCE {
-            Some(PhotoAspectRatio::Ratio4x3)
-        } else if (frame_ratio - 16.0 / 9.0).abs() < Self::RATIO_TOLERANCE {
-            Some(PhotoAspectRatio::Ratio16x9)
-        } else if (frame_ratio - 2.0).abs() < Self::RATIO_TOLERANCE {
-            Some(PhotoAspectRatio::Ratio2x1)
-        } else if (frame_ratio - 1.0).abs() < Self::RATIO_TOLERANCE {
-            Some(PhotoAspectRatio::Ratio1x1)
-        } else {
-            None
-        }
-    }
-
-    /// Get the default aspect ratio for given frame dimensions
-    /// If native matches a defined ratio, use that; otherwise use Native
-    pub fn default_for_frame(width: u32, height: u32) -> Self {
-        Self::from_frame_dimensions(width, height).unwrap_or(PhotoAspectRatio::Native)
-    }
-
     /// Cycle to next aspect ratio: Native → 4:3 → 16:9 → 2:1 → 1:1 → Native
     pub fn next_for_frame(&self, _frame_width: u32, _frame_height: u32) -> Self {
         match self {
@@ -1294,22 +1259,6 @@ impl PhotoAspectRatio {
             let offset = (1.0 - scale) / 2.0;
             Some((0.0, offset, 1.0, 1.0 - offset))
         }
-    }
-
-    /// Get the default aspect ratio accounting for sensor rotation
-    /// For 90°/270° rotations, the frame dimensions are swapped after GStreamer applies rotation
-    pub fn default_for_frame_with_rotation(
-        width: u32,
-        height: u32,
-        rotation: crate::backends::camera::types::SensorRotation,
-    ) -> Self {
-        // For 90°/270° rotations, swap dimensions to match the rotated frame
-        let (effective_width, effective_height) = if rotation.swaps_dimensions() {
-            (height, width)
-        } else {
-            (width, height)
-        };
-        Self::default_for_frame(effective_width, effective_height)
     }
 }
 
