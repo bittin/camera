@@ -67,7 +67,7 @@ impl AppModel {
         self.blur_frame_rotation = self.current_frame_rotation;
         self.blur_frame_mirror = self.should_mirror_preview();
         self.blur_frame_zoom = self.current_zoom_level();
-        let _ = self.transition_state.start();
+        self.transition_state.start();
     }
 
     /// Save current camera and format settings to config

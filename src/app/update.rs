@@ -50,7 +50,6 @@ impl AppModel {
                 | Message::ExposureControlsQueried(..)
                 | Message::ExposureControlApplied
                 | Message::ExposureControlFailed(_)
-                | Message::ExposureBaseTimeCaptured(_)
                 | Message::WhiteBalanceToggled(_)
                 | Message::PhotoSaved(_)
                 | Message::PhotoCaptureAcquired(_)
@@ -59,7 +58,6 @@ impl AppModel {
                 | Message::PhotoEncodingWatchdog(_)
                 | Message::ShutdownRecorderStopped(_)
                 | Message::ShutdownDrainWatchdog
-                | Message::BurstModeProgress(_)
                 | Message::BurstModeFramesCollected
                 | Message::BurstModeRawFramesCaptured(_)
                 | Message::BurstModeComplete(_)
@@ -146,10 +144,6 @@ impl AppModel {
                 self.set_v4l2_tilt(value);
                 Task::none()
             }
-            Message::SetZoomAbsolute(value) => {
-                self.set_v4l2_zoom(value);
-                Task::none()
-            }
             Message::ResetPanTilt => {
                 self.reset_pan_tilt();
                 Task::none()
@@ -184,10 +178,6 @@ impl AppModel {
             }
             Message::ExposureControlFailed(error) => {
                 warn!(error = %error, "Exposure control failed");
-                Task::none()
-            }
-            Message::ExposureBaseTimeCaptured(base_time) => {
-                info!(base_time, "Captured base exposure time for EV slider");
                 Task::none()
             }
             Message::SetBacklightCompensation(value) => {
@@ -245,7 +235,6 @@ impl AppModel {
             Message::ToggleBurstMode => self.handle_toggle_burst_mode(),
             Message::ToggleMotionPhotoCapture => self.handle_toggle_motion_photo_capture(),
             Message::SetBurstModeFrameCount(index) => self.handle_set_burst_mode_frame_count(index),
-            Message::BurstModeProgress(progress) => self.handle_burst_mode_progress(progress),
             Message::BurstModeFramesCollected => self.handle_burst_mode_frames_collected(),
             Message::BurstModeRawFramesCaptured(result) => {
                 self.handle_burst_mode_raw_frames_captured(result)
@@ -510,20 +499,20 @@ impl AppModel {
                         rec.action,
                         crate::app::keybind::SerializedKeyBind::from(&combo),
                     );
-                    self.persist_config();
+                    self.persist_config_async();
                 }
                 Task::none()
             }
             Message::ResetKeyBindToDefault(action) => {
                 self.config.key_bindings.remove(&action);
                 self.bindings.reset_to_default(action);
-                self.persist_config();
+                self.persist_config_async();
                 Task::none()
             }
             Message::ResetAllKeyBindings => {
                 self.config.key_bindings.clear();
                 self.bindings = crate::app::keybind::Bindings::defaults();
-                self.persist_config();
+                self.persist_config_async();
                 Task::none()
             }
 

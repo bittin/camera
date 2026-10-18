@@ -42,14 +42,14 @@ impl AppModel {
                 .qr_detection_scheduler
                 .has_stale_detection_in_progress()
             {
-                self.pending_qr_frame = Some(Arc::new(frame.to_copied()));
+                self.pending_qr_frame = Some(Arc::clone(frame));
             }
             return Task::none();
         };
 
         self.pending_qr_frame = None;
-        // Mapped camera buffers may be reused while detection is running.
-        let frame = Arc::new(frame.to_copied());
+        // CameraFrame owns its bytes; retain the immutable frame through detection.
+        let frame = Arc::clone(frame);
         Task::perform(
             async move {
                 crate::app::frame_processor::tasks::QrDetector::new()
@@ -243,7 +243,7 @@ impl AppModel {
         self.turn_off_flash_hardware();
 
         self.switch_camera_or_mode(new_index, self.mode);
-        let _ = self.transition_state.start();
+        self.transition_state.start();
 
         // Force subscription restart in case the index didn't change
         // (e.g., hotplug removed current camera and we fall back to index 0 again)
@@ -776,7 +776,7 @@ impl AppModel {
         self.blur_frame_rotation = self.current_frame_rotation;
         self.blur_frame_mirror = self.should_mirror_preview();
         self.blur_frame_zoom = self.current_zoom_level();
-        let _ = self.transition_state.start();
+        self.transition_state.start();
         Task::none()
     }
 

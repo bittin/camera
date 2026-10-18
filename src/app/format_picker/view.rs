@@ -19,7 +19,7 @@ impl AppModel {
         let spacing = cosmic::theme::spacing();
 
         // Group formats by resolution label
-        let (unique_resolutions, resolution_groups) = self.group_formats_by_label();
+        let resolution_groups = self.group_formats_by_label();
 
         // Determine currently selected resolution for picker
         let selected_res = self
@@ -39,8 +39,9 @@ impl AppModel {
                     .width(Length::Fixed(ui::PICKER_LABEL_WIDTH)),
             );
 
-        for &(res_label, width) in &unique_resolutions {
-            let centered_text = widget::container(widget::text(res_label))
+        for group in &resolution_groups {
+            let width = group.width;
+            let centered_text = widget::container(widget::text(group.label))
                 .width(Length::Fill)
                 .align_x(cosmic::iced::alignment::Horizontal::Center);
 
@@ -74,14 +75,17 @@ impl AppModel {
                     .width(Length::Fixed(ui::PICKER_LABEL_WIDTH)),
             );
 
-        if let Some(formats) = resolution_groups.get(&selected_res) {
+        if let Some(group) = resolution_groups
+            .iter()
+            .find(|group| group.width == selected_res)
+        {
             use crate::backends::camera::types::Framerate;
             use std::collections::HashSet;
             let mut seen_fps: HashSet<Framerate> = HashSet::new();
             let mut fps_buttons: Vec<(Framerate, usize)> = Vec::new();
 
             // Collect unique framerates
-            for &(idx, fmt) in formats {
+            for &(idx, fmt) in &group.formats {
                 if let Some(fps) = fmt.framerate
                     && seen_fps.insert(fps)
                 {

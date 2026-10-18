@@ -59,6 +59,7 @@ mod view;
 mod window_controls;
 
 // Re-export public API
+use crate::backends::camera::types::{CameraDevice, CameraFormat};
 use crate::config::Config;
 use crate::fl;
 use cosmic::cosmic_config::{self, CosmicConfigEntry};
@@ -214,6 +215,29 @@ fn pick_startup_camera_index(
         );
     }
     0
+}
+
+/// Resolve camera identity and formats without re-querying an explicitly cached
+/// camera-zero result (including an empty result). Callers retain their warm or
+/// asynchronous scheduling and choose when to construct the backend.
+fn resolve_startup_camera(
+    cameras: Vec<CameraDevice>,
+    cached_default_formats: Option<Vec<CameraFormat>>,
+    last_path: Option<&str>,
+    failed_paths: &[String],
+    query_formats: impl FnOnce(&CameraDevice) -> Vec<CameraFormat>,
+) -> (Vec<CameraDevice>, usize, Vec<CameraFormat>) {
+    let index = pick_startup_camera_index(&cameras, last_path, failed_paths);
+    let formats = if let Some(formats) = cached_default_formats.filter(|_| index == 0) {
+        formats
+    } else {
+        cameras
+            .get(index)
+            .filter(|camera| !camera.path.is_empty())
+            .map(query_formats)
+            .unwrap_or_default()
+    };
+    (cameras, index, formats)
 }
 
 const REPOSITORY: &str = "https://github.com/cosmic-utils/cosmic-ext-camera";
@@ -612,13 +636,7 @@ impl cosmic::Application for AppModel {
                 fl!("guide-diagonal"),
                 fl!("guide-crosshair"),
             ],
-            default_mode_dropdown_options: {
-                let mut opts = vec![fl!("mode-photo"), fl!("mode-video"), fl!("mode-timelapse")];
-                if virtual_camera_enabled {
-                    opts.push(fl!("mode-virtual"));
-                }
-                opts
-            },
+            default_mode_dropdown_options: dropdowns::default_mode_options(virtual_camera_enabled),
             timelapse: TimelapseState::default(),
             timelapse_interval_dropdown_options: crate::config::TimelapseInterval::ALL
                 .iter()
@@ -626,7 +644,6 @@ impl cosmic::Application for AppModel {
                 .collect(),
             device_info_visible: false,
             audio_probe: None,
-            probe_audio_levels: None,
             audio_levels_snapshot: None,
             screen_width: 0.0,
             screen_height: 0.0,
@@ -669,21 +686,13 @@ impl cosmic::Application for AppModel {
                 .expect("camera enumeration handle");
             let (cameras, default_formats) =
                 handle.join().unwrap_or_else(|_| (Vec::new(), Vec::new()));
-            let camera_index = pick_startup_camera_index(
-                &cameras,
+            let (cameras, camera_index, formats) = resolve_startup_camera(
+                cameras,
+                Some(default_formats),
                 last_camera_path.as_deref(),
                 &failed_camera_paths,
+                |camera| crate::backends::camera::create_backend().get_formats(camera, false),
             );
-            let formats = if camera_index == 0 {
-                default_formats
-            } else {
-                let backend = crate::backends::camera::create_backend();
-                cameras
-                    .get(camera_index)
-                    .filter(|camera| !camera.path.is_empty())
-                    .map(|camera| backend.get_formats(camera, false))
-                    .unwrap_or_default()
-            };
             let task = app.handle_cameras_initialized(cameras, camera_index, formats);
             (true, task)
         } else {
@@ -735,29 +744,15 @@ impl cosmic::Application for AppModel {
                         handle.join().unwrap_or_else(|_| (Vec::new(), Vec::new()));
                     info!(count = cameras.len(), "Prewarmed camera enumeration ready");
 
-                    let camera_index = pick_startup_camera_index(
-                        &cameras,
+                    resolve_startup_camera(
+                        cameras,
+                        Some(default_formats),
                         last_camera_path.as_deref(),
                         &failed_paths,
-                    );
-
-                    if camera_index == 0 {
-                        // Prewarm already queried formats for camera[0]
-                        (cameras, camera_index, default_formats)
-                    } else {
-                        // Selected camera is not camera[0] — query its formats
-                        let backend = crate::backends::camera::create_backend();
-                        let formats = if let Some(camera) = cameras.get(camera_index) {
-                            if !camera.path.is_empty() {
-                                backend.get_formats(camera, false)
-                            } else {
-                                Vec::new()
-                            }
-                        } else {
-                            Vec::new()
-                        };
-                        (cameras, camera_index, formats)
-                    }
+                        |camera| {
+                            crate::backends::camera::create_backend().get_formats(camera, false)
+                        },
+                    )
                 },
                 |(cameras, index, formats)| {
                     cosmic::Action::App(Message::CamerasInitialized(cameras, index, formats))
@@ -773,23 +768,13 @@ impl cosmic::Application for AppModel {
                     let cameras = backend.enumerate_cameras();
                     info!(count = cameras.len(), "Found camera(s)");
 
-                    let camera_index = pick_startup_camera_index(
-                        &cameras,
+                    resolve_startup_camera(
+                        cameras,
+                        None,
                         last_camera_path.as_deref(),
                         &failed_paths,
-                    );
-
-                    let formats = if let Some(camera) = cameras.get(camera_index) {
-                        if !camera.path.is_empty() {
-                            backend.get_formats(camera, false)
-                        } else {
-                            Vec::new()
-                        }
-                    } else {
-                        Vec::new()
-                    };
-
-                    (cameras, camera_index, formats)
+                        |camera| backend.get_formats(camera, false),
+                    )
                 },
                 |(cameras, index, formats)| {
                     cosmic::Action::App(Message::CamerasInitialized(cameras, index, formats))
@@ -1797,5 +1782,81 @@ mod tests {
     #[test]
     fn window_title_uses_localized_app_name() {
         assert_eq!(app_title(), fl!("camera"));
+    }
+}
+
+#[cfg(test)]
+mod startup_camera_tests {
+    use super::*;
+
+    fn cameras(paths: &[&str]) -> Vec<CameraDevice> {
+        paths
+            .iter()
+            .map(|path| CameraDevice {
+                name: (*path).into(),
+                path: (*path).into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn startup_resolver_preserves_selection_cache_and_query_boundaries() {
+        // Prewarm's empty formats are authoritative, including failed/empty camera-zero fallback.
+        for paths in [&["a", "b"][..], &[""][..], &[][..]] {
+            let (_, index, formats) =
+                resolve_startup_camera(cameras(paths), Some(Vec::new()), None, &[], |_| {
+                    panic!("cached camera-zero formats must not be queried again")
+                });
+            assert_eq!(index, 0);
+            assert!(formats.is_empty());
+        }
+        for (paths, last, failed, expected_index, expected_query) in [
+            (vec!["a", "b"], None, vec![], 0, Some("a")),
+            (vec!["a", "b"], Some("b"), vec![], 1, Some("b")),
+            (vec!["a", "b"], Some("a"), vec!["a"], 1, Some("b")),
+            (vec!["a", "b"], Some("b"), vec!["a", "b"], 0, Some("a")),
+            (vec!["", "b"], None, vec![], 1, Some("b")),
+            (vec![""], None, vec![], 0, None),
+            (vec![], None, vec![], 0, None),
+        ] {
+            let mut queried = None;
+            let failed: Vec<_> = failed.into_iter().map(str::to_string).collect();
+            let (resolved, index, formats) =
+                resolve_startup_camera(cameras(&paths), None, last, &failed, |camera| {
+                    queried = Some(camera.path.clone());
+                    Vec::new()
+                });
+            assert_eq!(
+                resolved.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+                paths
+            );
+            assert_eq!(index, expected_index);
+            assert_eq!(queried.as_deref(), expected_query);
+            assert!(formats.is_empty());
+        }
+        let cached = vec![CameraFormat {
+            width: 640,
+            height: 480,
+            framerate: None,
+            hardware_accelerated: false,
+            pixel_format: "YUYV".into(),
+        }];
+        let (_, _, formats) =
+            resolve_startup_camera(cameras(&["a"]), Some(cached.clone()), None, &[], |_| {
+                panic!("populated cache is authoritative too")
+            });
+        assert_eq!(formats, cached);
+        let (_, index, _) = resolve_startup_camera(
+            cameras(&["a", "b"]),
+            Some(cached),
+            Some("b"),
+            &[],
+            |camera| {
+                assert_eq!(camera.path, "b");
+                Vec::new()
+            },
+        );
+        assert_eq!(index, 1);
     }
 }

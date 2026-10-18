@@ -124,19 +124,7 @@ impl AppModel {
     }
 
     pub(crate) fn handle_reset_exposure_compensation(&mut self) -> Task<cosmic::Action<Message>> {
-        // Reset local state
-        if let Some(ref mut settings) = self.exposure_settings {
-            settings.exposure_compensation = 0;
-        }
-
-        let Some(device_path) = self.get_v4l2_device_path() else {
-            return Task::none();
-        };
-
-        info!("Resetting exposure compensation");
-
-        // Reset EV bias to 0 (only works on cameras that support it)
-        set_control_task(device_path, v4l2_controls::V4L2_CID_AUTO_EXPOSURE_BIAS, 0)
+        self.handle_set_exposure_compensation(0)
     }
 
     pub(crate) fn handle_set_exposure_time(&mut self, value: i32) -> Task<cosmic::Action<Message>> {

@@ -999,6 +999,25 @@ impl AppModel {
         Task::none()
     }
 
+    fn start_photo_timer(&mut self) -> Task<cosmic::Action<Message>> {
+        let seconds = self.photo_timer_setting.seconds();
+        info!(seconds, "Starting photo timer countdown");
+        self.photo_timer_countdown = Some(seconds);
+        self.photo_timer_tick_start = Some(std::time::Instant::now());
+        Self::delay_task(1000, Message::PhotoTimerTick)
+    }
+
+    fn start_preflash(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.use_hardware_flash() {
+            info!("Flash enabled - turning on hardware flash before capture");
+            self.turn_on_flash_hardware();
+        } else {
+            info!("Flash enabled - showing screen flash before capture");
+            self.flash.active = true;
+        }
+        Self::delay_task(1000, Message::FlashComplete)
+    }
+
     pub(crate) fn handle_capture(&mut self) -> Task<cosmic::Action<Message>> {
         // If quick-record is active, ignore direct Capture messages
         // (the quick-record state machine handles capture)
@@ -1027,23 +1046,12 @@ impl AppModel {
         if self.mode == CameraMode::Photo
             && self.photo_timer_setting != crate::app::state::PhotoTimerSetting::Off
         {
-            let seconds = self.photo_timer_setting.seconds();
-            info!(seconds, "Starting photo timer countdown");
-            self.photo_timer_countdown = Some(seconds);
-            self.photo_timer_tick_start = Some(std::time::Instant::now());
-            return Self::delay_task(1000, Message::PhotoTimerTick);
+            return self.start_photo_timer();
         }
 
         // Normal capture flow (with flash check)
         if self.mode == CameraMode::Photo && self.flash.enabled && !self.flash.active {
-            if self.use_hardware_flash() {
-                info!("Flash enabled - turning on hardware flash before capture");
-                self.turn_on_flash_hardware();
-            } else {
-                info!("Flash enabled - showing screen flash before capture");
-                self.flash.active = true;
-            }
-            return Self::delay_task(1000, Message::FlashComplete);
+            return self.start_preflash();
         }
         self.capture_photo()
     }
@@ -1155,14 +1163,7 @@ impl AppModel {
     }
 
     pub(crate) fn handle_cycle_photo_aspect_ratio(&mut self) -> Task<cosmic::Action<Message>> {
-        // Get frame dimensions to determine if native matches a defined ratio
-        let (width, height) = self
-            .current_frame
-            .as_ref()
-            .map(|f| (f.width, f.height))
-            .unwrap_or((0, 0));
-
-        self.photo_aspect_ratio = self.photo_aspect_ratio.next_for_frame(width, height);
+        self.photo_aspect_ratio = self.photo_aspect_ratio.next();
         info!(aspect_ratio = ?self.photo_aspect_ratio, "Photo aspect ratio changed");
 
         self.config.photo_aspect_ratio = self.photo_aspect_ratio;
@@ -1203,14 +1204,7 @@ impl AppModel {
                 self.animate_capture_scale(1.0);
                 // Check if flash is enabled
                 if self.flash.enabled && !self.flash.active {
-                    if self.use_hardware_flash() {
-                        info!("Flash enabled - turning on hardware flash before capture");
-                        self.turn_on_flash_hardware();
-                    } else {
-                        info!("Flash enabled - showing screen flash before capture");
-                        self.flash.active = true;
-                    }
-                    return Self::delay_task(1000, Message::FlashComplete);
+                    return self.start_preflash();
                 }
                 return self.capture_photo();
             } else {
@@ -1777,24 +1771,13 @@ impl AppModel {
                 if self.mode == CameraMode::Photo
                     && self.photo_timer_setting != crate::app::state::PhotoTimerSetting::Off
                 {
-                    let seconds = self.photo_timer_setting.seconds();
-                    info!(seconds, "Starting photo timer countdown");
-                    self.photo_timer_countdown = Some(seconds);
-                    self.photo_timer_tick_start = Some(std::time::Instant::now());
-                    return Self::delay_task(1000, Message::PhotoTimerTick);
+                    return self.start_photo_timer();
                 }
 
                 // Screen flash (front camera) or hardware flash (back camera)
                 self.animate_capture_scale(1.0);
                 if self.flash.enabled && !self.flash.active {
-                    if self.use_hardware_flash() {
-                        info!("Flash enabled - turning on hardware flash before capture");
-                        self.turn_on_flash_hardware();
-                    } else {
-                        info!("Flash enabled - showing screen flash before capture");
-                        self.flash.active = true;
-                    }
-                    return Self::delay_task(1000, Message::FlashComplete);
+                    return self.start_preflash();
                 }
 
                 // No timer or flash — use the zero-shutter-lag frame
@@ -2152,21 +2135,6 @@ impl AppModel {
         Task::batch([start_signal, recording_task])
     }
 
-    /// Handle burst mode progress update
-    pub(crate) fn handle_burst_mode_progress(
-        &mut self,
-        progress: f32,
-    ) -> Task<cosmic::Action<Message>> {
-        self.burst_mode.processing_progress = progress;
-
-        debug!(
-            progress,
-            stage = ?self.burst_mode.stage,
-            "Burst mode progress"
-        );
-        Task::none()
-    }
-
     /// Handle burst mode capture complete
     pub(crate) fn handle_burst_mode_complete(
         &mut self,
@@ -2185,7 +2153,7 @@ impl AppModel {
         self.blur_frame_rotation = self.current_frame_rotation;
         self.blur_frame_mirror = self.should_mirror_preview();
         self.blur_frame_zoom = self.current_zoom_level();
-        let _ = self.transition_state.start_with_duration(200, false);
+        self.transition_state.start_with_duration(200, false);
 
         // Restart the camera stream after HDR+ processing
         // The stream was stopped when processing began to free GPU resources.
@@ -2755,6 +2723,73 @@ mod tests {
         })
         .await
         .expect("capture task must make progress")
+    }
+
+    #[tokio::test]
+    async fn direct_and_release_timers_keep_countdown_and_tick_task() {
+        use crate::app::state::PhotoTimerSetting::{Sec3, Sec5, Sec10};
+        for setting in [Sec3, Sec5, Sec10] {
+            for release in [false, true] {
+                let mut model = raw_queue_model();
+                model.photo_timer_setting = setting;
+                let task = if release {
+                    drop(model.handle_capture_button_pressed());
+                    model.handle_capture_button_released()
+                } else {
+                    model.handle_capture()
+                };
+                assert_eq!(model.photo_timer_countdown, Some(setting.seconds()));
+                assert!(model.photo_timer_tick_start.is_some());
+                assert!(!model.flash.active && !model.is_capturing);
+                let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+                assert!(matches!(
+                    next_capture_message(&mut stream).await,
+                    super::Message::PhotoTimerTick
+                ));
+                drop(model.handle_abort_photo_timer());
+                assert!(
+                    model.photo_timer_countdown.is_none() && model.photo_timer_tick_start.is_none()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn all_preflash_callers_keep_screen_flash_delay_and_close_guard() {
+        for location in [None, Some("front"), Some("back")] {
+            for route in 0..3 {
+                let mut model = raw_queue_model();
+                model.available_cameras[0].camera_location = location.map(str::to_string);
+                // No flash devices exist in this test: back cameras fall back to screen too.
+                assert!(model.flash.hardware.devices.is_empty());
+                model.flash.enabled = true;
+                let task = match route {
+                    0 => model.handle_capture(),
+                    1 => {
+                        drop(model.handle_capture_button_pressed());
+                        model.handle_capture_button_released()
+                    }
+                    _ => {
+                        model.photo_timer_countdown = Some(1);
+                        model.photo_timer_tick_start = Some(std::time::Instant::now());
+                        model.handle_photo_timer_tick()
+                    }
+                };
+                assert!(model.flash.active && !model.is_capturing);
+                assert!(model.photo_timer_countdown.is_none());
+                let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+                assert!(matches!(
+                    next_capture_message(&mut stream).await,
+                    super::Message::FlashComplete
+                ));
+                model.pending_close = true;
+                assert!(
+                    cosmic::iced::runtime::task::into_stream(model.handle_flash_complete())
+                        .is_none()
+                );
+                assert!(!model.is_capturing);
+            }
+        }
     }
 
     #[test]

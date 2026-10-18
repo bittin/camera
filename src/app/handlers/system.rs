@@ -258,17 +258,10 @@ impl AppModel {
         &mut self,
         index: usize,
     ) -> Task<cosmic::Action<Message>> {
-        use crate::app::state::CameraMode;
-
-        // Build the same visible modes list as the dropdown
-        let mut visible_modes = vec![CameraMode::Photo, CameraMode::Video, CameraMode::Timelapse];
-        if self.config.virtual_camera_enabled {
-            visible_modes.push(CameraMode::Virtual);
-        }
-
-        let mode = match visible_modes.get(index) {
-            Some(&m) => m,
-            None => return Task::none(),
+        let Some(&mode) =
+            crate::app::dropdowns::default_modes(self.config.virtual_camera_enabled).get(index)
+        else {
+            return Task::none();
         };
 
         info!(?mode, "Setting default launch mode");
@@ -331,7 +324,7 @@ impl AppModel {
         let source = if self.recording.is_recording() {
             self.recording.audio_levels().cloned()
         } else {
-            self.probe_audio_levels.clone()
+            self.audio_probe.as_ref().map(|probe| probe.levels())
         };
 
         self.audio_levels_snapshot =
@@ -1205,10 +1198,6 @@ impl AppModel {
 
         serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
     }
-
-    pub(crate) fn persist_config(&mut self) {
-        self.persist_config_async();
-    }
 }
 
 /// Serialize a single CameraFrame's metadata to JSON.
@@ -1282,6 +1271,49 @@ fn frame_metadata_to_json(
 #[cfg(test)]
 mod tests {
     use super::{file_manager_dbus_args, portal_gallery_item};
+
+    #[test]
+    fn audio_tick_snapshots_the_owned_source_and_clears_missing_or_poisoned_levels() {
+        use crate::app::state::{AppModel, RecordingState};
+        use crate::pipelines::audio_level::{AudioLevels, SharedAudioLevels};
+        let levels: SharedAudioLevels = Default::default();
+        levels.lock().unwrap().input_rms_db = vec![-12.0, -24.0];
+        let (stop, _receiver) = tokio::sync::oneshot::channel();
+        let mut model = AppModel {
+            recording: RecordingState::start(1, String::new(), stop, Some(levels.clone())),
+            ..Default::default()
+        };
+        drop(model.handle_audio_level_tick());
+        assert_eq!(
+            model.current_audio_levels().unwrap().input_rms_db,
+            vec![-12.0, -24.0]
+        );
+        levels.lock().unwrap().input_rms_db = vec![-6.0];
+        assert_eq!(
+            model.current_audio_levels().unwrap().input_rms_db,
+            vec![-12.0, -24.0]
+        );
+        drop(model.handle_audio_level_tick());
+        assert_eq!(
+            model.current_audio_levels().unwrap().input_rms_db,
+            vec![-6.0]
+        );
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = levels.lock().unwrap();
+            panic!("poison levels");
+        });
+        drop(model.handle_audio_level_tick());
+        assert!(model.current_audio_levels().is_none());
+        model.recording = RecordingState::Idle;
+        model.audio_levels_snapshot = Some(AudioLevels::default());
+        drop(model.handle_audio_level_tick());
+        assert!(model.current_audio_levels().is_none());
+        // No probe is started for a closed settings drawer, even with audio enabled.
+        model.config.record_audio = true;
+        model.core.window.show_context = false;
+        model.sync_audio_probe();
+        assert!(model.audio_probe.is_none());
+    }
 
     #[test]
     fn demosaic_handler_persists_each_method_and_reset_restores_bilinear() {
