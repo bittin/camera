@@ -435,9 +435,6 @@ pub struct FormatSettings {
     pub pixel_format: String,
 }
 
-/// Backwards compatibility alias
-pub type VideoSettings = FormatSettings;
-
 #[derive(Debug, Clone, CosmicConfigEntry, Eq, PartialEq, Serialize, Deserialize)]
 #[version = 21]
 pub struct Config {

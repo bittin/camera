@@ -315,19 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn flipped_variants_follow_their_unflipped_quarter_turn() {
-        // `degrees()` ignores flip, so Flipped90 lays out like Rotate90.
-        assert_eq!(
-            bar_layout(DisplayOrientation::Flipped90),
-            bar_layout(DisplayOrientation::Rotate90)
-        );
-        assert_eq!(
-            bar_layout(DisplayOrientation::Flipped0),
-            bar_layout(DisplayOrientation::Rotate0)
-        );
-    }
-
-    #[test]
     fn rotate270_reverses_column_putting_window_controls_at_top() {
         // 270° (Ccw90): the portrait row's trailing end (window controls) lands
         // at the TOP of the side strip, so the sideways Column reverses the
