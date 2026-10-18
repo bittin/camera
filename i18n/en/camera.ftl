@@ -147,8 +147,6 @@ settings-microphone = Microphone
 settings-record-audio = Record audio
 # Toggle in Photo settings. The preference is kept for unsupported formats.
 settings-motion-photo = Motion Photo
-motion-photo-error-title = Motion Photo could not be saved
-motion-photo-error-dismiss = Dismiss
 settings-motion-photo-description = Continuously buffer a short video in memory with the selected video encoder. Save JPEG/AVIF photos with 1.25 seconds before and after the shutter. Not available for PNG/DNG; your preference is kept when switching formats.
 # Dropdown label for the audio codec used in recordings.
 settings-audio-encoder = Video audio encoder
@@ -218,8 +216,6 @@ device-info-none = No device information available
 
 ## Camera preview.
 
-# Centred placeholder shown before any camera has been found.
-initializing-camera = Initializing camera...
 # Centred empty state after camera discovery finishes without supported devices.
 no-camera-available = No camera available
 
@@ -372,10 +368,6 @@ burst-mode-hold-steady = Hold steady...
 burst-mode-frames = { $captured }/{ $total } frames
 # Full screen status while the frames are merged. Same large text, keep short.
 burst-mode-processing = Processing...
-# Merge algorithm option: slower, better results. FFT is a technical term.
-burst-mode-quality = Quality (FFT)
-# Merge algorithm option: faster, lower quality.
-burst-mode-fast = Fast (Spatial)
 
 ## HDR+ frame count options in settings.
 
@@ -464,12 +456,8 @@ insights-stream-combined = Preview + Capture Stream
 
 # Row label, delay from sensor to screen, in milliseconds.
 insights-frame-latency = Frame Latency
-# Row label, count of frames that never arrived.
-insights-dropped-frames = Dropped Frames
 # Row label, size of one decoded frame in memory, in megabytes.
 insights-frame-size-decoded = Frame Size
-# Row label, time spent wrapping a frame for the renderer, in milliseconds.
-insights-copy-time = Frame Wrap Time
 # Row label, time spent sending a frame to the GPU, in milliseconds.
 insights-gpu-upload-time = GPU Upload Time
 # Row label, throughput of those uploads, in megabytes per second.
