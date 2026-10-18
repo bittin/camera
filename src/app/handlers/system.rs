@@ -125,14 +125,10 @@ impl AppModel {
         &mut self,
         data: Option<crate::storage::GalleryThumbnailData>,
     ) -> Task<cosmic::Action<Message>> {
-        if let Some((handle, rgba, width, height, path)) = data {
-            self.gallery_thumbnail = Some(handle);
-            self.gallery_thumbnail_rgba = Some((rgba, width, height));
-            self.last_media_path = Some(path.display().to_string());
-        } else {
-            self.gallery_thumbnail = None;
-            self.gallery_thumbnail_rgba = None;
+        if let Some(thumbnail) = &data {
+            self.last_media_path = Some(thumbnail.path().display().to_string());
         }
+        self.gallery_thumbnail = data;
         Task::none()
     }
 
@@ -1271,6 +1267,23 @@ fn frame_metadata_to_json(
 #[cfg(test)]
 mod tests {
     use super::{file_manager_dbus_args, portal_gallery_item};
+
+    #[test]
+    fn gallery_updates_keep_payload_identity_and_last_path_when_cleared() {
+        use crate::app::state::AppModel;
+        use crate::storage::GalleryThumbnailData;
+        let thumbnail = GalleryThumbnailData::new("synthetic.jpg".into(), vec![7, 8, 9, 255], 1, 1);
+        let mut model = AppModel::default();
+        drop(model.handle_gallery_thumbnail_loaded(Some(thumbnail.clone())));
+        assert_eq!(
+            model.gallery_thumbnail.as_ref().unwrap().id(),
+            thumbnail.id()
+        );
+        assert_eq!(model.last_media_path.as_deref(), Some("synthetic.jpg"));
+        drop(model.handle_gallery_thumbnail_loaded(None));
+        assert!(model.gallery_thumbnail.is_none());
+        assert_eq!(model.last_media_path.as_deref(), Some("synthetic.jpg"));
+    }
 
     #[test]
     fn audio_tick_snapshots_the_owned_source_and_clears_missing_or_poisoned_levels() {

@@ -2,8 +2,6 @@
 
 //! Gallery button widget implementation
 
-use std::sync::Arc;
-
 use crate::app::gallery_widget::gallery_widget;
 use crate::app::state::{AppModel, Message};
 use cosmic::Element;
@@ -22,27 +20,8 @@ impl AppModel {
         let theme = cosmic::theme::active();
         let corner_radius = theme.cosmic().corner_radii.radius_xl[0].min(22.0);
 
-        // If we have both the thumbnail handle and RGBA data, use custom primitive
-        let button_content = if let (Some(thumbnail), Some((rgba_data, width, height))) =
-            (&self.gallery_thumbnail, &self.gallery_thumbnail_rgba)
-        {
-            gallery_widget(
-                thumbnail.clone(),
-                Arc::clone(rgba_data),
-                *width,
-                *height,
-                corner_radius,
-            )
-        } else if let Some(thumbnail) = &self.gallery_thumbnail {
-            let image = widget::image::Image::new(thumbnail.clone())
-                .content_fit(cosmic::iced::ContentFit::Cover)
-                .width(Length::Fixed(42.0))
-                .height(Length::Fixed(42.0));
-
-            widget::container(image)
-                .width(Length::Fixed(44.0))
-                .height(Length::Fixed(44.0))
-                .into()
+        let button_content = if let Some(thumbnail) = &self.gallery_thumbnail {
+            gallery_widget(thumbnail.clone(), corner_radius)
         } else {
             widget::container(icon::from_name("folder-pictures-symbolic").size(24))
                 .width(Length::Fixed(44.0))

@@ -567,7 +567,6 @@ impl cosmic::Application for AppModel {
             last_media_path: None,
             pending_close: false,
             gallery_thumbnail: None,
-            gallery_thumbnail_rgba: None,
             picker_selected_resolution: None,
             pending_hotplug_switch: None,
             recording_bridge: Some(recording_bridge),

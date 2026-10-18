@@ -2,9 +2,8 @@
 
 //! Custom gallery widget for rendering thumbnails with rounded corners using GPU primitives
 
-use std::sync::Arc;
-
 use crate::app::gallery_primitive::GalleryPrimitive;
+use crate::storage::GalleryThumbnailData;
 use cosmic::iced::advanced::widget::Tree;
 use cosmic::iced::advanced::{Widget, layout};
 use cosmic::iced::{Element, Length, Rectangle, Size};
@@ -20,15 +19,8 @@ pub struct GalleryWidget {
 
 impl GalleryWidget {
     /// Create a new gallery widget from image data
-    pub fn new(
-        image_handle: cosmic::widget::image::Handle,
-        rgba_data: Arc<Vec<u8>>,
-        width: u32,
-        height: u32,
-        corner_radius: f32,
-    ) -> Self {
-        let primitive =
-            GalleryPrimitive::new(image_handle, rgba_data, width, height, corner_radius);
+    pub fn new(thumbnail: GalleryThumbnailData, corner_radius: f32) -> Self {
+        let primitive = GalleryPrimitive::new(thumbnail, corner_radius);
 
         Self {
             primitive,
@@ -88,17 +80,8 @@ impl<'a> From<GalleryWidget> for Element<'a, crate::app::Message, Theme, Rendere
 
 /// Create a gallery widget from image data
 pub fn gallery_widget<'a>(
-    image_handle: cosmic::widget::image::Handle,
-    rgba_data: Arc<Vec<u8>>,
-    width: u32,
-    height: u32,
+    thumbnail: GalleryThumbnailData,
     corner_radius: f32,
 ) -> Element<'a, crate::app::Message, Theme, Renderer> {
-    Element::new(GalleryWidget::new(
-        image_handle,
-        rgba_data,
-        width,
-        height,
-        corner_radius,
-    ))
+    Element::new(GalleryWidget::new(thumbnail, corner_radius))
 }

@@ -788,9 +788,7 @@ pub struct AppModel {
     /// check this flag and exit the process once the file is finalized.
     pub pending_close: bool,
     /// Latest gallery thumbnail (cached)
-    pub gallery_thumbnail: Option<cosmic::widget::image::Handle>,
-    /// Gallery thumbnail RGBA data for custom rendering (Arc for cheap cloning)
-    pub gallery_thumbnail_rgba: Option<(Arc<Vec<u8>>, u32, u32)>,
+    pub gallery_thumbnail: Option<crate::storage::GalleryThumbnailData>,
     /// Currently selected resolution in the picker (width for grouping)
     pub picker_selected_resolution: Option<u32>,
     /// V4L2 device path the user is trying to switch to (set when switching

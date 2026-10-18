@@ -5,10 +5,9 @@
 use super::video_primitive::rendering::{
     encode_screen_triangle, fullscreen_pipeline, sampled_texture_layout,
 };
-use std::sync::Arc;
+use crate::storage::GalleryThumbnailData;
 
 use cosmic::iced::Rectangle;
-use iced_core::image::Id as ImageId;
 use iced_wgpu::graphics::Viewport;
 use iced_wgpu::primitive::{Pipeline as PipelineTrait, Primitive as PrimitiveTrait};
 use iced_wgpu::wgpu;
@@ -16,33 +15,17 @@ use iced_wgpu::wgpu;
 /// Custom primitive for gallery thumbnail with rounded corners
 #[derive(Debug, Clone)]
 pub struct GalleryPrimitive {
-    pub image_handle: cosmic::widget::image::Handle,
-    /// RGBA data wrapped in Arc for cheap cloning (avoids copying image buffer every frame)
-    pub rgba_data: Arc<Vec<u8>>,
-    pub width: u32,
-    pub height: u32,
+    pub thumbnail: GalleryThumbnailData,
     pub corner_radius: f32,
-    /// Hover/pressed overlay intensity (0.0 = none, 0.15 = hover, 0.25 = pressed)
-    pub hover_alpha: f32,
     /// Accent border color (RGBA) shown when hovered
     pub accent_color: [f32; 4],
 }
 
 impl GalleryPrimitive {
-    pub fn new(
-        image_handle: cosmic::widget::image::Handle,
-        rgba_data: Arc<Vec<u8>>,
-        width: u32,
-        height: u32,
-        corner_radius: f32,
-    ) -> Self {
+    pub fn new(thumbnail: GalleryThumbnailData, corner_radius: f32) -> Self {
         Self {
-            image_handle,
-            rgba_data,
-            width,
-            height,
+            thumbnail,
             corner_radius,
-            hover_alpha: 0.0,
             accent_color: [0.0; 4],
         }
     }
@@ -55,7 +38,7 @@ pub struct GalleryPipeline {
     sampler: wgpu::Sampler,
     texture_format: wgpu::TextureFormat,
     // Cache for the single uploaded texture (at most one gallery thumbnail at a time)
-    texture_cache: Option<(ImageId, GalleryTexture)>,
+    texture_cache: Option<(uuid::Uuid, GalleryTexture)>,
 }
 
 struct GalleryTexture {
@@ -64,6 +47,18 @@ struct GalleryTexture {
     /// Physical widget bounds (x, y, width, height) clamped to render target
     /// Stored during prepare() and used in render() for valid viewport rect
     physical_bounds: Option<(f32, f32, f32, f32)>,
+}
+
+/// The unused fourth scalar remains padding: WGSL's accent color starts at 16.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GalleryUniform {
+    size: [f32; 2],
+    corner_radius: f32,
+    _pad: f32,
+    accent_color: [f32; 4],
+    uv_offset: [f32; 2],
+    uv_scale: [f32; 2],
 }
 
 impl PipelineTrait for GalleryPipeline {
@@ -89,14 +84,7 @@ impl PrimitiveTrait for GalleryPrimitive {
         viewport: &Viewport,
     ) {
         // Upload image texture if needed and update viewport buffer
-        pipeline.upload_image(
-            _device,
-            queue,
-            &self.image_handle,
-            &self.rgba_data,
-            self.width,
-            self.height,
-        );
+        pipeline.upload_image(_device, queue, &self.thumbnail);
 
         // Calculate physical bounds from logical bounds using scale factor
         // Then clamp to render target to ensure valid viewport rect
@@ -127,18 +115,17 @@ impl PrimitiveTrait for GalleryPrimitive {
 
         // Store physical bounds for render()
         pipeline.store_physical_bounds(
-            &self.image_handle,
+            self.thumbnail.id(),
             (clamped_x, clamped_y, clamped_w, clamped_h),
         );
 
         // Update viewport size, corner radius, and UV adjustment
         pipeline.update_viewport(
             queue,
-            &self.image_handle,
+            self.thumbnail.id(),
             bounds.width,
             bounds.height,
             self.corner_radius,
-            self.hover_alpha,
             self.accent_color,
             uv_offset,
             uv_scale,
@@ -152,7 +139,7 @@ impl PrimitiveTrait for GalleryPrimitive {
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
     ) {
-        _pipeline.render(encoder, target, clip_bounds, &self.image_handle);
+        _pipeline.render(encoder, target, clip_bounds, self.thumbnail.id());
     }
 }
 
@@ -206,7 +193,13 @@ impl GalleryPipeline {
             pipeline,
             bind_group_layout,
             sampler,
-            texture_format: format,
+            // Source channel order is independent of the attachment; retain
+            // its transfer function while sampling the RGBA bytes directly.
+            texture_format: match format {
+                wgpu::TextureFormat::Bgra8Unorm => wgpu::TextureFormat::Rgba8Unorm,
+                wgpu::TextureFormat::Bgra8UnormSrgb => wgpu::TextureFormat::Rgba8UnormSrgb,
+                _ => format,
+            },
             texture_cache: None,
         }
     }
@@ -215,13 +208,9 @@ impl GalleryPipeline {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        image_handle: &cosmic::widget::image::Handle,
-        rgba_data: &[u8],
-        width: u32,
-        height: u32,
+        thumbnail: &GalleryThumbnailData,
     ) {
-        // Get a unique ID for this image
-        let image_id = image_handle.id();
+        let image_id = thumbnail.id();
 
         // Check if already uploaded
         if self
@@ -232,26 +221,12 @@ impl GalleryPipeline {
             return;
         }
 
-        // Use the provided RGBA data directly
+        let rgba_data = thumbnail.rgba();
+        let (width, height) = thumbnail.dimensions();
         if rgba_data.is_empty() {
             tracing::warn!("Empty RGBA data for gallery thumbnail");
             return;
         }
-
-        // Convert RGBA to BGRA if needed
-        let texture_data = if matches!(
-            self.texture_format,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-        ) {
-            // Convert RGBA -> BGRA by swapping R and B channels
-            let mut bgra_data = rgba_data.to_vec();
-            for chunk in bgra_data.as_chunks_mut::<4>().0 {
-                chunk.swap(0, 2); // Swap R and B
-            }
-            bgra_data
-        } else {
-            rgba_data.to_vec()
-        };
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gallery texture"),
@@ -276,7 +251,7 @@ impl GalleryPipeline {
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
-            &texture_data,
+            rgba_data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(4 * width),
@@ -292,10 +267,10 @@ impl GalleryPipeline {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create viewport params buffer (will be updated in update_viewport before render)
-        // Contains: size (2), corner_radius (1), hover_alpha (1), accent_color (4), uv_offset (2), uv_scale (2)
+        // The unused shader hover scalar is padding; accent/UV offsets stay fixed.
         let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("gallery viewport buffer"),
-            size: std::mem::size_of::<[f32; 12]>() as u64,
+            size: std::mem::size_of::<GalleryUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -331,10 +306,9 @@ impl GalleryPipeline {
 
     fn store_physical_bounds(
         &mut self,
-        image_handle: &cosmic::widget::image::Handle,
+        image_id: uuid::Uuid,
         physical_bounds: (f32, f32, f32, f32),
     ) {
-        let image_id = image_handle.id();
         if let Some((id, gallery_texture)) = &mut self.texture_cache
             && *id == image_id
         {
@@ -346,40 +320,30 @@ impl GalleryPipeline {
     fn update_viewport(
         &mut self,
         queue: &wgpu::Queue,
-        image_handle: &cosmic::widget::image::Handle,
+        image_id: uuid::Uuid,
         width: f32,
         height: f32,
         corner_radius: f32,
-        hover_alpha: f32,
         accent_color: [f32; 4],
         uv_offset: (f32, f32),
         uv_scale: (f32, f32),
     ) {
-        let image_id = image_handle.id();
-
         if let Some((id, gallery_texture)) = &self.texture_cache {
             if *id != image_id {
                 return;
             }
-            // Pack: size (2), corner_radius (1), hover_alpha (1), accent_color (4), uv_offset (2), uv_scale (2)
-            let viewport_data = [
-                width,
-                height,
+            let viewport_data = GalleryUniform {
+                size: [width, height],
                 corner_radius,
-                hover_alpha,
-                accent_color[0],
-                accent_color[1],
-                accent_color[2],
-                accent_color[3],
-                uv_offset.0,
-                uv_offset.1,
-                uv_scale.0,
-                uv_scale.1,
-            ];
+                _pad: 0.0,
+                accent_color,
+                uv_offset: [uv_offset.0, uv_offset.1],
+                uv_scale: [uv_scale.0, uv_scale.1],
+            };
             queue.write_buffer(
                 &gallery_texture.viewport_buffer,
                 0,
-                bytemuck::cast_slice(&viewport_data),
+                bytemuck::bytes_of(&viewport_data),
             );
         }
     }
@@ -389,10 +353,8 @@ impl GalleryPipeline {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         clip_bounds: &Rectangle<u32>,
-        image_handle: &cosmic::widget::image::Handle,
+        image_id: uuid::Uuid,
     ) {
-        let image_id = image_handle.id();
-
         if let Some((id, gallery_texture)) = &self.texture_cache {
             if *id != image_id || clip_bounds.width == 0 || clip_bounds.height == 0 {
                 return;
@@ -424,6 +386,345 @@ impl GalleryPipeline {
 mod tests {
     use super::*;
     use crate::test_gpu::{headless_device, skip_no_gpu};
+
+    const SIDE: u32 = 64; // Exactly one aligned 256-byte readback row.
+    const BOUNDS: Rectangle = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 64.0,
+        height: 64.0,
+    };
+
+    fn thumbnail(color: [u8; 4]) -> GalleryThumbnailData {
+        GalleryThumbnailData::new("same.png".into(), color.repeat(8 * 4), 8, 4)
+    }
+
+    fn render_cached(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &GalleryPipeline,
+        primitive: &GalleryPrimitive,
+        format: wgpu::TextureFormat,
+    ) -> Vec<u8> {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gallery test target"),
+            size: wgpu::Extent3d {
+                width: SIDE,
+                height: SIDE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&Default::default());
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gallery test readback"),
+            size: u64::from(SIDE * SIDE * 4),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gallery test clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+        primitive.render(
+            pipeline,
+            &mut encoder,
+            &view,
+            &Rectangle {
+                x: 0,
+                y: 0,
+                width: SIDE,
+                height: SIDE,
+            },
+        );
+        encoder.copy_texture_to_buffer(
+            target.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(SIDE * 4),
+                    rows_per_image: Some(SIDE),
+                },
+            },
+            target.size(),
+        );
+        queue.submit([encoder.finish()]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        let mut pixels = readback.slice(..).get_mapped_range().to_vec();
+        readback.unmap();
+        if matches!(
+            format,
+            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+        ) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
+        }
+        pixels
+    }
+
+    fn render_thumbnail(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pipeline: &mut GalleryPipeline,
+        primitive: &GalleryPrimitive,
+        format: wgpu::TextureFormat,
+        bounds: Rectangle,
+    ) -> Vec<u8> {
+        let viewport = Viewport::with_physical_size(cosmic::iced::Size::new(SIDE, SIDE), 1.0);
+        primitive.prepare(pipeline, device, queue, &bounds, &viewport);
+        render_cached(device, queue, pipeline, primitive, format)
+    }
+
+    fn pixel(pixels: &[u8], x: u32, y: u32) -> &[u8] {
+        let offset = ((y * SIDE + x) * 4) as usize;
+        &pixels[offset..offset + 4]
+    }
+
+    #[test]
+    fn gallery_uniform_keeps_the_shader_abi_without_hover_state() {
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<GalleryUniform>(), 48);
+        assert_eq!(offset_of!(GalleryUniform, size), 0);
+        assert_eq!(offset_of!(GalleryUniform, corner_radius), 8);
+        assert_eq!(offset_of!(GalleryUniform, _pad), 12);
+        assert_eq!(offset_of!(GalleryUniform, accent_color), 16);
+        assert_eq!(offset_of!(GalleryUniform, uv_offset), 32);
+        assert_eq!(offset_of!(GalleryUniform, uv_scale), 40);
+        let module = crate::test_gpu::validate_shader("gallery", &gallery_shader());
+        let (_, ty) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("ViewportParams"))
+            .unwrap();
+        let naga::TypeInner::Struct { members, span } = &ty.inner else {
+            panic!("gallery uniform is not a struct")
+        };
+        assert_eq!(*span, 48);
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 8, 12, 16, 32, 40]
+        );
+    }
+
+    #[test]
+    fn gallery_cache_reuses_clones_and_replaces_same_size_payloads() {
+        let Some((_gpu_test, device, queue)) = headless_device() else {
+            skip_no_gpu("gallery_cache_reuses_clones_and_replaces_same_size_payloads");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut pipeline = GalleryPipeline::new(&device, format);
+        let first = GalleryPrimitive::new(thumbnail([30, 160, 220, 255]), 10.0);
+        let original = render_thumbnail(&device, &queue, &mut pipeline, &first, format, BOUNDS);
+        let (id, cached) = pipeline.texture_cache.as_ref().unwrap();
+        assert_eq!(*id, first.thumbnail.id());
+        let binding = cached.bind_group.clone();
+        let uniform = cached.viewport_buffer.clone();
+        pipeline.trim();
+        for _ in 0..3 {
+            let clone = first.clone();
+            assert_eq!(
+                clone.thumbnail.rgba().as_ptr(),
+                first.thumbnail.rgba().as_ptr()
+            );
+            assert_eq!(
+                render_thumbnail(&device, &queue, &mut pipeline, &clone, format, BOUNDS),
+                original
+            );
+            let cached = &pipeline.texture_cache.as_ref().unwrap().1;
+            assert_eq!(cached.bind_group, binding);
+            assert_eq!(cached.viewport_buffer, uniform);
+        }
+        let replacement = GalleryPrimitive::new(thumbnail([200, 80, 20, 255]), 10.0);
+        let replaced =
+            render_thumbnail(&device, &queue, &mut pipeline, &replacement, format, BOUNDS);
+        let (id, cached) = pipeline.texture_cache.as_ref().unwrap();
+        assert_eq!(*id, replacement.thumbnail.id());
+        assert_ne!(*id, first.thumbnail.id());
+        assert_ne!(cached.bind_group, binding);
+        assert_ne!(cached.viewport_buffer, uniform);
+        assert_eq!(pixel(&replaced, 32, 32), &[200, 80, 20, 255]);
+        assert_eq!(pixel(&original, 32, 32), &[30, 160, 220, 255]);
+        let bounds = cached.physical_bounds;
+        pipeline.store_physical_bounds(first.thumbnail.id(), (9.0, 9.0, 9.0, 9.0));
+        assert_eq!(
+            pipeline.texture_cache.as_ref().unwrap().1.physical_bounds,
+            bounds
+        );
+        pipeline.update_viewport(
+            &queue,
+            first.thumbnail.id(),
+            8.0,
+            8.0,
+            0.0,
+            [1.0, 0.0, 0.0, 1.0],
+            (0.0, 0.0),
+            (1.0, 1.0),
+        );
+        assert_eq!(
+            render_cached(&device, &queue, &pipeline, &replacement, format),
+            replaced,
+            "stale identity cannot overwrite the replacement's uniform"
+        );
+        assert!(
+            render_cached(&device, &queue, &pipeline, &first, format)
+                .iter()
+                .all(|&v| v == 0),
+            "stale identity cannot draw the replacement"
+        );
+        // Re-selecting an older retained clone is a real replacement, not a hit
+        // based on equal dimensions or a dangling pixel pointer.
+        assert_eq!(
+            render_thumbnail(
+                &device,
+                &queue,
+                &mut pipeline,
+                &first.clone(),
+                format,
+                BOUNDS
+            ),
+            original
+        );
+    }
+
+    #[test]
+    fn gallery_sampling_preserves_color_hover_and_rounding_on_all_surface_orders() {
+        let Some((_gpu_test, device, queue)) = headless_device() else {
+            skip_no_gpu(
+                "gallery_sampling_preserves_color_hover_and_rounding_on_all_surface_orders",
+            );
+            return;
+        };
+        for format in [
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+        ] {
+            let mut pipeline = GalleryPipeline::new(&device, format);
+            let primitive = GalleryPrimitive::new(thumbnail([30, 160, 220, 255]), 10.0);
+            let plain =
+                render_thumbnail(&device, &queue, &mut pipeline, &primitive, format, BOUNDS);
+            for (&actual, expected) in pixel(&plain, 32, 32).iter().zip([30u8, 160, 220, 255]) {
+                assert!(
+                    actual.abs_diff(expected) <= 2,
+                    "{format:?}: {actual} != {expected}"
+                );
+            }
+            assert_eq!(pixel(&plain, 0, 0), &[0, 0, 0, 0]);
+            let binding = pipeline
+                .texture_cache
+                .as_ref()
+                .unwrap()
+                .1
+                .bind_group
+                .clone();
+            let mut hovered = primitive.clone();
+            hovered.accent_color = [1.0, 0.0, 0.0, 1.0];
+            let hover = render_thumbnail(&device, &queue, &mut pipeline, &hovered, format, BOUNDS);
+            assert_eq!(
+                pipeline.texture_cache.as_ref().unwrap().1.bind_group,
+                binding,
+                "hover must not reupload pixels"
+            );
+            assert_eq!(pixel(&hover, 32, 32), pixel(&plain, 32, 32));
+            assert_eq!(pixel(&hover, 1, 32), &[255, 0, 0, 255]);
+            assert_ne!(pixel(&plain, 1, 32), pixel(&hover, 1, 32));
+            assert_eq!(pixel(&hover, 0, 0), &[0, 0, 0, 0]);
+            assert_eq!(
+                render_thumbnail(&device, &queue, &mut pipeline, &primitive, format, BOUNDS),
+                plain,
+                "leaving hover restores the unmodified image"
+            );
+        }
+    }
+
+    #[test]
+    fn gallery_cover_fit_and_clipped_uvs_preserve_aspect_and_corner_positions() {
+        let Some((_gpu_test, device, queue)) = headless_device() else {
+            skip_no_gpu("gallery_cover_fit_and_clipped_uvs_preserve_aspect_and_corner_positions");
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut pipeline = GalleryPipeline::new(&device, format);
+        for (width, height) in [(128, 64), (64, 128)] {
+            let image = image::RgbaImage::from_fn(width, height, |x, y| {
+                let long_axis = if width > height { x } else { y };
+                image::Rgba(if long_axis < 32 {
+                    [255, 0, 0, 255]
+                } else if long_axis < 96 {
+                    [0, 255, 0, 255]
+                } else {
+                    [0, 0, 255, 255]
+                })
+            });
+            let primitive = GalleryPrimitive::new(
+                GalleryThumbnailData::new("aspect.png".into(), image.into_raw(), width, height),
+                10.0,
+            );
+            let full = render_thumbnail(&device, &queue, &mut pipeline, &primitive, format, BOUNDS);
+            for (x, y) in [(8, 32), (55, 32), (32, 8), (32, 55)] {
+                assert_eq!(
+                    pixel(&full, x, y),
+                    &[0, 255, 0, 255],
+                    "cover must crop the outer stripes, not stretch {width}x{height}"
+                );
+            }
+            let clipped = render_thumbnail(
+                &device,
+                &queue,
+                &mut pipeline,
+                &primitive,
+                format,
+                Rectangle { x: -16.0, ..BOUNDS },
+            );
+            for y in 0..SIDE {
+                for x in 0..48 {
+                    for (&actual, &expected) in
+                        pixel(&clipped, x, y).iter().zip(pixel(&full, x + 16, y))
+                    {
+                        assert!(
+                            actual.abs_diff(expected) <= 2,
+                            "clipping moved the corner/UV at {x},{y}"
+                        );
+                    }
+                }
+                assert_eq!(pixel(&clipped, 56, y), &[0, 0, 0, 0]);
+            }
+        }
+    }
 
     /// `GalleryPipeline::new` must actually compile its shader.
     ///

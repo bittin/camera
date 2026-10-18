@@ -1111,11 +1111,12 @@ mod tests {
             fs::write(&source, &encoded).unwrap();
             let ordinary = photos.join(format!("IMG_oriented_{value}.{ext}"));
             fs::write(&ordinary, &encoded).unwrap();
-            let (_, plain, width, height, path) =
+            let plain =
                 crate::storage::load_latest_thumbnail(photos.clone(), f.0.join("no-videos"))
                     .await
                     .unwrap();
-            assert_eq!(path, ordinary);
+            let (width, height) = plain.dimensions();
+            assert_eq!(plain.path(), ordinary);
             fs::remove_file(&ordinary).unwrap();
             let packaged = f.embed(&source);
             assert_eq!(fs::read(&source).unwrap(), encoded);
@@ -1127,12 +1128,13 @@ mod tests {
                 embedded_image_orientation(&encoded),
                 embedded_image_orientation(&live_bytes)
             );
-            let (_, motion, mw, mh, path) =
+            let motion =
                 crate::storage::load_latest_thumbnail(photos.clone(), f.0.join("no-videos"))
                     .await
                     .unwrap();
+            let (mw, mh) = motion.dimensions();
             fs::remove_file(&live).unwrap();
-            assert_eq!(path, live);
+            assert_eq!(motion.path(), live);
             let expected_dims = if value >= 5 { (64, 96) } else { (96, 64) };
             assert_eq!(
                 (width, height),
@@ -1141,8 +1143,8 @@ mod tests {
             );
             assert_eq!((mw, mh), expected_dims, "live {ext} EXIF={value}");
             for (rgba, w, h, label) in [
-                (&plain, width, height, "ordinary"),
-                (&motion, mw, mh, "live"),
+                (plain.rgba(), width, height, "ordinary"),
+                (motion.rgba(), mw, mh, "live"),
             ] {
                 for (i, (x, y)) in [
                     (w / 4, h / 4),
@@ -1165,7 +1167,8 @@ mod tests {
                 }
             }
             assert_eq!(
-                plain, motion,
+                plain.rgba(),
+                motion.rgba(),
                 "{ext} EXIF={value}: packaging must not change gallery pixels"
             );
             assert_eq!(
