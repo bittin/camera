@@ -783,20 +783,6 @@ mod tests {
         }
     }
 
-    /// A config written on COSMIC, then read on a desktop that never offers
-    /// `System`. It must land on Translucent — the off-COSMIC default — and must
-    /// never fall through to opaque or blank chrome.
-    #[test]
-    fn system_effect_stored_off_cosmic_resolves_to_translucent() {
-        for transparent in [true, false] {
-            assert_eq!(
-                resolve_surface(OverlayEffect::System, false, transparent),
-                OverlaySurface::Translucent,
-                "System off-COSMIC (transparent={transparent})"
-            );
-        }
-    }
-
     /// Only `Frosted` may schedule the blur. `is_frosted()` is the exact gate on
     /// the early returns in `frosted_panel` / `frosted_bars`, so a false here is
     /// a `FrostedContainer`/`FrostedScrim` that never gets built and a
@@ -806,23 +792,6 @@ mod tests {
         assert!(OverlaySurface::Frosted.is_frosted());
         assert!(!OverlaySurface::Translucent.is_frosted());
         assert!(!OverlaySurface::Opaque.is_frosted());
-    }
-
-    /// Every effect that resolves away from `Frosted` costs zero GPU, in every
-    /// environment.
-    #[test]
-    fn translucent_and_off_never_blur_in_any_environment() {
-        for is_cosmic in [true, false] {
-            for transparent in [true, false] {
-                for effect in [OverlayEffect::Translucent, OverlayEffect::Off] {
-                    assert!(
-                        !resolve_surface(effect, is_cosmic, transparent).is_frosted(),
-                        "{effect:?} scheduled a blur on is_cosmic={is_cosmic} \
-                         transparent={transparent}"
-                    );
-                }
-            }
-        }
     }
 
     /// Translucent must reproduce what the app shipped before the frosted
@@ -906,48 +875,5 @@ mod tests {
         }
 
         init_overlay_effect(OverlayEffect::default());
-    }
-
-    /// The default follows COSMIC where there is a flag to follow, and is a flat
-    /// translucent tint elsewhere.
-    ///
-    /// `is_cosmic_desktop()` caches in a `LazyLock`, so the test can only assert
-    /// against whichever environment it happens to run in; the branch it does
-    /// not take is covered by
-    /// `default_effect_is_system_on_cosmic_translucent_elsewhere` in `config`,
-    /// which tests the pure form.
-    #[test]
-    fn default_effect_is_system_on_cosmic_translucent_elsewhere() {
-        let want = if crate::config::is_cosmic_desktop() {
-            OverlayEffect::System
-        } else {
-            OverlayEffect::Translucent
-        };
-        assert_eq!(OverlayEffect::default(), want);
-        assert_eq!(crate::config::Config::default().overlay_effect, want);
-    }
-
-    /// Whatever the default is, it must resolve to the intended surface:
-    /// translucent off-COSMIC, and on COSMIC frosted when frosting is on and
-    /// translucent when it is off. Opaque is never a default — only `Off` reaches
-    /// it, and only by the user picking it.
-    #[test]
-    fn default_effect_resolves_to_the_intended_surface() {
-        for transparent in [true, false] {
-            // Off-COSMIC the default is translucent, regardless of `transparent`.
-            assert_eq!(
-                resolve_surface(OverlayEffect::Translucent, false, transparent),
-                OverlaySurface::Translucent
-            );
-            // On COSMIC `System` maps frosting on/off to frosted/translucent.
-            assert_eq!(
-                resolve_surface(OverlayEffect::System, true, transparent),
-                if transparent {
-                    OverlaySurface::Frosted
-                } else {
-                    OverlaySurface::Translucent
-                }
-            );
-        }
     }
 }

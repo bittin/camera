@@ -674,6 +674,7 @@ mod tests {
                 OverlayEffect::Translucent
             }
         );
+        assert_eq!(Config::default().overlay_effect, OverlayEffect::default());
         assert!(OverlayEffect::available().contains(&OverlayEffect::default()));
     }
 }
