@@ -1,5 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use libcamera::camera::Orientation;
+
+/// Keep buffers in the sensor's native orientation: Camera already applies the
+/// mounting rotation to preview, photos and video. Requesting Rotate0 lets
+/// libcamera compensate too, causing a double rotation on capable sensors.
+fn native_orientation(rotation: Option<i32>) -> Orientation {
+    match rotation.unwrap_or(0).rem_euclid(360) {
+        90 => Orientation::Rotate90,
+        180 => Orientation::Rotate180,
+        270 => Orientation::Rotate270,
+        _ => Orientation::Rotate0,
+    }
+}
+
 /// Negotiate stream configuration only. Acquisition, allocation and start errors
 /// belong to the caller and must not trigger a second initialization attempt.
 pub(super) fn negotiate<T>(
@@ -53,6 +67,12 @@ pub(super) fn prepare(
     let mut config = cam
         .generate_configuration(&roles)
         .ok_or_else(|| "Failed to generate camera configuration".to_string())?;
+    config.set_orientation(native_orientation(
+        cam.properties()
+            .get::<libcamera::properties::Rotation>()
+            .ok()
+            .map(|rotation| rotation.0),
+    ));
     if let Some((width, height)) = size
         && let Some(mut vf) = config.get_mut(0)
     {
@@ -74,6 +94,37 @@ pub(super) fn prepare(
 #[cfg(test)]
 mod tests {
     use super::negotiate;
+
+    #[test]
+    fn native_orientation_defaults_to_unrotated() {
+        assert_eq!(super::native_orientation(None), super::Orientation::Rotate0);
+        assert_eq!(
+            super::native_orientation(Some(0)),
+            super::Orientation::Rotate0
+        );
+    }
+
+    #[test]
+    fn upside_down_sensor_keeps_mounting_rotation_in_buffers() {
+        // Rotate0 would let libcamera flip this sensor upright, then Camera's
+        // existing preview/photo rotation would turn the image upside down.
+        assert_eq!(
+            super::native_orientation(Some(180)),
+            super::Orientation::Rotate180,
+        );
+    }
+
+    #[test]
+    fn phone_sensors_keep_quarter_turn_mounting_rotation_in_buffers() {
+        assert_eq!(
+            super::native_orientation(Some(90)),
+            super::Orientation::Rotate90
+        );
+        assert_eq!(
+            super::native_orientation(Some(270)),
+            super::Orientation::Rotate270
+        );
+    }
 
     #[test]
     fn single_stream_fallback_keeps_capture_resolution() {
