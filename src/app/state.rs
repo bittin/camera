@@ -547,25 +547,15 @@ impl BurstModeState {
     /// Try to get the processing result.
     /// Returns Some(result) if complete, None if still processing or not in processing state.
     pub fn try_get_result(&mut self) -> Option<Result<String, String>> {
-        if let Some(rx) = &self.result_rx {
-            match rx.try_recv() {
-                Ok(result) => {
-                    // Clear processing state
-                    self.progress_atomic = None;
-                    self.result_rx = None;
-                    Some(result)
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // Channel closed unexpectedly
-                    self.progress_atomic = None;
-                    self.result_rx = None;
-                    Some(Err("Processing task terminated unexpectedly".to_string()))
-                }
+        let result = match self.result_rx.as_ref()?.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Processing task terminated unexpectedly".to_string())
             }
-        } else {
-            None
-        }
+        };
+        self.clear_processing_state();
+        Some(result)
     }
 
     /// Clear processing state (called when not in Processing stage)
@@ -1992,6 +1982,38 @@ impl AppModel {
                     self.probe_audio_levels = None;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod burst_result_tests {
+    use super::*;
+
+    #[test]
+    fn burst_result_polling_retains_pending_state_and_retires_each_terminal_outcome() {
+        for result in [Some(Ok("hdr.jpg".into())), Some(Err("failed".into())), None] {
+            let mut burst = BurstModeState::default();
+            assert_eq!(burst.try_get_result(), None);
+            let (progress, sender) = burst.start_processing_task();
+            progress.store(375, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(burst.try_get_result(), None);
+            assert!(burst.result_rx.is_some());
+            assert!(burst.poll_progress());
+            assert_eq!(burst.processing_progress, 0.375);
+            let expected = result
+                .clone()
+                .unwrap_or_else(|| Err("Processing task terminated unexpectedly".into()));
+            match result {
+                Some(result) => sender.send(result).unwrap(),
+                None => drop(sender),
+            }
+            // A disconnected producer must report a terminal error only once.
+            assert_eq!(burst.try_get_result(), Some(expected));
+            assert!(burst.progress_atomic.is_none());
+            assert!(burst.result_rx.is_none());
+            assert_eq!(burst.stage, BurstModeStage::Processing);
+            assert_eq!(burst.try_get_result(), None);
         }
     }
 }

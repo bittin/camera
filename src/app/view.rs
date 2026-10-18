@@ -502,6 +502,23 @@ fn disabled_top_bar_icon_style(theme: &cosmic::Theme) -> widget::container::Styl
     }
 }
 
+/// Top-bar toggles keep the same footprint and disabled foreground during transitions.
+fn top_bar_toggle_button<'a>(
+    handle: widget::icon::Handle,
+    message: Message,
+    active: bool,
+    disabled: bool,
+) -> Element<'a, Message> {
+    if disabled {
+        widget::container(widget::icon(handle).size(20))
+            .style(disabled_top_bar_icon_style)
+            .padding([4, 8])
+            .into()
+    } else {
+        overlay_icon_button(handle, Some(message), active)
+    }
+}
+
 /// Animation duration for fit/fill transition.
 pub const FIT_ANIMATION_DURATION: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -1345,20 +1362,12 @@ impl AppModel {
             };
             let flash_icon = widget::icon::from_svg_bytes(flash_icon_bytes).symbolic(true);
 
-            if is_disabled {
-                cells.push(
-                    widget::container(widget::icon(flash_icon).size(20))
-                        .style(disabled_top_bar_icon_style)
-                        .padding([4, 8])
-                        .into(),
-                );
-            } else {
-                cells.push(overlay_icon_button(
-                    flash_icon,
-                    Some(Message::ToggleFlash),
-                    self.flash.enabled,
-                ));
-            }
+            cells.push(top_bar_toggle_button(
+                flash_icon,
+                Message::ToggleFlash,
+                self.flash.enabled,
+                is_disabled,
+            ));
 
             // 5px spacing
             cells.push(axis_gap(5.0));
@@ -1371,20 +1380,12 @@ impl AppModel {
                     MOTION_PHOTO_OFF_ICON
                 })
                 .symbolic(true);
-                if is_disabled || !self.motion_photo_format_compatible() {
-                    cells.push(
-                        widget::container(widget::icon(motion_photo_icon).size(20))
-                            .style(disabled_top_bar_icon_style)
-                            .padding([4, 8])
-                            .into(),
-                    );
-                } else {
-                    cells.push(overlay_icon_button(
-                        motion_photo_icon,
-                        Some(Message::ToggleMotionPhotoCapture),
-                        motion_photo_active,
-                    ));
-                }
+                cells.push(top_bar_toggle_button(
+                    motion_photo_icon,
+                    Message::ToggleMotionPhotoCapture,
+                    motion_photo_active,
+                    is_disabled || !self.motion_photo_format_compatible(),
+                ));
                 cells.push(axis_gap(5.0));
             }
 
@@ -1398,20 +1399,12 @@ impl AppModel {
                 };
                 let moon_icon = widget::icon::from_svg_bytes(moon_icon_bytes).symbolic(true);
 
-                if is_disabled {
-                    cells.push(
-                        widget::container(widget::icon(moon_icon).size(20))
-                            .style(disabled_top_bar_icon_style)
-                            .padding([4, 8])
-                            .into(),
-                    );
-                } else {
-                    cells.push(overlay_icon_button(
-                        moon_icon,
-                        Some(Message::ToggleBurstMode),
-                        is_hdr_active,
-                    ));
-                }
+                cells.push(top_bar_toggle_button(
+                    moon_icon,
+                    Message::ToggleBurstMode,
+                    is_hdr_active,
+                    is_disabled,
+                ));
 
                 // 5px spacing
                 cells.push(axis_gap(5.0));
@@ -1453,20 +1446,12 @@ impl AppModel {
         let tools_active = self.tools_menu_visible || self.has_non_default_tool_settings();
         let tools_icon = widget::icon::from_svg_bytes(TOOLS_GRID_ICON).symbolic(true);
 
-        if is_disabled {
-            cells.push(
-                widget::container(widget::icon(tools_icon).size(20))
-                    .style(disabled_top_bar_icon_style)
-                    .padding([4, 8])
-                    .into(),
-            );
-        } else {
-            cells.push(overlay_icon_button(
-                tools_icon,
-                Some(Message::ToggleToolsMenu),
-                tools_active,
-            ));
-        }
+        cells.push(top_bar_toggle_button(
+            tools_icon,
+            Message::ToggleToolsMenu,
+            tools_active,
+            is_disabled,
+        ));
 
         // Settings button (normally in header_end)
         if is_disabled {
@@ -2073,31 +2058,15 @@ impl AppModel {
         message: Message,
         is_active: bool,
     ) -> Element<'a, Message> {
-        self.build_tools_grid_button_with_enabled(icon_handle, label, message, is_active, true)
-    }
-
-    /// Build a grid button with large icon and text label below, with optional enabled state
-    fn build_tools_grid_button_with_enabled<'a>(
-        &self,
-        icon_handle: impl Into<widget::icon::Handle>,
-        label: String,
-        message: Message,
-        is_active: bool,
-        enabled: bool,
-    ) -> Element<'a, Message> {
         // Icon button with appropriate styling
-        let mut button = widget::button::custom(widget::icon(icon_handle.into()).size(32))
+        let button = widget::button::custom(widget::icon(icon_handle.into()).size(32))
             .class(if is_active {
                 cosmic::theme::Button::Suggested
             } else {
                 cosmic::theme::Button::Text
             })
-            .padding(12);
-
-        // Only add on_press handler if enabled
-        if enabled {
-            button = button.on_press(message);
-        }
+            .padding(12)
+            .on_press(message);
 
         // Wrap inactive buttons in a container with visible background
         let button_element: Element<'_, Message> = if is_active {

@@ -1069,20 +1069,12 @@ impl cosmic::Application for AppModel {
 
                         // If no camera available yet (cameras not initialized), just exit the subscription
                         // The subscription will restart when cameras become available (cameras_initialized flag changes)
-                        if current_camera.is_none() {
+                        let Some(camera) = &current_camera else {
                             info!(
                                 "No camera available - subscription will restart when cameras are initialized"
                             );
                             break;
-                        }
-
-                        let device_path = current_camera.as_ref().and_then(|cam| {
-                            if cam.path.is_empty() {
-                                None
-                            } else {
-                                Some(cam.path.as_str())
-                            }
-                        });
+                        };
 
                         // Extract format parameters
                         let (width, height, framerate, pixel_format) =
@@ -1097,11 +1089,7 @@ impl cosmic::Application for AppModel {
                                 (None, None, None, None)
                             };
 
-                        if let Some(cam) = &current_camera {
-                            info!(name = %cam.name, path = %cam.path, "Creating camera");
-                        } else {
-                            info!("Creating default camera...");
-                        }
+                        info!(name = %camera.name, path = %camera.path, "Creating camera");
 
                         if let Some(fmt) = &current_format {
                             info!(format = %fmt, "Using format");
@@ -1132,47 +1120,12 @@ impl cosmic::Application for AppModel {
 
                             // Create camera pipeline based on backend type
                             use crate::backends::camera::pipeline::CapturePipeline;
-                            use crate::backends::camera::types::{CameraDevice, CameraFormat};
+                            use crate::backends::camera::types::CameraFormat;
 
                             let (sender, mut receiver) =
                                 cosmic::iced::futures::channel::mpsc::channel(
                                     crate::constants::latency::FRAME_CHANNEL_CAPACITY,
                                 );
-
-                            // Build device and format objects for backend
-                            let device = CameraDevice {
-                                name: current_camera
-                                    .as_ref()
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_else(|| "Default Camera".to_string()),
-                                path: device_path.unwrap_or("").to_string(),
-                                device_info: current_camera
-                                    .as_ref()
-                                    .and_then(|c| c.device_info.clone()),
-                                rotation: current_camera
-                                    .as_ref()
-                                    .map(|c| c.rotation)
-                                    .unwrap_or_default(),
-                                pipeline_handler: current_camera
-                                    .as_ref()
-                                    .and_then(|c| c.pipeline_handler.clone()),
-                                supports_multistream: current_camera
-                                    .as_ref()
-                                    .map(|c| c.supports_multistream)
-                                    .unwrap_or(false),
-                                sensor_model: current_camera
-                                    .as_ref()
-                                    .and_then(|c| c.sensor_model.clone()),
-                                camera_location: current_camera
-                                    .as_ref()
-                                    .and_then(|c| c.camera_location.clone()),
-                                libcamera_version: current_camera
-                                    .as_ref()
-                                    .and_then(|c| c.libcamera_version.clone()),
-                                lens_actuator_path: current_camera
-                                    .as_ref()
-                                    .and_then(|c| c.lens_actuator_path.clone()),
-                            };
 
                             let format = CameraFormat {
                                 width: width.unwrap_or(640),
@@ -1184,7 +1137,7 @@ impl cosmic::Application for AppModel {
 
                             let pipeline_opt = {
                                 info!(
-                                    backend = if device.path.starts_with("pipewire:") {
+                                    backend = if camera.path.starts_with("pipewire:") {
                                         "pipewire-v4l2"
                                     } else {
                                         "libcamera"
@@ -1201,7 +1154,7 @@ impl cosmic::Application for AppModel {
                                         .await;
                                 }
 
-                                let camera_name = &device.path;
+                                let camera_name = &camera.path;
 
                                 // Pass capture resolution intact. The native negotiation
                                 // caps preview only if a separate raw stream succeeds.
