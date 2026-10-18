@@ -19,8 +19,37 @@ use tracing::{debug, info, warn};
 /// Workgroup size for the CSI-2 unpack shader (one thread per pixel pair).
 const UNPACK_WORKGROUP_SIZE: u32 = 256;
 
-/// Workgroup size for the debayer, AWB, and YUV conversion shaders (16×16 tile).
+/// Workgroup size for generic debayer, AWB, and YUV conversion (16×16 tile).
 const TILE_WORKGROUP_SIZE: u32 = 16;
+
+/// Retained ordinary-photo Bilinear shape; matches debayer_photo.wgsl.
+const PHOTO_WORKGROUP_SIZE: [u32; 2] = [64, 4];
+
+// R16 storage usage is guaranteed with enabled 16-bit norm support. This is
+// a descriptor policy, NOT a guarantee about driver image compression. It is
+// independent of optional shader routes and retained by frozen references.
+fn r16_input_usage(storage_capable: bool, format: wgpu::TextureFormat) -> wgpu::TextureUsages {
+    let ordinary = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
+    if storage_capable && format == wgpu::TextureFormat::R16Unorm {
+        ordinary | wgpu::TextureUsages::STORAGE_BINDING
+    } else {
+        ordinary
+    }
+}
+
+fn bayer_workgroups(
+    width: u32,
+    height: u32,
+    fused_bilinear: bool,
+    photo_workgroup_size: [u32; 2],
+) -> [u32; 2] {
+    let [x, y] = if fused_bilinear {
+        photo_workgroup_size
+    } else {
+        [TILE_WORKGROUP_SIZE; 2]
+    };
+    [width.div_ceil(x), height.div_ceil(y)]
+}
 
 /// Required byte alignment for `copy_buffer_to_texture` / `copy_texture_to_buffer` row stride.
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
@@ -28,6 +57,24 @@ const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
 /// Round `value` up to the next multiple of [`COPY_BYTES_PER_ROW_ALIGNMENT`].
 fn align_to_copy_row(value: u32) -> u32 {
     (value + COPY_BYTES_PER_ROW_ALIGNMENT - 1) & !(COPY_BYTES_PER_ROW_ALIGNMENT - 1)
+}
+
+/// Resolve a dispatch rectangle without changing sensor coordinates or extents.
+/// Validate even requests that fall back to full-frame non-Bilinear processing.
+fn bayer_conversion_region(
+    width: u32,
+    height: u32,
+    fused_bilinear: bool,
+    requested: Option<(u32, u32, u32, u32)>,
+) -> Result<(u32, u32, u32, u32), String> {
+    let full = (0, 0, width, height);
+    let region = requested.unwrap_or(full);
+    let (x, y, w, h) = region;
+    if x > width || y > height || w > width - x || h > height - y {
+        return Err("Bayer conversion region exceeds sensor dimensions".into());
+    }
+    // Empty rectangles preserve existing empty regional-readback behavior.
+    Ok(if fused_bilinear { region } else { full })
 }
 
 /// YUV conversion parameters (32 bytes, matches yuv_convert.wgsl)
@@ -44,15 +91,23 @@ struct ConvertParams {
     _pad1: u32,
 }
 
-/// Debayer conversion parameters (96 bytes, std140-compatible)
-/// White balance gains are now in a separate storage buffer (AwbGains).
+/// Dispatch-local rendering boundary, never persistent converter state.
+#[derive(Debug, Clone, Copy)]
+#[repr(u32)]
+pub(crate) enum BayerRenderingIntent {
+    Legacy = 0,
+    OrdinaryStillSdr = 1,
+}
+
+/// Debayer conversion parameters (112 bytes, std140-compatible).
+/// White balance gains are in a separate storage buffer (AwbGains).
 #[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DebayerParams {
     width: u32,
     height: u32,
-    pattern: u32,  // 0=RGGB, 1=BGGR, 2=GRBG, 3=GBRG
-    _padding: u32, // Keeps the shared AWB uniform prefix aligned.
+    pattern: u32,          // 0=RGGB, 1=BGGR, 2=GRBG, 3=GBRG
+    rendering_intent: u32, // Unused shared AWB prefix word; no layout shift.
     black_level: f32,
     _pad0: u32,
     _pad1: u32,
@@ -61,6 +116,7 @@ struct DebayerParams {
     ccm_row1: [f32; 4],     // xyz used, w=pad
     ccm_row2: [f32; 4],     // xyz used, w=pad
     white_levels: [f32; 4], // [R, Gr, Gb, B], normalized sensor codes
+    region: [u32; 4],       // Photo dispatch origin/extent; sensor dimensions stay unchanged.
 }
 
 /// White balance gains stored in a GPU storage buffer.
@@ -393,9 +449,10 @@ mod bayer_input_tests {
             let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
             let mut p = GpuConvertPipeline::new().await.unwrap();
             // Real early Err after allocating and completing GPU conversion.
+            // Select RCD explicitly to exercise cached tiled-engine resources.
             let result: Result<(), BayerError> = (|| {
                 let mut photo = p.photo_workspace();
-                photo.convert_bayer(&input)?;
+                photo.convert_bayer_with_method(&input, super::super::DemosaicMethod::Rcd)?;
                 let mut bad = GpuFrameInput::from_camera_frame(&frame).unwrap();
                 bad.colour_gains = Some([f32::NAN, 1.0]);
                 photo.convert_bayer(&bad)?;
@@ -408,7 +465,9 @@ mod bayer_input_tests {
             // Cancellation is dropping that future while its scope is live.
             let mut future = Box::pin(async {
                 let mut photo = p.photo_workspace();
-                photo.convert_bayer(&input).unwrap();
+                photo
+                    .convert_bayer_with_method(&input, super::super::DemosaicMethod::Rcd)
+                    .unwrap();
                 let _output = photo.read_rgba_to_cpu(513, 517).await.unwrap();
                 std::future::pending::<()>().await;
             });
@@ -447,7 +506,9 @@ mod bayer_input_tests {
             ));
             // Resource recreation must be valid immediately after cancellation.
             let mut photo = p.photo_workspace();
-            photo.convert_bayer(&input).unwrap();
+            photo
+                .convert_bayer_with_method(&input, super::super::DemosaicMethod::Rcd)
+                .unwrap();
             assert_eq!(
                 photo.read_rgba_to_cpu(513, 517).await.unwrap().len(),
                 513 * 517 * 4
@@ -477,7 +538,8 @@ mod bayer_input_tests {
             };
             let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
             let mut p = GpuConvertPipeline::new().await.unwrap();
-            p.convert_bayer(&input).unwrap();
+            p.convert_bayer_with_method(&input, super::super::DemosaicMethod::Rcd)
+                .unwrap();
             let programs = p.demosaic_programs.clone().unwrap();
             let mut photo = p.photo_workspace();
             assert!(
@@ -489,7 +551,9 @@ mod bayer_input_tests {
                     && photo.output_texture.is_none()
                     && photo.tex_y.is_none()
             );
-            photo.convert_bayer(&input).unwrap();
+            photo
+                .convert_bayer_with_method(&input, super::super::DemosaicMethod::Rcd)
+                .unwrap();
             assert!(Arc::ptr_eq(
                 &programs,
                 photo.demosaic_programs.as_ref().unwrap()
@@ -1022,7 +1086,7 @@ struct UnpackParams {
     packed_stride: u32,
     bit_depth: u32,         // 10, 12, or 14
     output_stride_u32: u32, // padded row stride in u32 units
-    _pad: [u32; 3],         // align to 32 bytes for WGSL uniform struct layout
+    _pad: [u32; 3],         // [0] is the photo band's sensor row offset; zero for generic
 }
 
 /// Binding type specification for pipeline creation
@@ -1088,7 +1152,13 @@ impl BindingSpec {
 struct FormatPipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    #[cfg(test)]
+    unpaced_photo_reference: bool,
 }
+
+#[path = "photo_session.rs"]
+mod photo_session;
+pub(crate) use photo_session::{PhotoSession, current_photo_session};
 
 /// GPU pipeline for format conversion
 ///
@@ -1102,6 +1172,11 @@ pub struct GpuConvertPipeline {
     /// Signed float demosaic and colour correction pipeline.
     debayer_pipeline: Option<FormatPipeline>,
     debayer_finish_pipeline: Option<FormatPipeline>,
+
+    photo_bilinear_pipeline: Option<FormatPipeline>,
+    // Layout policy survives frozen-reference shader overrides and workspace retirement.
+    r16_input_storage_capable: bool,
+    photo_workgroup_size: [u32; 2],
     bayer_linear_texture: Option<wgpu::Texture>,
     bayer_demosaic_texture: Option<wgpu::Texture>,
     demosaic_engine: Option<super::demosaic_gpu::GpuDemosaic>,
@@ -1147,6 +1222,8 @@ pub struct GpuConvertPipeline {
 #[must_use]
 pub struct PhotoWorkspace<'a> {
     pipeline: &'a mut GpuConvertPipeline,
+    session: Option<Arc<PhotoSession>>,
+    completed: bool,
 }
 impl std::ops::Deref for PhotoWorkspace<'_> {
     type Target = GpuConvertPipeline;
@@ -1161,7 +1238,19 @@ impl std::ops::DerefMut for PhotoWorkspace<'_> {
 }
 impl Drop for PhotoWorkspace<'_> {
     fn drop(&mut self) {
+        if self.completed
+            && let Some(session) = &self.session
+        {
+            session.store(self.pipeline);
+        }
         self.pipeline.release_frame_workspace();
+    }
+}
+
+impl PhotoWorkspace<'_> {
+    /// Retain only fully processed, unmapped resources; errors/cancellation retire them.
+    pub(crate) fn complete(&mut self) {
+        self.completed = true;
     }
 }
 
@@ -1170,7 +1259,32 @@ impl GpuConvertPipeline {
     /// from the photo scope. Preview users keep the ordinary reusable API.
     pub fn photo_workspace(&mut self) -> PhotoWorkspace<'_> {
         self.release_frame_workspace();
-        PhotoWorkspace { pipeline: self }
+        PhotoWorkspace {
+            pipeline: self,
+            session: None,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn photo_workspace_for_session(
+        &mut self,
+        session: Option<Arc<PhotoSession>>,
+        input: &GpuFrameInput,
+        method: super::DemosaicMethod,
+    ) -> PhotoWorkspace<'_> {
+        self.release_frame_workspace();
+        let session = session.filter(|session| {
+            if !session.matches(input, method) {
+                session.discard();
+                return false;
+            }
+            session.take(self)
+        });
+        PhotoWorkspace {
+            pipeline: self,
+            session,
+            completed: false,
+        }
     }
 
     fn release_frame_workspace(&mut self) {
@@ -1204,6 +1318,10 @@ impl GpuConvertPipeline {
         info!("Initializing format conversion pipelines");
 
         let gpu = gpu::get_shared_gpu().await?;
+        let r16_input_storage_capable = gpu
+            .device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
         let device = gpu.device;
         let queue = gpu.queue;
 
@@ -1252,6 +1370,10 @@ impl GpuConvertPipeline {
             yuv_pipeline: None,
             debayer_pipeline: None,
             debayer_finish_pipeline: None,
+
+            photo_bilinear_pipeline: None,
+            r16_input_storage_capable,
+            photo_workgroup_size: PHOTO_WORKGROUP_SIZE,
             bayer_linear_texture: None,
             bayer_demosaic_texture: None,
             demosaic_engine: None,
@@ -1351,10 +1473,13 @@ impl GpuConvertPipeline {
     pub fn warmup_pipelines(&mut self) {
         let start = std::time::Instant::now();
         self.ensure_yuv_pipeline();
-        self.ensure_bayer_pipelines();
-        self.ensure_awb_pipeline();
-        self.ensure_awb_finalize_pipeline();
-        self.ensure_unpack_pipeline();
+        if self.r16_input_storage_capable {
+            self.ensure_bayer_pipelines();
+            self.ensure_photo_bilinear_pipeline();
+            self.ensure_awb_pipeline();
+            self.ensure_awb_finalize_pipeline();
+            self.ensure_unpack_pipeline();
+        }
         info!(
             elapsed_ms = format!("{:.1}", start.elapsed().as_millis()),
             "GPU convert pipelines warmed up"
@@ -1407,15 +1532,7 @@ impl GpuConvertPipeline {
         output_stride_u32
     }
 
-    /// Encode the CSI-2 unpack compute pass and buffer-to-texture copy.
-    fn encode_unpack_pass(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        tex_y: &wgpu::Texture,
-        width: u32,
-        height: u32,
-        output_stride_u32: u32,
-    ) -> Result<(), String> {
+    fn unpack_bind_group(&self) -> Result<wgpu::BindGroup, String> {
         let unpack_pipeline = self
             .unpack_pipeline
             .as_ref()
@@ -1429,7 +1546,7 @@ impl GpuConvertPipeline {
             .as_ref()
             .ok_or("Unpack output buffer not allocated")?;
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        Ok(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("unpack_bind_group"),
             layout: &unpack_pipeline.bind_group_layout,
             entries: &[
@@ -1446,8 +1563,20 @@ impl GpuConvertPipeline {
                     resource: self.unpack_uniform_buffer.as_entire_binding(),
                 },
             ],
-        });
+        }))
+    }
 
+    /// Encode the CSI-2 unpack compute pass and buffer-to-texture copy.
+    fn encode_unpack_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        bindings: &wgpu::BindGroup,
+        tex_y: &wgpu::Texture,
+        extent: [u32; 2],
+        output_stride_u32: u32,
+        row_offset: u32,
+    ) {
+        let [width, height] = extent;
         // Dispatch: each thread handles one pixel pair
         let workgroups_x = width.div_ceil(2).div_ceil(UNPACK_WORKGROUP_SIZE);
         {
@@ -1455,8 +1584,8 @@ impl GpuConvertPipeline {
                 label: Some("unpack_csi2_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&unpack_pipeline.pipeline);
-            pass.set_bind_group(0, Some(&bind_group), &[]);
+            pass.set_pipeline(&self.unpack_pipeline.as_ref().unwrap().pipeline);
+            pass.set_bind_group(0, bindings, &[]);
             pass.dispatch_workgroups(workgroups_x, height, 1);
         }
 
@@ -1464,9 +1593,9 @@ impl GpuConvertPipeline {
         let bytes_per_row = output_stride_u32 * 4;
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
-                buffer: output_buf,
+                buffer: self.unpack_output_buffer.as_ref().unwrap(),
                 layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
+                    offset: u64::from(row_offset) * u64::from(bytes_per_row),
                     bytes_per_row: Some(bytes_per_row),
                     rows_per_image: Some(height),
                 },
@@ -1474,7 +1603,11 @@ impl GpuConvertPipeline {
             wgpu::TexelCopyTextureInfo {
                 texture: tex_y,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: row_offset,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::Extent3d {
@@ -1483,8 +1616,6 @@ impl GpuConvertPipeline {
                 depth_or_array_layers: 1,
             },
         );
-
-        Ok(())
     }
 
     /// Create a compute pipeline with the given shader and bind group layout spec
@@ -1535,6 +1666,8 @@ impl GpuConvertPipeline {
         FormatPipeline {
             pipeline,
             bind_group_layout,
+            #[cfg(test)]
+            unpaced_photo_reference: name == "immutable baseline photo_bilinear",
         }
     }
 
@@ -1609,7 +1742,7 @@ impl GpuConvertPipeline {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: y_format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: r16_input_usage(self.r16_input_storage_capable, y_format),
             view_formats: &[],
         }));
 
@@ -1679,6 +1812,8 @@ impl GpuConvertPipeline {
         input: &GpuFrameInput,
         raw_layout: RawLayout,
         gpu_demosaic: bool,
+        region: (u32, u32, u32, u32),
+        intent: BayerRenderingIntent,
     ) -> bool {
         // CCM and WB are independently supplied libcamera metadata. Missing
         // gains still use GPU gray-world AWB, not an identity-CCM override.
@@ -1692,7 +1827,7 @@ impl GpuConvertPipeline {
             width: input.width,
             height: input.height,
             pattern: input.format.bayer_pattern_code().unwrap_or(0),
-            _padding: 0,
+            rendering_intent: intent as u32,
             black_level: blacks[0],
             _pad0: match raw_layout {
                 RawLayout::U8 => (65535.0f32 / 65280.0).to_bits(),
@@ -1709,6 +1844,7 @@ impl GpuConvertPipeline {
             ccm_row1: [ccm[1][0], ccm[1][1], ccm[1][2], blacks[2]],
             ccm_row2: [ccm[2][0], ccm[2][1], ccm[2][2], blacks[3]],
             white_levels: input.sensor_white_levels.unwrap_or([1.0; 4]),
+            region: [region.0, region.1, region.2, region.3],
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
@@ -1816,17 +1952,106 @@ impl GpuConvertPipeline {
         Ok(())
     }
 
+    /// One sensor-space spatial band per completed submission. Dimensions and
+    /// CFA sampling remain global; only dispatch coordinates change.
+    fn dispatch_photo_bands(
+        &self,
+        pipeline: &FormatPipeline,
+        bindings: &wgpu::BindGroup,
+        region: (u32, u32, u32, u32),
+        workgroup: [u32; 2],
+        stage: &str,
+    ) -> Result<(), String> {
+        let (x, y, width, height) = region;
+        for (row, rows) in super::photo_scheduling::photo_bands(width, height, workgroup[1]) {
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                std::mem::offset_of!(DebayerParams, region) as u64,
+                bytemuck::cast_slice(&[x, y + row, width, rows]),
+            );
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some(stage),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_bind_group(0, bindings, &[]);
+                pass.dispatch_workgroups(
+                    width.div_ceil(workgroup[0]),
+                    rows.div_ceil(workgroup[1]),
+                    1,
+                );
+            }
+            super::photo_scheduling::submit_photo_batch(&self.device, &self.queue, encoder, stage)?;
+            debug!(
+                stage,
+                row,
+                width,
+                height = rows,
+                "Photo conversion band completed"
+            );
+        }
+        Ok(())
+    }
+
+    fn bounded_photo_submissions(&self) -> bool {
+        // The immutable, test-only full-sensor oracle deliberately ignores
+        // the appended ROI ABI and remains unpaced, independent of tile shape.
+        #[cfg(test)]
+        if self
+            .photo_bilinear_pipeline
+            .as_ref()
+            .is_some_and(|p| p.unpaced_photo_reference)
+        {
+            return false;
+        }
+        true
+    }
+
     /// Set up Bayer resources and encode unpack + AWB + debayer passes onto a command encoder.
     ///
     /// The canonical signed float Bayer path. Callers append the finishing
     /// pass to the returned encoder before submitting.
     ///
-    /// Returns `(encoder, needs_gpu_awb, had_gpu_unpack)` for logging and chaining.
+    /// Paced photos complete here; unpaced callers receive an encoder to finish.
     fn prepare_and_encode_bayer(
         &mut self,
         input: &GpuFrameInput,
         method: super::DemosaicMethod,
-    ) -> Result<(wgpu::CommandEncoder, bool, bool), String> {
+        fused_bilinear: bool,
+        region: (u32, u32, u32, u32),
+        bounded_photo: bool,
+        intent: BayerRenderingIntent,
+    ) -> Result<Option<wgpu::CommandEncoder>, String> {
+        let raw_layout = input
+            .raw_layout
+            .or_else(|| (input.y_stride == input.width).then_some(RawLayout::U8))
+            .ok_or("Unknown RAW packing; row stride is not a packing descriptor")?;
+        let row_bytes = match raw_layout {
+            RawLayout::U8 => input.width,
+            RawLayout::Unpacked16 { bits: 8..=16 } => {
+                input.width.checked_mul(2).ok_or("RAW row overflow")?
+            }
+            RawLayout::Csi2 { bits } if [10, 12, 14].contains(&bits) => {
+                let group = if bits == 12 { 2 } else { 4 };
+                input
+                    .width
+                    .div_ceil(group)
+                    .checked_mul(group * bits / 8)
+                    .ok_or("RAW row overflow")?
+            }
+            _ => return Err("Unsupported RAW bit depth".into()),
+        };
+        checked_plane(
+            input.y_data,
+            0,
+            input.y_data.len(),
+            input.y_stride as usize,
+            row_bytes as usize,
+            input.height as usize,
+        )
+        .map_err(|e| e.to_string())?;
         // All &mut self calls first (before immutable texture borrows)
         self.ensure_resources(input.width, input.height, input.format, None);
         if method == super::DemosaicMethod::Bilinear {
@@ -1857,40 +2082,13 @@ impl GpuConvertPipeline {
                 ],
             ));
         }
-        self.ensure_bayer_resources(input.width, input.height, method);
+        self.ensure_bayer_resources(input.width, input.height, method, fused_bilinear);
+
         if input.colour_gains.is_none() {
             self.ensure_awb_pipeline();
             self.ensure_awb_finalize_pipeline();
         }
 
-        let raw_layout = input
-            .raw_layout
-            .or_else(|| (input.y_stride == input.width).then_some(RawLayout::U8))
-            .ok_or("Unknown RAW packing; row stride is not a packing descriptor")?;
-        let row_bytes = match raw_layout {
-            RawLayout::U8 => input.width,
-            RawLayout::Unpacked16 { bits: 8..=16 } => {
-                input.width.checked_mul(2).ok_or("RAW row overflow")?
-            }
-            RawLayout::Csi2 { bits } if [10, 12, 14].contains(&bits) => {
-                let group = if bits == 12 { 2 } else { 4 };
-                input
-                    .width
-                    .div_ceil(group)
-                    .checked_mul(group * bits / 8)
-                    .ok_or("RAW row overflow")?
-            }
-            _ => return Err("Unsupported RAW bit depth".into()),
-        };
-        checked_plane(
-            input.y_data,
-            0,
-            input.y_data.len(),
-            input.y_stride as usize,
-            row_bytes as usize,
-            input.height as usize,
-        )
-        .map_err(|e| e.to_string())?;
         let unpack_info = if let RawLayout::Csi2 { bits: bit_depth } = raw_layout {
             if [10, 12, 14].contains(&bit_depth) {
                 self.ensure_unpack_pipeline();
@@ -1909,11 +2107,13 @@ impl GpuConvertPipeline {
 
         // Immutable references
         let tex_y = self.tex_y.as_ref().ok_or("Y texture not allocated")?;
-        let linear_view = self
-            .bayer_linear_texture
-            .as_ref()
-            .ok_or("Bayer linear texture missing")?
-            .create_view(&Default::default());
+        let linear_view = if fused_bilinear {
+            self.output_texture.as_ref()
+        } else {
+            self.bayer_linear_texture.as_ref()
+        }
+        .ok_or("Bayer linear texture missing")?
+        .create_view(&Default::default());
 
         // Upload data
         if let Some((bit_depth, output_stride_u32)) = unpack_info {
@@ -1978,12 +2178,15 @@ impl GpuConvertPipeline {
         }
 
         let gpu_demosaic = method != super::DemosaicMethod::Bilinear;
-        let needs_gpu_awb = self.prepare_debayer_params(input, raw_layout, gpu_demosaic);
+        let needs_gpu_awb =
+            self.prepare_debayer_params(input, raw_layout, gpu_demosaic, region, intent);
 
-        let debayer_pipeline = self
-            .debayer_pipeline
-            .as_ref()
-            .ok_or("Debayer pipeline not created")?;
+        let debayer_pipeline = if fused_bilinear {
+            self.photo_bilinear_pipeline.as_ref()
+        } else {
+            self.debayer_pipeline.as_ref()
+        }
+        .ok_or("Debayer pipeline not created")?;
 
         let y_view = tex_y.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1992,31 +2195,32 @@ impl GpuConvertPipeline {
             .as_ref()
             .unwrap()
             .create_view(&Default::default());
+        let debayer_entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&y_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&linear_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: self.uniform_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: self.awb_gains_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&demosaic_view),
+            },
+        ];
         let debayer_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("debayer_bind_group"),
             layout: &debayer_pipeline.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&linear_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.uniform_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.awb_gains_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&demosaic_view),
-                },
-            ],
+            entries: &debayer_entries,
         });
 
         let mut encoder = self
@@ -2026,17 +2230,84 @@ impl GpuConvertPipeline {
             });
 
         if let Some((_, output_stride_u32)) = unpack_info {
-            self.encode_unpack_pass(
-                &mut encoder,
-                tex_y,
-                input.width,
-                input.height,
-                output_stride_u32,
-            )?;
+            let bindings = self.unpack_bind_group()?;
+            if bounded_photo {
+                // The packed upload above is shared by every band. Complete
+                // each unpack/copy before changing its row-offset uniform.
+                for (row, height) in
+                    super::photo_scheduling::photo_bands(input.width, input.height, 1)
+                {
+                    self.queue.write_buffer(
+                        &self.unpack_uniform_buffer,
+                        std::mem::offset_of!(UnpackParams, _pad) as u64,
+                        bytemuck::bytes_of(&row),
+                    );
+                    self.encode_unpack_pass(
+                        &mut encoder,
+                        &bindings,
+                        tex_y,
+                        [input.width, height],
+                        output_stride_u32,
+                        row,
+                    );
+                    super::photo_scheduling::submit_photo_batch(
+                        &self.device,
+                        &self.queue,
+                        encoder,
+                        "unpack",
+                    )?;
+                    debug!(
+                        stage = "unpack",
+                        row,
+                        width = input.width,
+                        height,
+                        "Photo conversion band completed"
+                    );
+                    encoder = self
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                            label: Some("photo preparation"),
+                        });
+                }
+            } else {
+                self.encode_unpack_pass(
+                    &mut encoder,
+                    &bindings,
+                    tex_y,
+                    [input.width, input.height],
+                    output_stride_u32,
+                    0,
+                );
+            }
         }
 
         if needs_gpu_awb {
             self.encode_awb_passes(&mut encoder, &y_view, input.width, input.height)?;
+        }
+
+        let mut encoder = if bounded_photo {
+            // AWB is full-sensor, exactly once, and completes before any ROI
+            // uniform mutation. Supplied gains take the same upload fence.
+            super::photo_scheduling::submit_photo_batch(
+                &self.device,
+                &self.queue,
+                encoder,
+                "prepare",
+            )?;
+            None
+        } else {
+            Some(encoder)
+        };
+
+        if bounded_photo && fused_bilinear {
+            self.dispatch_photo_bands(
+                debayer_pipeline,
+                &debayer_bind_group,
+                region,
+                self.photo_workgroup_size,
+                "bilinear",
+            )?;
+            return Ok(None);
         }
 
         if gpu_demosaic {
@@ -2061,24 +2332,46 @@ impl GpuConvertPipeline {
                     },
                 ],
             });
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("normalize CFA once"),
-                    timestamp_writes: None,
-                });
+            if bounded_photo {
+                self.dispatch_photo_bands(
+                    pipeline,
+                    &bg,
+                    (0, 0, input.width, input.height),
+                    [16, 16],
+                    "normalize",
+                )?;
+            } else {
+                let mut pass =
+                    encoder
+                        .as_mut()
+                        .unwrap()
+                        .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("normalize CFA once"),
+                            timestamp_writes: None,
+                        });
                 pass.set_pipeline(&pipeline.pipeline);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(input.width.div_ceil(16), input.height.div_ceil(16), 1);
             }
-            engine.encode(
-                &self.device,
-                &self.queue,
-                &mut encoder,
-                self.bayer_demosaic_texture.as_ref().unwrap(),
-                input.format.bayer_pattern_code().unwrap(),
-                method,
-            );
-            self.queue.submit([encoder.finish()]);
+            if bounded_photo {
+                engine.encode_photo(
+                    &self.device,
+                    &self.queue,
+                    self.bayer_demosaic_texture.as_ref().unwrap(),
+                    input.format.bayer_pattern_code().unwrap(),
+                    method,
+                )?;
+            } else {
+                engine.encode(
+                    &self.device,
+                    &self.queue,
+                    encoder.as_mut().unwrap(),
+                    self.bayer_demosaic_texture.as_ref().unwrap(),
+                    input.format.bayer_pattern_code().unwrap(),
+                    method,
+                );
+                self.queue.submit([encoder.take().unwrap().finish()]);
+            }
             let bound = engine.validate(&self.device)?;
             super::validate_bayer_colour(
                 Some(
@@ -2090,33 +2383,51 @@ impl GpuConvertPipeline {
                 bound,
             )
             .map_err(str::to_owned)?;
-            encoder = self
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("validated Bayer colour"),
-                });
+            if !bounded_photo {
+                encoder = Some(self.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor {
+                        label: Some("validated Bayer colour"),
+                    },
+                ));
+            }
         }
 
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("debayer_pass"),
-                timestamp_writes: None,
-            });
+        if bounded_photo {
+            self.dispatch_photo_bands(
+                debayer_pipeline,
+                &debayer_bind_group,
+                (0, 0, input.width, input.height),
+                [16, 16],
+                "colour",
+            )?;
+        } else {
+            let mut pass =
+                encoder
+                    .as_mut()
+                    .unwrap()
+                    .begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("debayer_pass"),
+                        timestamp_writes: None,
+                    });
             pass.set_pipeline(&debayer_pipeline.pipeline);
             pass.set_bind_group(0, Some(&debayer_bind_group), &[]);
-            let workgroups_x = input.width.div_ceil(TILE_WORKGROUP_SIZE);
-            let workgroups_y = input.height.div_ceil(TILE_WORKGROUP_SIZE);
+            let [workgroups_x, workgroups_y] = bayer_workgroups(
+                region.2,
+                region.3,
+                fused_bilinear,
+                self.photo_workgroup_size,
+            );
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
-        Ok((encoder, needs_gpu_awb, unpack_info.is_some()))
+        Ok(encoder)
     }
 
     /// Compile canonical Bayer pipelines without allocating frame surfaces.
     fn ensure_bayer_pipelines(&mut self) {
         if self.debayer_pipeline.is_none() {
             self.debayer_pipeline = Some(self.create_pipeline(
-                &super::compose_debayer(include_str!("debayer_texture.wgsl")),
+                &super::compose_bayer_texture(include_str!("debayer_texture.wgsl")),
                 "debayer",
                 &[
                     (0, BindingSpec::Texture),
@@ -2129,15 +2440,49 @@ impl GpuConvertPipeline {
         }
         if self.debayer_finish_pipeline.is_none() {
             self.debayer_finish_pipeline = Some(self.create_pipeline(
-                include_str!("debayer_finish.wgsl"),
+                &format!(
+                    "{}\n{}",
+                    super::BAYER_FINISH_FUNCTIONS,
+                    include_str!("debayer_finish.wgsl")
+                ),
                 "debayer_finish",
-                &[(0, BindingSpec::Texture), (1, BindingSpec::StorageTexture)],
+                &[
+                    (0, BindingSpec::Texture),
+                    (1, BindingSpec::StorageTexture),
+                    (2, BindingSpec::Uniform),
+                ],
             ));
         }
     }
 
-    fn ensure_bayer_resources(&mut self, width: u32, height: u32, method: super::DemosaicMethod) {
-        self.ensure_bayer_pipelines();
+    fn ensure_photo_bilinear_pipeline(&mut self) {
+        if self.photo_bilinear_pipeline.is_none() {
+            self.photo_bilinear_pipeline = Some(self.create_pipeline(
+                &super::compose_bayer_texture(include_str!("debayer_photo.wgsl")),
+                "photo_bilinear",
+                &[
+                    (0, BindingSpec::Texture),
+                    (1, BindingSpec::StorageTexture),
+                    (2, BindingSpec::Uniform),
+                    (3, BindingSpec::ReadOnlyStorageBuffer),
+                    (4, BindingSpec::Texture),
+                ],
+            ));
+        }
+    }
+
+    fn ensure_bayer_resources(
+        &mut self,
+        width: u32,
+        height: u32,
+        method: super::DemosaicMethod,
+        fused_bilinear: bool,
+    ) {
+        if fused_bilinear {
+            self.ensure_photo_bilinear_pipeline();
+        } else {
+            self.ensure_bayer_pipelines();
+        }
         // Bilinear never samples the engine RGB binding; use a tiny placeholder
         // rather than allocating another full-frame float surface for video.
         let (rgb_width, rgb_height) = if method == super::DemosaicMethod::Bilinear {
@@ -2168,7 +2513,9 @@ impl GpuConvertPipeline {
                     view_formats: &[],
                 }));
         }
-        if self
+        if fused_bilinear {
+            self.bayer_linear_texture = None;
+        } else if self
             .bayer_linear_texture
             .as_ref()
             .is_none_or(|t| t.width() != width || t.height() != height)
@@ -2196,7 +2543,7 @@ impl GpuConvertPipeline {
     /// Canonical signed float Bayer conversion with typed fail-closed errors.
     /// The working surface is separate from HDR+; callers receive encoded RGBA.
     pub fn convert_bayer(&mut self, input: &GpuFrameInput) -> Result<&wgpu::Texture, BayerError> {
-        self.convert_bayer_with_method(input, super::DemosaicMethod::Rcd)
+        self.convert_bayer_with_method(input, super::DemosaicMethod::default())
     }
 
     /// Explicit photo method; shared GPU RCD/LMMSE followed by common colour finishing.
@@ -2205,12 +2552,101 @@ impl GpuConvertPipeline {
         input: &GpuFrameInput,
         method: super::DemosaicMethod,
     ) -> Result<&wgpu::Texture, BayerError> {
+        self.convert_bayer_impl(
+            input,
+            method,
+            false,
+            None,
+            false,
+            BayerRenderingIntent::Legacy,
+        )
+    }
+
+    /// Photo-only fast path; keep the linear working API for video and HDR callers.
+    #[cfg(test)]
+    pub(crate) fn convert_photo_bayer_with_method(
+        &mut self,
+        input: &GpuFrameInput,
+        method: super::DemosaicMethod,
+    ) -> Result<&wgpu::Texture, BayerError> {
+        self.convert_bayer_impl(
+            input,
+            method,
+            method == super::DemosaicMethod::Bilinear,
+            None,
+            true,
+            BayerRenderingIntent::Legacy,
+        )
+    }
+
+    /// Photo-only regional development. Only the requested rectangle is valid
+    /// in the full-size output texture for Bilinear; never feed it to a full
+    /// frame filter. Other methods deliberately retain full-frame processing.
+    #[cfg(test)]
+    pub(crate) fn convert_photo_bayer_region_with_method(
+        &mut self,
+        input: &GpuFrameInput,
+        method: super::DemosaicMethod,
+        region: (u32, u32, u32, u32),
+    ) -> Result<&wgpu::Texture, BayerError> {
+        self.convert_still_bayer_region(input, method, region, true, BayerRenderingIntent::Legacy)
+    }
+
+    /// Preserve the photo fused algorithm/ROI with the original single submission
+    /// for continuous Motion Photo frames; do not substitute generic demosaicing.
+    #[cfg(test)]
+    pub(crate) fn convert_photo_bayer_region_unpaced_with_method(
+        &mut self,
+        input: &GpuFrameInput,
+        method: super::DemosaicMethod,
+        region: (u32, u32, u32, u32),
+    ) -> Result<&wgpu::Texture, BayerError> {
+        self.convert_still_bayer_region(input, method, region, false, BayerRenderingIntent::Legacy)
+    }
+
+    /// Explicit caller-scoped colour intent, independent of submission pacing.
+    pub(crate) fn convert_still_bayer_region(
+        &mut self,
+        input: &GpuFrameInput,
+        method: super::DemosaicMethod,
+        region: (u32, u32, u32, u32),
+        pace: bool,
+        intent: BayerRenderingIntent,
+    ) -> Result<&wgpu::Texture, BayerError> {
+        self.convert_bayer_impl(
+            input,
+            method,
+            method == super::DemosaicMethod::Bilinear,
+            Some(region),
+            pace,
+            intent,
+        )
+    }
+
+    fn convert_bayer_impl(
+        &mut self,
+        input: &GpuFrameInput,
+        method: super::DemosaicMethod,
+        fused_bilinear: bool,
+        requested_region: Option<(u32, u32, u32, u32)>,
+        pace_photo: bool,
+        intent: BayerRenderingIntent,
+    ) -> Result<&wgpu::Texture, BayerError> {
+        if !self
+            .device
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        {
+            return Err("GPU Bayer requires TEXTURE_FORMAT_16BIT_NORM".into());
+        }
         if !input.format.is_bayer() {
             return Err("Bayer conversion requires a Bayer source".into());
         }
         if input.width < 2 || input.height < 2 {
             return Err("Bayer conversion needs at least a 2x2 CFA lattice".into());
         }
+        let region =
+            bayer_conversion_region(input.width, input.height, fused_bilinear, requested_region)?;
         if input
             .colour_gains
             .is_some_and(|g| g.iter().any(|v| !v.is_finite() || *v <= 0.0))
@@ -2240,7 +2676,26 @@ impl GpuConvertPipeline {
             .unwrap_or([super::BAYER_AWB_GAIN_BOUND; 2]);
         super::validate_bayer_colour(Some(gain_bounds), input.colour_correction_matrix, 1.0)
             .map_err(|_| BayerError::UnsafeArithmetic)?;
-        let (mut encoder, _, _) = self.prepare_and_encode_bayer(input, method)?;
+        let bounded_photo = pace_photo && self.bounded_photo_submissions();
+        let encoder = self.prepare_and_encode_bayer(
+            input,
+            method,
+            fused_bilinear,
+            region,
+            bounded_photo,
+            intent,
+        )?;
+        if fused_bilinear {
+            // Continuous frames and the frozen test oracle retain one original
+            // submission. Paced still photos are already fenced above.
+            if let Some(encoder) = encoder {
+                self.queue.submit([encoder.finish()]);
+            }
+            return self
+                .output_texture
+                .as_ref()
+                .ok_or("Missing Bayer output".into());
+        }
         let linear_view = self
             .bayer_linear_texture
             .as_ref()
@@ -2251,30 +2706,46 @@ impl GpuConvertPipeline {
             .debayer_finish_pipeline
             .as_ref()
             .ok_or("Missing Bayer finishing pipeline")?;
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&linear_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: self.uniform_buffer.as_entire_binding(),
+            },
+        ];
         let bindings = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("debayer_finish_bindings"),
             layout: &pipeline.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&linear_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(output_view),
-                },
-            ],
+            entries: &entries,
         });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("bayer_scene_to_encoder"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&pipeline.pipeline);
-            pass.set_bind_group(0, Some(&bindings), &[]);
-            pass.dispatch_workgroups(input.width.div_ceil(16), input.height.div_ceil(16), 1);
+        if bounded_photo {
+            self.dispatch_photo_bands(
+                pipeline,
+                &bindings,
+                (0, 0, input.width, input.height),
+                [16, 16],
+                "finish",
+            )?;
+        } else {
+            let mut encoder = encoder.unwrap();
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("bayer_scene_to_encoder"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&pipeline.pipeline);
+                pass.set_bind_group(0, Some(&bindings), &[]);
+                pass.dispatch_workgroups(input.width.div_ceil(16), input.height.div_ceil(16), 1);
+            }
+            self.queue.submit([encoder.finish()]);
         }
-        self.queue.submit([encoder.finish()]);
         self.output_texture
             .as_ref()
             .ok_or("Missing Bayer output".into())
@@ -2579,50 +3050,72 @@ impl GpuConvertPipeline {
 
     /// Read back the converted RGBA data to CPU memory
     pub async fn read_rgba_to_cpu(&mut self, width: u32, height: u32) -> Result<Vec<u8>, String> {
-        let output = self
-            .output_texture
-            .as_ref()
-            .ok_or("Output texture not allocated")?;
+        self.read_rgba_region_to_cpu((0, 0, width, height)).await
+    }
 
-        let padded_bytes_per_row = align_to_copy_row(width * 4);
-        let required_size = (padded_bytes_per_row * height) as u64;
-
-        // Reuse cached staging buffer if it matches, otherwise allocate and cache
-        if self.readback_staging_buffer_size != required_size {
+    fn ensure_photo_readback(&mut self, required_size: u64) {
+        if self.readback_staging_buffer_size < required_size {
             self.readback_staging_buffer = Some(crate::gpu::readback::ReadbackBuffer::from_buffer(
                 &self.device,
                 self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("convert_staging"),
+                    label: Some("photo_region_staging"),
                     size: required_size,
                     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                     mapped_at_creation: false,
                 }),
-                "convert_staging",
+                "photo_region_staging",
             ));
             self.readback_staging_buffer_size = required_size;
         }
+    }
 
+    /// Read only the final integer crop/zoom rectangle from canonical RGBA8.
+    /// Geometry is a byte-preserving copy; texture dimensions stay full-sensor.
+    pub(crate) async fn read_rgba_region_to_cpu(
+        &mut self,
+        (x, y, width, height): (u32, u32, u32, u32),
+    ) -> Result<Vec<u8>, String> {
+        let output = self
+            .output_texture
+            .as_ref()
+            .ok_or("Output texture not allocated")?;
+        if x > output.width()
+            || y > output.height()
+            || width > output.width() - x
+            || height > output.height() - y
+        {
+            return Err("Readback region exceeds source dimensions".into());
+        }
+        if width == 0 || height == 0 {
+            return Ok(Vec::new());
+        }
+        let row_bytes = width.checked_mul(4).ok_or("Readback row overflow")?;
+        let padded_row = row_bytes
+            .checked_add(COPY_BYTES_PER_ROW_ALIGNMENT - 1)
+            .ok_or("Readback row alignment overflow")?
+            & !(COPY_BYTES_PER_ROW_ALIGNMENT - 1);
+        let required_size = u64::from(padded_row) * u64::from(height);
+        self.ensure_photo_readback(required_size);
+        let output = self.output_texture.as_ref().unwrap();
         let readback = self.readback_staging_buffer.as_ref().unwrap();
-        let staging_buffer = readback.buffer();
-
+        let staging = readback.buffer();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("readback_encoder"),
+                label: Some("photo_region_readback"),
             });
-
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: output,
                 mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                origin: wgpu::Origin3d { x, y, z: 0 },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
-                buffer: &staging_buffer,
+                buffer: &staging,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(padded_bytes_per_row),
+                    bytes_per_row: Some(padded_row),
                     rows_per_image: Some(height),
                 },
             },
@@ -2632,25 +3125,14 @@ impl GpuConvertPipeline {
                 depth_or_array_layers: 1,
             },
         );
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-
+        self.queue.submit([encoder.finish()]);
         let data = readback.read_async().await?;
-        let mut output_data = Vec::with_capacity((width * height * 4) as usize);
-
-        if padded_bytes_per_row == width * 4 {
-            output_data.extend_from_slice(&data[..(width * height * 4) as usize]);
-        } else {
-            for row in 0..height {
-                let start = (row * padded_bytes_per_row) as usize;
-                let end = start + (width * 4) as usize;
-                output_data.extend_from_slice(&data[start..end]);
-            }
+        let mut result = Vec::with_capacity(row_bytes as usize * height as usize);
+        for row in data.chunks_exact(padded_row as usize).take(height as usize) {
+            result.extend_from_slice(&row[..row_bytes as usize]);
         }
-
         drop(data);
-
-        Ok(output_data)
+        Ok(result)
     }
 
     pub fn output_texture(&self) -> Option<&wgpu::Texture> {
@@ -2698,15 +3180,27 @@ pub async fn get_gpu_convert_pipeline()
 }
 
 #[cfg(test)]
+#[path = "photo_fast_path_tests.rs"]
+mod photo_fast_path_tests;
+
+#[cfg(test)]
+#[path = "photo_session_tests.rs"]
+mod photo_session_tests;
+
+#[cfg(test)]
+#[path = "photo_workgroup_tests.rs"]
+mod photo_workgroup_tests;
+
+#[cfg(test)]
 mod method_routing_tests {
     use super::*;
     use crate::backends::camera::types::FrameData;
     use crate::shaders::DemosaicMethod;
     #[test]
-    fn production_gpu_routes_three_methods_and_generic_defaults_rcd() {
+    fn production_gpu_routes_three_methods_and_generic_defaults_bilinear() {
         let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
             crate::test_gpu::skip_no_gpu(
-                "production_gpu_routes_three_methods_and_generic_defaults_rcd",
+                "production_gpu_routes_three_methods_and_generic_defaults_bilinear",
             );
             return;
         };
@@ -2756,7 +3250,7 @@ mod method_routing_tests {
                 assert_ne!(outputs[1], outputs[2]);
                 pipeline.convert(&input).unwrap();
                 assert_eq!(
-                    outputs[0],
+                    outputs[2],
                     pipeline.read_bayer_linear_for_test().await.unwrap()
                 );
             }
@@ -2904,6 +3398,14 @@ mod fully_gpu_contract_tests {
 }
 
 #[cfg(test)]
+#[path = "bayer_region_tests.rs"]
+mod bayer_region_tests;
+
+#[cfg(test)]
+#[path = "photo_roi_reference.rs"]
+mod roi_frozen_reference;
+
+#[cfg(test)]
 mod readback_owner_tests {
     use super::*;
     #[test]
@@ -2939,3 +3441,15 @@ mod readback_owner_tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "packed_photo_tests.rs"]
+mod packed_photo_tests;
+
+#[cfg(test)]
+#[path = "photo_batch_tests.rs"]
+mod photo_batch_tests;
+
+#[cfg(test)]
+#[path = "r16_input_tests.rs"]
+mod r16_input_tests;

@@ -124,8 +124,8 @@ fn group_max(value:vec2<u32>,lane:u32)->vec2<u32>{
 @compute @workgroup_size(16,16)
 fn bounds(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocation_index) lane:u32){
     var value=vec2<u32>(0u);
-    if id.x<p.width && id.y<p.height {
-        let v=textureLoad(raw_tex,id.xy,0).r;
+    if id.x<p.tile_width && id.y<p.tile_height {
+        let v=textureLoad(raw_tex,id.xy+vec2(p.origin_x,p.origin_y),0).r;
         if !finite(v){
             atomicOr(&status.invalid,1u);
         }
@@ -356,13 +356,16 @@ fn final_pass(@builtin(global_invocation_id) id:vec3<u32>,@builtin(local_invocat
                 v[2u-c]=0.5*(raw(q-vec2(0,1))+raw(q+vec2(0,1)));
             }
         }
-        v.w=raw(q);
-        for(var y=-1;y<=1;y++){
-            for(var x=-1;x<=1;x++){
-                if c0!=1u||x==0||y==0{
-                    v.w=max(v.w,raw(q+vec2(x,y)));
-                }
-            }
+        // Same bilinear recovery driver as the shared core. Refined colour is
+        // untouched and cannot independently select the highlight shoulder.
+        let cross=0.25*(raw(q-vec2(1,0))+raw(q+vec2(1,0))+raw(q-vec2(0,1))+raw(q+vec2(0,1)));
+        let diagonal=0.25*(raw(q-vec2(1,1))+raw(q+vec2(1,-1))+raw(q+vec2(-1,1))+raw(q+vec2(1,1)));
+        if c0==1u{
+            let horizontal=0.5*(raw(q-vec2(1,0))+raw(q+vec2(1,0)));
+            let vertical=0.5*(raw(q-vec2(0,1))+raw(q+vec2(0,1)));
+            v.w=max(raw(q),max(horizontal,vertical));
+        } else {
+            v.w=max(raw(q),max(cross,diagonal));
         }
         for(var c=0u;c<4u;c++){
             if !finite(v[c]){

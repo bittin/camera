@@ -20,9 +20,9 @@
 //! │  Pipeline (main)     │         │                       │
 //! │                      │  init   │  CameraManager        │
 //! │  stop_flag ──────────┼────────►│  ActiveCamera         │
-//! │  still_requested ────┼────────►│  FrameBuffers         │
+//! │  still_capture ─────┼────────►│  FrameBuffers         │
 //! │  latest_preview ◄────┼─────────│  Request loop         │
-//! │  latest_still   ◄────┼─────────│                       │
+//! │  still_capture ◄────┼─────────│                       │
 //! │  frame_sender   ◄────┼─────────│  (all libcamera ops)  │
 //! └──────────────────────┘         └───────────────────────┘
 //! ```
@@ -34,6 +34,7 @@ pub(crate) mod pixel_formats;
 pub use diagnostics::is_capture_active;
 
 use crate::backends::camera::preview_metrics::PreviewMetrics;
+use crate::backends::camera::still_capture::{StillCapture, StillRequest};
 use crate::backends::camera::types::*;
 use capture_thread::{CaptureThreadInitResult, CaptureThreadParams, capture_thread_main};
 use diagnostics::clear_global_diagnostics;
@@ -45,11 +46,7 @@ use tracing::{debug, error, info};
 /// Shared communication handles passed into the native pipeline
 pub(crate) struct PipelineSharedState {
     pub(crate) frame_sender: FrameSender,
-    pub(crate) still_requested: Arc<AtomicBool>,
-    pub(crate) still_frame: Arc<Mutex<Option<CameraFrame>>>,
-    /// Notifier fired by the capture thread when a new still frame is stored.
-    /// Allows consumers to await rather than poll.
-    pub(crate) still_frame_notify: Arc<tokio::sync::Notify>,
+    pub(crate) still_capture: Arc<StillCapture>,
     pub(crate) recording_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<RecordingFrame>>>>,
     pub(crate) jpeg_recording_mode: Arc<AtomicBool>,
     /// Cancel flag from the subscription — allows the capture thread to abort
@@ -69,12 +66,10 @@ pub(crate) struct NativeLibcameraPipeline {
     is_multistream: bool,
     /// Stop flag for capture thread
     stop_flag: Arc<AtomicBool>,
-    /// Still capture requested flag
-    still_capture_requested: Arc<AtomicBool>,
+    still_capture: Arc<StillCapture>,
+    still_request: Mutex<Option<StillRequest>>,
     /// Latest preview frame
     latest_preview: Arc<Mutex<Option<CameraFrame>>>,
-    /// Latest still frame (full resolution)
-    latest_still: Arc<Mutex<Option<CameraFrame>>>,
     /// Preview frame counter
     preview_frame_count: Arc<AtomicU64>,
     /// Still frame counter
@@ -126,9 +121,7 @@ impl NativeLibcameraPipeline {
             limit_preview,
             stop_flag: Arc::clone(&stop_flag),
             latest_preview: Arc::clone(&latest_preview),
-            latest_still: Arc::clone(&shared.still_frame),
-            still_requested: Arc::clone(&shared.still_requested),
-            still_frame_notify: Arc::clone(&shared.still_frame_notify),
+            still_capture: Arc::clone(&shared.still_capture),
             preview_frame_count: Arc::clone(&preview_frame_count),
             still_frame_count: Arc::clone(&still_frame_count),
             frame_sender: shared.frame_sender,
@@ -166,9 +159,9 @@ impl NativeLibcameraPipeline {
             is_multistream: init_result.is_multistream,
             preview_metrics,
             stop_flag,
-            still_capture_requested: shared.still_requested,
+            still_capture: shared.still_capture,
+            still_request: Mutex::new(None),
             latest_preview,
-            latest_still: shared.still_frame,
             preview_frame_count,
             still_frame_count,
             _recording_sender: shared.recording_sender,
@@ -181,20 +174,20 @@ impl NativeLibcameraPipeline {
 
     /// Request a still capture (full resolution).
     ///
-    /// Uses `Release` ordering so the capture thread (reading with `Acquire`)
-    /// is guaranteed to observe the request even on weakly-ordered ISAs
-    /// (AArch64).
+    /// Retain consumer ownership for the synchronous backend compatibility API.
     pub(crate) fn request_still_capture(&self) {
         debug!("Still capture requested");
-        self.still_capture_requested.store(true, Ordering::Release);
+        let mut request = self.still_request.lock().unwrap();
+        *request = Some(self.begin_still_capture());
     }
 
     /// Get the latest still frame (if available)
     pub(crate) fn get_still_frame(&self) -> Option<CameraFrame> {
-        self.latest_still
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
+        self.still_request.lock().unwrap().as_ref()?.take()
+    }
+
+    pub(crate) fn begin_still_capture(&self) -> StillRequest {
+        self.still_capture.request()
     }
 
     /// Get the latest preview frame
@@ -257,9 +250,9 @@ mod tests {
             is_multistream: false,
             capture_thread: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
-            still_capture_requested: Arc::new(AtomicBool::new(false)),
+            still_capture: Default::default(),
+            still_request: Mutex::new(None),
             latest_preview: Arc::new(Mutex::new(None)),
-            latest_still: Arc::new(Mutex::new(None)),
             preview_frame_count: Arc::new(AtomicU64::new(0)),
             still_frame_count: Arc::new(AtomicU64::new(0)),
             _recording_sender: Arc::new(Mutex::new(None)),

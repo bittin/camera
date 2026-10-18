@@ -21,6 +21,16 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Post-processing configuration
+///
+/// Public settings support struct update syntax from external crates:
+///
+/// ```
+/// let config = camera::pipelines::photo::PostProcessingConfig {
+///     sharpening: true,
+///     ..Default::default()
+/// };
+/// assert!(config.sharpening);
+/// ```
 #[derive(Debug, Clone)]
 pub struct PostProcessingConfig {
     /// Photo-only demosaic selection, independent of video.
@@ -46,7 +56,7 @@ pub struct PostProcessingConfig {
 impl Default for PostProcessingConfig {
     fn default() -> Self {
         Self {
-            demosaic_method: crate::shaders::DemosaicMethod::Rcd,
+            demosaic_method: crate::shaders::DemosaicMethod::default(),
             color_correction: true,
             sharpening: false,
             brightness: 0.0,
@@ -69,12 +79,37 @@ pub struct ProcessedImage {
 /// Post-processor for captured frames
 pub struct PostProcessor {
     config: PostProcessingConfig,
+    session: Option<Arc<crate::shaders::PhotoSession>>,
+    pace_gpu: bool,
+    rendering_intent: crate::shaders::BayerRenderingIntent,
 }
 
 impl PostProcessor {
     /// Create a new post-processor with the given configuration
     pub fn new(config: PostProcessingConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            session: None,
+            pace_gpu: true,
+            rendering_intent: crate::shaders::BayerRenderingIntent::OrdinaryStillSdr,
+        }
+    }
+
+    /// Submission scheduling only; never changes colour/rendering intent.
+    pub(crate) fn without_gpu_pacing(mut self) -> Self {
+        self.pace_gpu = false;
+        self
+    }
+
+    /// Continuous Motion Photo retains legacy colour independently of pacing.
+    pub(crate) fn for_continuous_frames(mut self) -> Self {
+        self.rendering_intent = crate::shaders::BayerRenderingIntent::Legacy;
+        self
+    }
+
+    /// Use the negotiated camera session snapshotted at shutter dispatch.
+    pub(crate) fn set_photo_session(&mut self, session: Option<Arc<crate::shaders::PhotoSession>>) {
+        self.session = session;
     }
 
     /// Process a captured frame asynchronously
@@ -162,38 +197,13 @@ impl PostProcessor {
             _ => None,
         };
 
-        // Bayer decoding is mandatory; only an optional filter may fall back.
-        let filtered_rgba: Vec<u8> = if frame.format.is_bayer() {
-            let rgba = Self::convert_bayer_to_rgba(&frame, self.config.demosaic_method).await?;
-            if config.filter_type != FilterType::Standard {
-                apply_filter_gpu_rgba(&rgba, frame_width, frame_height, config.filter_type)
-                    .await
-                    .unwrap_or(rgba)
-            } else {
-                rgba
-            }
-        } else if frame.format.is_yuv() {
-            debug!(format = ?frame.format, "Converting frame to RGBA for photo processing");
-            let rgba = Self::convert_yuv_to_rgba(&frame)
-                .await
-                .map_err(|e| format!("Failed to convert to RGBA: {}", e))?;
-            // Apply filter for non-Bayer formats (YUV)
-            if config.filter_type != FilterType::Standard {
-                match apply_filter_gpu_rgba(&rgba, frame_width, frame_height, config.filter_type)
-                    .await
-                {
-                    Ok(filtered) => {
-                        debug!("Filter applied via GPU pipeline (RGBA-native)");
-                        filtered
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "GPU filter failed, using unfiltered frame");
-                        rgba
-                    }
-                }
-            } else {
-                rgba
-            }
+        // Converted GPU photos keep the full canonical image on-device until
+        // filtering is complete, then read only the final crop/zoom rectangle.
+        let region = Self::final_region(frame_width, frame_height, &config)?;
+        let gpu_converted = frame.format.is_bayer() || frame.format.is_yuv();
+        let filtered_rgba: Vec<u8> = if gpu_converted {
+            self.convert_gpu_photo_region(&frame, &config, region)
+                .await?
         } else if config.filter_type != FilterType::Standard {
             // Already RGBA, just apply filter
             let rgba = compact_rgba.unwrap_or_else(|| frame.data.to_vec());
@@ -211,27 +221,21 @@ impl PostProcessor {
             frame.data.to_vec()
         };
 
-        // Step 2: Apply aspect ratio cropping if configured
-        let (cropped_rgba, current_width, current_height) = if let Some((x, y, w, h)) =
-            config.crop_rect
-        {
-            debug!(x, y, width = w, height = h, "Applying aspect ratio crop");
-            let cropped = Self::crop_rgba(&filtered_rgba, frame_width, frame_height, x, y, w, h)?;
-            (cropped, w, h)
-        } else {
-            (filtered_rgba, frame_width, frame_height)
-        };
-
-        // Step 3: Apply zoom (center crop) if zoom_level > 1.0
-        let (final_rgba, final_width, final_height) = if config.zoom_level > 1.0 {
-            Self::apply_zoom_crop(
-                &cropped_rgba,
-                current_width,
-                current_height,
-                config.zoom_level,
+        // Aspect crop then rounded center zoom share the same sensor-space region.
+        // GPU conversion already read this region; rendered inputs need one CPU crop.
+        let (x, y, final_width, final_height) = region;
+        let final_rgba = if !gpu_converted && region != (0, 0, frame_width, frame_height) {
+            Self::crop_rgba(
+                &filtered_rgba,
+                frame_width,
+                frame_height,
+                x,
+                y,
+                final_width,
+                final_height,
             )?
         } else {
-            (cropped_rgba, current_width, current_height)
+            filtered_rgba
         };
 
         // Step 4: Convert filtered RGBA to RGB (drop alpha channel)
@@ -280,53 +284,120 @@ impl PostProcessor {
         Self::convert_bayer_to_rgba(frame, method).await
     }
 
+    #[cfg(test)]
     async fn convert_bayer_to_rgba(
         frame: &CameraFrame,
         method: crate::shaders::DemosaicMethod,
     ) -> Result<Vec<u8>, String> {
         let input = GpuFrameInput::from_camera_frame(frame).map_err(|e| e.to_string())?;
         let mut guard = get_gpu_convert_pipeline().await?;
-        let mut pipeline = guard
-            .as_mut()
-            .ok_or("Convert pipeline not initialized")?
-            .photo_workspace();
+        let converter = guard.as_mut().ok_or("Convert pipeline not initialized")?;
+        let mut pipeline = converter.photo_workspace();
         pipeline
-            .convert_bayer_with_method(&input, method)
+            .convert_photo_bayer_with_method(&input, method)
             .map_err(|e| e.to_string())?;
         pipeline.read_rgba_to_cpu(frame.width, frame.height).await
     }
 
-    /// Convert YUV frame to RGBA using GPU compute shader
-    ///
-    /// Uses the same compute shader as the preview pipeline for consistency.
-    async fn convert_yuv_to_rgba(frame: &CameraFrame) -> Result<Vec<u8>, String> {
-        // RGBA doesn't need conversion
-        if frame.format == PixelFormat::RGBA {
-            return Ok(frame.data.as_ref().to_vec());
+    #[cfg(test)]
+    pub(crate) async fn gpu_rgba_for_test(&self, frame: &CameraFrame) -> Result<Vec<u8>, String> {
+        let region = Self::final_region(frame.width, frame.height, &self.config)?;
+        self.convert_gpu_photo_region(frame, &self.config, region)
+            .await
+    }
+
+    /// Compose aspect crop THEN rounded center zoom in original sensor coordinates.
+    fn final_region(
+        width: u32,
+        height: u32,
+        config: &PostProcessingConfig,
+    ) -> Result<(u32, u32, u32, u32), String> {
+        let (mut x, mut y, mut w, mut h) = config.crop_rect.unwrap_or((0, 0, width, height));
+        if x > width || y > height || w > width - x || h > height - y {
+            return Err(format!(
+                "Crop region ({x},{y} {w}x{h}) exceeds source dimensions ({width}x{height})"
+            ));
         }
+        if config.zoom_level > 1.0 {
+            let zoom_width = (w as f32 / config.zoom_level).round() as u32;
+            let zoom_height = (h as f32 / config.zoom_level).round() as u32;
+            let zoom_width = zoom_width.max(1);
+            let zoom_height = zoom_height.max(1);
+            if zoom_width > w || zoom_height > h {
+                return Err("Zoom crop out of bounds".into());
+            }
+            x += (w - zoom_width) / 2;
+            y += (h - zoom_height) / 2;
+            w = zoom_width;
+            h = zoom_height;
+        }
+        Ok((x, y, w, h))
+    }
 
+    async fn convert_gpu_photo_region(
+        &self,
+        frame: &CameraFrame,
+        config: &PostProcessingConfig,
+        region: (u32, u32, u32, u32),
+    ) -> Result<Vec<u8>, String> {
         let input = GpuFrameInput::from_camera_frame(frame).map_err(|e| e.to_string())?;
-
-        // Use GPU compute shader pipeline for conversion
-        let mut pipeline_guard = get_gpu_convert_pipeline()
-            .await
-            .map_err(|e| format!("Failed to get YUV convert pipeline: {}", e))?;
-
-        let mut pipeline = pipeline_guard
-            .as_mut()
-            .ok_or("YUV convert pipeline not initialized")?
-            .photo_workspace();
-
-        // Run GPU conversion (synchronous, just dispatches compute shader)
-        pipeline
-            .convert(&input)
-            .map_err(|e| format!("YUV→RGBA GPU conversion failed: {}", e))?;
-
-        // Read back RGBA data from GPU to CPU memory
-        pipeline
-            .read_rgba_to_cpu(frame.width, frame.height)
-            .await
-            .map_err(|e| format!("Failed to read RGBA from GPU: {}", e))
+        let mut guard = get_gpu_convert_pipeline().await?;
+        let converter = guard.as_mut().ok_or("Convert pipeline not initialized")?;
+        let mut pipeline = converter.photo_workspace_for_session(
+            self.session.clone(),
+            &input,
+            config.demosaic_method,
+        );
+        if frame.format.is_bayer() {
+            // Filters require the full canonical sensor source for UV/neighbor modes.
+            let conversion_region = if config.filter_type == FilterType::Standard {
+                region
+            } else {
+                (0, 0, frame.width, frame.height)
+            };
+            pipeline
+                .convert_still_bayer_region(
+                    &input,
+                    config.demosaic_method,
+                    conversion_region,
+                    self.pace_gpu,
+                    self.rendering_intent,
+                )
+                .map_err(|e| e.to_string())?;
+        } else {
+            pipeline
+                .convert(&input)
+                .map_err(|e| format!("Failed to convert to RGBA: {e}"))?;
+        }
+        if config.filter_type != FilterType::Standard {
+            let filtered = async {
+                let mut filter_guard = crate::shaders::get_gpu_filter_pipeline().await?;
+                let filter = filter_guard
+                    .as_mut()
+                    .ok_or("GPU filter pipeline not initialized")?;
+                filter
+                    .apply_filter_texture_region(
+                        pipeline
+                            .output_texture()
+                            .ok_or("Missing converted photo texture")?,
+                        config.filter_type,
+                        region,
+                    )
+                    .await
+            }
+            .await;
+            match filtered {
+                Ok(rgba) => {
+                    pipeline.complete();
+                    return Ok(rgba);
+                }
+                Err(error) => warn!(%error, "GPU filter failed, using unfiltered frame"),
+            }
+        }
+        // Mandatory conversion errors are never optional-filter fallbacks.
+        let rgba = pipeline.read_rgba_region_to_cpu(region).await?;
+        pipeline.complete();
+        Ok(rgba)
     }
 
     /// Crop RGBA data to a rectangular region
@@ -431,6 +502,7 @@ impl PostProcessor {
     /// Apply zoom by center-cropping the RGBA image
     ///
     /// At zoom_level 2.0, the center 50% of the image is cropped and returned.
+    #[cfg(test)]
     fn apply_zoom_crop(
         rgba_data: &[u8],
         width: u32,
@@ -545,8 +617,201 @@ impl PostProcessor {
 }
 
 #[cfg(test)]
+#[path = "processing_roi_tests.rs"]
+mod roi_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn final_gpu_region_matches_sequential_cpu_geometry() {
+        for (width, height) in [(21, 19), (67, 65), (1, 1)] {
+            let pixels: Vec<u8> = (0..width * height)
+                .flat_map(|i| [(i % 256) as u8, (i / 256) as u8, 53, 255])
+                .collect();
+            for crop_rect in [
+                None,
+                Some((0, 0, width, height)),
+                Some((
+                    width / 3,
+                    height / 3,
+                    width - width / 3,
+                    height - height / 3,
+                )),
+            ] {
+                for zoom_level in [1.0, 1.01, 1.5, 2.0, 7.0, f32::INFINITY, f32::NAN] {
+                    let config = PostProcessingConfig {
+                        crop_rect,
+                        zoom_level,
+                        ..Default::default()
+                    };
+                    let (first, w, h) = if let Some((x, y, w, h)) = crop_rect {
+                        (
+                            PostProcessor::crop_rgba(&pixels, width, height, x, y, w, h).unwrap(),
+                            w,
+                            h,
+                        )
+                    } else {
+                        (pixels.clone(), width, height)
+                    };
+                    let expected = if zoom_level > 1.0 {
+                        PostProcessor::apply_zoom_crop(&first, w, h, zoom_level).unwrap()
+                    } else {
+                        (first, w, h)
+                    };
+                    let (x, y, w, h) = PostProcessor::final_region(width, height, &config).unwrap();
+                    let actual =
+                        PostProcessor::crop_rgba(&pixels, width, height, x, y, w, h).unwrap();
+                    assert_eq!(
+                        (actual, w, h),
+                        expected,
+                        "{width}x{height} {crop_rect:?} zoom={zoom_level}"
+                    );
+                }
+            }
+        }
+        for crop_rect in [
+            Some((u32::MAX, 0, 2, 1)),
+            Some((0, 19, 1, 1)),
+            Some((20, 0, 2, 1)),
+        ] {
+            assert!(
+                PostProcessor::final_region(
+                    21,
+                    19,
+                    &PostProcessingConfig {
+                        crop_rect,
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_photo_gpu_region_matches_full_readback_reference() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "ordinary_photo_gpu_region_matches_full_readback_reference",
+            );
+            return;
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            use crate::backends::camera::types::{FrameData, FrameMetadata};
+            use crate::shaders::{DemosaicMethod, GpuConvertPipeline};
+            for format in [
+                PixelFormat::BayerRGGB,
+                PixelFormat::BayerBGGR,
+                PixelFormat::BayerGRBG,
+                PixelFormat::BayerGBRG,
+                PixelFormat::YUYV,
+            ] {
+                let (width, height) = (21u32, 19u32);
+                let stride = if format.is_bayer() {
+                    width
+                } else {
+                    width.div_ceil(2) * 4
+                };
+                let frame = CameraFrame {
+                    width,
+                    height,
+                    stride,
+                    format,
+                    data: FrameData::from_owned_vec(
+                        (0..stride * height)
+                            .map(|i| ((i * 37 + i / stride * 13) % 256) as u8)
+                            .collect(),
+                    ),
+                    yuv_planes: None,
+                    captured_at: std::time::Instant::now(),
+                    sensor_timestamp_ns: None,
+                    libcamera_metadata: format.is_bayer().then_some(FrameMetadata {
+                        colour_gains: Some([1.3, 0.9]),
+                        ..Default::default()
+                    }),
+                };
+                for method in [
+                    DemosaicMethod::Bilinear,
+                    DemosaicMethod::Rcd,
+                    DemosaicMethod::Lmmse,
+                ] {
+                    if !format.is_bayer() && method != DemosaicMethod::Bilinear {
+                        continue;
+                    }
+                    let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
+                    let mut converter = GpuConvertPipeline::new().await.unwrap();
+                    if format.is_bayer() {
+                        converter
+                            .convert_still_bayer_region(
+                                &input,
+                                method,
+                                (0, 0, width, height),
+                                true,
+                                crate::shaders::BayerRenderingIntent::OrdinaryStillSdr,
+                            )
+                            .unwrap();
+                    } else {
+                        converter.convert(&input).unwrap();
+                    }
+                    let full = converter.read_rgba_to_cpu(width, height).await.unwrap();
+                    // Direct regional readback must preserve bytes and reject bad bounds.
+                    for region in [
+                        (0, 0, width, height),
+                        (3, 2, 9, 7),
+                        (20, 18, 1, 1),
+                        (21, 19, 0, 0),
+                    ] {
+                        let (x, y, w, h) = region;
+                        assert_eq!(
+                            converter.read_rgba_region_to_cpu(region).await.unwrap(),
+                            PostProcessor::crop_rgba(&full, width, height, x, y, w, h).unwrap()
+                        );
+                    }
+                    assert!(
+                        converter
+                            .read_rgba_region_to_cpu((u32::MAX, 0, 2, 1))
+                            .await
+                            .is_err()
+                    );
+                    for code in 0..=14 {
+                        let config = PostProcessingConfig {
+                            demosaic_method: method,
+                            filter_type: FilterType::from_gpu_filter_code(code),
+                            crop_rect: Some((3, 2, 15, 13)),
+                            zoom_level: 1.7,
+                            brightness: 0.04,
+                            contrast: 1.1,
+                            saturation: 0.9,
+                            sharpening: true,
+                            ..Default::default()
+                        };
+                        let processor = PostProcessor::new(config);
+                        let reference = processor
+                            .process(Arc::new(CameraFrame {
+                                data: FrameData::from_owned_vec(full.clone()),
+                                format: PixelFormat::RGBA,
+                                stride: width * 4,
+                                libcamera_metadata: None,
+                                ..frame.clone()
+                            }))
+                            .await
+                            .unwrap();
+                        let actual = processor.process(Arc::new(frame.clone())).await.unwrap();
+                        assert_eq!(
+                            (actual.width, actual.height),
+                            (reference.width, reference.height)
+                        );
+                        assert_eq!(
+                            actual.image, reference.image,
+                            "{format:?} {method:?} filter={code}"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     #[tokio::test]
     async fn normal_photo_normalizes_padded_bgra() {
@@ -881,7 +1146,7 @@ mod tests {
                 (PixelFormat::BayerGRBG, [1, 0, 3, 2]),
                 (PixelFormat::BayerGBRG, [2, 3, 0, 1]),
             ];
-            for codes in [[0.7296_f32, 0.9954, 0.9954, 0.9771], [1.0; 4]] {
+            for codes in [[0.75_f32, 0.99, 0.99, 0.95], [1.0; 4]] {
                 for (format, sites) in patterns {
                     let mut data = vec![0xa5; 60];
                     for y in 0..5 {
@@ -902,11 +1167,11 @@ mod tests {
                         sensor_timestamp_ns: None,
                         libcamera_metadata: Some(FrameMetadata {
                             raw_layout: Some(RawLayout::Unpacked16 { bits: 16 }),
-                            colour_gains: Some([2.1832347, 1.6135153]),
+                            colour_gains: Some([2.0, 1.5]),
                             colour_correction_matrix: Some([
-                                [2.100_02, -0.7964949, -0.30352515],
-                                [-0.469_05, 1.9604946, -0.49144363],
-                                [-0.1991288, -0.585788, 1.7849169],
+                                [2.0, -0.75, -0.25],
+                                [-0.5, 2.0, -0.5],
+                                [-0.25, -0.5, 1.75],
                             ]),
                             ..Default::default()
                         }),
@@ -993,19 +1258,15 @@ mod tests {
         };
         pollster::block_on(async {
             use crate::backends::camera::types::{FrameData, FrameMetadata, RawLayout};
-            let ccm = [
-                [2.100_02, -0.7964949, -0.30352515],
-                [-0.469_05, 1.9604946, -0.49144363],
-                [-0.1991288, -0.585788, 1.7849169],
-            ];
+            let ccm = [[2.0, -0.75, -0.25], [-0.5, 2.0, -0.5], [-0.25, -0.5, 1.75]];
             let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
             for (sensor, gains, matrix) in [
                 ([0.9_f32, 0.1, 0.1], [2.0, 1.5], identity),
                 ([1.0, 0.1, 0.1], [2.0, 1.5], identity),
-                ([0.6, 0.6, 0.55], [2.1832347, 1.6135153], ccm),
-                ([0.7296, 0.979, 0.9771], [2.1832347, 1.6135153], ccm),
-                ([0.7296, 0.9875, 0.9771], [2.1832347, 1.6135153], ccm),
-                ([0.7296, 0.9954, 0.9771], [2.1832347, 1.6135153], ccm),
+                ([0.6, 0.6, 0.55], [2.0, 1.5], ccm),
+                ([0.75, 0.975, 0.95], [2.0, 1.5], ccm),
+                ([0.75, 0.9875, 0.95], [2.0, 1.5], ccm),
+                ([0.75, 0.99, 0.95], [2.0, 1.5], ccm),
             ] {
                 let codes = sensor.map(|v| (v * 65535.0).round() as u16);
                 let sensor = codes.map(|v| f64::from(v) / 65535.0);
@@ -1042,20 +1303,21 @@ mod tests {
                     sensor[2] * f64::from(gains[1]),
                 ];
                 let peak = sensor.into_iter().fold(0.0_f64, f64::max);
-                let t = ((peak - 0.980) / 0.015).clamp(0.0, 1.0);
+                // Independent f64 oracle for the intentional C1 sensor shoulder;
+                // no general WB cap applies below the final tenth of headroom.
+                let t = ((peak - 0.9) / 0.1).clamp(0.0, 1.0);
                 let blend = t * t * (3.0 - 2.0 * t);
                 let linear: [f64; 3] = std::array::from_fn(|row| {
-                    (0..3)
-                        .map(|c| {
-                            f64::from(matrix[row][c])
-                                * ((1.0 - blend) * balanced[c]
-                                    + blend * balanced[c].clamp(0.0, 1.0))
-                        })
-                        .sum()
+                    let a: f64 = (0..3)
+                        .map(|c| f64::from(matrix[row][c]) * balanced[c])
+                        .sum();
+                    let b: f64 = (0..3)
+                        .map(|c| f64::from(matrix[row][c]) * balanced[c].clamp(0.0, 1.0))
+                        .sum();
+                    (1.0 - blend) * a.clamp(0.0, 1.0) + blend * b.clamp(0.0, 1.0)
                 });
-                let scale = 1.0 / linear.into_iter().fold(1.0_f64, f64::max);
                 let expected = linear.map(|v| {
-                    let v = (v * scale).clamp(0.0, 1.0);
+                    let v = v.clamp(0.0, 1.0);
                     let encoded = if v <= 0.0031308 {
                         12.92 * v
                     } else {
@@ -1129,9 +1391,9 @@ mod tests {
             let mut supplied = base;
             supplied.libcamera_metadata.as_mut().unwrap().colour_gains = Some([8.0, 1.0]);
             let out = processor.process(Arc::new(supplied)).await.unwrap();
-            // WB exactly once -> (512,128,192)/255; T=min(max(rgb),1) -> (1,.25,.375).
+            // Ordinary SDR independently bounds channels, not max-RGB ratios.
             let encode = |v: f32| ((1.055 * v.powf(1.0 / 2.4) - 0.055) * 255.0).round() as u8;
-            let expected = [255, encode(0.25), encode(0.375)];
+            let expected = [255, encode(128.0 / 255.0), encode(192.0 / 255.0)];
             for pixel in out.image.pixels() {
                 for c in 0..3 {
                     assert!(
@@ -1282,9 +1544,15 @@ mod tests {
             let out = processor.process(Arc::new(frame.clone())).await.unwrap();
             assert_eq!(out.image.get_pixel(1, 1).0, [255, 255, 255]);
             // Below sensor clipping, extreme over-white float ratios still
-            // survive; the fallback must not become a general RGB clamp.
+            // survive for the legacy contract; ordinary SDR clips independently.
             frame.data = FrameData::from_owned_vec(vec![128; 16]);
-            let out = processor.process(Arc::new(frame)).await.unwrap();
+            let out = processor.process(Arc::new(frame.clone())).await.unwrap();
+            assert_eq!(out.image.get_pixel(1, 1).0, [255, 188, 255]);
+            let out = processor
+                .for_continuous_frames()
+                .process(Arc::new(frame))
+                .await
+                .unwrap();
             assert_eq!(out.image.get_pixel(1, 1).0, [255, 0, 255]);
         });
     }
@@ -1461,7 +1729,7 @@ mod method_selection_tests {
             assert_ne!(outputs[0], outputs[2]);
             assert_ne!(outputs[1], outputs[2]);
             assert_eq!(
-                outputs[0],
+                outputs[2],
                 PostProcessor::new(PostProcessingConfig::default())
                     .process(frame)
                     .await

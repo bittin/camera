@@ -53,7 +53,41 @@ fn should_use_jpeg_recording_pipeline(
         && !live_filters_required
 }
 
+/// Keep synchronous GPU waits and photo-sized CPU work off libcosmic's single
+/// async worker so preview subscriptions and animation tasks can keep running.
+/// Once started, the blocking job survives cancellation of this outer future
+/// and may finish writing the photo; its workspaces retire when the job ends.
+async fn run_photo_save(
+    gate: Arc<tokio::sync::Semaphore>,
+    job: impl std::future::Future<Output = Result<String, String>> + Send + 'static,
+) -> Result<String, String> {
+    let permit = gate
+        .acquire_owned()
+        .await
+        .map_err(|error| format!("Photo queue closed: {error}"))?;
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        // The blocking worker, not its cancellable async caller, owns the gate.
+        let _permit = permit;
+        runtime.block_on(job)
+    })
+    .await
+    .map_err(|error| format!("Photo save task failed: {error}"))?
+}
+
 impl AppModel {
+    /// Acquisition and bounded processing admission shared by every photo shutter.
+    /// Processing jobs alone do not lock acquisition while a slot remains.
+    pub(crate) fn can_accept_photo(&self) -> bool {
+        !self.pending_close
+            && !self.transition_state.ui_disabled
+            && !self.is_capturing
+            && self.hardware_photo_id.is_none()
+            && self.motion_photo_capture.is_none()
+            && !self.burst_mode.is_active()
+            && self.photo_jobs.len() < 8
+    }
+
     /// Snapshot photo-only processing preferences before dispatching a save job.
     fn photo_processing_config(&self) -> crate::pipelines::photo::PostProcessingConfig {
         crate::pipelines::photo::PostProcessingConfig {
@@ -226,15 +260,7 @@ impl AppModel {
         &mut self,
         zsl_frame: Option<Arc<crate::backends::camera::types::CameraFrame>>,
     ) -> Task<cosmic::Action<Message>> {
-        if self.pending_close || self.photo_jobs.len() >= 8 {
-            self.motion_photo_error = Some(
-                "Photo shutter not accepted: closing or eight encoding jobs already pending".into(),
-            );
-            return Task::none();
-        }
-        if self.is_capturing || self.motion_photo_capture.is_some() || self.burst_mode.is_active() {
-            self.motion_photo_error =
-                Some("Photo shutter not accepted: hardware/HDR acquisition is busy".into());
+        if !self.can_accept_photo() {
             return Task::none();
         }
         if self.motion_photo_enabled()
@@ -269,7 +295,7 @@ impl AppModel {
         // Skip when file source is active — there is no capture thread to provide raw frames.
         if self.is_current_camera_multistream() && !self.current_frame_is_file_source {
             self.hardware_photo_id = Some(capture_id);
-            let task = self.capture_photo_from_raw_stream();
+            let task = self.capture_photo_from_raw_stream(capture_id);
             return Task::batch([
                 task,
                 Self::delay_task(60_000, Message::PhotoEncodingWatchdog(capture_id)),
@@ -353,6 +379,7 @@ impl AppModel {
             self.config.photo_output_format.into();
 
         let photo_config = self.photo_processing_config();
+        let photo_session = crate::shaders::current_photo_session();
         let mut camera_metadata = self.build_camera_metadata();
         camera_metadata.orientation =
             crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
@@ -360,8 +387,9 @@ impl AppModel {
                 mirror_horizontal,
             );
 
+        let processing_gate = Arc::clone(&self.photo_processing_gate.0);
         let save_task = Task::perform(
-            async move {
+            run_photo_save(processing_gate, async move {
                 use crate::pipelines::photo::{
                     EncodingQuality, PhotoPipeline, PostProcessingConfig,
                 };
@@ -373,12 +401,13 @@ impl AppModel {
                 };
                 let mut pipeline =
                     PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
+                pipeline.set_photo_session(photo_session);
                 pipeline.set_camera_metadata(camera_metadata);
                 pipeline
                     .capture_and_save(frame_arc, save_dir)
                     .await
                     .map(|p| p.display().to_string())
-            },
+            }),
             move |result| cosmic::Action::App(Message::PhotoCaptureSaved(capture_id, result)),
         );
 
@@ -394,16 +423,12 @@ impl AppModel {
     ///
     /// Requests a full-resolution raw frame from the dedicated raw stream,
     /// which bypasses the ISP and captures at the sensor's native resolution.
-    fn capture_photo_from_raw_stream(&mut self) -> Task<cosmic::Action<Message>> {
+    fn capture_photo_from_raw_stream(&mut self, capture_id: u64) -> Task<cosmic::Action<Message>> {
         info!("Capturing photo from raw stream (multistream mode)...");
         self.is_capturing = true;
 
         // Request a still capture from the raw stream
-        self.still_capture_requested
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        let still_frame = Arc::clone(&self.latest_still_frame);
-        let still_frame_notify = Arc::clone(&self.still_frame_notify);
+        let still_request = self.still_capture.request();
         let preview_frame = self.current_frame.as_ref().map(Arc::clone);
         let save_dir = crate::app::get_photo_directory(&self.config.save_folder_name);
         let filter_type = self.selected_filter;
@@ -440,144 +465,149 @@ impl AppModel {
             );
 
         let raw_photo_config = photo_config.clone();
+        let raw_photo_session = crate::shaders::current_photo_session();
         let raw_save_dir = save_dir.clone();
         let raw_camera_metadata = camera_metadata.clone();
-        let save_task = Task::perform(
-            capture_with_preview_fallback(
-                move || async move {
-                    use crate::pipelines::photo::{
-                        EncodingQuality, PhotoPipeline, PostProcessingConfig,
-                    };
+        let processing_gate = Arc::clone(&self.photo_processing_gate.0);
+        let save_task = Task::run(
+            async_stream::stream! {
+                // Acquisition must not wait for processing or hold the UI shutter
+                // lock through GPU work and file encoding (including fallback).
+                let frame = wait_for_still_frame(
+                    still_request, std::time::Duration::from_secs(2),
+                ).await.ok_or_else(|| "Timeout waiting for raw frame from still stream".to_string());
+                yield Message::PhotoCaptureAcquired(capture_id);
+                let result = run_photo_save(processing_gate, capture_with_preview_fallback(
+                    move || async move {
+                        use crate::pipelines::photo::{
+                            EncodingQuality, PhotoPipeline, PostProcessingConfig,
+                        };
 
-                    // Wait for the raw frame with a timeout, blocking on the
-                    // capture-thread notifier instead of polling.
-                    let timeout = std::time::Duration::from_secs(2);
-                    let frame = wait_for_still_frame(&still_frame, &still_frame_notify, timeout)
-                        .await
-                        .ok_or_else(|| {
-                            "Timeout waiting for raw frame from still stream".to_string()
+                        let frame = frame?;
+
+                        info!(
+                            width = frame.width,
+                            height = frame.height,
+                            format = ?frame.format,
+                            "Raw frame captured from still stream"
+                        );
+
+                        let (rw, rh) = if geometry_rotation.swaps_dimensions() {
+                            (frame.height, frame.width)
+                        } else {
+                            (frame.width, frame.height)
+                        };
+                        let crop_rect = {
+                            let (x, y, w, h) = if preview_fit_to_view {
+                                photo_aspect_ratio.crop_rect(
+                                    rw,
+                                    rh,
+                                    geometry_rotation.swaps_dimensions(),
+                                )
+                            } else {
+                                crate::app::preview_geometry::cover_capture_crop(
+                                    rw,
+                                    rh,
+                                    cover_screen_w,
+                                    cover_screen_h,
+                                    cover_insets,
+                                    cover_target_ratio,
+                                )
+                            };
+                            if x == 0 && y == 0 && w == rw && h == rh {
+                                None
+                            } else {
+                                Some(crate::app::preview_geometry::inverse_oriented_crop(
+                                    (x, y, w, h),
+                                    frame.width,
+                                    frame.height,
+                                    geometry_rotation,
+                                ))
+                            }
+                        };
+
+                        let config = PostProcessingConfig {
+                            filter_type,
+                            crop_rect,
+                            zoom_level,
+                            ..raw_photo_config
+                        };
+                        let mut pipeline =
+                            PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
+                        pipeline.set_photo_session(raw_photo_session);
+                        pipeline.set_camera_metadata(raw_camera_metadata);
+                        pipeline
+                            .capture_and_save(Arc::new(frame), raw_save_dir)
+                            .await
+                            .map(|p| p.display().to_string())
+                    },
+                    move || async move {
+                        use crate::pipelines::photo::{
+                            EncodingQuality, PhotoPipeline, PostProcessingConfig,
+                        };
+
+                        let frame = preview_frame.ok_or_else(|| {
+                            "Raw capture failed and no preview frame is available".to_string()
                         })?;
+                        info!(
+                            width = frame.width,
+                            height = frame.height,
+                            format = ?frame.format,
+                            "Saving ISP-processed preview frame as CPU fallback"
+                        );
 
-                    info!(
-                        width = frame.width,
-                        height = frame.height,
-                        format = ?frame.format,
-                        "Raw frame captured from still stream"
-                    );
-
-                    let (rw, rh) = if geometry_rotation.swaps_dimensions() {
-                        (frame.height, frame.width)
-                    } else {
-                        (frame.width, frame.height)
-                    };
-                    let crop_rect = {
-                        let (x, y, w, h) = if preview_fit_to_view {
-                            photo_aspect_ratio.crop_rect(
-                                rw,
-                                rh,
-                                geometry_rotation.swaps_dimensions(),
-                            )
+                        let (fw, fh) = if geometry_rotation.swaps_dimensions() {
+                            (frame.height, frame.width)
                         } else {
-                            crate::app::preview_geometry::cover_capture_crop(
-                                rw,
-                                rh,
-                                cover_screen_w,
-                                cover_screen_h,
-                                cover_insets,
-                                cover_target_ratio,
-                            )
+                            (frame.width, frame.height)
                         };
-                        if x == 0 && y == 0 && w == rw && h == rh {
-                            None
-                        } else {
-                            Some(crate::app::preview_geometry::inverse_oriented_crop(
-                                (x, y, w, h),
-                                frame.width,
-                                frame.height,
-                                geometry_rotation,
-                            ))
-                        }
-                    };
-
-                    let config = PostProcessingConfig {
-                        filter_type,
-                        crop_rect,
-                        zoom_level,
-                        ..raw_photo_config
-                    };
-                    let mut pipeline =
-                        PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
-                    pipeline.set_camera_metadata(raw_camera_metadata);
-                    pipeline
-                        .capture_and_save(Arc::new(frame), raw_save_dir)
-                        .await
-                        .map(|p| p.display().to_string())
-                },
-                move || async move {
-                    use crate::pipelines::photo::{
-                        EncodingQuality, PhotoPipeline, PostProcessingConfig,
-                    };
-
-                    let frame = preview_frame.ok_or_else(|| {
-                        "Raw capture failed and no preview frame is available".to_string()
-                    })?;
-                    info!(
-                        width = frame.width,
-                        height = frame.height,
-                        format = ?frame.format,
-                        "Saving ISP-processed preview frame as CPU fallback"
-                    );
-
-                    let (fw, fh) = if geometry_rotation.swaps_dimensions() {
-                        (frame.height, frame.width)
-                    } else {
-                        (frame.width, frame.height)
-                    };
-                    let crop_rect = {
-                        let (x, y, w, h) = if preview_fit_to_view {
-                            photo_aspect_ratio.crop_rect(
-                                fw,
-                                fh,
-                                geometry_rotation.swaps_dimensions(),
-                            )
-                        } else {
-                            crate::app::preview_geometry::cover_capture_crop(
-                                fw,
-                                fh,
-                                cover_screen_w,
-                                cover_screen_h,
-                                cover_insets,
-                                cover_target_ratio,
-                            )
+                        let crop_rect = {
+                            let (x, y, w, h) = if preview_fit_to_view {
+                                photo_aspect_ratio.crop_rect(
+                                    fw,
+                                    fh,
+                                    geometry_rotation.swaps_dimensions(),
+                                )
+                            } else {
+                                crate::app::preview_geometry::cover_capture_crop(
+                                    fw,
+                                    fh,
+                                    cover_screen_w,
+                                    cover_screen_h,
+                                    cover_insets,
+                                    cover_target_ratio,
+                                )
+                            };
+                            if x == 0 && y == 0 && w == fw && h == fh {
+                                None
+                            } else {
+                                Some(crate::app::preview_geometry::inverse_oriented_crop(
+                                    (x, y, w, h),
+                                    frame.width,
+                                    frame.height,
+                                    geometry_rotation,
+                                ))
+                            }
                         };
-                        if x == 0 && y == 0 && w == fw && h == fh {
-                            None
-                        } else {
-                            Some(crate::app::preview_geometry::inverse_oriented_crop(
-                                (x, y, w, h),
-                                frame.width,
-                                frame.height,
-                                geometry_rotation,
-                            ))
-                        }
-                    };
 
-                    let config = PostProcessingConfig {
-                        filter_type,
-                        crop_rect,
-                        zoom_level,
-                        ..photo_config
-                    };
-                    let mut pipeline =
-                        PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
-                    pipeline.set_camera_metadata(camera_metadata);
-                    pipeline
-                        .capture_and_save(frame, save_dir)
-                        .await
-                        .map(|p| p.display().to_string())
-                },
-            ),
-            |result| cosmic::Action::App(Message::PhotoSaved(result)),
+                        let config = PostProcessingConfig {
+                            filter_type,
+                            crop_rect,
+                            zoom_level,
+                            ..photo_config
+                        };
+                        let mut pipeline =
+                            PhotoPipeline::with_config(config, encoding_format, EncodingQuality::High);
+                        pipeline.set_camera_metadata(camera_metadata);
+                        pipeline
+                            .capture_and_save(frame, save_dir)
+                            .await
+                            .map(|p| p.display().to_string())
+                    },
+                )).await;
+                yield Message::PhotoCaptureSaved(capture_id, result);
+            },
+            cosmic::Action::App,
         );
 
         let animation_task = Self::delay_task(150, Message::ClearCaptureAnimation);
@@ -634,9 +664,7 @@ impl AppModel {
         if self.is_current_camera_multistream() {
             // Use the shared still capture Arcs (same mechanism as single photo capture)
             // These are connected to the subscription's NativeLibcameraPipeline
-            let still_requested = Arc::clone(&self.still_capture_requested);
-            let still_frame = Arc::clone(&self.latest_still_frame);
-            let still_frame_notify = Arc::clone(&self.still_frame_notify);
+            let still_capture = Arc::clone(&self.still_capture);
             info!(
                 frame_count,
                 "Starting burst mode capture - raw frames from raw stream (multistream)"
@@ -649,13 +677,12 @@ impl AppModel {
 
                     for i in 0..frame_count {
                         // Request a still capture from the raw stream
-                        still_requested.store(true, std::sync::atomic::Ordering::Release);
+                        let still_request = still_capture.request();
 
                         // Wait for raw frame with timeout
                         let timeout = std::time::Duration::from_secs(2);
                         let frame = wait_for_still_frame(
-                            &still_frame,
-                            &still_frame_notify,
+                            still_request,
                             timeout,
                         )
                         .await
@@ -990,14 +1017,6 @@ impl AppModel {
     }
 
     pub(crate) fn handle_capture(&mut self) -> Task<cosmic::Action<Message>> {
-        // Animate the correct button depending on recording state
-        if self.recording.is_recording() {
-            self.haptic_tap();
-            self.animate_photo_btn_scale(0.82);
-        } else {
-            self.animate_capture_scale(0.82);
-        }
-
         // If quick-record is active, ignore direct Capture messages
         // (the quick-record state machine handles capture)
         if self.quick_record.is_pressed() || self.quick_record.is_recording() {
@@ -1007,6 +1026,18 @@ impl AppModel {
         // If timer countdown is active, abort it
         if self.photo_timer_countdown.is_some() {
             return self.handle_abort_photo_timer();
+        }
+
+        if !self.can_accept_photo() {
+            return Task::none();
+        }
+
+        // Animate the correct button depending on recording state
+        if self.recording.is_recording() {
+            self.haptic_tap();
+            self.animate_photo_btn_scale(0.82);
+        } else {
+            self.animate_capture_scale(0.82);
         }
 
         // In Photo mode with timer set, start countdown
@@ -1272,6 +1303,27 @@ impl AppModel {
             self.zoom_level = new_zoom;
             self.zoom_animation = None; // pinch is real-time
         }
+        Task::none()
+    }
+
+    pub(crate) fn handle_photo_capture_acquired(
+        &mut self,
+        id: u64,
+    ) -> Task<cosmic::Action<Message>> {
+        // Stale/duplicate acquisition cannot release a newer RAW/HDR shutter
+        // or steal its Motion Photo clip.
+        if self.hardware_photo_id != Some(id) || self.photo_jobs.contains_key(&id) {
+            return Task::none();
+        }
+        self.photo_jobs.insert(
+            id,
+            crate::app::handlers::motion_photo::PhotoJob {
+                live: self.motion_photo_capture.take(),
+                still_path: None,
+            },
+        );
+        self.hardware_photo_id = None;
+        self.is_capturing = false;
         Task::none()
     }
 
@@ -1663,17 +1715,13 @@ impl AppModel {
 
     /// Photo mode: capture frame on press, start 300ms timer for quick-record.
     pub(crate) fn handle_capture_button_pressed(&mut self) -> Task<cosmic::Action<Message>> {
-        self.haptic_tap();
         use crate::app::state::QuickRecordState;
 
         // Only handle in Photo mode when idle
         if self.pending_close
             || self.mode != CameraMode::Photo
             || self.recording.is_recording()
-            || self.burst_mode.is_active()
             || self.quick_record.is_recording()
-            || self.motion_photo_capture.is_some()
-            || self.is_capturing
         {
             return Task::none();
         }
@@ -1682,6 +1730,12 @@ impl AppModel {
         if self.photo_timer_countdown.is_some() {
             return self.handle_abort_photo_timer();
         }
+
+        if !self.can_accept_photo() {
+            return Task::none();
+        }
+
+        self.haptic_tap();
 
         // Compatible Motion Photos accept the shutter on press, so both the
         // still snapshot and the centered motion window use the press instant.
@@ -1728,6 +1782,11 @@ impl AppModel {
                 if self.photo_timer_countdown.is_some() {
                     self.animate_capture_scale(1.0);
                     return self.handle_abort_photo_timer();
+                }
+
+                if !self.can_accept_photo() {
+                    self.animate_capture_scale(1.0);
+                    return Task::none();
                 }
 
                 // In Photo mode with timer set, start countdown
@@ -1789,8 +1848,7 @@ impl AppModel {
             return Task::none();
         }
         if !self.photo_jobs.is_empty() || !self.recording_jobs.is_empty() {
-            self.motion_photo_error =
-                Some("Quick recording waits for pending photo/video encoding".into());
+            debug!("Quick recording waits for pending photo/video encoding");
             self.quick_record = QuickRecordState::Idle;
             return Task::none();
         }
@@ -2770,38 +2828,12 @@ where
     }
 }
 
-/// Wait for a still frame to appear in the shared mutex.
-///
-/// Awaits a notification from the capture thread (no polling), then takes the
-/// frame out of the shared slot. Returns `None` on timeout.
-///
-/// Subscribing to `Notify` *before* checking the slot is important: the
-/// capture thread may have already stored the frame between the caller's
-/// `still_requested.store(true, …)` and this await, in which case we'd miss
-/// the notification. The pre-await check below catches that case.
+/// Await and retire this request before releasing the application's hardware lock.
 pub(super) async fn wait_for_still_frame(
-    still_frame: &std::sync::Mutex<Option<crate::backends::camera::types::CameraFrame>>,
-    still_frame_notify: &tokio::sync::Notify,
+    request: crate::backends::camera::still_capture::StillRequest,
     timeout: std::time::Duration,
 ) -> Option<crate::backends::camera::types::CameraFrame> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        // Register interest BEFORE checking the slot, otherwise we'd race
-        // with a frame stored between the take attempt and the await.
-        let notified = still_frame_notify.notified();
-        if let Ok(mut guard) = still_frame.lock()
-            && let Some(frame) = guard.take()
-        {
-            return Some(frame);
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        if tokio::time::timeout(remaining, notified).await.is_err() {
-            return None;
-        }
-    }
+    request.wait(timeout).await
 }
 
 #[cfg(test)]
@@ -2839,6 +2871,809 @@ mod tests {
                 priority: 0,
             });
         model
+    }
+
+    fn raw_queue_model() -> crate::app::state::AppModel {
+        let mut model = live_model();
+        model.config.motion_photo = false;
+        model.config.photo_output_format = crate::config::PhotoOutputFormat::Png;
+        model.preview_fit_to_view = true;
+        model.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Native;
+        model
+            .available_cameras
+            .push(crate::backends::camera::types::CameraDevice {
+                supports_multistream: true,
+                ..Default::default()
+            });
+        model.config.save_folder_name = std::env::temp_dir()
+            .join(format!("camera-raw-queue-{}", uuid::Uuid::new_v4()))
+            .to_string_lossy()
+            .into_owned();
+        model
+    }
+
+    async fn next_capture_message<S>(stream: &mut S) -> super::Message
+    where
+        S: futures::Stream<Item = cosmic::iced::runtime::Action<cosmic::Action<super::Message>>>
+            + Unpin,
+    {
+        use futures::StreamExt;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(action) = stream.next().await {
+                if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action
+                {
+                    if matches!(
+                        message,
+                        super::Message::ClearCaptureAnimation
+                            | super::Message::PhotoEncodingWatchdog(_)
+                    ) {
+                        continue;
+                    }
+                    return message;
+                }
+            }
+            panic!("capture task ended without a message");
+        })
+        .await
+        .expect("capture task must make progress")
+    }
+
+    #[test]
+    fn rejected_direct_photo_does_not_animate_a_disabled_shutter() {
+        let mut model = raw_queue_model();
+        model.capture_scale_to = 1.0;
+        model.photo_btn_scale_to = 1.0;
+        model.is_capturing = true;
+        let _ = model.handle_capture();
+        assert_eq!(model.capture_scale_to, 1.0);
+        assert!(model.capture_anim_start.is_none());
+        assert!(model.photo_btn_anim_start.is_none());
+    }
+
+    #[test]
+    fn backpressured_quick_record_threshold_is_silent() {
+        let mut model = raw_queue_model();
+        model.photo_jobs.insert(
+            1,
+            crate::app::handlers::motion_photo::PhotoJob {
+                live: None,
+                still_path: None,
+            },
+        );
+        model.quick_record = crate::app::state::QuickRecordState::Pressed {
+            press_time: std::time::Instant::now() - std::time::Duration::from_secs(1),
+            captured_frame: None,
+        };
+        model.motion_photo_error = Some("existing diagnostic".into());
+        let _ = model.handle_quick_record_threshold();
+        assert_eq!(
+            model.motion_photo_error.as_deref(),
+            Some("existing diagnostic")
+        );
+        assert!(!model.quick_record.is_pressed());
+        assert!(!model.recording.is_recording());
+    }
+
+    #[test]
+    fn release_rechecks_photo_admission_before_starting_timer() {
+        let mut model = raw_queue_model();
+        model.photo_timer_setting = crate::app::state::PhotoTimerSetting::Sec3;
+        let _press = model.handle_capture_button_pressed();
+        assert!(model.quick_record.is_pressed());
+        model.is_capturing = true;
+        assert!(
+            cosmic::iced::runtime::task::into_stream(model.handle_capture_button_released())
+                .is_none()
+        );
+        assert!(model.photo_timer_countdown.is_none());
+        assert!(!model.quick_record.is_pressed());
+    }
+
+    #[test]
+    fn full_queue_rejects_press_before_quick_record_or_timer_side_effects() {
+        for motion in [false, true] {
+            let mut model = raw_queue_model();
+            model.config.motion_photo = motion;
+            for id in 1..=8 {
+                model.photo_jobs.insert(
+                    id,
+                    crate::app::handlers::motion_photo::PhotoJob {
+                        live: None,
+                        still_path: None,
+                    },
+                );
+            }
+            let next_id = model.next_photo_id;
+            let task = model.handle_capture_button_pressed();
+            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+            assert!(!model.quick_record.is_pressed());
+            model.photo_timer_setting = crate::app::state::PhotoTimerSetting::Sec3;
+            let task = model.handle_capture();
+            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+            assert!(model.photo_timer_countdown.is_none());
+            assert_eq!(model.next_photo_id, next_id);
+            assert!(!model.still_capture.has_request());
+            assert!(model.motion_photo_error.is_none());
+        }
+    }
+
+    #[test]
+    fn busy_photo_rejection_is_silent_and_does_not_allocate() {
+        for motion in [false, true] {
+            let mut model = raw_queue_model();
+            model.config.motion_photo = motion;
+            model.is_capturing = true;
+            model.motion_photo_error = Some("existing diagnostic".into());
+            let next_id = model.next_photo_id;
+            assert!(cosmic::iced::runtime::task::into_stream(model.capture_photo()).is_none());
+            assert_eq!(
+                model.motion_photo_error.as_deref(),
+                Some("existing diagnostic")
+            );
+            assert_eq!(model.next_photo_id, next_id);
+            assert!(!model.still_capture.has_request());
+        }
+    }
+
+    #[tokio::test]
+    async fn hdr_raw_burst_uses_fresh_tickets_without_changing_exclusive_acquisition() {
+        use futures::StreamExt;
+        use std::task::Poll;
+        let mut model = raw_queue_model();
+        model.auto_detected_frame_count = 3;
+        let mut stream =
+            cosmic::iced::runtime::task::into_stream(model.capture_burst_mode_photo()).unwrap();
+        let mut previous = None;
+        for value in [40, 80, 120] {
+            let ticket = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                futures::future::poll_fn(|cx| {
+                    assert!(
+                        stream.poll_next_unpin(cx).is_pending(),
+                        "burst must wait for the next RAW frame"
+                    );
+                    match model.still_capture.pending() {
+                        Some(ticket) => Poll::Ready(ticket),
+                        None => Poll::Pending,
+                    }
+                }),
+            )
+            .await
+            .expect("burst must issue its next request");
+            assert_ne!(Some(ticket), previous);
+            let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            if let Some(old) = previous {
+                assert!(!model.still_capture.publish(old, frame.clone()));
+                assert_eq!(model.still_capture.pending(), Some(ticket));
+            }
+            frame.data =
+                crate::backends::camera::types::FrameData::from_owned_vec(vec![value; 64 * 48 * 4]);
+            assert!(model.still_capture.publish(ticket, frame));
+            previous = Some(ticket);
+            assert!(model.is_capturing);
+        }
+        let super::Message::BurstModeRawFramesCaptured(Ok(frames)) =
+            next_capture_message(&mut stream).await
+        else {
+            panic!("HDR must acquire its entire ordered RAW burst");
+        };
+        assert_eq!(
+            frames
+                .iter()
+                .map(|frame| frame.data.as_ref()[0])
+                .collect::<Vec<_>>(),
+            [40, 80, 120]
+        );
+        assert!(!model.still_capture.has_request());
+        assert!(
+            model.is_capturing,
+            "HDR remains exclusive through processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_raw_producer_cannot_publish_into_next_acquisition() {
+        use futures::FutureExt;
+
+        // Cover both the stale-slot window before the UI receives Acquired and
+        // the producer finishing after the UI has already admitted B.
+        for complete_before_ui in [true, false] {
+            let mut model = raw_queue_model();
+            let save_dir = model.config.save_folder_name.clone();
+            let mut a = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+            let capture = model.still_capture.clone();
+            let old_frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+            let (complete_tx, complete_rx) = tokio::sync::oneshot::channel();
+            let producer = tokio::spawn(async move {
+                // Same snapshot/publication API used around native process_buffer.
+                let ticket = capture.pending().unwrap();
+                observed_tx.send(()).unwrap();
+                complete_rx.await.unwrap();
+                assert!(!capture.publish(ticket, old_frame));
+            });
+            observed_rx.await.unwrap();
+            let acquired = next_capture_message(&mut a).await;
+            assert!(matches!(acquired, super::Message::PhotoCaptureAcquired(1)));
+            assert!(
+                !model.still_capture.has_request(),
+                "timeout retires A before UI unlock"
+            );
+            let mut completion = Some((complete_tx, producer));
+            if complete_before_ui {
+                let (tx, producer) = completion.take().unwrap();
+                tx.send(()).unwrap();
+                producer.await.unwrap();
+            }
+            let _ = model.update(acquired);
+            let mut b = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+            assert_eq!(model.hardware_photo_id, Some(2));
+            let ticket_b = model.still_capture.pending().unwrap();
+            if let Some((tx, producer)) = completion {
+                tx.send(()).unwrap();
+                producer.await.unwrap();
+            }
+            assert_eq!(
+                model.still_capture.pending(),
+                Some(ticket_b),
+                "A must not erase B's request"
+            );
+            assert!(
+                next_capture_message(&mut b).now_or_never().is_none(),
+                "B must not acquire the retired producer A's frame"
+            );
+            let mut frame_b = model.current_frame.as_ref().unwrap().as_ref().clone();
+            frame_b.data =
+                crate::backends::camera::types::FrameData::from_owned_vec(vec![160; 64 * 48 * 4]);
+            assert!(model.still_capture.publish(ticket_b, frame_b));
+            let acquired = next_capture_message(&mut b).await;
+            assert!(matches!(acquired, super::Message::PhotoCaptureAcquired(2)));
+            let _ = model.update(acquired);
+            let saved = next_capture_message(&mut b).await;
+            let super::Message::PhotoCaptureSaved(2, Ok(path)) = saved else {
+                panic!("B must save its own frame");
+            };
+            assert_eq!(
+                image::open(path).unwrap().to_rgb8().get_pixel(0, 0).0,
+                [160; 3]
+            );
+            std::fs::remove_dir_all(save_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_acquisition_unlocks_shutter_before_save_completion() {
+        let mut model = raw_queue_model();
+        let save_dir = model.config.save_folder_name.clone();
+        let mut stream = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+        assert!(model.still_capture.publish(
+            model.still_capture.pending().unwrap(),
+            model.current_frame.as_ref().unwrap().as_ref().clone()
+        ));
+        let first = next_capture_message(&mut stream).await;
+        assert!(
+            !matches!(
+                first,
+                super::Message::PhotoSaved(_) | super::Message::PhotoCaptureSaved(..)
+            ),
+            "RAW acquisition must produce its own event before saving finishes"
+        );
+        let _ = model.update(first);
+        assert!(!model.is_capturing);
+        assert!(model.hardware_photo_id.is_none());
+        assert_eq!(model.photo_jobs.len(), 1);
+        assert!(model.photo_jobs[&1].still_path.is_none());
+        let _second = model.capture_photo();
+        assert_eq!(model.hardware_photo_id, Some(2));
+        assert_eq!(model.next_photo_id, 3);
+        let saved = next_capture_message(&mut stream).await;
+        let path = match saved {
+            super::Message::PhotoCaptureSaved(1, ref result) => result.as_ref().unwrap().clone(),
+            _ => panic!("RAW save must be identified"),
+        };
+        let _ = model.update(saved);
+        assert_eq!(model.hardware_photo_id, Some(2));
+        assert!(model.is_capturing);
+        assert!(image::open(path).is_ok());
+        std::fs::remove_dir_all(save_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_photo_processing_waits_for_the_app_queue() {
+        for raw in [false, true] {
+            let mut model = raw_queue_model();
+            model.available_cameras[0].supports_multistream = raw;
+            let save_dir = model.config.save_folder_name.clone();
+            let gate = model.photo_processing_gate.0.clone();
+            let held = gate.acquire_owned().await.unwrap();
+            let mut stream =
+                cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+            if raw {
+                assert!(model.still_capture.publish(
+                    model.still_capture.pending().unwrap(),
+                    model.current_frame.as_ref().unwrap().as_ref().clone()
+                ));
+                let acquired = next_capture_message(&mut stream).await;
+                assert!(matches!(acquired, super::Message::PhotoCaptureAcquired(1)));
+                let _ = model.update(acquired);
+            }
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    next_capture_message(&mut stream)
+                )
+                .await
+                .is_err(),
+                "ordinary processing must wait while the app worker is occupied (raw={raw})"
+            );
+            drop(held);
+            let saved = next_capture_message(&mut stream).await;
+            assert!(matches!(saved, super::Message::PhotoCaptureSaved(1, Ok(_))));
+            let _ = model.update(saved);
+            assert!(model.photo_jobs.is_empty());
+            std::fs::remove_dir_all(save_dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_timeout_finishes_acquisition_before_fallback_or_error() {
+        for fallback in [false, true] {
+            let mut model = raw_queue_model();
+            let save_dir = model.config.save_folder_name.clone();
+            if !fallback {
+                model.current_frame = None;
+            }
+            let mut stream =
+                cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+            let acquired = next_capture_message(&mut stream).await;
+            assert!(matches!(acquired, super::Message::PhotoCaptureAcquired(1)));
+            let _ = model.update(acquired);
+            assert!(!model.is_capturing);
+            assert!(
+                !model.still_capture.has_request(),
+                "timed-out acquisition must not leave a request keeping the source alive"
+            );
+            assert_eq!(model.shutdown_pending_saves(), 1);
+            let _second = model.capture_photo();
+            let saved = next_capture_message(&mut stream).await;
+            match &saved {
+                super::Message::PhotoCaptureSaved(1, result) => {
+                    assert_eq!(result.is_ok(), fallback)
+                }
+                _ => panic!("timeout completion must retain its ID"),
+            }
+            let _ = model.update(saved);
+            assert_eq!(model.hardware_photo_id, Some(2));
+            assert!(model.is_capturing);
+            assert!(model.photo_jobs.is_empty());
+            if fallback {
+                std::fs::remove_dir_all(save_dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_queue_accepts_eight_owned_frames_and_rejects_ninth_without_request() {
+        use futures::FutureExt;
+        let mut model = raw_queue_model();
+        let save_dir = model.config.save_folder_name.clone();
+        let held = model
+            .photo_processing_gate
+            .0
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut streams = Vec::new();
+        for id in 1..=8 {
+            let mut stream =
+                cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+            assert_eq!(model.hardware_photo_id, Some(id));
+            assert!(!model.can_accept_photo());
+            assert!(model.still_capture.has_request());
+            assert_eq!(model.shutdown_pending_saves(), id as usize);
+            let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            frame.data = crate::backends::camera::types::FrameData::from_owned_vec(vec![
+                id as u8
+                    * 20;
+                64 * 48 * 4
+            ]);
+            assert!(
+                model
+                    .still_capture
+                    .publish(model.still_capture.pending().unwrap(), frame)
+            );
+            let acquired = next_capture_message(&mut stream).await;
+            assert!(matches!(acquired, super::Message::PhotoCaptureAcquired(got) if got == id));
+            let _ = model.update(acquired);
+            assert_eq!(model.photo_jobs.len(), id as usize);
+            assert_eq!(model.can_accept_photo(), id < 8);
+            assert_eq!(model.shutdown_pending_saves(), id as usize);
+            assert!(!model.is_capturing);
+            assert!(next_capture_message(&mut stream).now_or_never().is_none());
+            streams.push(stream);
+        }
+        assert!(cosmic::iced::runtime::task::into_stream(model.capture_photo()).is_none());
+        assert_eq!(model.next_photo_id, 9);
+        assert!(model.motion_photo_error.is_none());
+        assert!(!model.still_capture.has_request());
+        assert!(model.hardware_photo_id.is_none());
+        // Shutter-time frame/encoding/crop/directory snapshots must survive
+        // queued work and changes made while the worker is occupied.
+        model.zoom_level = 3.0;
+        model.selected_filter = crate::app::state::FilterType::Negative;
+        model.photo_aspect_ratio = crate::app::state::PhotoAspectRatio::Ratio2x1;
+        model.config.photo_output_format = crate::config::PhotoOutputFormat::Jpeg;
+        model.config.save_folder_name = format!("{save_dir}/changed");
+        let _close = model.update(super::Message::WindowClose);
+        assert_eq!(model.shutdown_pending_saves(), 8);
+        drop(held);
+        let mut paths = std::collections::BTreeSet::new();
+        for (index, stream) in streams.iter_mut().enumerate() {
+            let saved = next_capture_message(stream).await;
+            let path = match &saved {
+                super::Message::PhotoCaptureSaved(id, Ok(path)) => {
+                    assert_eq!(*id as usize, index + 1);
+                    path.clone()
+                }
+                _ => panic!("queued RAW photo must save with its ID"),
+            };
+            let image = image::open(&path).unwrap().to_rgb8();
+            assert_eq!(image.dimensions(), (64, 48));
+            assert_eq!(image.get_pixel(0, 0).0, [(index as u8 + 1) * 20; 3]);
+            assert!(path.ends_with(".png"));
+            assert_eq!(
+                std::path::Path::new(&path).parent().unwrap(),
+                std::path::Path::new(&save_dir)
+            );
+            assert!(paths.insert(path));
+            let _ = model.update(saved);
+            assert_eq!(model.shutdown_pending_saves(), 7 - index);
+        }
+        assert_eq!(paths.len(), 8);
+        std::fs::remove_dir_all(save_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_acquisition_event_remains_accepted_during_shutdown() {
+        let mut model = raw_queue_model();
+        let save_dir = model.config.save_folder_name.clone();
+        let held = model
+            .photo_processing_gate
+            .0
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut stream = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+        assert!(model.still_capture.publish(
+            model.still_capture.pending().unwrap(),
+            model.current_frame.as_ref().unwrap().as_ref().clone()
+        ));
+        let acquired = next_capture_message(&mut stream).await;
+        let _close = model.update(super::Message::WindowClose);
+        assert!(model.pending_close);
+        assert_eq!(model.shutdown_pending_saves(), 1);
+        let _ = model.update(acquired);
+        assert_eq!(model.photo_jobs.len(), 1);
+        assert!(!model.is_capturing);
+        assert_eq!(model.shutdown_pending_saves(), 1);
+        assert!(
+            model
+                .camera_cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        drop(held);
+        let saved = next_capture_message(&mut stream).await;
+        assert!(matches!(saved, super::Message::PhotoCaptureSaved(1, Ok(_))));
+        let _finish = model.update(saved);
+        assert_eq!(model.shutdown_pending_saves(), 0);
+        std::fs::remove_dir_all(save_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_raw_acquisition_and_completion_preserve_newer_clip_and_hardware() {
+        use std::sync::atomic::Ordering;
+        let mut model = raw_queue_model();
+        let held = model
+            .photo_processing_gate
+            .0
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut stream = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+        // Start real clip state without requiring a hardware encoder or frames.
+        model.start_motion_photo_capture().unwrap();
+        let first_clip = model.motion_photo_capture.as_ref().unwrap().cancel.clone();
+        assert!(model.still_capture.publish(
+            model.still_capture.pending().unwrap(),
+            model.current_frame.as_ref().unwrap().as_ref().clone()
+        ));
+        let acquired = next_capture_message(&mut stream).await;
+        let _ = model.update(acquired);
+        assert!(Arc::ptr_eq(
+            &model.photo_jobs[&1].live.as_ref().unwrap().cancel,
+            &first_clip
+        ));
+        assert!(model.motion_photo_capture.is_none());
+        let _second = model.capture_photo();
+        model.start_motion_photo_capture().unwrap();
+        let second_clip = model.motion_photo_capture.as_ref().unwrap().cancel.clone();
+        for stale in [1, 0, 999, 1] {
+            let _ = model.update(super::Message::PhotoCaptureAcquired(stale));
+            assert_eq!(model.hardware_photo_id, Some(2));
+            assert!(model.is_capturing);
+            assert!(model.still_capture.has_request());
+            assert_eq!(model.photo_jobs.len(), 1);
+            assert!(Arc::ptr_eq(
+                &model.motion_photo_capture.as_ref().unwrap().cancel,
+                &second_clip
+            ));
+        }
+        let _ = model.update(super::Message::PhotoCaptureSaved(
+            1,
+            Err("first worker failed".into()),
+        ));
+        assert!(first_clip.load(Ordering::Acquire));
+        assert!(!second_clip.load(Ordering::Acquire));
+        assert_eq!(model.hardware_photo_id, Some(2));
+        assert!(model.is_capturing);
+        // A queued RAW completion cannot unlock an HDR acquisition either.
+        model.burst_mode.stage = crate::app::state::BurstModeStage::Processing;
+        let _ = model.update(super::Message::PhotoCaptureSaved(1, Ok("late.png".into())));
+        assert_eq!(model.hardware_photo_id, Some(2));
+        assert!(model.is_capturing);
+        assert_eq!(
+            model.burst_mode.stage,
+            crate::app::state::BurstModeStage::Processing
+        );
+        drop(stream);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn photo_queue_runs_fifo_one_worker_and_recovers_from_errors() {
+        use futures::FutureExt;
+        let model = raw_queue_model();
+        let gate = model.photo_processing_gate.0.clone();
+        let held = gate.clone().acquire_owned().await.unwrap();
+        let (started, mut starts) = tokio::sync::mpsc::unbounded_channel();
+        let mut jobs = Vec::new();
+        let mut releases = Vec::new();
+        for id in 1..=3 {
+            let (release, wait) = tokio::sync::oneshot::channel();
+            releases.push(release);
+            let started = started.clone();
+            let mut job = Box::pin(super::run_photo_save(gate.clone(), async move {
+                started.send(id).unwrap();
+                wait.await.unwrap();
+                if id == 1 {
+                    Err("controlled worker error".into())
+                } else {
+                    Ok(format!("{id}.png"))
+                }
+            }));
+            assert!(job.as_mut().now_or_never().is_none());
+            jobs.push(tokio::spawn(job));
+        }
+        assert!(starts.try_recv().is_err());
+        drop(held);
+        for (index, release) in releases.into_iter().enumerate() {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), starts.recv())
+                    .await
+                    .unwrap(),
+                Some(index + 1)
+            );
+            assert!(
+                starts.try_recv().is_err(),
+                "only one processing worker may enter"
+            );
+            release.send(()).unwrap();
+            let result = (&mut jobs[index]).await.unwrap();
+            assert_eq!(result.is_err(), index == 0);
+        }
+        assert_eq!(gate.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn photo_queue_cancellation_keeps_started_worker_exclusive() {
+        use futures::FutureExt;
+        let model = raw_queue_model();
+        let gate = model.photo_processing_gate.0.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(super::run_photo_save(gate.clone(), async move {
+            entered.send(()).unwrap();
+            wait.await.unwrap();
+            Ok("first.png".into())
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            gate.available_permits(),
+            0,
+            "blocking worker must still own the gate"
+        );
+        // Cancelling a waiter must remove it, without consuming a later permit.
+        let mut cancelled = Box::pin(super::run_photo_save(gate.clone(), async {
+            panic!("cancelled waiter started")
+        }));
+        assert!(cancelled.as_mut().now_or_never().is_none());
+        drop(cancelled);
+        let (entered, mut ready) = tokio::sync::oneshot::channel();
+        let mut second = Box::pin(super::run_photo_save(gate.clone(), async move {
+            entered.send(()).unwrap();
+            Ok("second.png".into())
+        }));
+        assert!(second.as_mut().now_or_never().is_none());
+        assert!(ready.try_recv().is_err());
+        release.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), second)
+                .await
+                .unwrap(),
+            Ok("second.png".into())
+        );
+        ready.await.unwrap();
+        assert_eq!(gate.available_permits(), 1);
+        let panic =
+            super::run_photo_save(gate.clone(), async { panic!("controlled worker panic") }).await;
+        assert!(panic.unwrap_err().contains("Photo save task failed"));
+        assert_eq!(gate.available_permits(), 1);
+        assert_eq!(
+            super::run_photo_save(gate, async { Ok("survived.png".into()) }).await,
+            Ok("survived.png".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_processing_error_uses_shutter_preview_without_unlocking_next_acquisition() {
+        let mut model = raw_queue_model();
+        let save_dir = model.config.save_folder_name.clone();
+        let held = model
+            .photo_processing_gate
+            .0
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut stream = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+        let mut bad_raw = model.current_frame.as_ref().unwrap().as_ref().clone();
+        bad_raw.stride = 1; // Invalid layout fails the real post-processor.
+        assert!(
+            model
+                .still_capture
+                .publish(model.still_capture.pending().unwrap(), bad_raw)
+        );
+        let acquired = next_capture_message(&mut stream).await;
+        let _ = model.update(acquired);
+        let _second = model.capture_photo();
+        model.current_frame = None;
+        model.zoom_level = 4.0;
+        model.config.save_folder_name = format!("{save_dir}/changed");
+        drop(held);
+        let saved = next_capture_message(&mut stream).await;
+        let path = match &saved {
+            super::Message::PhotoCaptureSaved(1, Ok(path)) => path.clone(),
+            _ => panic!("RAW processing error must fall back to the shutter-time preview"),
+        };
+        let image = image::open(path).unwrap().to_rgb8();
+        assert_eq!(image.dimensions(), (64, 48));
+        assert_eq!(image.get_pixel(0, 0).0, [80; 3]);
+        let _ = model.update(saved);
+        assert_eq!(model.hardware_photo_id, Some(2));
+        assert!(model.is_capturing);
+        assert!(model.photo_jobs.is_empty());
+        std::fs::remove_dir_all(save_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn raw_save_completion_does_not_release_a_later_hdr_shutter() {
+        let mut model = raw_queue_model();
+        let save_dir = model.config.save_folder_name.clone();
+        let held = model
+            .photo_processing_gate
+            .0
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let mut stream = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+        assert!(model.still_capture.publish(
+            model.still_capture.pending().unwrap(),
+            model.current_frame.as_ref().unwrap().as_ref().clone()
+        ));
+        let acquired = next_capture_message(&mut stream).await;
+        let _ = model.update(acquired);
+        model.config.burst_mode_setting = crate::config::BurstModeSetting::Frames4;
+        let _hdr = model.capture_photo();
+        assert!(model.burst_mode.is_collecting_frames());
+        assert_eq!(model.hardware_photo_id, Some(2));
+        let stage = model.burst_mode.stage;
+        drop(held);
+        let saved = next_capture_message(&mut stream).await;
+        assert!(matches!(saved, super::Message::PhotoCaptureSaved(1, Ok(_))));
+        let _ = model.update(saved);
+        assert!(model.is_capturing);
+        assert_eq!(model.hardware_photo_id, Some(2));
+        assert_eq!(model.burst_mode.stage, stage);
+        let next_id = model.next_photo_id;
+        assert!(cosmic::iced::runtime::task::into_stream(model.capture_photo()).is_none());
+        assert_eq!(model.next_photo_id, next_id);
+        std::fs::remove_dir_all(save_dir).unwrap();
+    }
+
+    #[test]
+    fn raw_queue_generated_bayer_saves_via_native_gpu_after_acquisition() {
+        let Some((_gpu_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "raw_queue_generated_bayer_saves_via_native_gpu_after_acquisition",
+            );
+            return;
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut model = raw_queue_model();
+                model.config.demosaic_method = crate::shaders::DemosaicMethod::Bilinear;
+                let save_dir = model.config.save_folder_name.clone();
+                let held = model
+                    .photo_processing_gate
+                    .0
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .unwrap();
+                let mut stream =
+                    cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+                let mut raw = model.current_frame.as_ref().unwrap().as_ref().clone();
+                raw.width = 32;
+                raw.height = 24;
+                raw.format = crate::backends::camera::types::PixelFormat::BayerRGGB;
+                raw.stride = raw.width;
+                raw.data = crate::backends::camera::types::FrameData::from_owned_vec(
+                    (0..raw.width * raw.height)
+                        .map(|index| 40 + (index % 100) as u8)
+                        .collect(),
+                );
+                assert!(
+                    model
+                        .still_capture
+                        .publish(model.still_capture.pending().unwrap(), raw)
+                );
+                let acquired = next_capture_message(&mut stream).await;
+                assert!(matches!(acquired, super::Message::PhotoCaptureAcquired(1)));
+                let _ = model.update(acquired);
+                let _second = model.capture_photo();
+                assert_eq!(model.hardware_photo_id, Some(2));
+                // Distinct sensor dimensions ensure preview fallback cannot conceal
+                // a failure in the real Bayer processing path.
+                drop(held);
+                let saved = next_capture_message(&mut stream).await;
+                let path = match &saved {
+                    super::Message::PhotoCaptureSaved(1, Ok(path)) => path.clone(),
+                    _ => panic!("generated Bayer frame must save"),
+                };
+                let image = image::open(path).unwrap().to_rgb8();
+                assert_eq!(image.dimensions(), (32, 24));
+                assert!(
+                    image
+                        .pixels()
+                        .any(|pixel| pixel.0 != image.get_pixel(0, 0).0)
+                );
+                let _ = model.update(saved);
+                assert_eq!(model.hardware_photo_id, Some(2));
+                assert!(model.is_capturing);
+                std::fs::remove_dir_all(save_dir).unwrap();
+            });
     }
 
     async fn warm_live_model(model: &mut crate::app::state::AppModel) {
@@ -3085,9 +3920,7 @@ mod tests {
         }
         // Simulate raw acquisition having delivered its frame while its still
         // encoder is slow. No additional camera frames are needed for encoding.
-        model
-            .still_capture_requested
-            .store(false, std::sync::atomic::Ordering::Release);
+        model.still_capture.reset();
         let _ = model.update(super::Message::Noop);
         assert!(
             model
@@ -3920,8 +4753,24 @@ mod tests {
     async fn motion_photo_pending_clip_rejects_quick_record_press() {
         let mut model = live_model();
         model.start_motion_photo_capture().unwrap();
-        let _ = model.handle_capture_button_pressed();
+        assert!(!model.can_accept_photo());
+        let next_id = model.next_photo_id;
+        model.motion_photo_error = Some("existing diagnostic".into());
+        for task in [
+            model.handle_capture_button_pressed(),
+            model.capture_photo(),
+            model.handle_capture(),
+        ] {
+            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+        }
+        assert_eq!(model.next_photo_id, next_id);
+        assert_eq!(
+            model.motion_photo_error.as_deref(),
+            Some("existing diagnostic")
+        );
         assert!(!model.quick_record.is_pressed());
+        model.motion_photo_capture = None;
+        assert!(model.can_accept_photo());
     }
 
     #[tokio::test]
@@ -4119,6 +4968,85 @@ mod tests {
             model.photo_jobs.len() == 1,
             "Missing prebuffer/encoder must never delay or reject the still shutter"
         );
+    }
+
+    #[tokio::test]
+    async fn photo_save_does_not_block_the_async_executor() {
+        use crate::app::state::{AppModel, Message};
+        use crate::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
+        use futures::StreamExt;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        struct UiWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for UiWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let save_dir =
+            std::env::temp_dir().join(format!("camera-ui-photo-test-{}", uuid::Uuid::new_v4()));
+        let mut model = AppModel {
+            current_frame: Some(Arc::new(CameraFrame {
+                width: 16,
+                height: 16,
+                data: FrameData::from_owned_vec(vec![128; 16 * 16 * 4]),
+                format: PixelFormat::RGBA,
+                stride: 16 * 4,
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            })),
+            hdr_override_disabled: true,
+            ..AppModel::default()
+        };
+        model.config.save_folder_name = save_dir.to_string_lossy().into_owned();
+        let mut stream = cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&events);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || UiWriter(Arc::clone(&writer)))
+            .finish();
+        {
+            // The first poll is iced's initial yield. The next runs the save
+            // job on its single async worker; heavy processing must not run
+            // inline there and starve preview subscriptions and animations.
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let waker = futures::task::noop_waker();
+            let mut context = std::task::Context::from_waker(&waker);
+            assert!(stream.poll_next_unpin(&mut context).is_pending());
+            assert!(stream.poll_next_unpin(&mut context).is_pending());
+        }
+        let ui_events = String::from_utf8(events.lock().unwrap().clone()).unwrap();
+        assert!(
+            !ui_events.contains("Starting post-processing"),
+            "photo processing ran inline on the async executor: {ui_events}"
+        );
+
+        let mut saved = None;
+        while let Some(action) = stream.next().await {
+            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                Message::PhotoCaptureSaved(_, result),
+            )) = action
+            {
+                saved = Some(result.unwrap());
+                // Encoding completion is the readiness signal; do not wait
+                // for the independent animation/watchdog timers to drain.
+                break;
+            }
+        }
+        let image = image::open(saved.expect("save task must still finish")).unwrap();
+        std::fs::remove_dir_all(save_dir).unwrap();
+        assert_eq!((image.width(), image.height()), (16, 16));
     }
 
     #[test]

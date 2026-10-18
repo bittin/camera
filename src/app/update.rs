@@ -52,6 +52,7 @@ impl AppModel {
                 | Message::ExposureBaseTimeCaptured(_)
                 | Message::WhiteBalanceToggled(_)
                 | Message::PhotoSaved(_)
+                | Message::PhotoCaptureAcquired(_)
                 | Message::PhotoCaptureSaved(..)
                 | Message::PhotoCaptureFinished(..)
                 | Message::PhotoEncodingWatchdog(_)
@@ -314,6 +315,7 @@ impl AppModel {
             Message::WindowDrag => self.core.drag(None),
             Message::PinchZoom(level) => self.handle_pinch_zoom(level),
             Message::PhotoSaved(result) => self.handle_photo_saved(result),
+            Message::PhotoCaptureAcquired(id) => self.handle_photo_capture_acquired(id),
             Message::PhotoCaptureSaved(id, result) => self.handle_photo_capture_saved(id, result),
             Message::PhotoEncodingWatchdog(id) => self.handle_photo_encoding_watchdog(id),
             Message::PhotoCaptureFinished(id, result) => {

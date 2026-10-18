@@ -695,17 +695,13 @@ impl CameraBackend for LibcameraBackend {
         );
 
         // Create native pipeline
-        let still_requested = Arc::new(AtomicBool::new(false));
-        let still_frame = Arc::new(Mutex::new(None));
         let pipeline = CapturePipeline::new(
             &device.path,
             format,
             false,
             PipelineSharedState {
                 frame_sender: sender,
-                still_requested,
-                still_frame,
-                still_frame_notify: Arc::new(tokio::sync::Notify::new()),
+                still_capture: Default::default(),
                 recording_sender: Arc::new(Mutex::new(None)),
                 jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -790,15 +786,15 @@ impl CameraBackend for LibcameraBackend {
             .as_ref()
             .ok_or_else(|| BackendError::Other("Pipeline not initialized".to_string()))?;
 
-        // Request still capture
-        pipeline.request_still_capture();
+        // This blocking caller owns its ticket, independently of the poll API.
+        let request = pipeline.begin_still_capture();
 
         // Wait for still frame (with timeout)
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(2);
 
         while start.elapsed() < timeout {
-            if let Some(frame) = pipeline.get_still_frame() {
+            if let Some(frame) = request.take() {
                 info!(
                     width = frame.width,
                     height = frame.height,
@@ -810,6 +806,7 @@ impl CameraBackend for LibcameraBackend {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
+        drop(request);
         // Timeout - fall back to preview frame
         warn!("Still capture timeout, using preview frame");
         pipeline
@@ -887,9 +884,7 @@ pub fn create_pipeline(
         false,
         PipelineSharedState {
             frame_sender: sender,
-            still_requested: Arc::new(AtomicBool::new(false)),
-            still_frame: Arc::new(Mutex::new(None)),
-            still_frame_notify: Arc::new(tokio::sync::Notify::new()),
+            still_capture: Default::default(),
             recording_sender: Arc::clone(&recording_sender),
             jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
             cancel_flag: Arc::new(AtomicBool::new(false)),

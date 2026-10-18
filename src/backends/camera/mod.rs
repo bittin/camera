@@ -34,6 +34,7 @@ pub mod manager;
 pub(crate) mod pipeline;
 pub(crate) mod pipewire;
 pub(crate) mod preview_metrics;
+pub(crate) mod still_capture;
 pub mod synthetic;
 pub mod types;
 mod usb_name;

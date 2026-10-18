@@ -607,6 +607,15 @@ pub struct FlashState {
     pub error_popup: Option<String>,
 }
 
+/// A defaultable per-app semaphore, also used by headless AppModel tests.
+pub(crate) struct PhotoProcessingGate(pub Arc<tokio::sync::Semaphore>);
+
+impl Default for PhotoProcessingGate {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(1)))
+    }
+}
+
 /// The application model stores app-specific state used to describe its interface and
 /// drive its logic.
 #[cfg_attr(test, derive(Default))]
@@ -698,6 +707,8 @@ pub struct AppModel {
     /// Independently identified ordinary still/live encoding jobs (bounded to 8).
     pub(crate) photo_jobs:
         std::collections::BTreeMap<u64, crate::app::handlers::motion_photo::PhotoJob>,
+    /// One ordinary photo worker per app; acquisition never waits on this gate.
+    pub(crate) photo_processing_gate: PhotoProcessingGate,
     pub(crate) next_photo_id: u64,
     pub(crate) hardware_photo_id: Option<u64>,
     pub(crate) last_published_photo_id: u64,
@@ -802,13 +813,8 @@ pub struct AppModel {
     pub camera_cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Counter to force camera stream restart (incremented to change subscription ID)
     pub camera_stream_restart_counter: u32,
-    /// Shared flag to request a still capture from the raw stream (multistream mode)
-    pub still_capture_requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Shared storage for the latest still frame from the raw stream (multistream mode)
-    pub latest_still_frame: std::sync::Arc<std::sync::Mutex<Option<CameraFrame>>>,
-    /// Notifier fired by the capture thread when a new still frame is stored.
-    /// Lets `wait_for_still_frame` await on a notification instead of polling.
-    pub still_frame_notify: std::sync::Arc<tokio::sync::Notify>,
+    /// Generation-owned still acquisition shared with the active backend.
+    pub(crate) still_capture: std::sync::Arc<crate::backends::camera::still_capture::StillCapture>,
     /// Current camera frame
     pub current_frame: Option<Arc<CameraFrame>>,
     /// Available camera devices
@@ -1697,6 +1703,7 @@ pub enum Message {
     PinchZoom(f32),
     /// Photo was saved successfully with the given file path
     PhotoSaved(Result<String, String>),
+    PhotoCaptureAcquired(u64),
     PhotoCaptureSaved(u64, Result<String, String>),
     PhotoEncodingWatchdog(u64),
     PhotoCaptureFinished(u64, Result<String, String>),

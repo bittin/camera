@@ -51,7 +51,29 @@ pub struct GpuFilterPipeline {
     staging_buffer: Option<crate::gpu::readback::ReadbackBuffer>,
 }
 
+/// Keep only compiled programs/uniforms after a photo, including cancellation.
+struct PhotoFilterWorkspace<'a> {
+    pipeline: &'a mut GpuFilterPipeline,
+}
+
+impl Drop for PhotoFilterWorkspace<'_> {
+    fn drop(&mut self) {
+        self.pipeline.release_frame_resources();
+    }
+}
+
 impl GpuFilterPipeline {
+    fn release_frame_resources(&mut self) {
+        self.input_texture = None;
+        self.preblur_texture = None;
+        self.output_buffer = None;
+        self.staging_buffer = None;
+        self.cached_width = 0;
+        self.cached_height = 0;
+        if let Err(error) = self.device.poll(wgpu::PollType::Poll) {
+            warn!(%error, "Photo filter workspace retirement poll failed");
+        }
+    }
     /// Create a new GPU filter pipeline
     ///
     /// This will attempt to use hardware GPU acceleration with low-priority queue
@@ -61,8 +83,8 @@ impl GpuFilterPipeline {
 
         // Get shared GPU device to avoid creating multiple wgpu instances
         let gpu = gpu::get_shared_gpu().await?;
-        let device = gpu.device;
-        let queue = gpu.queue;
+        let device = gpu.device.clone();
+        let queue = gpu.queue.clone();
 
         info!(
             adapter_name = %gpu.info.adapter_name,
@@ -261,7 +283,7 @@ impl GpuFilterPipeline {
     }
 
     /// Ensure resources are allocated for the given dimensions
-    fn ensure_resources(&mut self, width: u32, height: u32) {
+    fn ensure_resources(&mut self, width: u32, height: u32, upload: bool) {
         if self.cached_width == width && self.cached_height == height {
             return;
         }
@@ -271,21 +293,41 @@ impl GpuFilterPipeline {
         let buffer_size = (width * height * 4) as u64;
 
         // Create input texture
-        self.input_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("filter_input_texture"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+        self.input_texture = upload.then(|| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("filter_input_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        });
+
+        self.preblur_texture = None;
+
+        // Create output storage buffer
+        self.output_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("filter_output_buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
         }));
 
+        self.cached_width = width;
+        self.cached_height = height;
+    }
+
+    fn ensure_preblur_texture(&mut self, width: u32, height: u32) {
+        if self.preblur_texture.is_some() {
+            return;
+        }
         // Pre-blur intermediate texture (storage + texture binding for two-pass filters)
         self.preblur_texture = Some(self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("filter_preblur_texture"),
@@ -301,29 +343,6 @@ impl GpuFilterPipeline {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         }));
-
-        // Create output storage buffer
-        self.output_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("filter_output_buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        }));
-
-        // Create staging buffer for CPU readback
-        self.staging_buffer = Some(crate::gpu::readback::ReadbackBuffer::from_buffer(
-            &self.device,
-            self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("filter_staging_buffer"),
-                size: buffer_size,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            }),
-            "filter_staging_buffer",
-        ));
-
-        self.cached_width = width;
-        self.cached_height = height;
     }
 
     /// Apply a filter to RGBA data
@@ -342,22 +361,12 @@ impl GpuFilterPipeline {
             return Ok(rgba_data.to_vec());
         }
 
-        self.ensure_resources(width, height);
+        self.ensure_resources(width, height, true);
 
         let input_texture = self
             .input_texture
             .as_ref()
             .ok_or("Input texture not allocated")?;
-        let output_buffer = self
-            .output_buffer
-            .as_ref()
-            .ok_or("Output buffer not allocated")?;
-        let readback = self
-            .staging_buffer
-            .as_ref()
-            .ok_or("Staging buffer not allocated")?;
-        let staging_buffer = readback.buffer();
-
         // Upload RGBA data to input texture
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -379,6 +388,89 @@ impl GpuFilterPipeline {
             },
         );
 
+        let input_view = input_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.apply_filter_view_region(input_view, width, height, filter, (0, 0, width, height))
+            .await
+    }
+
+    /// Chain the canonical RGBA8 converter texture without CPU readback/upload.
+    /// Filter the FULL source before extracting the region: UV-dependent,
+    /// neighbor-sampling and preblur filters must never see cropped dimensions.
+    pub(crate) async fn apply_filter_texture_region(
+        &mut self,
+        texture: &wgpu::Texture,
+        filter: FilterType,
+        region: (u32, u32, u32, u32),
+    ) -> Result<Vec<u8>, String> {
+        self.release_frame_resources();
+        let workspace = PhotoFilterWorkspace { pipeline: self };
+        if texture.format() != wgpu::TextureFormat::Rgba8Unorm
+            || !texture
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            || texture.dimension() != wgpu::TextureDimension::D2
+            || texture.depth_or_array_layers() != 1
+            || texture.sample_count() != 1
+            || filter == FilterType::Standard
+        {
+            return Err("Incompatible photo filter texture".into());
+        }
+        let (width, height) = (texture.width(), texture.height());
+        workspace.pipeline.ensure_resources(width, height, false);
+        workspace
+            .pipeline
+            .apply_filter_view_region(
+                texture.create_view(&Default::default()),
+                width,
+                height,
+                filter,
+                region,
+            )
+            .await
+    }
+
+    async fn apply_filter_view_region(
+        &mut self,
+        input_view: wgpu::TextureView,
+        width: u32,
+        height: u32,
+        filter: FilterType,
+        (x, y, region_width, region_height): (u32, u32, u32, u32),
+    ) -> Result<Vec<u8>, String> {
+        if x > width || y > height || region_width > width - x || region_height > height - y {
+            return Err("Filter readback region exceeds source dimensions".into());
+        }
+        if region_width == 0 || region_height == 0 {
+            return Ok(Vec::new());
+        }
+        if filter.needs_preblur() {
+            self.ensure_preblur_texture(width, height);
+        }
+        let buffer_size = u64::from(region_width) * u64::from(region_height) * 4;
+        // Staging is sized to the final region, not the sensor dimensions.
+        if self
+            .staging_buffer
+            .as_ref()
+            .is_none_or(|b| b.buffer().size() != buffer_size)
+        {
+            self.staging_buffer = Some(crate::gpu::readback::ReadbackBuffer::from_buffer(
+                &self.device,
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("filter_staging_buffer"),
+                    size: buffer_size,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                }),
+                "filter_staging_buffer",
+            ));
+        }
+        let readback = self.staging_buffer.as_ref().unwrap();
+        let staging_buffer = readback.buffer();
+        let output_buffer = self
+            .output_buffer
+            .as_ref()
+            .ok_or("Output buffer not allocated")?;
+
         // Update uniform buffer
         let params = FilterParams {
             width,
@@ -388,8 +480,6 @@ impl GpuFilterPipeline {
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&params));
-
-        let input_view = input_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Create and submit command buffer
         let mut encoder = self
@@ -497,9 +587,28 @@ impl GpuFilterPipeline {
             compute_pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
-        // Copy output buffer to staging buffer
-        let buffer_size = (width * height * 4) as u64;
-        encoder.copy_buffer_to_buffer(output_buffer, 0, &staging_buffer, 0, buffer_size);
+        // Row copies compact the final crop/zoom into one mapped allocation.
+        if x == 0 && region_width == width {
+            encoder.copy_buffer_to_buffer(
+                output_buffer,
+                u64::from(y) * u64::from(width) * 4,
+                &staging_buffer,
+                0,
+                buffer_size,
+            );
+        } else {
+            let row_bytes = u64::from(region_width) * 4;
+            for row in 0..region_height {
+                let source = (u64::from(y + row) * u64::from(width) + u64::from(x)) * 4;
+                encoder.copy_buffer_to_buffer(
+                    output_buffer,
+                    source,
+                    &staging_buffer,
+                    u64::from(row) * row_bytes,
+                    row_bytes,
+                );
+            }
+        }
 
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -556,6 +665,69 @@ pub async fn apply_filter_gpu_rgba(
     pipeline
         .apply_filter_rgba(rgba_data, width, height, filter)
         .await
+}
+
+#[cfg(test)]
+#[path = "gpu_filter_photo_tests.rs"]
+mod photo_scheduling_tests;
+
+#[cfg(test)]
+mod texture_region_tests {
+    use super::*;
+
+    #[test]
+    fn photo_filter_allocates_only_required_surfaces_and_cleans_cancelled_lease() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "photo_filter_allocates_only_required_surfaces_and_cleans_cancelled_lease",
+            );
+            return;
+        };
+        pollster::block_on(async {
+            let mut filter = GpuFilterPipeline::new().await.unwrap();
+            filter.ensure_resources(17, 19, false);
+            assert!(filter.input_texture.is_none());
+            assert!(
+                filter.preblur_texture.is_none(),
+                "single-pass photo allocated unused preblur"
+            );
+            filter.release_frame_resources();
+            let mut future = Box::pin(async {
+                let lease = PhotoFilterWorkspace {
+                    pipeline: &mut filter,
+                };
+                lease.pipeline.ensure_resources(17, 19, false);
+                std::future::pending::<()>().await;
+                drop(lease);
+            });
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(std::future::Future::poll(future.as_mut(), &mut cx).is_pending());
+            drop(future);
+            assert!(filter.output_buffer.is_none());
+            assert!(filter.preblur_texture.is_none());
+            assert!(filter.staging_buffer.is_none());
+            assert_eq!((filter.cached_width, filter.cached_height), (0, 0));
+            // Recreate via the ordinary upload API after cancellation.
+            assert_eq!(
+                filter
+                    .apply_filter_rgba(&[80, 100, 120, 255].repeat(4), 2, 2, FilterType::Mono)
+                    .await
+                    .unwrap()
+                    .len(),
+                16
+            );
+            let texture = filter.input_texture.as_ref().unwrap().clone();
+            assert!(
+                filter
+                    .apply_filter_texture_region(&texture, FilterType::Mono, (u32::MAX, 0, 1, 1))
+                    .await
+                    .is_err()
+            );
+            assert!(filter.output_buffer.is_none());
+            assert!(filter.input_texture.is_none());
+            assert_eq!((filter.cached_width, filter.cached_height), (0, 0));
+        });
+    }
 }
 
 #[cfg(test)]

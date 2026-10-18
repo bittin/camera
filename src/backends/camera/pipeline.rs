@@ -20,12 +20,7 @@ impl CapturePipeline {
         // Shared GUI still storage survives subscription replacement. Clear it
         // for both routes so a PipeWire frame/request cannot cross into a native
         // camera (including failed initialization), or vice versa.
-        if let Ok(mut frame) = shared.still_frame.lock() {
-            *frame = None;
-        }
-        shared
-            .still_requested
-            .store(false, std::sync::atomic::Ordering::Release);
+        shared.still_capture.reset();
         if let Some(serial) = path.strip_prefix("pipewire:") {
             tracing::info!(
                 backend = "pipewire-v4l2",
@@ -66,6 +61,12 @@ impl CapturePipeline {
             Self::PipeWire(p) => p.get_still_frame(),
         }
     }
+    pub(crate) fn begin_still_capture(&self) -> super::still_capture::StillRequest {
+        match self {
+            Self::Native(p) => p.begin_still_capture(),
+            Self::PipeWire(p) => p.begin_still_capture(),
+        }
+    }
     pub(crate) fn get_preview_frame(&self) -> Option<CameraFrame> {
         match self {
             Self::Native(p) => p.get_preview_frame(),
@@ -83,10 +84,7 @@ impl CapturePipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
     #[test]
     fn switching_to_native_clears_fallback_still_even_if_initialization_fails() {
         let (tx, _rx) = futures::channel::mpsc::channel(1);
@@ -101,13 +99,13 @@ mod tests {
             sensor_timestamp_ns: None,
             libcamera_metadata: None,
         };
-        let still = Arc::new(Mutex::new(Some(frame)));
-        let requested = Arc::new(AtomicBool::new(true));
+        let still = Arc::new(super::super::still_capture::StillCapture::default());
+        let request = still.request();
+        let ticket = still.pending().unwrap();
+        assert!(still.publish(ticket, frame));
         let shared = PipelineSharedState {
             frame_sender: tx,
-            still_requested: requested.clone(),
-            still_frame: still.clone(),
-            still_frame_notify: Arc::new(tokio::sync::Notify::new()),
+            still_capture: still.clone(),
             recording_sender: Arc::new(Mutex::new(None)),
             jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -128,9 +126,9 @@ mod tests {
             .is_err()
         );
         assert!(
-            still.lock().unwrap().is_none(),
+            request.take().is_none(),
             "a fallback still must not cross into the native camera lifecycle"
         );
-        assert!(!requested.load(Ordering::Acquire));
+        assert!(!still.has_request());
     }
 }

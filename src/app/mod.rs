@@ -477,6 +477,7 @@ impl cosmic::Application for AppModel {
             video_preview_stop_tx: None,
             file_source_preview_receiver: None,
             photo_jobs: std::collections::BTreeMap::new(),
+            photo_processing_gate: state::PhotoProcessingGate::default(),
             next_photo_id: 1,
             hardware_photo_id: None,
             last_published_photo_id: 0,
@@ -549,9 +550,7 @@ impl cosmic::Application for AppModel {
             backend_manager: Some(backend_manager),
             camera_cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             camera_stream_restart_counter: 0,
-            still_capture_requested: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            latest_still_frame: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            still_frame_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+            still_capture: Default::default(),
             current_frame: None,
             available_cameras,
             camera_discovery_complete: false,
@@ -846,7 +845,7 @@ impl cosmic::Application for AppModel {
             |_| cosmic::Action::App(Message::Noop),
         );
 
-        // Precompile GPU shader pipelines in background (eliminates ~270ms first-capture penalty).
+        // Precompile conversion/photo/filter shaders on a background blocking worker.
         //
         // Wait for the iced renderer to seed the shared GPU device first so warmup
         // binds its pipelines to the renderer's device (no second wgpu::Instance).
@@ -1028,9 +1027,7 @@ impl cosmic::Application for AppModel {
         let camera_index = self.current_camera_index;
         let current_format = self.active_format.clone();
         let cancel_flag = Arc::clone(&self.camera_cancel_flag);
-        let still_capture_requested = Arc::clone(&self.still_capture_requested);
-        let latest_still_frame = Arc::clone(&self.latest_still_frame);
-        let still_frame_notify = Arc::clone(&self.still_frame_notify);
+        let still_capture = Arc::clone(&self.still_capture);
         // Create a unique ID based on format properties to trigger restart when format changes
         let format_id = current_format
             .as_ref()
@@ -1239,9 +1236,7 @@ impl cosmic::Application for AppModel {
                                     true,
                                     crate::backends::camera::libcamera::PipelineSharedState {
                                         frame_sender: sender,
-                                        still_requested: Arc::clone(&still_capture_requested),
-                                        still_frame: Arc::clone(&latest_still_frame),
-                                        still_frame_notify: Arc::clone(&still_frame_notify),
+                                        still_capture: Arc::clone(&still_capture),
                                         recording_sender: rec_sender,
                                         jpeg_recording_mode: Arc::clone(&jpeg_recording_mode),
                                         cancel_flag: Arc::clone(&cancel_flag),

@@ -60,7 +60,6 @@ fn demosaic(x: u32, y: u32, pattern: u32) -> DemosaicResult {
     var b: f32;
 
     let center = sample_bayer(ix, iy);
-    var sensor_peak_raw = center;
 
     // Bilinear interpolation based on pixel position in Bayer pattern
     if (pixel_type == 0u) {
@@ -76,10 +75,6 @@ fn demosaic(x: u32, y: u32, pattern: u32) -> DemosaicResult {
         r = center;
         g = (left + right + top + bottom) * 0.25;
         b = (top_left + top_right + bottom_left + bottom_right) * 0.25;
-        sensor_peak_raw = max(
-            max(max(top_left, top), max(top_right, left)),
-            max(max(center, right), max(bottom_left, max(bottom, bottom_right))),
-        );
     } else if (pixel_type == 1u) {
         // Green pixel on R row - interpolate R (horizontal neighbors) and B (vertical neighbors)
         let top = sample_bayer(ix, iy - 1);
@@ -89,7 +84,6 @@ fn demosaic(x: u32, y: u32, pattern: u32) -> DemosaicResult {
         r = (left + right) * 0.5;
         g = center;
         b = (top + bottom) * 0.5;
-        sensor_peak_raw = max(max(center, top), max(bottom, max(left, right)));
     } else if (pixel_type == 2u) {
         // Green pixel on B row - interpolate R (vertical neighbors) and B (horizontal neighbors)
         let top = sample_bayer(ix, iy - 1);
@@ -99,7 +93,6 @@ fn demosaic(x: u32, y: u32, pattern: u32) -> DemosaicResult {
         r = (top + bottom) * 0.5;
         g = center;
         b = (left + right) * 0.5;
-        sensor_peak_raw = max(max(center, top), max(bottom, max(left, right)));
     } else {
         // Blue pixel - interpolate R and G
         let top_left = sample_bayer(ix - 1, iy - 1);
@@ -113,33 +106,46 @@ fn demosaic(x: u32, y: u32, pattern: u32) -> DemosaicResult {
         r = (top_left + top_right + bottom_left + bottom_right) * 0.25;
         g = (left + right + top + bottom) * 0.25;
         b = center;
-        sensor_peak_raw = max(
-            max(max(top_left, top), max(top_right, left)),
-            max(max(center, right), max(bottom_left, max(bottom, bottom_right))),
-        );
     }
 
-    return DemosaicResult(vec3(r,g,b), sensor_peak_raw);
+    // Common reconstructed sensor headroom; never a CFA-dependent support max.
+    return DemosaicResult(vec3(r,g,b), max(r, max(g, b)));
 }
 
 fn apply_bayer_colour(rgb: vec3<f32>, sensor_peak_raw: f32, gains: vec2<f32>, row0: vec3<f32>, row1: vec3<f32>, row2: vec3<f32>) -> vec3<f32> {
+    return apply_bayer_colour_intent(rgb, sensor_peak_raw, gains, row0, row1, row2, false);
+}
+
+fn apply_bayer_colour_intent(rgb: vec3<f32>, sensor_peak_raw: f32, gains: vec2<f32>, row0: vec3<f32>, row1: vec3<f32>, row2: vec3<f32>, still_sdr: bool) -> vec3<f32> {
     // Supplied gains or the unchanged GPU gray-world producer. CCM metadata
     // is independent of gains; identity is used only when the CCM is absent.
     let balanced = rgb * vec3(gains.x, 1.0, gains.y);
-    let linear = vec3(dot(row0, balanced),
+    var linear = vec3(dot(row0, balanced),
         dot(row1, balanced), dot(row2, balanced));
     // Sensor-clipped samples have lost their channel ratios. White balance can
     // turn them magenta; scaling display RGB afterward preserves that false hue.
-    // Use a camera-space highlight cap only near sensor saturation,
-    // then apply the CCM to both candidates before blending. This is a bounded
-    // fallback, not spatial reconstruction of lost sensor detail. Adapters
-    // supply black-to-white normalized samples: the knee follows supplied
-    // sensor white, or nominal unity when metadata is absent.
+    // Recovery is a pointwise function of bilinear sensor RGB, never the
+    // legacy neighbourhood maximum (whose 9/5 sample supports depend on CFA
+    // phase). All methods use that same driver, not their refined RGB extrema.
+    // Reserve only the final tenth of black-to-white sensor range for a C1
+    // shoulder: zero change at/below .9, full recovery at/above sensor white,
+    // and maximum blend slope 15 per normalized unit (versus 100 previously).
+    // Thus one normalized RAW10 code cannot switch recovery candidates. No
+    // spatial smoothing, exposure change, or general WB-gamut clamp is involved.
+    // Lost channel ratios still use the bounded camera-space fallback, with
+    // the supplied signed CCM applied to both candidates, not clipped afterward.
     let clipped_balanced = clamp(balanced, vec3(0.0), vec3(1.0));
-    let reconstructed = vec3(dot(row0, clipped_balanced),
+    var reconstructed = vec3(dot(row0, clipped_balanced),
         dot(row1, clipped_balanced),
         dot(row2, clipped_balanced));
-    let transition = clamp((sensor_peak_raw - 0.980) / (0.995 - 0.980), 0.0, 1.0);
+    // Restore the ordinary SDR still boundary: clamp EACH signed-CCM
+    // candidate before the convex blend, not the blended result alone.
+    // HDR/generic/continuous callers retain signed and over-white values.
+    if still_sdr {
+        linear = clamp(linear, vec3(0.0), vec3(1.0));
+        reconstructed = clamp(reconstructed, vec3(0.0), vec3(1.0));
+    }
+    let transition = clamp((sensor_peak_raw - 0.9) / (1.0 - 0.9), 0.0, 1.0);
     let blend = transition * transition * (3.0 - 2.0 * transition);
     // Avoid mixing extreme candidates at zero weight: preserve signed and
     // over-white values exactly outside the sensor-clipping knee.
@@ -148,6 +154,11 @@ fn apply_bayer_colour(rgb: vec3<f32>, sensor_peak_raw: f32, gains: vec2<f32>, ro
         corrected = reconstructed;
     } else if blend > 0.0 {
         corrected = (1.0 - blend) * linear + blend * reconstructed;
+    }
+    if still_sdr {
+        // Bound rounding too. The shared encoder's legacy max-RGB cap is
+        // exactly unity for this cube, so SDR channels encode independently.
+        return clamp(corrected, vec3(0.0), vec3(1.0));
     }
     return corrected;
 }

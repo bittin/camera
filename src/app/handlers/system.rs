@@ -977,9 +977,7 @@ impl AppModel {
 
         // For the raw/capture stream we use the same still-capture mechanism as burst mode
         let is_multistream = self.is_current_camera_multistream();
-        let still_requested = std::sync::Arc::clone(&self.still_capture_requested);
-        let still_frame = std::sync::Arc::clone(&self.latest_still_frame);
-        let still_frame_notify = std::sync::Arc::clone(&self.still_frame_notify);
+        let still_capture = std::sync::Arc::clone(&self.still_capture);
 
         let save_dir =
             crate::app::get_photo_directory(&self.config.save_folder_name).join("insights");
@@ -1034,15 +1032,11 @@ impl AppModel {
 
                     // --- Raw/capture stream frame ---
                     if is_multistream {
-                        still_requested.store(true, std::sync::atomic::Ordering::Release);
+                        let still_request = still_capture.request();
 
                         let timeout = std::time::Duration::from_secs(2);
-                        let raw_frame = super::capture::wait_for_still_frame(
-                            &still_frame,
-                            &still_frame_notify,
-                            timeout,
-                        )
-                        .await;
+                        let raw_frame =
+                            super::capture::wait_for_still_frame(still_request, timeout).await;
                         if raw_frame.is_none() {
                             info!(frame = i + 1, "Timeout waiting for raw frame, skipping");
                         }
@@ -1291,7 +1285,7 @@ mod tests {
     use super::{file_manager_dbus_args, portal_gallery_item};
 
     #[test]
-    fn demosaic_handler_persists_each_method_and_reset_restores_rcd() {
+    fn demosaic_handler_persists_each_method_and_reset_restores_bilinear() {
         use crate::app::state::{AppModel, Message, SettingsPage};
         use crate::config::Config;
         use crate::shaders::DemosaicMethod;
@@ -1322,15 +1316,15 @@ mod tests {
             assert_eq!(Config::get_entry(store).unwrap().demosaic_method, method);
             drop(app.settings_view());
         }
-        drop(app.update(Message::SetDemosaicMethod(DemosaicMethod::Bilinear)));
+        drop(app.update(Message::SetDemosaicMethod(DemosaicMethod::Rcd)));
         drop(app.update(Message::ResetAllSettings));
         app.config_persistence.flush();
-        assert_eq!(app.config.demosaic_method, DemosaicMethod::Rcd);
+        assert_eq!(app.config.demosaic_method, DemosaicMethod::Bilinear);
         assert_eq!(
             Config::get_entry(app.config_handler.as_ref().unwrap())
                 .unwrap()
                 .demosaic_method,
-            DemosaicMethod::Rcd
+            DemosaicMethod::Bilinear
         );
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
