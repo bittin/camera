@@ -41,7 +41,7 @@ fn photo_dispatch_covers_tiny_odd_and_partial_workgroups_once() {
         (129, 9, [3, 3]),
         (21, 19, [1, 5]),
     ] {
-        let groups = bayer_workgroups(width, height, true, PHOTO_WORKGROUP_SIZE);
+        let groups = bayer_workgroups(width, height, true);
         assert_eq!(groups, expected, "{width}x{height}");
         let mut visits = vec![0; (width * height) as usize];
         for y in 0..groups[1] * 4 {
@@ -66,10 +66,7 @@ fn non_fused_dispatch_keeps_generic_video_and_high_quality_tiles() {
         (65, 5, [5, 1]),
         (129, 19, [9, 2]),
     ] {
-        assert_eq!(
-            bayer_workgroups(width, height, false, PHOTO_WORKGROUP_SIZE),
-            expected
-        );
+        assert_eq!(bayer_workgroups(width, height, false), expected);
     }
     assert_eq!(
         shader_workgroup(&super::super::compose_bayer_texture(include_str!(
@@ -88,19 +85,13 @@ fn non_fused_dispatch_keeps_generic_video_and_high_quality_tiles() {
 }
 
 #[test]
-fn frozen_reference_dispatch_can_explicitly_keep_sixteen_by_sixteen() {
-    assert_eq!(bayer_workgroups(65, 19, true, [16, 16]), [5, 2]);
-    assert_eq!(bayer_workgroups(65, 19, true, PHOTO_WORKGROUP_SIZE), [2, 5]);
-}
-
-#[test]
 fn dispatch_ceiling_does_not_overflow_large_dimensions() {
     assert_eq!(
-        bayer_workgroups(u32::MAX, u32::MAX, true, [64, 4]),
+        bayer_workgroups(u32::MAX, u32::MAX, true),
         [67_108_864, 1_073_741_824]
     );
     assert_eq!(
-        bayer_workgroups(u32::MAX, u32::MAX, false, [64, 4]),
+        bayer_workgroups(u32::MAX, u32::MAX, false),
         [268_435_456, 268_435_456]
     );
 }

@@ -27,7 +27,7 @@ const PHOTO_WORKGROUP_SIZE: [u32; 2] = [64, 4];
 
 // R16 storage usage is guaranteed with enabled 16-bit norm support. This is
 // a descriptor policy, NOT a guarantee about driver image compression. It is
-// independent of optional shader routes and retained by frozen references.
+// independent of optional shader routes.
 fn r16_input_usage(storage_capable: bool, format: wgpu::TextureFormat) -> wgpu::TextureUsages {
     let ordinary = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
     if storage_capable && format == wgpu::TextureFormat::R16Unorm {
@@ -37,14 +37,9 @@ fn r16_input_usage(storage_capable: bool, format: wgpu::TextureFormat) -> wgpu::
     }
 }
 
-fn bayer_workgroups(
-    width: u32,
-    height: u32,
-    fused_bilinear: bool,
-    photo_workgroup_size: [u32; 2],
-) -> [u32; 2] {
+fn bayer_workgroups(width: u32, height: u32, fused_bilinear: bool) -> [u32; 2] {
     let [x, y] = if fused_bilinear {
-        photo_workgroup_size
+        PHOTO_WORKGROUP_SIZE
     } else {
         [TILE_WORKGROUP_SIZE; 2]
     };
@@ -1152,8 +1147,6 @@ impl BindingSpec {
 struct FormatPipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
-    #[cfg(test)]
-    unpaced_photo_reference: bool,
 }
 
 #[path = "photo_session.rs"]
@@ -1174,9 +1167,8 @@ pub struct GpuConvertPipeline {
     debayer_finish_pipeline: Option<FormatPipeline>,
 
     photo_bilinear_pipeline: Option<FormatPipeline>,
-    // Layout policy survives frozen-reference shader overrides and workspace retirement.
+    // Layout policy survives workspace retirement.
     r16_input_storage_capable: bool,
-    photo_workgroup_size: [u32; 2],
     bayer_linear_texture: Option<wgpu::Texture>,
     bayer_demosaic_texture: Option<wgpu::Texture>,
     demosaic_engine: Option<super::demosaic_gpu::GpuDemosaic>,
@@ -1373,7 +1365,6 @@ impl GpuConvertPipeline {
 
             photo_bilinear_pipeline: None,
             r16_input_storage_capable,
-            photo_workgroup_size: PHOTO_WORKGROUP_SIZE,
             bayer_linear_texture: None,
             bayer_demosaic_texture: None,
             demosaic_engine: None,
@@ -1666,8 +1657,6 @@ impl GpuConvertPipeline {
         FormatPipeline {
             pipeline,
             bind_group_layout,
-            #[cfg(test)]
-            unpaced_photo_reference: name == "immutable baseline photo_bilinear",
         }
     }
 
@@ -1995,20 +1984,6 @@ impl GpuConvertPipeline {
         Ok(())
     }
 
-    fn bounded_photo_submissions(&self) -> bool {
-        // The immutable, test-only full-sensor oracle deliberately ignores
-        // the appended ROI ABI and remains unpaced, independent of tile shape.
-        #[cfg(test)]
-        if self
-            .photo_bilinear_pipeline
-            .as_ref()
-            .is_some_and(|p| p.unpaced_photo_reference)
-        {
-            return false;
-        }
-        true
-    }
-
     /// Set up Bayer resources and encode unpack + AWB + debayer passes onto a command encoder.
     ///
     /// The canonical signed float Bayer path. Callers append the finishing
@@ -2304,7 +2279,7 @@ impl GpuConvertPipeline {
                 debayer_pipeline,
                 &debayer_bind_group,
                 region,
-                self.photo_workgroup_size,
+                PHOTO_WORKGROUP_SIZE,
                 "bilinear",
             )?;
             return Ok(None);
@@ -2411,12 +2386,7 @@ impl GpuConvertPipeline {
                     });
             pass.set_pipeline(&debayer_pipeline.pipeline);
             pass.set_bind_group(0, Some(&debayer_bind_group), &[]);
-            let [workgroups_x, workgroups_y] = bayer_workgroups(
-                region.2,
-                region.3,
-                fused_bilinear,
-                self.photo_workgroup_size,
-            );
+            let [workgroups_x, workgroups_y] = bayer_workgroups(region.2, region.3, fused_bilinear);
             pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
         }
 
@@ -2676,7 +2646,7 @@ impl GpuConvertPipeline {
             .unwrap_or([super::BAYER_AWB_GAIN_BOUND; 2]);
         super::validate_bayer_colour(Some(gain_bounds), input.colour_correction_matrix, 1.0)
             .map_err(|_| BayerError::UnsafeArithmetic)?;
-        let bounded_photo = pace_photo && self.bounded_photo_submissions();
+        let bounded_photo = pace_photo;
         let encoder = self.prepare_and_encode_bayer(
             input,
             method,
@@ -2686,8 +2656,8 @@ impl GpuConvertPipeline {
             intent,
         )?;
         if fused_bilinear {
-            // Continuous frames and the frozen test oracle retain one original
-            // submission. Paced still photos are already fenced above.
+            // Continuous frames retain one original submission.
+            // Paced still photos are already fenced above.
             if let Some(encoder) = encoder {
                 self.queue.submit([encoder.finish()]);
             }
@@ -3400,10 +3370,6 @@ mod fully_gpu_contract_tests {
 #[cfg(test)]
 #[path = "bayer_region_tests.rs"]
 mod bayer_region_tests;
-
-#[cfg(test)]
-#[path = "photo_roi_reference.rs"]
-mod roi_frozen_reference;
 
 #[cfg(test)]
 mod readback_owner_tests {

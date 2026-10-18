@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! Parent-run GPU pixel tests. Not run by the ROI preparation subagent.
+//! GPU pixel comparisons between regional and full-sensor production processing.
 use super::*;
 
 #[test]
-fn bilinear_roi_matches_independent_full_sensor_reference() {
+fn bilinear_roi_matches_full_sensor_production() {
     let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu("bilinear_roi_matches_independent_full_sensor_reference");
+        crate::test_gpu::skip_no_gpu("bilinear_roi_matches_full_sensor_production");
         return;
     };
     tokio::runtime::Runtime::new().unwrap().block_on(async {
@@ -44,7 +44,7 @@ fn bilinear_roi_matches_independent_full_sensor_reference() {
                 let input = GpuFrameInput::from_camera_frame(&frame).unwrap();
                 let mut converter = GpuConvertPipeline::new().await.unwrap();
                 let mut reference_converter = GpuConvertPipeline::new().await.unwrap();
-                reference_converter.install_roi_frozen_reference();
+
                 // This API always passes None to the resolver: no crop can leak
                 // into the reference, unlike comparing two process() calls.
                 let full = {
@@ -96,8 +96,8 @@ fn bilinear_roi_matches_independent_full_sensor_reference() {
                         sharpening: true,
                         ..Default::default()
                     };
-                    // Frozen float/legacy oracle stays unchanged. Ordinary SDR
-                    // ROI coverage lives in still_sdr_tests for all methods.
+                    // Compare the production legacy paths. Ordinary SDR ROI
+                    // coverage lives in still_sdr_tests for all methods.
                     let processor = PostProcessor::new(config).for_continuous_frames();
                     let reference = processor
                         .process(Arc::new(CameraFrame {

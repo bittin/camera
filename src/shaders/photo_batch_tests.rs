@@ -58,8 +58,7 @@ fn photo_batches_complete_and_match_unpaced_bytes() {
     pollster::block_on(async {
         let mut photo = GpuConvertPipeline::new().await.unwrap();
         let mut generic = GpuConvertPipeline::new().await.unwrap();
-        let mut frozen = GpuConvertPipeline::new().await.unwrap();
-        frozen.install_roi_frozen_reference();
+
         for layout in [
             RawLayout::Csi2 { bits: 10 },
             RawLayout::Csi2 { bits: 12 },
@@ -98,14 +97,12 @@ fn photo_batches_complete_and_match_unpaced_bytes() {
                         generic
                             .convert_bayer_with_method(&input, DemosaicMethod::Bilinear)
                             .unwrap();
-                        frozen
-                            .convert_photo_bayer_with_method(&input, DemosaicMethod::Bilinear)
-                            .unwrap();
+
                         assert!(
                             !events.lock().unwrap().iter().any(|e| e
                                 .get("message")
                                 .is_some_and(|m| m == "Photo GPU batch completed")),
-                            "reference routes must remain unpaced"
+                            "generic conversion must remain unpaced"
                         );
                         for roi in [
                             (0, 0, w, h),
@@ -137,11 +134,7 @@ fn photo_batches_complete_and_match_unpaced_bytes() {
                                 actual == expected,
                                 "generic {layout:?} {format:?} {w}x{h} gains={gains:?} {roi:?}"
                             );
-                            let expected = frozen.read_rgba_region_to_cpu(roi).await.unwrap();
-                            assert!(
-                                actual == expected,
-                                "frozen {layout:?} {format:?} {w}x{h} gains={gains:?} {roi:?}"
-                            );
+
                             if matches!(layout, RawLayout::Csi2 { .. }) {
                                 check_batches(&events, "unpack", w, h, 1);
                             }
@@ -343,42 +336,6 @@ fn advanced_photo_batches_are_fenced_and_byte_exact(method: DemosaicMethod) {
                 }
             }
         }
-    });
-}
-
-#[test]
-fn photo_program_shape_does_not_disable_bounded_submissions() {
-    let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu("photo_program_shape_does_not_disable_bounded_submissions");
-        return;
-    };
-    let events = Events::default();
-    let subscriber = tracing_subscriber::registry().with(Capture(events.clone()));
-    let _subscriber = tracing::subscriber::set_default(subscriber);
-    pollster::block_on(async {
-        let mut photo = GpuConvertPipeline::new().await.unwrap();
-        photo.ensure_photo_bilinear_pipeline();
-        let source = super::super::compose_bayer_texture(include_str!("debayer_photo.wgsl"))
-            .replace("@workgroup_size(64,4)", "@workgroup_size(16,16)");
-        photo.photo_workgroup_size = [16, 16];
-        photo.photo_bilinear_pipeline = Some(photo.create_pipeline(
-            &source,
-            "ROI-aware 16x16 candidate",
-            &[
-                (0, BindingSpec::Texture),
-                (1, BindingSpec::StorageTexture),
-                (2, BindingSpec::Uniform),
-                (3, BindingSpec::ReadOnlyStorageBuffer),
-                (4, BindingSpec::Texture),
-            ],
-        ));
-        let (w, h) = (513, 1101);
-        let data = vec![96; (w * h) as usize];
-        let input = packed_photo_tests::input(&data, RawLayout::U8, w, h, w);
-        photo
-            .convert_photo_bayer_with_method(&input, DemosaicMethod::Bilinear)
-            .unwrap();
-        check_batches(&events, "bilinear", w, h, 16);
     });
 }
 

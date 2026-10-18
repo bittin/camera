@@ -5,11 +5,8 @@ use super::*;
 fn roi_retained_dispatch_uses_final_extent() {
     let region = bayer_conversion_region(67, 65, true, Some((3, 5, 9, 7))).unwrap();
     assert_eq!(region, (3, 5, 9, 7));
-    assert_eq!(
-        bayer_workgroups(region.2, region.3, true, PHOTO_WORKGROUP_SIZE),
-        [1, 2]
-    );
-    assert_eq!(bayer_workgroups(67, 65, true, [16, 16]), [5, 5]);
+    assert_eq!(bayer_workgroups(region.2, region.3, true), [1, 2]);
+    assert_eq!(bayer_workgroups(67, 65, true), [2, 17]);
 }
 
 #[test]

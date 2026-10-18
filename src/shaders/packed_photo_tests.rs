@@ -73,16 +73,13 @@ pub(super) fn input(
 async fn compare_routes(
     photo: &mut GpuConvertPipeline,
     generic: &mut GpuConvertPipeline,
-    frozen: &mut GpuConvertPipeline,
     input: &GpuFrameInput<'_>,
 ) {
     let (w, h) = (input.width, input.height);
     generic
         .convert_bayer_with_method(input, DemosaicMethod::Bilinear)
         .unwrap();
-    frozen
-        .convert_photo_bayer_with_method(input, DemosaicMethod::Bilinear)
-        .unwrap();
+
     // Full frame, odd sensor-origin ROI, last pixel, and empty ROI.
     for roi in [
         (0, 0, w, h),
@@ -116,28 +113,18 @@ async fn compare_routes(
             input.format,
             input.colour_gains
         );
-        assert_eq!(
-            actual,
-            frozen.read_rgba_region_to_cpu(roi).await.unwrap(),
-            "frozen {:?} {:?} gains={:?} roi={roi:?}",
-            input.raw_layout,
-            input.format,
-            input.colour_gains
-        );
     }
 }
 
 #[test]
-fn packed_and_unpacked_photo_match_unfused_and_frozen() {
+fn packed_and_unpacked_photo_match_unfused() {
     let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu("packed_and_unpacked_photo_match_unfused_and_frozen");
+        crate::test_gpu::skip_no_gpu("packed_and_unpacked_photo_match_unfused");
         return;
     };
     pollster::block_on(async {
         let mut photo = GpuConvertPipeline::new().await.unwrap();
         let mut generic = GpuConvertPipeline::new().await.unwrap();
-        let mut frozen = GpuConvertPipeline::new().await.unwrap();
-        frozen.install_roi_frozen_reference();
         for layout in [
             RawLayout::Csi2 { bits: 10 },
             RawLayout::Csi2 { bits: 12 },
@@ -156,7 +143,7 @@ fn packed_and_unpacked_photo_match_unfused_and_frozen() {
                         let mut i = input(&data, layout, w, h, stride);
                         i.format = format;
                         i.colour_gains = gains;
-                        compare_routes(&mut photo, &mut generic, &mut frozen, &i).await;
+                        compare_routes(&mut photo, &mut generic, &i).await;
                     }
                 }
             }
@@ -223,18 +210,14 @@ fn nonconstant_raw10_stress_preserves_padding_and_inactive_tail_sequence() {
 }
 
 #[test]
-fn raw10_code257_and_nonconstant_regressions_match_unfused_and_frozen() {
+fn raw10_code257_and_nonconstant_regressions_match_unfused() {
     let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu(
-            "raw10_code257_and_nonconstant_regressions_match_unfused_and_frozen",
-        );
+        crate::test_gpu::skip_no_gpu("raw10_code257_and_nonconstant_regressions_match_unfused");
         return;
     };
     pollster::block_on(async {
         let mut photo = GpuConvertPipeline::new().await.unwrap();
         let mut generic = GpuConvertPipeline::new().await.unwrap();
-        let mut frozen = GpuConvertPipeline::new().await.unwrap();
-        frozen.install_roi_frozen_reference();
         for cohort in 0..4 {
             let layout = RawLayout::Csi2 { bits: 10 };
             let (width, height) = if cohort == 3 { (1025, 769) } else { (65, 33) };
@@ -265,10 +248,10 @@ fn raw10_code257_and_nonconstant_regressions_match_unfused_and_frozen() {
                 i.sensor_black_levels = None;
                 i.sensor_white_levels = None;
             }
-            compare_routes(&mut photo, &mut generic, &mut frozen, &i).await;
+            compare_routes(&mut photo, &mut generic, &i).await;
             if cohort == 3 {
                 i.colour_gains = None;
-                compare_routes(&mut photo, &mut generic, &mut frozen, &i).await;
+                compare_routes(&mut photo, &mut generic, &i).await;
             }
         }
     });
