@@ -825,7 +825,7 @@ impl cosmic::Application for AppModel {
 
         // Log available encoders in parallel (non-critical, doesn't block camera init)
         let encoder_log_task = Task::perform(
-            async { crate::pipelines::video::check_available_encoders() },
+            async { crate::media::encoders::log_available_encoders() },
             |_| cosmic::Action::App(Message::Noop),
         );
 

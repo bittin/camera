@@ -15,44 +15,6 @@ pub fn is_element_available(element_name: &str) -> bool {
     gst::ElementFactory::find(element_name).is_some()
 }
 
-/// Detect all available video encoders
-///
-/// Returns a list of available encoder names in no particular order.
-pub fn detect_video_encoders() -> Vec<String> {
-    gst::init().ok();
-
-    let encoders = [
-        // Hardware AV1
-        "vaapiavcenc",
-        "nvav1enc",
-        // Hardware HEVC/H.265
-        "vaapih265enc",
-        "nvh265enc",
-        "v4l2h265enc",
-        // Hardware H.264
-        "vaapih264enc",
-        "nvh264enc",
-        "v4l2h264enc",
-        // Software HEVC/H.265
-        "x265enc",
-        // Software H.264
-        "x264enc",
-        "openh264enc",
-    ];
-
-    let mut available = Vec::new();
-
-    for encoder in &encoders {
-        if is_element_available(encoder) {
-            debug!("Video encoder available: {}", encoder);
-            available.push(encoder.to_string());
-        }
-    }
-
-    info!("Detected {} video encoders", available.len());
-    available
-}
-
 /// Detect all available audio encoders
 ///
 /// Returns a list of available encoder names in no particular order.
@@ -83,14 +45,14 @@ pub fn detect_audio_encoders() -> Vec<String> {
 
 /// Detect a working hardware JPEG decoder element.
 ///
-/// Tries `vajpegdec` (VA-API new), `vaapijpegdec` (VA-API legacy), and
+/// Tries `vajpegdec` (VA-API) and
 /// `nvjpegdec` (NVIDIA NVDEC) in order. Each candidate is probed with a
 /// `jpegenc ! decoder ! fakesink` pipeline using the camera's actual YUV
 /// chroma subsampling (e.g. I420 for 4:2:0, Y42B for 4:2:2) to verify
 /// the decoder works on this hardware. Some GPUs advertise a decoder but
 /// fail at runtime with specific subsampling modes.
 pub fn detect_va_jpeg_decoder(yuv_format: &str) -> Option<&'static str> {
-    let candidates = ["vajpegdec", "vaapijpegdec", "nvjpegdec"];
+    let candidates = ["vajpegdec", "nvjpegdec"];
 
     for candidate in candidates {
         if !is_element_available(candidate) {
@@ -221,8 +183,7 @@ pub fn probe_broken_encoders(encoder_names: &[String]) -> Vec<String> {
         .iter()
         .filter(|name| !defer_probe_until_recording(name))
         .partition(|name| {
-            name.starts_with("vaapi")
-                || name.starts_with("va")
+            name.starts_with("va")
                 || name.starts_with("nv")
                 || name.starts_with("qsv")
                 || name.starts_with("amf")
@@ -270,8 +231,8 @@ pub fn log_available_encoders() {
     info!("=== GStreamer Encoder Detection ===");
 
     info!("Video encoders:");
-    for encoder in detect_video_encoders() {
-        info!("  ✓ {}", encoder);
+    for encoder in super::video::enumerate_video_encoders() {
+        info!("  ✓ {}", encoder.element_name);
     }
 
     info!("Audio encoders:");
@@ -283,13 +244,6 @@ pub fn log_available_encoders() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_detection_runs() {
-        // Just ensure detection doesn't panic
-        let _ = detect_video_encoders();
-        let _ = detect_audio_encoders();
-    }
 
     #[test]
     fn v4l2_encoder_probe_is_deferred_without_marking_it_broken() {

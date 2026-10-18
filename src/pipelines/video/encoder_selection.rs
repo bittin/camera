@@ -133,72 +133,27 @@ pub struct SelectedEncoders {
     pub audio: Option<SelectedAudioEncoder>,
 }
 
-/// Select best available encoders based on configuration
-///
-/// This will select the best video and audio encoders based on hardware
-/// availability and the provided configuration.
-///
-/// # Arguments
-/// * `config` - Encoder configuration
-/// * `enable_audio` - Whether to select an audio encoder
-///
-/// # Returns
-/// * `Ok(SelectedEncoders)` - Selected encoders
-/// * `Err(String)` - Error message if encoder selection fails
+/// Select an explicit video encoder or the best available one, plus optional audio.
 pub fn select_encoders(
     config: &EncoderConfig,
+    encoder_info: Option<&EncoderInfo>,
     enable_audio: bool,
 ) -> Result<SelectedEncoders, String> {
-    // Select video encoder
-    let video = select_video_encoder_with_bitrate(
-        config.video_quality,
-        config.width,
-        config.height,
-        config.bitrate_override_kbps,
-    )?;
-
-    // Select audio encoder if enabled
-    let audio = if enable_audio {
-        match select_audio_encoder(config.audio_quality, config.audio_channels) {
-            Ok(encoder) => Some(encoder),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to select audio encoder: {}. Recording without audio.",
-                    e
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    Ok(SelectedEncoders { video, audio })
-}
-
-/// Select encoders with specific video encoder
-///
-/// # Arguments
-/// * `config` - Encoder configuration
-/// * `encoder_info` - Specific video encoder to use
-/// * `enable_audio` - Whether to select an audio encoder
-///
-/// # Returns
-/// * `Ok(SelectedEncoders)` - Selected encoders
-/// * `Err(String)` - Error message if encoder selection fails
-pub fn select_encoders_with_video(
-    config: &EncoderConfig,
-    encoder_info: &EncoderInfo,
-    enable_audio: bool,
-) -> Result<SelectedEncoders, String> {
-    // Create specific video encoder
-    let video = create_encoder_from_info_with_bitrate(
-        encoder_info,
-        config.video_quality,
-        config.width,
-        config.height,
-        config.bitrate_override_kbps,
-    )?;
+    let video = match encoder_info {
+        Some(info) => create_encoder_from_info_with_bitrate(
+            info,
+            config.video_quality,
+            config.width,
+            config.height,
+            config.bitrate_override_kbps,
+        ),
+        None => select_video_encoder_with_bitrate(
+            config.video_quality,
+            config.width,
+            config.height,
+            config.bitrate_override_kbps,
+        ),
+    }?;
 
     // Select audio encoder if enabled
     let audio = if enable_audio {
@@ -222,14 +177,70 @@ pub fn select_encoders_with_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::encoders::video::VideoCodec;
+    use gstreamer::prelude::*;
     use std::str::FromStr;
 
     #[test]
-    fn test_default_config() {
-        let config = EncoderConfig::default();
-        assert_eq!(config.width, 1920);
-        assert_eq!(config.height, 1080);
-        assert_eq!(config.audio_channels, AudioChannels::Mono);
+    fn explicit_encoder_preserves_bitrate_parser_muxer_and_audio_policy() {
+        gst::init().unwrap();
+        let info = EncoderInfo {
+            element_name: "openh264enc".into(),
+            display_name: "OpenH264".into(),
+            codec: VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        };
+        let config = EncoderConfig {
+            bitrate_override_kbps: Some(800),
+            ..Default::default()
+        };
+        for enable_audio in [false, true] {
+            let selected = select_encoders(&config, Some(&info), enable_audio).unwrap();
+            assert_eq!(
+                selected.video.encoder.factory().unwrap().name(),
+                "openh264enc"
+            );
+            assert_eq!(selected.video.encoder.property::<u32>("bitrate"), 800_000);
+            assert_eq!(
+                selected.video.parser.unwrap().factory().unwrap().name(),
+                "h264parse"
+            );
+            assert_eq!(selected.video.muxer.factory().unwrap().name(), "mp4mux");
+            assert_eq!(selected.video.extension, "mp4");
+            assert_eq!(selected.audio.is_some(), enable_audio);
+        }
+    }
+
+    #[test]
+    fn unavailable_explicit_encoder_is_not_silently_substituted() {
+        gst::init().unwrap();
+        let info = EncoderInfo {
+            element_name: "camera-nonexistent-encoder".into(),
+            display_name: "Missing".into(),
+            codec: VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        };
+        let error = select_encoders(&EncoderConfig::default(), Some(&info), false)
+            .err()
+            .unwrap();
+        assert!(error.contains(&info.element_name), "{error}");
+    }
+
+    #[test]
+    fn automatic_selection_assembles_a_video_without_audio() {
+        gst::init().unwrap();
+        let selected = select_encoders(&EncoderConfig::default(), None, false).unwrap();
+        assert!(selected.audio.is_none());
+        assert_eq!(
+            selected.video.extension,
+            selected.video.codec.file_extension()
+        );
+        assert_eq!(
+            selected.video.muxer.factory().unwrap().name(),
+            selected.video.codec.container_format().muxer_name()
+        );
     }
 
     #[test]

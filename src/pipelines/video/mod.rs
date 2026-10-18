@@ -18,7 +18,6 @@ pub mod timelapse;
 pub use encoder_selection::EncoderConfig;
 pub use recorder::{
     AppsrcRecorderConfig, AudioLevels, RecorderConfig, SharedAudioLevels, VideoRecorder,
-    check_available_encoders,
 };
 pub use stats::{
     RecordingDiagnostics, RecordingStatsSnapshot, get_recording_diagnostics, get_recording_stats,

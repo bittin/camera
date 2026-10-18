@@ -10,7 +10,6 @@
 
 use super::encoder_selection::{
     EncoderConfig, VideoEncoderInput, prepare_video_encoder_input, select_encoders,
-    select_encoders_with_video,
 };
 use super::muxer::{create_muxer, link_muxer_to_sink, link_video_to_muxer};
 use super::recorder::{apply_video_tags_to_muxer, convert_frame_to_rgba};
@@ -68,12 +67,8 @@ pub async fn run_timelapse_encoder(
         ..Default::default()
     };
 
-    let encoders = if let Some(ref info) = encoder_info {
-        select_encoders_with_video(&encoder_config, info, false)
-    } else {
-        select_encoders(&encoder_config, false)
-    }
-    .map_err(|e| format!("Encoder selection failed: {e}"))?;
+    let encoders = select_encoders(&encoder_config, encoder_info.as_ref(), false)
+        .map_err(|e| format!("Encoder selection failed: {e}"))?;
 
     let video_enc = encoders.video;
 
