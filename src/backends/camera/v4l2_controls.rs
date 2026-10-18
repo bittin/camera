@@ -22,8 +22,6 @@ const V4L2_CID_IMAGE_SOURCE_CLASS_BASE: u32 = V4L2_CTRL_CLASS_IMAGE_SOURCE | 0x9
 
 // ===== V4L2 Control IDs (User Class) =====
 
-/// Brightness control
-pub const V4L2_CID_BRIGHTNESS: u32 = V4L2_CID_BASE;
 /// Contrast control
 pub const V4L2_CID_CONTRAST: u32 = V4L2_CID_BASE + 1;
 /// Saturation control
@@ -59,8 +57,6 @@ pub const V4L2_CID_FOCUS_AUTO: u32 = V4L2_CID_CAMERA_CLASS_BASE + 12;
 pub const V4L2_CID_AUTO_EXPOSURE_BIAS: u32 = V4L2_CID_CAMERA_CLASS_BASE + 19;
 /// ISO sensitivity value
 pub const V4L2_CID_ISO_SENSITIVITY: u32 = V4L2_CID_CAMERA_CLASS_BASE + 23;
-/// Auto ISO control
-pub const V4L2_CID_ISO_SENSITIVITY_AUTO: u32 = V4L2_CID_CAMERA_CLASS_BASE + 24;
 /// Exposure metering mode
 pub const V4L2_CID_EXPOSURE_METERING: u32 = V4L2_CID_CAMERA_CLASS_BASE + 25;
 /// Privacy control - when 1 (TRUE), camera cannot capture (privacy cover closed)
@@ -72,24 +68,12 @@ pub const V4L2_CID_PRIVACY: u32 = V4L2_CID_CAMERA_CLASS_BASE + 16;
 pub const V4L2_CID_PAN_RELATIVE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 4;
 /// Tilt relative movement (write-only, undefined units)
 pub const V4L2_CID_TILT_RELATIVE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 5;
-/// Reset pan to default position
-pub const V4L2_CID_PAN_RESET: u32 = V4L2_CID_CAMERA_CLASS_BASE + 6;
-/// Reset tilt to default position
-pub const V4L2_CID_TILT_RESET: u32 = V4L2_CID_CAMERA_CLASS_BASE + 7;
 /// Pan absolute position (arc seconds, -180*3600 to +180*3600)
 pub const V4L2_CID_PAN_ABSOLUTE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 8;
 /// Tilt absolute position (arc seconds, -180*3600 to +180*3600)
 pub const V4L2_CID_TILT_ABSOLUTE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 9;
 /// Zoom absolute position (driver-specific units)
 pub const V4L2_CID_ZOOM_ABSOLUTE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 13;
-/// Zoom relative movement
-pub const V4L2_CID_ZOOM_RELATIVE: u32 = V4L2_CID_CAMERA_CLASS_BASE + 14;
-/// Zoom continuous movement (-1, 0, +1)
-pub const V4L2_CID_ZOOM_CONTINUOUS: u32 = V4L2_CID_CAMERA_CLASS_BASE + 15;
-/// Pan speed (continuous movement)
-pub const V4L2_CID_PAN_SPEED: u32 = V4L2_CID_CAMERA_CLASS_BASE + 32;
-/// Tilt speed (continuous movement)
-pub const V4L2_CID_TILT_SPEED: u32 = V4L2_CID_CAMERA_CLASS_BASE + 33;
 
 // ===== V4L2 Control IDs (Image Source Class) =====
 

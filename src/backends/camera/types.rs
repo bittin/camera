@@ -963,17 +963,7 @@ impl CameraFrame {
     /// Frame bytes remain valid independently of the capture pipeline; pooled
     /// buffers are returned only after the last frame clone is dropped.
     pub fn to_copied(&self) -> Self {
-        Self {
-            width: self.width,
-            height: self.height,
-            data: self.data.clone(),
-            format: self.format,
-            stride: self.stride,
-            yuv_planes: self.yuv_planes,
-            captured_at: self.captured_at,
-            sensor_timestamp_ns: self.sensor_timestamp_ns,
-            libcamera_metadata: self.libcamera_metadata.clone(),
-        }
+        self.clone()
     }
 }
 
@@ -1007,18 +997,12 @@ pub type BackendResult<T> = Result<T, BackendError>;
 /// Error types for backend operations
 #[derive(Debug, Clone)]
 pub enum BackendError {
-    /// Backend is not available on this system
-    NotAvailable(String),
     /// Failed to initialize backend
     InitializationFailed(String),
     /// Camera device not found
     DeviceNotFound(String),
     /// Format not supported
     FormatNotSupported(String),
-    /// Backend crashed or became unresponsive
-    Crashed(String),
-    /// General I/O error
-    IoError(String),
     /// Other errors
     Other(String),
 }
@@ -1026,12 +1010,9 @@ pub enum BackendError {
 impl std::fmt::Display for BackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BackendError::NotAvailable(msg) => write!(f, "Backend not available: {}", msg),
             BackendError::InitializationFailed(msg) => write!(f, "Initialization failed: {}", msg),
             BackendError::DeviceNotFound(msg) => write!(f, "Device not found: {}", msg),
             BackendError::FormatNotSupported(msg) => write!(f, "Format not supported: {}", msg),
-            BackendError::Crashed(msg) => write!(f, "Backend crashed: {}", msg),
-            BackendError::IoError(msg) => write!(f, "I/O error: {}", msg),
             BackendError::Other(msg) => write!(f, "Error: {}", msg),
         }
     }

@@ -19,16 +19,6 @@ pub enum AudioCodec {
     AAC,
 }
 
-impl AudioCodec {
-    /// Get audio caps string for this codec
-    pub fn caps_string(&self) -> &'static str {
-        match self {
-            AudioCodec::Opus => "audio/x-opus",
-            AudioCodec::AAC => "audio/mpeg,mpegversion=4",
-        }
-    }
-}
-
 /// Audio channel configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioChannels {
@@ -47,15 +37,6 @@ impl AudioChannels {
             AudioChannels::Mono => 1,
             AudioChannels::Stereo => 2,
             AudioChannels::MultiChannel(n) => *n,
-        }
-    }
-
-    /// Create from channel count
-    pub fn from_count(count: u32) -> Self {
-        match count {
-            1 => AudioChannels::Mono,
-            2 => AudioChannels::Stereo,
-            n => AudioChannels::MultiChannel(n),
         }
     }
 }
@@ -141,7 +122,7 @@ pub fn select_audio_encoder(
             "Selected audio encoder"
         );
 
-        configure_opus_encoder(&encoder, quality, channels);
+        configure_opus_encoder(&encoder, quality);
 
         return Ok(SelectedAudioEncoder {
             encoder,
@@ -161,7 +142,7 @@ pub fn select_audio_encoder(
                 "Selected audio encoder (opusenc unavailable)"
             );
 
-            configure_aac_encoder(&encoder, encoder_name, quality, channels);
+            configure_aac_encoder(&encoder, encoder_name, quality);
 
             return Ok(SelectedAudioEncoder {
                 encoder,
@@ -174,7 +155,7 @@ pub fn select_audio_encoder(
 }
 
 /// Configure Opus encoder
-fn configure_opus_encoder(encoder: &gst::Element, quality: AudioQuality, _channels: AudioChannels) {
+fn configure_opus_encoder(encoder: &gst::Element, quality: AudioQuality) {
     let bitrate = quality.bitrate_bps();
 
     // Opus bitrate is in bits per second
@@ -190,12 +171,7 @@ fn configure_opus_encoder(encoder: &gst::Element, quality: AudioQuality, _channe
 }
 
 /// Configure AAC encoder
-fn configure_aac_encoder(
-    encoder: &gst::Element,
-    encoder_name: &str,
-    quality: AudioQuality,
-    _channels: AudioChannels,
-) {
+fn configure_aac_encoder(encoder: &gst::Element, encoder_name: &str, quality: AudioQuality) {
     let bitrate = quality.bitrate_bps();
 
     match encoder_name {
@@ -232,10 +208,6 @@ mod tests {
         assert_eq!(AudioChannels::Mono.count(), 1);
         assert_eq!(AudioChannels::Stereo.count(), 2);
         assert_eq!(AudioChannels::MultiChannel(6).count(), 6);
-
-        assert_eq!(AudioChannels::from_count(1), AudioChannels::Mono);
-        assert_eq!(AudioChannels::from_count(2), AudioChannels::Stereo);
-        assert_eq!(AudioChannels::from_count(6), AudioChannels::MultiChannel(6));
     }
 
     #[test]
@@ -243,11 +215,5 @@ mod tests {
         assert!(AudioQuality::Low.bitrate_bps() < AudioQuality::High.bitrate_bps());
         assert_eq!(AudioQuality::Low.bitrate_bps(), 64_000);
         assert_eq!(AudioQuality::Maximum.bitrate_bps(), 192_000);
-    }
-
-    #[test]
-    fn test_codec_caps() {
-        assert_eq!(AudioCodec::Opus.caps_string(), "audio/x-opus");
-        assert!(AudioCodec::AAC.caps_string().contains("audio/mpeg"));
     }
 }
