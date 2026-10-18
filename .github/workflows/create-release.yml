@@ -81,30 +81,8 @@ jobs:
         id: release_notes
         run: |
           TAG="${{ steps.version.outputs.tag }}"
-          PREVIOUS_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -v "^${TAG}$" | head -1)
-
-          echo "Reconstructing notes from $PREVIOUS_TAG to HEAD for tag $TAG"
-
-          {
-            echo "## What's Changed"
-            if [ -n "$PREVIOUS_TAG" ]; then
-              PREV_DATE=$(git log -1 --format=%cI "$PREVIOUS_TAG")
-              gh pr list --state merged --base "${{ github.ref_name }}" --limit 1000 \
-                --json number,title,author,mergedAt \
-                --jq "[.[] | select(.mergedAt > \"$PREV_DATE\")] | sort_by(.mergedAt) | .[] | \"* \(.title) by @\(if (.author.login | startswith(\"app/\")) then (.author.login[4:] + \"[bot]\") else .author.login end) in ${{ github.server_url }}/${{ github.repository }}/pull/\(.number)\""
-              echo ""
-              echo "**Full Changelog**: ${{ github.server_url }}/${{ github.repository }}/compare/${PREVIOUS_TAG}...${TAG}"
-            else
-              gh pr list --state merged --base "${{ github.ref_name }}" --limit 1000 \
-                --json number,title,author,mergedAt \
-                --jq "sort_by(.mergedAt) | .[] | \"* \(.title) by @\(if (.author.login | startswith(\"app/\")) then (.author.login[4:] + \"[bot]\") else .author.login end) in ${{ github.server_url }}/${{ github.repository }}/pull/\(.number)\""
-            fi
-          } > release_notes.txt
-
-          if [ ! -s release_notes.txt ] || ! grep -q '^\* ' release_notes.txt; then
-            echo "No PRs found, using fallback"
-            echo "Bug fixes and improvements." > release_notes.txt
-          fi
+          bash scripts/release-notes.sh "$TAG" "${{ github.ref_name }}" \
+            "${{ github.server_url }}/${{ github.repository }}" release_notes.txt --fallback
           echo "📝 Release notes generated"
         env:
           GH_TOKEN: ${{ github.token }}
