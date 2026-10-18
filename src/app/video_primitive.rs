@@ -31,27 +31,8 @@ use iced_wgpu::wgpu;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
-// ---------------------------------------------------------------------------
-// Compositor blur parity
-//
-// The frosted backdrop must land on the SAME on-screen blur as cosmic-comp's own
-// frosted surfaces at the same "Frost thickness" setting. It does, and not by
-// approximation: we run THEIR algorithm — the dual-Kawase in
-// `video_shader_kawase.wgsl`, transcribed from their `blur_downsample.frag` and
-// `blur_upsample.frag` — with THEIR (passes, offset) out of the table below, in
-// THEIR unit (physical screen px). Parity is exact by construction.
-//
-// That is worth spelling out, because it used to be an elaborate model. Both
-// kernels were reduced to a Gaussian sigma and our ring radius was solved to hit
-// theirs, through two changes of unit (sensor texel -> intermediate texel ->
-// screen px) that depended on the window size and the live fit blend. It worked,
-// roughly, and it cost `compositor_blur_sigma`, `frosted_blur_radius_for_sigma`,
-// `RING_KERNEL_SIGMA_PER_RADIUS`, `FROST_MAX_BLUR_RADIUS` and a clamp that made
-// high frost read thin in Fit mode — and it still banded on device, because a
-// 37-tap rosette over sharp sensor data is a sparse lattice no radius fixes.
-// Running the real algorithm deleted all of it. The table is what survived, and
-// it is now the whole of the parity story rather than an input to a model.
-// ---------------------------------------------------------------------------
+// Compositor parity: use cosmic-comp's dual-Kawase kernels, table and physical
+// pixel offsets directly; do not approximate them with a sensor-space Gaussian.
 
 // Portions Copyright (C) System76, Inc. — derived from cosmic-comp (GPL-3.0-only)
 
@@ -616,84 +597,14 @@ pub struct FrameViewportData {
     /// is the `set_viewport` rect in `render()`. `None` for every other
     /// video_id.
     pub frosted_full_physical: Option<(f32, f32, f32, f32)>,
-    /// Frosted backdrop only: this primitive's OWN binding for the blur's final
-    /// pass, built in `prepare()` and used by `render()` instead of the shared
-    /// `intermediate_2.bind_group`.
-    ///
-    /// Why it can't be shared: iced_wgpu runs every `prepare()` before any
-    /// `render()`, so a uniform owned by the pipeline is clobbered by the last
-    /// panel to prepare — there'd be no way to give each panel its own rect and
-    /// corner radius. Each panel's primitive owning its buffer sidesteps that
-    /// without a slot allocator. The blur intermediates themselves stay shared,
-    /// so passes 1+2 still run once per frame; only this cheap final blit is
-    /// per-panel.
-    ///
-    /// # The per-frame allocation is deliberate — please don't "optimise" it
-    ///
-    /// Because `VideoPrimitive::new` mints a fresh `Arc<Mutex<FrameViewportData>>`
-    /// on every view build, this binding cannot survive a frame: `prepare()`
-    /// creates a `wgpu::Buffer` + `wgpu::BindGroup` for every frosted panel, every
-    /// frame (~6-10 panels at 30fps ≈ 200-300 of each per second). That churn is a
-    /// known, accepted cost. The alternatives were worked through and rejected:
-    ///
-    /// * **It is not the bottleneck.** This same feature runs a 3-pass Gaussian
-    ///   blur every frame; on the target phone (Adreno 630) that is milliseconds
-    ///   of GPU. Ten 112-byte uniform buffers plus ten descriptor sets are an
-    ///   estimated 0.1–0.3 ms of CPU — order of 1% of a 33 ms budget. If frosted
-    ///   glass ever needs to get cheaper, cut the panel count or the blur passes;
-    ///   this is noise beside them.
-    /// * **Pooling needs an identity this design does not have.** A pool could live
-    ///   on `VideoPipeline` (which does persist across frames), but the only
-    ///   channel from `prepare()` to `render()` is `self.data`, and that is new for
-    ///   every drawn instance — a fresh one per view build, and a fresh one per
-    ///   clone (see `VideoPrimitive`'s `Clone`), so it carries nothing a pool could
-    ///   be keyed on. A pool would therefore have to hand out slots
-    ///   round-robin during `prepare()` and reset the counter from
-    ///   `Pipeline::trim()`. iced_wgpu does call `trim()` at the end of each
-    ///   `draw()` today, and its render loop only ever renders primitives it also
-    ///   prepared — but `trim`'s own docs promise merely "normally called at the
-    ///   end of a frame". Betting the panel↔rect mapping on an undocumented
-    ///   ordering invariant of an external crate, where the failure mode is *panel
-    ///   A rendering with panel B's corner radius*, is a bad trade for ~1% CPU.
-    /// * **Pooling only the buffers doesn't help.** A bind group pins the specific
-    ///   buffer it was built over, so reusing a buffer still means knowing which
-    ///   buffer belongs to this panel — the identical identity problem — and a bind
-    ///   group would still be built per frame. All of the complexity, half of the
-    ///   win. (The reverse, pooling only bind groups, is impossible for the same
-    ///   reason.)
-    /// * **Dynamic offsets** — one persistent buffer + one bind group, with a
-    ///   per-panel offset passed to `set_bind_group` — would remove both
-    ///   allocations, but need `has_dynamic_offset: true`, hence a separate bind
-    ///   group layout, hence a second copy of the blur render pipeline, plus
-    ///   256-byte-aligned padding per panel, *and* they still leave unanswered
-    ///   which offset belongs to which panel.
-    ///
-    /// So: correct churn beats a subtle pooling bug. If this ever does show up in a
-    /// profile, fix the identity problem first — give panels a stable key at the
-    /// widget level, so a pool can be keyed on something real — rather than bolting
-    /// a round-robin allocator onto `trim()`.
+    /// Per-panel final composite binding. All prepares precede all renders, so
+    /// sharing this uniform would give every panel the last panel's silhouette.
+    /// Rebuild each frame to bind current resized targets; pooling requires stable
+    /// panel identity, not prepare order or an assumed `trim()` reset schedule.
     pub frosted_final_binding: Option<FilterBinding>,
-    /// Pre-blur filters only (today just `Pencil`): this primitive's OWN binding
-    /// for the pre-blur's second pass, built in `prepare()` and used by
-    /// `render()` instead of a pipeline-owned one.
-    ///
-    /// Per-primitive for exactly the reason [`Self::frosted_final_binding`] is,
-    /// and this field exists because that lesson was not applied here the first
-    /// time. The uniform carries `panel_rect` + `corner_radius`, which differ per
-    /// consumer, so one buffer on the pipeline is clobbered by the last consumer
-    /// to `prepare()`. That is not hypothetical: the live preview and the filter
-    /// picker's own Pencil swatch are both pre-blur consumers whenever Pencil is
-    /// selected *and* the picker is open. The swatch prepares last, so the
-    /// preview drew with the swatch's rect and radius — the SDF, which the
-    /// preview disables with `corner_radius = 0`, switched on against a
-    /// thumbnail-sized box and rejected every one of the preview's fragments,
-    /// blanking it to whatever was underneath.
-    ///
-    /// The pre-blur *intermediate* stays shared, which is safe for a different
-    /// reason: each consumer renders pass 1 into it and samples it in pass 2
-    /// back-to-back within its own `render()`, so the reuse is serial within the
-    /// encoder. Only the uniform outlives that window, because every
-    /// `queue.write_buffer` in `prepare()` lands before any `render()` runs.
+    /// Per-consumer second-pass binding for preblur filters. Preview and swatches
+    /// share an intermediate, but never panel rect/corner uniforms: each render
+    /// writes then samples the intermediate serially, after all prepares finish.
     pub preblur_binding: Option<FilterBinding>,
 }
 
@@ -1026,6 +937,50 @@ pub(crate) struct FilterBinding {
     viewport_buffer: wgpu::Buffer,
 }
 
+impl FilterBinding {
+    // Callers own allocation lifetime: cached per source/filter or rebuilt per panel.
+    fn new(
+        device: &wgpu::Device,
+        labels: (&str, &str),
+        layout: &wgpu::BindGroupLayout,
+        view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> Self {
+        let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(labels.0),
+            size: std::mem::size_of::<ViewportUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(labels.1),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: viewport_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        Self {
+            bind_group,
+            viewport_buffer,
+        }
+    }
+
+    fn write(&self, queue: &wgpu::Queue, uniform: ViewportUniform) {
+        queue.write_buffer(&self.viewport_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+}
+
 /// YUV conversion parameters uniform (must match shader struct)
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -1100,18 +1055,8 @@ pub struct VideoPipeline {
     output_format: wgpu::TextureFormat,
 }
 
-/// Intermediate texture for the filter pre-blur (full resolution).
-///
-/// It carries no bind group of its own: the preblur pass renders INTO it through
-/// the source's `FilterBinding`, and the pass that samples it back out uses the
-/// consuming primitive's own [`FrameViewportData::preblur_binding`]. (It used to
-/// hold a bind group + uniform buffer, which were dead — they only looked live
-/// because the blur chain's intermediates shared this type. They no longer do.)
-///
-/// The texture itself is shared by every pre-blur consumer, which is safe only
-/// because each renders into it and samples it back within its own `render()`:
-/// the reuse is serial within the encoder. See
-/// [`FrameViewportData::preblur_binding`] for what could NOT be shared, and why.
+/// Shared full-resolution preblur target; each consumer writes then samples it
+/// within one render. Bindings/uniforms remain per source and per consumer.
 struct PreblurIntermediate {
     view: wgpu::TextureView,
     width: u32,
@@ -1131,85 +1076,18 @@ struct KawaseStep {
     viewport_buffer: wgpu::Buffer,
 }
 
-/// The whole blur state for ONE `video_id`: the two screen-resolution ping-pong
-/// textures, the per-step bindings, the final composite's binding, and the
-/// "the chain already ran this frame" flag.
+/// One consumer's physical-screen-space blur targets, step uniforms and cache.
+/// Pass 0 applies source transforms; Kawase uses compositor offsets verbatim;
+/// the final composite is an identity blit with per-panel silhouette uniforms.
 ///
-/// # Why the textures are SCREEN resolution
+/// Transition and frosted ids must own separate textures, uniforms and cache
+/// flags: their blur/dim/noise settings differ, and cached results must survive
+/// interleaved rendering. Retain both entries so recurring effects stay warm.
 ///
-/// They used to be frame/4, because the kernel worked in frame space and the
-/// final pass did the cover/contain fit. The chain now does the opposite: pass 0
-/// applies every transform and lands in SCREEN space at SCREEN resolution, the
-/// Kawase runs there, and the composite is an identity blit. That is what makes
-/// `BLUR_PARAMS`'s offsets — which are authored in physical screen px — usable
-/// verbatim, with no scale conversion anywhere; the conversion apparatus was
-/// both the complexity and the source of the banding.
-///
-/// It costs memory: on a 1080x2340 phone the pair is ~20 MB against ~2.5 MB at
-/// frame/4. That is the deliberate trade. The compute does not scale the same way
-/// — Kawase halves after the first downsample, so the extra work is roughly one
-/// full-res 5-tap and one full-res 8-tap — and the alternative (Kawase on
-/// quarter-res intermediates) would put the offsets back into a converted unit
-/// and re-open exactly the question this design closes.
-///
-/// # Why this is per-`video_id` and not a singleton
-///
-/// Two consumers drive the chain with DIFFERENT parameterizations:
-///
-/// * [`VIDEO_ID_BLUR`] — the transition / HDR+ blur: [`TRANSITION_BLUR_PARAMS`]
-///   and [`TRANSITION_BLUR_DIM`], no grain.
-/// * [`VIDEO_ID_FROSTED`] — the live frosted chrome: the compositor's own
-///   (passes, offset) for the theme's frost level, no dim, [`FROSTED_NOISE`].
-///
-/// Every step here owns the *uniform buffer* it is configured with, so one shared
-/// set meant both consumers wrote the same buffers. iced_wgpu runs EVERY
-/// `prepare()` before ANY `render()`, so whenever both were on screen in the same
-/// frame (open a picker, then switch camera or let an HDR+ burst finish) the last
-/// `prepare()` won, whichever primitive rendered first ran the chain with those
-/// uniforms and set the shared `cached` flag, and the second primitive reused
-/// that result wholesale. Both got one parameterization — the wrong one for at
-/// least one of them. Keying by `video_id` gives each its own textures, its own
-/// uniforms and — the point — its own `cached` flag.
-///
-/// # Why exactly one entry per `video_id` is enough
-///
-/// All [`VIDEO_ID_FROSTED`] primitives legitimately share one parameterization:
-/// the frost level is global (theme-derived), every frosted primitive is built
-/// from the same preview config (same rotation / crop / zoom / fit blend / bars),
-/// and the chain spans the FULL preview rather than any one panel rect — so
-/// pass 0 and the Kawase are identical for all of them. Their per-panel data
-/// (rect + corner radius + this frame's `noise`/`dim`) lives in a separate
-/// per-primitive composite binding, not in these buffers. So the map holds at
-/// most 2 entries, and within a frame the chain still runs exactly ONCE per
-/// `video_id` no matter how many panels and scrim bars are drawn.
-///
-/// That sharing puts a hard constraint on the chain's geometry: it is a property
-/// of the `video_id`, so it must NOT be sourced from any one consumer's widget
-/// bounds. It used to be, and the consumers did not agree — a `FrostedContainer` reports its layer rect, a `FrostedScrim` its
-/// own inset layout bounds. Each `prepare()` then re-sized these textures out
-/// from under every consumer that had already prepared, orphaning their
-/// composite bind groups onto textures the chain never rendered into: the black
-/// scrim bars. `prepare()` now takes the RENDER TARGET, the one rect every
-/// consumer sees identically, so the invariant holds by construction. See
-/// `frosted_consumers_that_disagree_do_not_blank_the_scrim`.
-///
-/// Nor can the two ids share one PAIR of textures while keeping their own
-/// uniforms: `view_a` is not just scratch, it is where a run's result waits to be
-/// composited, and the composites do not follow their own chain — a frosted
-/// panel whose `cached` is already set does nothing but blit `view_a`. One shared
-/// pair would make that blit read whichever chain ran last. It happens to work
-/// out under today's draw order (preview first, chrome after), but nothing
-/// enforces that order, and the failure is silent wrong pixels — the same shape
-/// as the black scrim bars below.
-///
-/// Entries are never evicted, so both ids resident costs ~40 MB at 1080x2340.
-/// There are at most two of them, both belong to effects that recur constantly,
-/// and dropping one would only buy that memory back until the next transition —
-/// at the cost of a realloc and a cold `cached` flag on the frame that needs it
-/// most. There is also nowhere honest to do it from: `prepare()` only runs for
-/// primitives that exist, so an idle `VIDEO_ID_BLUR` never gets a turn, and
-/// evicting it from ANOTHER id's `prepare()` on a staleness counter would couple
-/// two consumers that share nothing else.
+/// All frosted panels share one chain per frame. Size it from the render target,
+/// never individual widget bounds: sibling prepares must not resize textures
+/// already referenced by another panel's composite binding. Transition geometry
+/// remains independent so its frozen source can outlive a live-preview resize.
 struct BlurTargets {
     /// Pass 0 renders here, and the ping-pong ends here. The composite samples it.
     view_a: wgpu::TextureView,
@@ -1639,47 +1517,19 @@ impl PrimitiveTrait for VideoPrimitive {
                     };
 
                     if let Ok(mut data_guard) = self.data.lock() {
-                        // Rebuilt each frame, per primitive: `panel_rect` and
-                        // `corner_radius` are this consumer's own, and a buffer on
-                        // the pipeline would be overwritten by the next consumer to
-                        // prepare (see `FrameViewportData::preblur_binding`).
-                        // Rebuilding also keeps the bind group's borrow of
-                        // `intermediate.view` from going stale across a resize.
-                        let pb_viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("camera preblur filter viewport buffer"),
-                            size: std::mem::size_of::<ViewportUniform>() as u64,
-                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        });
-                        let pb_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("camera preblur filter bind group"),
-                            layout: &pipeline.bind_group_layout_rgba,
-                            entries: &[
-                                wgpu::BindGroupEntry {
-                                    binding: 0,
-                                    resource: wgpu::BindingResource::TextureView(
-                                        &intermediate.view,
-                                    ),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 1,
-                                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
-                                },
-                                wgpu::BindGroupEntry {
-                                    binding: 2,
-                                    resource: pb_viewport_buffer.as_entire_binding(),
-                                },
-                            ],
-                        });
-                        queue.write_buffer(
-                            &pb_viewport_buffer,
-                            0,
-                            bytemuck::cast_slice(&[pb_uniform]),
+                        // Per-consumer uniforms and fresh views must survive sibling prepares/resizes.
+                        let binding = FilterBinding::new(
+                            device,
+                            (
+                                "camera preblur filter viewport buffer",
+                                "camera preblur filter bind group",
+                            ),
+                            &pipeline.bind_group_layout_rgba,
+                            &intermediate.view,
+                            &pipeline.sampler,
                         );
-                        data_guard.preblur_binding = Some(FilterBinding {
-                            bind_group: pb_bind_group,
-                            viewport_buffer: pb_viewport_buffer,
-                        });
+                        binding.write(queue, pb_uniform);
+                        data_guard.preblur_binding = Some(binding);
                     }
                 }
 
@@ -1794,52 +1644,19 @@ impl PrimitiveTrait for VideoPrimitive {
                         composite_uniform.corner_radius = corner_radius_px;
 
                         if let Ok(mut data_guard) = self.data.lock() {
-                            // Rebuilt each frame: the primitive (and its data) is
-                            // recreated on every view build, so the binding can
-                            // never outlive a resize of the ping-pong textures —
-                            // the bind group below borrows `targets.view_a`, and
-                            // this is what keeps that reference from going stale.
-                            //
-                            // Yes, this allocates a buffer + bind group per panel
-                            // per frame. That is a known, accepted cost, not an
-                            // oversight: see `FrameViewportData::frosted_final_binding`
-                            // for the pooling schemes that were considered and why
-                            // each was rejected. Please read that before changing it.
-                            let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                                label: Some("camera frosted composite viewport buffer"),
-                                size: std::mem::size_of::<ViewportUniform>() as u64,
-                                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                                mapped_at_creation: false,
-                            });
-                            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: Some("camera frosted composite bind group"),
-                                layout: &pipeline.bind_group_layout_rgb,
-                                entries: &[
-                                    wgpu::BindGroupEntry {
-                                        binding: 0,
-                                        resource: wgpu::BindingResource::TextureView(
-                                            &targets.view_a,
-                                        ),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 1,
-                                        resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
-                                    },
-                                    wgpu::BindGroupEntry {
-                                        binding: 2,
-                                        resource: viewport_buffer.as_entire_binding(),
-                                    },
-                                ],
-                            });
-                            queue.write_buffer(
-                                &viewport_buffer,
-                                0,
-                                bytemuck::cast_slice(&[composite_uniform]),
+                            // Rebuild per panel/frame: never share silhouette uniforms or stale views.
+                            let binding = FilterBinding::new(
+                                device,
+                                (
+                                    "camera frosted composite viewport buffer",
+                                    "camera frosted composite bind group",
+                                ),
+                                &pipeline.bind_group_layout_rgb,
+                                &targets.view_a,
+                                &pipeline.sampler,
                             );
-                            data_guard.frosted_final_binding = Some(FilterBinding {
-                                bind_group,
-                                viewport_buffer,
-                            });
+                            binding.write(queue, composite_uniform);
+                            data_guard.frosted_final_binding = Some(binding);
                         }
                     }
                 }
@@ -1907,6 +1724,43 @@ impl PrimitiveTrait for VideoPrimitive {
     }
 }
 
+/// Fullscreen passes share fixed raster state, but never infer blend or layout.
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    layout: &wgpu::PipelineLayout,
+    shader: &wgpu::ShaderModule,
+    entry: &str,
+    format: wgpu::TextureFormat,
+    blend: wgpu::BlendState,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(entry),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 impl VideoPipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         // ===== Video Pipeline =====
@@ -1966,35 +1820,15 @@ impl VideoPipeline {
             immediate_size: 0,
         });
 
-        let pipeline_rgba = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("camera video pipeline"),
-            layout: Some(&pipeline_layout_rgba),
-            vertex: wgpu::VertexState {
-                module: &shader_rgba,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader_rgba,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline_rgba = fullscreen_pipeline(
+            device,
+            "camera video pipeline",
+            &pipeline_layout_rgba,
+            &shader_rgba,
+            "fs_main",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         // ===== Blur Pipeline (for multi-pass blur) =====
         let shader_blur_source = format!(
@@ -2051,40 +1885,16 @@ impl VideoPipeline {
             immediate_size: 0,
         });
 
-        let pipeline_rgb_blur = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("camera blur pipeline"),
-            layout: Some(&pipeline_layout_rgb),
-            vertex: wgpu::VertexState {
-                module: &shader_rgb_blur,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader_rgb_blur,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    // Alpha blending (not REPLACE) so the frosted backdrop's
-                    // antialiased corners composite over the sharp preview
-                    // instead of overwriting it. Every other blur pass emits
-                    // alpha = 1, where blending is identical to REPLACE, so the
-                    // transition blur is unaffected.
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        // Composite antialiased edges over the sharp preview; opaque blur is unchanged.
+        let pipeline_rgb_blur = fullscreen_pipeline(
+            device,
+            "camera blur pipeline",
+            &pipeline_layout_rgb,
+            &shader_rgb_blur,
+            "fs_main",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         // ===== Dual-Kawase Pipelines =====
         // A verbatim port of cosmic-comp's blur kernels; see the shader header.
@@ -2092,41 +1902,17 @@ impl VideoPipeline {
             label: Some("camera kawase shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("video_shader_kawase.wgsl").into()),
         });
-        let make_kawase = |label: &str, entry: &str| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&pipeline_layout_rgb),
-                vertex: wgpu::VertexState {
-                    module: &shader_kawase,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader_kawase,
-                    entry_point: Some(entry),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        // REPLACE, not blending: these passes write the alpha
-                        // channel as DATA (it is the region mask the kernels
-                        // normalize by), so it must land in the target verbatim
-                        // rather than be composited away. The target is cleared to
-                        // transparent each step, so nothing is lost.
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
+        // Kawase alpha carries the normalization mask, so write it verbatim.
+        let make_kawase = |label, entry| {
+            fullscreen_pipeline(
+                device,
+                label,
+                &pipeline_layout_rgb,
+                &shader_kawase,
+                entry,
+                format,
+                wgpu::BlendState::REPLACE,
+            )
         };
         let pipeline_kawase_down = make_kawase("camera kawase down pipeline", "fs_down");
         let pipeline_kawase_up = make_kawase("camera kawase up pipeline", "fs_up");
@@ -2141,41 +1927,15 @@ impl VideoPipeline {
             label: Some("camera frosted composite shader"),
             source: wgpu::ShaderSource::Wgsl(shader_frosted_source.into()),
         });
-        let pipeline_frosted_composite =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("camera frosted composite pipeline"),
-                layout: Some(&pipeline_layout_rgb),
-                vertex: wgpu::VertexState {
-                    module: &shader_frosted,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader_frosted,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        // Alpha blending (not REPLACE) so the frosted backdrop's
-                        // antialiased corners composite over the sharp preview
-                        // instead of overwriting it. The transition blur emits
-                        // alpha = 1, where blending is identical to REPLACE, so it
-                        // is unaffected.
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            });
+        let pipeline_frosted_composite = fullscreen_pipeline(
+            device,
+            "camera frosted composite pipeline",
+            &pipeline_layout_rgb,
+            &shader_frosted,
+            "fs_main",
+            format,
+            wgpu::BlendState::ALPHA_BLENDING,
+        );
 
         // ===== Filter Pre-blur Pipeline (lightweight Gaussian for multi-pass filters) =====
         // Reuses the same bind group layout as the main RGBA pipeline (texture + sampler + viewport)
@@ -2184,35 +1944,15 @@ impl VideoPipeline {
             source: wgpu::ShaderSource::Wgsl(include_str!("video_shader_preblur.wgsl").into()),
         });
 
-        let pipeline_preblur = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("camera preblur pipeline"),
-            layout: Some(&pipeline_layout_rgba),
-            vertex: wgpu::VertexState {
-                module: &shader_preblur,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader_preblur,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline_preblur = fullscreen_pipeline(
+            device,
+            "camera preblur pipeline",
+            &pipeline_layout_rgba,
+            &shader_preblur,
+            "fs_main",
+            format,
+            wgpu::BlendState::REPLACE,
+        );
 
         // Shared sampler for all pipelines
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -3148,39 +2888,15 @@ impl VideoPipeline {
         // video_id's (see `source_texture_id`).
         let tex = self.textures.get(&source_texture_id(video_id))?;
 
-        // Create viewport buffer for this filter
-        let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("camera filter viewport buffer"),
-            size: std::mem::size_of::<ViewportUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera filter bind group"),
-            layout: &self.bind_group_layout_rgba,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&tex.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: viewport_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
         self.bindings.insert(
             key,
-            FilterBinding {
-                bind_group,
-                viewport_buffer,
-            },
+            FilterBinding::new(
+                device,
+                ("camera filter viewport buffer", "camera filter bind group"),
+                &self.bind_group_layout_rgba,
+                &tex.view,
+                &self.sampler,
+            ),
         );
 
         self.bindings.get(&key)
@@ -3256,34 +2972,13 @@ impl VideoPipeline {
         let view_b = make_texture("camera blur kawase B");
 
         let make_binding = |label: &str, view: &wgpu::TextureView| {
-            let viewport_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: std::mem::size_of::<ViewportUniform>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &self.bind_group_layout_rgb,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: viewport_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-            FilterBinding {
-                bind_group,
-                viewport_buffer,
-            }
+            FilterBinding::new(
+                device,
+                (label, label),
+                &self.bind_group_layout_rgb,
+                view,
+                &self.sampler,
+            )
         };
 
         // One step per ping-pong hop, at the deepest level any frost setting can
@@ -3970,23 +3665,24 @@ pub(crate) mod tests {
         );
     }
 
-    fn read_normal_source(
+    /// Copy full RGBA targets without changing the caller's submission ordering.
+    /// Keep padded rows here; image metrics decide whether to strip them.
+    fn encode_readback(
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
         texture: &wgpu::Texture,
-    ) -> Vec<u8> {
-        let row = (texture.width() * 4).next_multiple_of(256);
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("normal preview fixture"),
-            size: (row * texture.height()) as u64,
+    ) -> wgpu::Buffer {
+        let row = (texture.width() * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("preview test readback"),
+            size: u64::from(row) * u64::from(texture.height()),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut encoder = device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
+                buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row),
@@ -3995,21 +3691,36 @@ pub(crate) mod tests {
             },
             texture.size(),
         );
-        queue.submit([encoder.finish()]);
+        buffer
+    }
+
+    fn map_readback(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Vec<u8> {
         let (tx, rx) = std::sync::mpsc::channel();
-        staging.slice(..).map_async(wgpu::MapMode::Read, move |r| {
-            tx.send(r).unwrap();
-        });
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         rx.recv().unwrap().unwrap();
-        let mapped = staging.slice(..).get_mapped_range();
-        let result = mapped
+        let pixels = buffer.slice(..).get_mapped_range().to_vec();
+        buffer.unmap();
+        pixels
+    }
+
+    fn read_normal_source(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+    ) -> Vec<u8> {
+        let row = (texture.width() * 4).next_multiple_of(256);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        let staging = encode_readback(device, &mut encoder, texture);
+        queue.submit([encoder.finish()]);
+        map_readback(device, &staging)
             .chunks_exact(row as usize)
             .flat_map(|r| r[..texture.width() as usize * 4].iter().copied())
-            .collect();
-        drop(mapped);
-        staging.unmap();
-        result
+            .collect()
     }
 
     #[test]
@@ -5012,40 +4723,9 @@ pub(crate) mod tests {
             },
         );
 
-        // 64 px * 4 bytes = 256, already the required row alignment.
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (N * N * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(N * 4),
-                    rows_per_image: Some(N),
-                },
-            },
-            wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let data = slice.get_mapped_range().to_vec();
+        let data = map_readback(&device, &readback);
         Some(
             data.as_chunks::<4>()
                 .0
@@ -5199,40 +4879,9 @@ pub(crate) mod tests {
             },
         );
 
-        // 64 px * 4 bytes = 256, already the required row alignment.
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (N * N * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(N * 4),
-                    rows_per_image: Some(N),
-                },
-            },
-            wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let data = slice.get_mapped_range();
+        let data = map_readback(&device, &readback);
         Some(
             data.as_chunks::<4>()
                 .0
@@ -5438,40 +5087,9 @@ pub(crate) mod tests {
             );
         }
 
-        // 128 px * 4 bytes = 512, already a multiple of the 256-byte row alignment.
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (N * N * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(N * 4),
-                    rows_per_image: Some(N),
-                },
-            },
-            wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let data = slice.get_mapped_range();
+        let data = map_readback(&device, &readback);
         Some(
             data.as_chunks::<4>()
                 .0
@@ -5678,79 +5296,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The blur's cost must not quietly grow.
-    ///
-    /// `render()` documents the chain's fill rate in screen areas — 2.64 S at
-    /// Medium, 2.66 S at max frost, "essentially independent of the setting". That
-    /// accounting is load-bearing (it is the argument for why pass 0 is worth
-    /// keeping) and it is a comment, so nothing stops a change from doubling the
-    /// real cost while it goes on claiming 2.64.
-    ///
-    /// This recomputes it from the SAME recurrence `render()` walks — `dst_level`
-    /// per step `k`, area `1 / 4^level` — so it tracks a retune of the table
-    /// instead of fighting it, and only fires on a structural change: an extra
-    /// full-resolution pass, a pass that stops halving, or a run that no longer
-    /// mirrors. The bound is the structure's own claim (under 3 screen areas, and
-    /// flat across the range), not a magic number.
-    #[test]
-    fn the_blur_chain_costs_what_its_docs_claim() {
-        // Screen areas written by one chain at `passes`: pass 0's transform into
-        // the full-resolution target, then the ping-pong's destinations.
-        let fill = |passes: u32| -> f64 {
-            let mut total = 1.0; // pass 0 writes 1.00 S
-            for k in 0..(2 * passes) {
-                let dst_level = if k < passes {
-                    k + 1
-                } else {
-                    2 * passes - k - 1
-                };
-                total += 1.0 / f64::from(1u32 << (2 * dst_level));
-            }
-            total
-        };
-
-        // The documented figures, to two decimals.
-        assert!(
-            (fill(3) - 2.64).abs() < 0.005,
-            "Medium frost (3 passes) should write 2.64 screen areas, got {:.3} — \
-             `render()`'s fill-rate docs are now wrong",
-            fill(3)
-        );
-        assert!(
-            (fill(4) - 2.66).abs() < 0.005,
-            "max frost (4 passes) should write 2.66 screen areas, got {:.3}",
-            fill(4)
-        );
-
-        // The real claim: cost is essentially flat across the range, because the
-        // level-0 upsample dominates. Measured 2.250 / 2.563 / 2.641 / 2.660 for
-        // 1..=4 passes — a 0.41 S spread, and converging, since each extra pass
-        // adds only its own `4^-level` share. Half a screen area of slack keeps a
-        // retune of the table free while still failing on a chain that grew a
-        // pass at, or near, full resolution.
-        let (lo, hi) = (fill(1), fill(MAX_KAWASE_PASSES));
-        assert!(
-            hi - lo < 0.5,
-            "the chain's cost must stay essentially flat across the frost range, \
-             but 1 pass writes {lo:.3} S and {MAX_KAWASE_PASSES} passes {hi:.3} S \
-             — `render()`'s docs argue the setting barely matters, and that is \
-             what justifies the cost"
-        );
-        // And the ceiling. Two thirds of this is full-resolution work that is not
-        // ours to remove; anything approaching double it is a new full-res pass
-        // that IS.
-        for passes in 1..=MAX_KAWASE_PASSES {
-            assert!(
-                fill(passes) < 3.0,
-                "the blur chain at {passes} passes writes {:.2} screen areas, over \
-                 the 3.0 ceiling — something added full-resolution work to a chain \
-                 whose whole cost argument is that it has exactly one such pass \
-                 (pass 0) plus upstream's own level-0 upsample",
-                fill(passes)
-            );
-        }
-    }
-
     /// Target size for the step-edge sigma fixture at `params`.
     ///
     /// Sized from the MODEL sigma rather than fixed, because the fixture has to
@@ -5853,40 +5398,9 @@ pub(crate) mod tests {
             },
         );
 
-        // `sigma_fixture_size` keeps `n * 4` on the 256-byte row alignment.
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (n * n * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(n * 4),
-                    rows_per_image: Some(n),
-                },
-            },
-            wgpu::Extent3d {
-                width: n,
-                height: n,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let pixels = slice.get_mapped_range().to_vec();
+        let pixels = map_readback(&device, &readback);
 
         // `None` from here means the profile degenerated — the plateaus washed
         // together — NOT that there is no adapter, and the two must not share a
@@ -6071,39 +5585,9 @@ pub(crate) mod tests {
                 render_pass.draw(0..3, 0..1);
             }
 
-            let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: (N * N * 4) as u64,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &target,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(N * 4),
-                        rows_per_image: Some(N),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: N,
-                    height: N,
-                    depth_or_array_layers: 1,
-                },
-            );
+            let readback = encode_readback(&device, &mut encoder, &target);
             queue.submit([encoder.finish()]);
-
-            let slice = readback.slice(..);
-            slice.map_async(wgpu::MapMode::Read, |_| {});
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            let pixels = slice.get_mapped_range().to_vec();
+            let pixels = map_readback(&device, &readback);
 
             let mut sum = 0.0f64;
             let mut sx = 0.0f64;
@@ -6343,55 +5827,11 @@ pub(crate) mod tests {
         // At most one entry per consumer, ever.
         assert_eq!(pipeline.blur_targets.read().unwrap().len(), 2);
 
-        let readback = |label: &str| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: (N * N * 4) as u64,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            })
-        };
-        let blur_readback = readback("collision test transition readback");
-        let frosted_readback = readback("collision test frosted readback");
-        for (texture, buffer) in [
-            (&blur_target, &blur_readback),
-            (&frosted_target, &frosted_readback),
-        ] {
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        // 256 px * 4 bytes = 1024, already the required alignment.
-                        bytes_per_row: Some(N * 4),
-                        rows_per_image: Some(N),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: N,
-                    height: N,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        let blur_readback = encode_readback(&device, &mut encoder, &blur_target);
+        let frosted_readback = encode_readback(&device, &mut encoder, &frosted_target);
         queue.submit([encoder.finish()]);
-
-        blur_readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |_| {});
-        frosted_readback
-            .slice(..)
-            .map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-
-        let blur_pixels = blur_readback.slice(..).get_mapped_range().to_vec();
-        let frosted_pixels = frosted_readback.slice(..).get_mapped_range().to_vec();
+        let blur_pixels = map_readback(&device, &blur_readback);
+        let frosted_pixels = map_readback(&device, &frosted_readback);
         Some((
             sigma_from_step_image(&blur_pixels, N)?,
             sigma_from_step_image(&frosted_pixels, N)?,
@@ -6945,39 +6385,9 @@ pub(crate) mod tests {
         // `copy_texture_to_buffer` needs 256-byte-aligned rows; the fixture's size
         // follows sigma, so pad rather than assume.
         let bytes_per_row = (n * 4).div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (bytes_per_row * n) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(n),
-                },
-            },
-            wgpu::Extent3d {
-                width: n,
-                height: n,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let padded = slice.get_mapped_range().to_vec();
+        let padded = map_readback(&device, &readback);
         let pixels: Vec<u8> = (0..n)
             .flat_map(|y| {
                 let start = (y * bytes_per_row) as usize;
@@ -7239,39 +6649,9 @@ pub(crate) mod tests {
         }
 
         let bytes_per_row = (n * 4).div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (bytes_per_row * n) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(bytes_per_row),
-                    rows_per_image: Some(n),
-                },
-            },
-            wgpu::Extent3d {
-                width: n,
-                height: n,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let padded = slice.get_mapped_range().to_vec();
+        let padded = map_readback(&device, &readback);
         // Returned in the SHADER's space, on a 0..1 scale: on an sRGB target the
         // hardware encoded what the kernel wrote, and it is the kernel that is
         // under test, not the transfer function.
@@ -7443,39 +6823,9 @@ pub(crate) mod tests {
                 height: N,
             },
         );
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (N * N * 4) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(N * 4),
-                    rows_per_image: Some(N),
-                },
-            },
-            wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let pixels = slice.get_mapped_range().to_vec();
+        let pixels = map_readback(&device, &readback);
 
         // The centre quarter only: the Kawase's region normalization has its own
         // (correct) say near the border, and that is not what is being measured.
@@ -7731,37 +7081,9 @@ pub(crate) mod tests {
         }
 
         let row = (WW * 4).div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frosted scrim bar readback"),
-            size: (row * WH) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: Some(WH),
-                },
-            },
-            wgpu::Extent3d {
-                width: WW,
-                height: WH,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let pixels = readback.slice(..).get_mapped_range().to_vec();
+        let pixels = map_readback(&device, &readback);
 
         let stats = |y0: u32, y1: u32| -> (f32, f32) {
             let mut v = Vec::new();
@@ -7910,37 +7232,9 @@ pub(crate) mod tests {
         }
 
         let row = (WW * 4).div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: (row * WH) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: Some(WH),
-                },
-            },
-            wgpu::Extent3d {
-                width: WW,
-                height: WH,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let pixels = readback.slice(..).get_mapped_range().to_vec();
+        let pixels = map_readback(&device, &readback);
         let at = |x: u32, y: u32| -> [u8; 4] {
             let i = (y * row + x * 4) as usize;
             [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
@@ -8257,37 +7551,9 @@ pub(crate) mod tests {
         );
 
         let row_bytes = (N * 4).div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("frosted letterbox readback"),
-            size: (row_bytes * N) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row_bytes),
-                    rows_per_image: Some(N),
-                },
-            },
-            wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let pixels = readback.slice(..).get_mapped_range().to_vec();
+        let pixels = map_readback(&device, &readback);
 
         // Row means, so a single stray texel cannot decide anything.
         let rows: Vec<[f32; 3]> = (0..N)
@@ -8605,37 +7871,9 @@ pub(crate) mod tests {
         }
 
         let row = (RT_W * 4).div_ceil(256) * 256;
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("device scrim bar readback"),
-            size: (row * RT_H) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &target,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: Some(RT_H),
-                },
-            },
-            wgpu::Extent3d {
-                width: RT_W,
-                height: RT_H,
-                depth_or_array_layers: 1,
-            },
-        );
+        let readback = encode_readback(&device, &mut encoder, &target);
         queue.submit([encoder.finish()]);
-        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        let _ = device.poll(wgpu::PollType::wait_indefinitely());
-        let pixels = readback.slice(..).get_mapped_range().to_vec();
+        let pixels = map_readback(&device, &readback);
 
         let stats = |y0: u32, y1: u32| -> (f32, f32) {
             let mut v = Vec::new();
