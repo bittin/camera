@@ -28,14 +28,26 @@ makedepends="
 	gstreamer-dev
 	just
 	libcamera-dev
+	libjpeg-turbo-dev
 	libxkbcommon-dev
 	nasm
 	pkgconf
 	samurai
 	wayland-dev
 "
+checkdepends="
+	ffmpeg
+	gst-plugins-ugly
+"
 options="net"  # fetch dependencies
 source="$pkgname-$pkgver.tar.gz::https://github.com/cosmic-utils/cosmic-ext-camera/archive/refs/tags/v$pkgver.tar.gz"
+
+# Bundled static TurboJPEG exports libjpeg ABI 62 symbols, which interpose on
+# Alpine's ABI 80 GStreamer JPEG plugins under musl. Use the shared system library
+# for both build() and check(), without changing vendoring on other platforms.
+export TURBOJPEG_SOURCE=explicit
+export TURBOJPEG_DYNAMIC=1
+export TURBOJPEG_LIB_DIR=/usr/lib
 
 prepare() {
 	default_prepare
