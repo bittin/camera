@@ -133,8 +133,6 @@ static CACHED_FORMATS: std::sync::LazyLock<
 pub struct LibcameraBackend {
     /// Current device info
     current_device: Option<CameraDevice>,
-    /// Current preview format
-    current_format: Option<CameraFormat>,
     /// Selected native or PipeWire fallback pipeline
     pipeline: Option<CapturePipeline>,
     /// Frame receiver for preview stream (given to UI once)
@@ -152,7 +150,6 @@ impl LibcameraBackend {
     pub fn new() -> Self {
         Self {
             current_device: None,
-            current_format: None,
             pipeline: None,
             frame_receiver: Mutex::new(None),
         }
@@ -715,7 +712,6 @@ impl CameraBackend for LibcameraBackend {
         let mut current_device = device.clone();
         current_device.supports_multistream = is_multistream;
         self.current_device = Some(current_device);
-        self.current_format = Some(format.clone());
 
         info!("Camera backend initialized with selected capture pipeline");
         Ok(())
@@ -731,7 +727,6 @@ impl CameraBackend for LibcameraBackend {
 
         *self.frame_receiver.lock().unwrap() = None;
         self.current_device = None;
-        self.current_format = None;
 
         info!("libcamera backend shut down");
         Ok(())
@@ -814,23 +809,6 @@ impl CameraBackend for LibcameraBackend {
             .ok_or_else(|| BackendError::Other("No frame available".to_string()))
     }
 
-    fn request_still_capture(&self) -> BackendResult<()> {
-        let pipeline = self
-            .pipeline
-            .as_ref()
-            .ok_or_else(|| BackendError::Other("Pipeline not initialized".to_string()))?;
-        pipeline.request_still_capture();
-        Ok(())
-    }
-
-    fn poll_still_frame(&self) -> Option<CameraFrame> {
-        self.pipeline.as_ref()?.get_still_frame()
-    }
-
-    fn poll_preview_frame(&self) -> Option<CameraFrame> {
-        self.pipeline.as_ref()?.get_preview_frame()
-    }
-
     fn get_preview_receiver(&self) -> Option<FrameReceiver> {
         self.frame_receiver.lock().unwrap().take()
     }
@@ -841,10 +819,6 @@ impl CameraBackend for LibcameraBackend {
 
     fn current_device(&self) -> Option<&CameraDevice> {
         self.current_device.as_ref()
-    }
-
-    fn current_format(&self) -> Option<&CameraFormat> {
-        self.current_format.as_ref()
     }
 }
 

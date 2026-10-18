@@ -25,7 +25,6 @@ pub(crate) struct PipeWirePipeline {
     thread: Option<std::thread::JoinHandle<()>>,
     latest_preview: Arc<Mutex<Option<CameraFrame>>>,
     still_capture: Arc<StillCapture>,
-    still_request: Mutex<Option<StillRequest>>,
 }
 
 fn build_stream(
@@ -215,7 +214,6 @@ impl PipeWirePipeline {
             thread: None,
             latest_preview: Arc::clone(&latest_preview),
             still_capture: Arc::clone(&shared.still_capture),
-            still_request: Mutex::new(None),
         };
         let serial = serial.to_owned();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
@@ -353,13 +351,7 @@ impl PipeWirePipeline {
             .map_err(BackendError::InitializationFailed)?;
         Ok(result)
     }
-    pub(crate) fn request_still_capture(&self) {
-        let mut request = self.still_request.lock().unwrap();
-        *request = Some(self.begin_still_capture());
-    }
-    pub(crate) fn get_still_frame(&self) -> Option<CameraFrame> {
-        self.still_request.lock().unwrap().as_ref()?.take()
-    }
+
     pub(crate) fn begin_still_capture(&self) -> StillRequest {
         self.still_capture.request()
     }
@@ -1273,13 +1265,13 @@ mod tests {
             super::super::pipeline::CapturePipeline::new(&node.device.path, format, false, shared)
                 .unwrap();
         assert!(
-            pipeline.get_still_frame().is_none(),
+            old_request.take().is_none(),
             "pipeline restart must not expose previous camera's still frame"
         );
-        pipeline.request_still_capture();
+        let request = pipeline.begin_still_capture();
         let deadline = Instant::now() + Duration::from_secs(2);
         let still = loop {
-            if let Some(frame) = pipeline.get_still_frame() {
+            if let Some(frame) = request.take() {
                 break frame;
             }
             assert!(

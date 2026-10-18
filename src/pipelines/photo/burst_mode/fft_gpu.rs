@@ -79,17 +79,6 @@ struct WolaPassResources<'a> {
 }
 
 impl FftMergePipeline {
-    /// Create a compute pipeline with common defaults (delegates to `gpu_helpers`).
-    fn create_pipeline(
-        device: &wgpu::Device,
-        label: &str,
-        layout: &wgpu::PipelineLayout,
-        module: &wgpu::ShaderModule,
-        entry_point: &str,
-    ) -> wgpu::ComputePipeline {
-        super::gpu_helpers::create_pipeline(device, label, layout, module, entry_point)
-    }
-
     /// Create a new FFT merge pipeline using an existing GPU device and queue
     ///
     /// This shares the device/queue with BurstModeGpuPipeline to avoid:
@@ -141,63 +130,63 @@ impl FftMergePipeline {
 
         // Create compute pipelines (32x32 tiles)
         let pipelines = FftPipelineSet {
-            init: Self::create_pipeline(
+            init: gpu_helpers::create_pipeline(
                 &device,
                 "init_output_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "init_output",
             ),
-            rms: Self::create_pipeline(
+            rms: gpu_helpers::create_pipeline(
                 &device,
                 "calculate_rms_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "calculate_rms",
             ),
-            mismatch: Self::create_pipeline(
+            mismatch: gpu_helpers::create_pipeline(
                 &device,
                 "calculate_mismatch_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "calculate_mismatch",
             ),
-            highlights_norm: Self::create_pipeline(
+            highlights_norm: gpu_helpers::create_pipeline(
                 &device,
                 "calculate_highlights_norm_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "calculate_highlights_norm",
             ),
-            normalize_mismatch: Self::create_pipeline(
+            normalize_mismatch: gpu_helpers::create_pipeline(
                 &device,
                 "normalize_mismatch_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "normalize_mismatch",
             ),
-            add_reference: Self::create_pipeline(
+            add_reference: gpu_helpers::create_pipeline(
                 &device,
                 "add_reference_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "add_reference_to_output",
             ),
-            merge: Self::create_pipeline(
+            merge: gpu_helpers::create_pipeline(
                 &device,
                 "merge_tile_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "merge_tile",
             ),
-            normalize: Self::create_pipeline(
+            normalize: gpu_helpers::create_pipeline(
                 &device,
                 "normalize_output_pipeline",
                 &pipeline_layout,
                 &shader_module,
                 "normalize_output",
             ),
-            reduce_artifacts: Self::create_pipeline(
+            reduce_artifacts: gpu_helpers::create_pipeline(
                 &device,
                 "reduce_tile_artifacts_pipeline",
                 &pipeline_layout,
@@ -231,21 +220,21 @@ impl FftMergePipeline {
                 immediate_size: 0,
             });
 
-        let spatial_denoise_init_pipeline = Self::create_pipeline(
+        let spatial_denoise_init_pipeline = gpu_helpers::create_pipeline(
             &device,
             "spatial_denoise_init_pipeline",
             &spatial_denoise_pipeline_layout,
             &spatial_denoise_shader,
             "spatial_denoise_init",
         );
-        let spatial_denoise_pipeline = Self::create_pipeline(
+        let spatial_denoise_pipeline = gpu_helpers::create_pipeline(
             &device,
             "spatial_denoise_pipeline",
             &spatial_denoise_pipeline_layout,
             &spatial_denoise_shader,
             "spatial_denoise",
         );
-        let spatial_denoise_normalize_pipeline = Self::create_pipeline(
+        let spatial_denoise_normalize_pipeline = gpu_helpers::create_pipeline(
             &device,
             "spatial_denoise_normalize_pipeline",
             &spatial_denoise_pipeline_layout,
@@ -278,7 +267,7 @@ impl FftMergePipeline {
                 immediate_size: 0,
             });
 
-        let chroma_denoise_pipeline = Self::create_pipeline(
+        let chroma_denoise_pipeline = gpu_helpers::create_pipeline(
             &device,
             "chroma_denoise_pipeline",
             &chroma_denoise_pipeline_layout,
@@ -504,21 +493,6 @@ impl FftMergePipeline {
         self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: (tile_count * std::mem::size_of::<f32>()) as u64,
-            usage,
-            mapped_at_creation: false,
-        })
-    }
-
-    /// Create a storage buffer for per-tile vec4 data (RGBA per tile)
-    fn create_tile_rgba_buffer(
-        &self,
-        label: &str,
-        tile_count: usize,
-        usage: wgpu::BufferUsages,
-    ) -> wgpu::Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: (tile_count * 4 * std::mem::size_of::<f32>()) as u64,
             usage,
             mapped_at_creation: false,
         })
@@ -933,7 +907,7 @@ impl FftMergePipeline {
             mapped_at_creation: false,
         });
 
-        let rms_buffer = self.create_tile_rgba_buffer(
+        let rms_buffer = self.create_rgba_buffer(
             "rms_buffer",
             tile_count,
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
@@ -1241,27 +1215,7 @@ mod tests {
     use super::super::CA_ESTIMATE_SHADER;
     use super::*;
 
-    /// Validate that a WGSL shader compiles successfully using naga
-    fn validate_shader(name: &str, source: &str) {
-        let result = naga::front::wgsl::parse_str(source);
-        match result {
-            Ok(module) => {
-                // Validate the parsed module
-                let info = naga::valid::Validator::new(
-                    naga::valid::ValidationFlags::all(),
-                    naga::valid::Capabilities::all(),
-                )
-                .validate(&module);
-
-                if let Err(e) = info {
-                    panic!("Shader '{}' validation failed: {:?}", name, e);
-                }
-            }
-            Err(e) => {
-                panic!("Shader '{}' parse failed: {:?}", name, e);
-            }
-        }
-    }
+    use crate::test_gpu::validate_shader;
 
     #[test]
     fn test_fft_merge_shader_validates() {

@@ -673,12 +673,7 @@ impl AppModel {
     pub(crate) fn handle_virtual_camera_started(&mut self) -> Task<cosmic::Action<Message>> {
         info!("Virtual camera streaming started successfully");
         self.update_idle_inhibit();
-        Task::perform(
-            async {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            },
-            |_| cosmic::Action::App(Message::UpdateVirtualCameraDuration),
-        )
+        Self::delay_task(1000, Message::UpdateVirtualCameraDuration)
     }
 
     pub(crate) fn handle_virtual_camera_stopped(
@@ -762,12 +757,7 @@ impl AppModel {
         &mut self,
     ) -> Task<cosmic::Action<Message>> {
         if self.virtual_camera.is_streaming() {
-            return Task::perform(
-                async {
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                },
-                |_| cosmic::Action::App(Message::UpdateVirtualCameraDuration),
-            );
+            return Self::delay_task(1000, Message::UpdateVirtualCameraDuration);
         }
         Task::none()
     }

@@ -234,201 +234,50 @@ fn convert_to_gray(frame: &CameraFrame) -> (Vec<u8>, u32, u32) {
     let height = frame.height as usize;
     let stride = frame.stride as usize;
 
+    let mut gray = Vec::with_capacity(width * height);
     match frame.format {
-        // RGBA: Convert RGB to grayscale
-        PixelFormat::RGBA => {
-            let mut gray = Vec::with_capacity(width * height);
+        PixelFormat::RGBA | PixelFormat::RGB24 | PixelFormat::ABGR | PixelFormat::BGRA => {
+            let (pixel_size, r, g, b) = match frame.format {
+                PixelFormat::RGBA => (4, 0, 1, 2),
+                PixelFormat::RGB24 => (3, 0, 1, 2),
+                PixelFormat::ABGR => (4, 3, 2, 1),
+                PixelFormat::BGRA => (4, 2, 1, 0),
+                _ => unreachable!(),
+            };
+            let last_channel = r.max(g).max(b);
             for y in 0..height {
                 let row_start = y * stride;
                 for x in 0..width {
-                    let offset = row_start + x * 4;
-                    if offset + 2 < frame.data.len() {
-                        let r = frame.data[offset] as u32;
-                        let g = frame.data[offset + 1] as u32;
-                        let b = frame.data[offset + 2] as u32;
+                    let offset = row_start + x * pixel_size;
+                    if offset + last_channel < frame.data.len() {
+                        let r = frame.data[offset + r] as u32;
+                        let g = frame.data[offset + g] as u32;
+                        let b = frame.data[offset + b] as u32;
                         // Standard luminance formula: 0.299*R + 0.587*G + 0.114*B
-                        let gray_val = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
-                        gray.push(gray_val);
+                        gray.push(((r * 77 + g * 150 + b * 29) >> 8) as u8);
                     }
                 }
             }
-            (gray, frame.width, frame.height)
         }
-
-        // Gray8: Already grayscale, just copy
-        PixelFormat::Gray8 => {
-            let mut gray = Vec::with_capacity(width * height);
-            for y in 0..height {
-                let row_start = y * stride;
-                for x in 0..width {
-                    let offset = row_start + x;
-                    if offset < frame.data.len() {
-                        gray.push(frame.data[offset]);
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        // RGB24: Convert RGB to grayscale (no alpha)
-        PixelFormat::RGB24 => {
-            let mut gray = Vec::with_capacity(width * height);
-            for y in 0..height {
-                let row_start = y * stride;
-                for x in 0..width {
-                    let offset = row_start + x * 3;
-                    if offset + 2 < frame.data.len() {
-                        let r = frame.data[offset] as u32;
-                        let g = frame.data[offset + 1] as u32;
-                        let b = frame.data[offset + 2] as u32;
-                        let gray_val = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
-                        gray.push(gray_val);
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        // NV12/NV21: Extract Y plane (full resolution luminance)
-        PixelFormat::NV12 | PixelFormat::NV21 => {
-            let mut gray = Vec::with_capacity(width * height);
-            if let Some(ref planes) = frame.yuv_planes {
-                for y in 0..height {
-                    let row_start = planes.y_offset + y * stride;
-                    for x in 0..width {
-                        let offset = row_start + x;
-                        if offset < frame.data.len() {
-                            gray.push(frame.data[offset]);
-                        }
-                    }
-                }
-            } else {
-                // Fallback: assume Y plane is at start of buffer
-                for y in 0..height {
-                    let row_start = y * stride;
-                    for x in 0..width {
-                        let offset = row_start + x;
-                        if offset < frame.data.len() {
-                            gray.push(frame.data[offset]);
-                        }
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        // I420: Extract Y plane (full resolution luminance)
-        PixelFormat::I420 => {
-            let mut gray = Vec::with_capacity(width * height);
-            if let Some(ref planes) = frame.yuv_planes {
-                for y in 0..height {
-                    let row_start = planes.y_offset + y * stride;
-                    for x in 0..width {
-                        let offset = row_start + x;
-                        if offset < frame.data.len() {
-                            gray.push(frame.data[offset]);
-                        }
-                    }
-                }
-            } else {
-                // Fallback: assume Y plane is at start of buffer
-                for y in 0..height {
-                    let row_start = y * stride;
-                    for x in 0..width {
-                        let offset = row_start + x;
-                        if offset < frame.data.len() {
-                            gray.push(frame.data[offset]);
-                        }
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        // YUYV/UYVY/YVYU/VYUY: Extract Y values from packed format
-        // YUYV: Y0 U Y1 V (Y at positions 0, 2)
-        // UYVY: U Y0 V Y1 (Y at positions 1, 3)
-        // YVYU: Y0 V Y1 U (Y at positions 0, 2)
-        // VYUY: V Y0 U Y1 (Y at positions 1, 3)
-        PixelFormat::YUYV | PixelFormat::YVYU => {
-            let mut gray = Vec::with_capacity(width * height);
-            for y in 0..height {
-                let row_start = y * stride;
-                for x in 0..width {
-                    // In YUYV/YVYU: Y0 is at byte 0, Y1 is at byte 2 of each 4-byte pair
-                    let pair_offset = row_start + (x / 2) * 4;
-                    let y_offset = pair_offset + (x % 2) * 2;
-                    if y_offset < frame.data.len() {
-                        gray.push(frame.data[y_offset]);
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        PixelFormat::UYVY | PixelFormat::VYUY => {
-            let mut gray = Vec::with_capacity(width * height);
-            for y in 0..height {
-                let row_start = y * stride;
-                for x in 0..width {
-                    // In UYVY/VYUY: Y0 is at byte 1, Y1 is at byte 3 of each 4-byte pair
-                    let pair_offset = row_start + (x / 2) * 4;
-                    let y_offset = pair_offset + 1 + (x % 2) * 2;
-                    if y_offset < frame.data.len() {
-                        gray.push(frame.data[y_offset]);
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        // ABGR: Memory layout [A][B][G][R], so R=offset+3, G=offset+2, B=offset+1
-        PixelFormat::ABGR => {
-            let mut gray = Vec::with_capacity(width * height);
-            for y in 0..height {
-                let row_start = y * stride;
-                for x in 0..width {
-                    let offset = row_start + x * 4;
-                    if offset + 3 < frame.data.len() {
-                        let r = frame.data[offset + 3] as u32;
-                        let g = frame.data[offset + 2] as u32;
-                        let b = frame.data[offset + 1] as u32;
-                        let gray_val = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
-                        gray.push(gray_val);
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        // BGRA: Memory layout [B][G][R][A], so R=offset+2, G=offset+1, B=offset+0
-        PixelFormat::BGRA => {
-            let mut gray = Vec::with_capacity(width * height);
-            for y in 0..height {
-                let row_start = y * stride;
-                for x in 0..width {
-                    let offset = row_start + x * 4;
-                    if offset + 2 < frame.data.len() {
-                        let r = frame.data[offset + 2] as u32;
-                        let g = frame.data[offset + 1] as u32;
-                        let b = frame.data[offset] as u32;
-                        let gray_val = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
-                        gray.push(gray_val);
-                    }
-                }
-            }
-            (gray, frame.width, frame.height)
-        }
-
-        // Bayer patterns: Raw single-channel data, treat as grayscale (one sample per pixel)
-        // QR detection on raw Bayer is suboptimal but functional
-        PixelFormat::BayerRGGB
+        // Planar YUV uses its Y-plane offset; Gray8 and Bayer are already
+        // single-channel. Missing plane metadata retains the zero-offset fallback.
+        PixelFormat::NV12
+        | PixelFormat::NV21
+        | PixelFormat::I420
+        | PixelFormat::Gray8
+        | PixelFormat::BayerRGGB
         | PixelFormat::BayerBGGR
         | PixelFormat::BayerGRBG
         | PixelFormat::BayerGBRG => {
-            let mut gray = Vec::with_capacity(width * height);
+            let y_offset = match frame.format {
+                PixelFormat::NV12 | PixelFormat::NV21 | PixelFormat::I420 => frame
+                    .yuv_planes
+                    .as_ref()
+                    .map_or(0, |planes| planes.y_offset),
+                _ => 0,
+            };
             for y in 0..height {
-                let row_start = y * stride;
+                let row_start = y_offset + y * stride;
                 for x in 0..width {
                     let offset = row_start + x;
                     if offset < frame.data.len() {
@@ -436,9 +285,26 @@ fn convert_to_gray(frame: &CameraFrame) -> (Vec<u8>, u32, u32) {
                     }
                 }
             }
-            (gray, frame.width, frame.height)
+        }
+        // Packed YUV stores alternating luminance bytes; chroma order is irrelevant.
+        PixelFormat::YUYV | PixelFormat::YVYU | PixelFormat::UYVY | PixelFormat::VYUY => {
+            let first_y = usize::from(matches!(
+                frame.format,
+                PixelFormat::UYVY | PixelFormat::VYUY
+            ));
+            for y in 0..height {
+                let row_start = y * stride;
+                for x in 0..width {
+                    let pair_offset = row_start + (x / 2) * 4;
+                    let y_offset = pair_offset + first_y + (x % 2) * 2;
+                    if y_offset < frame.data.len() {
+                        gray.push(frame.data[y_offset]);
+                    }
+                }
+            }
         }
     }
+    (gray, frame.width, frame.height)
 }
 
 /// Downscale grayscale image using bilinear interpolation
@@ -569,6 +435,152 @@ mod tests {
         scheduler.invalidate();
 
         assert!(scheduler.try_start(true, finished_at).is_some());
+    }
+
+    #[test]
+    fn grayscale_layouts_preserve_channels_padding_and_truncation() {
+        use crate::backends::camera::types::{YuvColor, YuvPlanes};
+
+        let planes = YuvPlanes {
+            color: YuvColor::Legacy,
+            y_offset: 2,
+            y_size: 8,
+            uv_offset: 10,
+            uv_size: 0,
+            uv_stride: 0,
+            v_offset: 10,
+            v_size: 0,
+            v_stride: 0,
+            uv_width: 0,
+            uv_height: 0,
+        };
+        let mut cases = vec![
+            (
+                PixelFormat::RGBA,
+                10,
+                None,
+                vec![
+                    255, 0, 0, 9, 0, 255, 0, 9, 99, 99, 0, 0, 255, 9, 255, 255, 255, 9,
+                ],
+                vec![76, 149, 28, 255],
+            ),
+            (
+                PixelFormat::RGB24,
+                8,
+                None,
+                vec![255, 0, 0, 0, 255, 0, 99, 99, 0, 0, 255, 255, 255, 255],
+                vec![76, 149, 28, 255],
+            ),
+            (
+                PixelFormat::ABGR,
+                10,
+                None,
+                vec![
+                    9, 0, 0, 255, 9, 0, 255, 0, 99, 99, 9, 255, 0, 0, 9, 255, 255, 255,
+                ],
+                vec![76, 149, 28, 255],
+            ),
+            (
+                PixelFormat::BGRA,
+                10,
+                None,
+                vec![
+                    0, 0, 255, 9, 0, 255, 0, 9, 99, 99, 255, 0, 0, 9, 255, 255, 255, 9,
+                ],
+                vec![76, 149, 28, 255],
+            ),
+        ];
+        for format in [
+            PixelFormat::Gray8,
+            PixelFormat::BayerRGGB,
+            PixelFormat::BayerBGGR,
+            PixelFormat::BayerGRBG,
+            PixelFormat::BayerGBRG,
+        ] {
+            cases.push((
+                format,
+                4,
+                None,
+                vec![10, 20, 99, 99, 30, 40],
+                vec![10, 20, 30, 40],
+            ));
+        }
+        for format in [PixelFormat::NV12, PixelFormat::NV21, PixelFormat::I420] {
+            cases.push((
+                format,
+                4,
+                None,
+                vec![10, 20, 99, 99, 30, 40],
+                vec![10, 20, 30, 40],
+            ));
+            cases.push((
+                format,
+                4,
+                Some(planes),
+                vec![99, 99, 10, 20, 99, 99, 30, 40],
+                vec![10, 20, 30, 40],
+            ));
+        }
+        for format in [PixelFormat::YUYV, PixelFormat::YVYU] {
+            cases.push((
+                format,
+                6,
+                None,
+                vec![10, 99, 20, 99, 99, 99, 30, 99, 40, 99],
+                vec![10, 20, 30, 40],
+            ));
+        }
+        for format in [PixelFormat::UYVY, PixelFormat::VYUY] {
+            cases.push((
+                format,
+                6,
+                None,
+                vec![99, 10, 99, 20, 99, 99, 99, 30, 99, 40],
+                vec![10, 20, 30, 40],
+            ));
+        }
+        for (format, stride, yuv_planes, data, expected) in cases {
+            let frame = CameraFrame {
+                width: 2,
+                height: 2,
+                data: FrameData::from_copied(data.clone().into()),
+                format,
+                stride,
+                yuv_planes,
+                captured_at: Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            assert_eq!(
+                convert_to_gray(&frame),
+                (expected.clone(), 2, 2),
+                "{format:?}"
+            );
+            // Preserve the existing partial-buffer contract: missing samples are
+            // omitted, not padded; a missing unused alpha byte is still accepted.
+            for len in 0..data.len() {
+                let mut truncated = frame.clone();
+                truncated.data = FrameData::from_copied(data[..len].to_vec().into());
+                let (gray, width, height) = convert_to_gray(&truncated);
+                assert_eq!((width, height), (2, 2));
+                let required_offsets = match format {
+                    PixelFormat::RGBA | PixelFormat::BGRA => [2, 6, 12, 16],
+                    PixelFormat::RGB24 => [2, 5, 10, 13],
+                    PixelFormat::ABGR => [3, 7, 13, 17],
+                    PixelFormat::YUYV | PixelFormat::YVYU => [0, 2, 6, 8],
+                    PixelFormat::UYVY | PixelFormat::VYUY => [1, 3, 7, 9],
+                    _ => {
+                        let base = yuv_planes.map_or(0, |planes| planes.y_offset);
+                        [base, base + 1, base + 4, base + 5]
+                    }
+                };
+                let count = required_offsets
+                    .iter()
+                    .filter(|&&offset| offset < len)
+                    .count();
+                assert_eq!(gray, expected[..count], "{format:?}, len={len}");
+            }
+        }
     }
 
     #[test]

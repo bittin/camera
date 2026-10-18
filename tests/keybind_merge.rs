@@ -63,12 +63,11 @@ fn set_replaces_existing_binding_and_unbinds_conflict() {
 #[test]
 fn set_none_unbinds_action() {
     let mut b = Bindings::defaults();
-    let prev = b.keybind_for(Action::Capture).cloned();
+
     b.set(Action::Capture, None);
     assert_eq!(b.keybind_for(Action::Capture), None);
     // Other actions unaffected.
     assert!(b.keybind_for(Action::SwitchCamera).is_some());
-    let _ = prev;
 }
 
 #[test]

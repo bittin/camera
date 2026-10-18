@@ -27,19 +27,12 @@ fn run_mode(
     method: DemosaicMethod,
     paced: bool,
 ) -> Result<Vec<[f32; 4]>, String> {
-    let rgba: Vec<[f32; 4]> = input.iter().map(|&v| [v, 0.0, 0.0, 0.0]).collect();
-    let scalar = engine.raw.format() == wgpu::TextureFormat::R32Float;
-    let bytes: &[u8] = if scalar {
-        bytemuck::cast_slice(input)
-    } else {
-        bytemuck::cast_slice(&rgba)
-    };
     queue.write_texture(
         engine.raw.as_image_copy(),
-        bytes,
+        bytemuck::cast_slice(input),
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(w * if scalar { 4 } else { 16 }),
+            bytes_per_row: Some(w * 4),
             rows_per_image: Some(h),
         },
         wgpu::Extent3d {
@@ -56,7 +49,7 @@ fn run_mode(
         engine.encode(device, queue, &mut encoder, &output, pattern, method);
         queue.submit([encoder.finish()]);
     }
-    engine.validate(device)?;
+    engine.validate()?;
     let row = (w * 16).next_multiple_of(256);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("test decoded float RGB"),

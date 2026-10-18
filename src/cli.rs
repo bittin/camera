@@ -615,37 +615,6 @@ fn is_supported_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Load a DNG file and convert to RGBA CameraFrame
-fn load_dng_frame(path: &Path) -> Result<CameraFrame, Box<dyn std::error::Error>> {
-    use camera::backends::camera::types::{CameraFrame, FrameData, PixelFormat};
-    use image::GenericImageView;
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-
-    // Use the image crate's TIFF decoder for DNG (DNG is based on TIFF)
-    let decoder = image::codecs::tiff::TiffDecoder::new(reader)?;
-    let img = image::DynamicImage::from_decoder(decoder)?;
-
-    let (width, height) = img.dimensions();
-    let rgba = img.to_rgba8();
-    let data = FrameData::from_copied(Arc::from(rgba.into_raw().into_boxed_slice()));
-
-    Ok(CameraFrame {
-        width,
-        height,
-        data,
-        format: PixelFormat::RGBA,
-        stride: width * 4,
-        yuv_planes: None,
-        captured_at: Instant::now(),
-        sensor_timestamp_ns: None,
-        libcamera_metadata: None,
-    })
-}
-
 /// Load burst mode frames from image paths
 fn load_burst_mode_frames(
     paths: &[PathBuf],
@@ -661,25 +630,25 @@ fn load_burst_mode_frames(
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
-        let frame = if ext == "dng" {
-            load_dng_frame(path)?
+        let img = if ext == "dng" {
+            // DNG is TIFF-based but is not recognized by image::open's extension dispatch.
+            let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+            image::DynamicImage::from_decoder(image::codecs::tiff::TiffDecoder::new(reader)?)?
         } else {
-            let img = image::open(path)?;
-            let (width, height) = img.dimensions();
-            let rgba = img.to_rgba8();
-            let data = FrameData::from_copied(Arc::from(rgba.into_raw().into_boxed_slice()));
-
-            CameraFrame {
-                width,
-                height,
-                data,
-                format: PixelFormat::RGBA,
-                stride: width * 4,
-                yuv_planes: None,
-                captured_at: Instant::now(),
-                sensor_timestamp_ns: None,
-                libcamera_metadata: None,
-            }
+            image::open(path)?
+        };
+        let (width, height) = img.dimensions();
+        let data = FrameData::from_copied(Arc::from(img.to_rgba8().into_raw().into_boxed_slice()));
+        let frame = CameraFrame {
+            width,
+            height,
+            data,
+            format: PixelFormat::RGBA,
+            stride: width * 4,
+            yuv_planes: None,
+            captured_at: Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
         };
 
         println!(
@@ -699,6 +668,41 @@ fn load_burst_mode_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn burst_inputs_preserve_pixels_geometry_and_missing_metadata() {
+        let root = std::env::temp_dir().join(format!("burst-inputs-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pixels = [23, 42, 91, 255].repeat(6);
+        let image = image::RgbaImage::from_raw(3, 2, pixels.clone()).unwrap();
+        let paths = [root.join("input.PNG"), root.join("input.DNG")];
+        for (path, format) in paths
+            .iter()
+            .zip([image::ImageFormat::Png, image::ImageFormat::Tiff])
+        {
+            image.save_with_format(path, format).unwrap();
+        }
+        let before = Instant::now();
+        let frames = load_burst_mode_frames(&paths).unwrap();
+        assert_eq!(frames.len(), 2);
+        for frame in frames {
+            assert_eq!((frame.width, frame.height, frame.stride), (3, 2, 12));
+            assert_eq!(
+                frame.format,
+                camera::backends::camera::types::PixelFormat::RGBA
+            );
+            assert_eq!(&frame.data[..], pixels);
+            assert!(frame.yuv_planes.is_none());
+            assert!(frame.sensor_timestamp_ns.is_none());
+            assert!(frame.libcamera_metadata.is_none());
+            assert!(frame.captured_at >= before);
+        }
+        std::fs::write(&paths[0], b"not an image").unwrap();
+        assert!(load_burst_mode_frames(&paths).is_err());
+        assert!(load_burst_mode_frames(&[root.join("missing.dng")]).is_err());
+        assert!(load_burst_mode_frames(&[]).unwrap().is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn recording_metadata_preserves_sensor_orientation() {

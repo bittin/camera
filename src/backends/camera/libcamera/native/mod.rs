@@ -41,7 +41,7 @@ use diagnostics::clear_global_diagnostics;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// Shared communication handles passed into the native pipeline
 pub(crate) struct PipelineSharedState {
@@ -67,7 +67,6 @@ pub(crate) struct NativeLibcameraPipeline {
     /// Stop flag for capture thread
     stop_flag: Arc<AtomicBool>,
     still_capture: Arc<StillCapture>,
-    still_request: Mutex<Option<StillRequest>>,
     /// Latest preview frame
     latest_preview: Arc<Mutex<Option<CameraFrame>>>,
     /// Preview frame counter
@@ -161,7 +160,6 @@ impl NativeLibcameraPipeline {
             preview_metrics,
             stop_flag,
             still_capture: shared.still_capture,
-            still_request: Mutex::new(None),
             latest_preview,
             preview_frame_count,
             still_frame_count,
@@ -171,20 +169,6 @@ impl NativeLibcameraPipeline {
 
     pub(crate) fn is_multistream(&self) -> bool {
         self.is_multistream
-    }
-
-    /// Request a still capture (full resolution).
-    ///
-    /// Retain consumer ownership for the synchronous backend compatibility API.
-    pub(crate) fn request_still_capture(&self) {
-        debug!("Still capture requested");
-        let mut request = self.still_request.lock().unwrap();
-        *request = Some(self.begin_still_capture());
-    }
-
-    /// Get the latest still frame (if available)
-    pub(crate) fn get_still_frame(&self) -> Option<CameraFrame> {
-        self.still_request.lock().unwrap().as_ref()?.take()
     }
 
     pub(crate) fn begin_still_capture(&self) -> StillRequest {
@@ -252,7 +236,6 @@ mod tests {
             capture_thread: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             still_capture: Default::default(),
-            still_request: Mutex::new(None),
             latest_preview: Arc::new(Mutex::new(None)),
             preview_frame_count: Arc::new(AtomicU64::new(0)),
             still_frame_count: Arc::new(AtomicU64::new(0)),

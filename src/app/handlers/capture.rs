@@ -1892,58 +1892,8 @@ impl AppModel {
             "Starting quick-record (long-press in Photo mode)"
         );
 
-        // Snapshot the physical device orientation at recording start so the
-        // resulting video is upright and remains stable for the whole session.
-        let sensor_rotation = self.capture_media_rotation();
-        let framerate = format.framerate.map(|f| f.as_int()).unwrap_or(30);
-
-        // Use viewfinder frame dimensions (not raw format dimensions)
-        let (appsrc_width, appsrc_height) = self
-            .current_frame
-            .as_ref()
-            .map(|f| (f.width, f.height))
-            .unwrap_or((format.width, format.height));
-
-        let selected_audio_device = self
-            .available_audio_devices
-            .get(self.current_audio_device_index);
-        let audio_device = if self.config.record_audio {
-            selected_audio_device.map(|dev| dev.node_name.clone())
-        } else {
-            None
-        };
-        // Gate symmetrically with `audio_device`: when the user disabled audio,
-        // both `audio_device` and `audio_source_rate_hz` are zero/None so the
-        // downstream capsfilter can't accidentally pin a rate that doesn't
-        // match whatever PA would otherwise produce.
-        let audio_source_rate_hz = if self.config.record_audio {
-            selected_audio_device.map(|d| d.sample_rate).unwrap_or(0)
-        } else {
-            0
-        };
-
-        let selected_encoder = self
-            .available_video_encoders
-            .get(self.current_video_encoder_index)
-            .cloned();
-
-        let appsrc_bitrate = self
-            .config
-            .bitrate_preset
-            .bitrate_kbps(appsrc_width, appsrc_height);
-
-        self.start_appsrc_recording(AppsrcRecordingConfig {
-            width: appsrc_width,
-            height: appsrc_height,
-            framerate,
-            format: format.clone(),
-            output_path,
-            sensor_rotation,
-            audio_device,
-            audio_source_rate_hz,
-            selected_encoder,
-            bitrate_kbps: appsrc_bitrate,
-        })
+        let config = self.appsrc_recording_config(format, output_path);
+        self.start_appsrc_recording(config)
     }
 
     pub(crate) fn handle_start_recording_after_delay(&mut self) -> Task<cosmic::Action<Message>> {
@@ -1984,60 +1934,45 @@ impl AppModel {
             self.turn_on_flash_hardware();
         }
 
-        // Snapshot the physical device orientation at recording start so the
-        // resulting video is upright and remains stable for the whole session.
-        let sensor_rotation = self.capture_media_rotation();
-        let width = format.width;
-        let height = format.height;
-        let framerate = format.framerate.map(|f| f.as_int()).unwrap_or(30);
+        let config = self.appsrc_recording_config(format, output_path);
+        self.start_appsrc_recording(config)
+    }
 
-        // Only get audio device if audio recording is enabled in settings
-        let selected_audio_device = self
-            .available_audio_devices
-            .get(self.current_audio_device_index);
-        let audio_device = if self.config.record_audio {
-            selected_audio_device.map(|dev| dev.node_name.clone())
-        } else {
-            None
-        };
-        // Gate symmetrically with `audio_device`: when the user disabled audio,
-        // both `audio_device` and `audio_source_rate_hz` are zero/None so the
-        // downstream capsfilter can't accidentally pin a rate that doesn't
-        // match whatever PA would otherwise produce.
-        let audio_source_rate_hz = if self.config.record_audio {
-            selected_audio_device.map(|d| d.sample_rate).unwrap_or(0)
-        } else {
-            0
-        };
-
-        let selected_encoder = self
-            .available_video_encoders
-            .get(self.current_video_encoder_index)
-            .cloned();
-
-        // For the appsrc pipeline, use the actual viewfinder frame dimensions
-        // (not active_format, which may be the raw/Bayer stream resolution).
-        let (appsrc_width, appsrc_height) = self
+    /// Snapshot the shared normal/quick-record settings before opening a pipeline.
+    fn appsrc_recording_config(
+        &self,
+        format: &crate::backends::camera::types::CameraFormat,
+        output_path: PathBuf,
+    ) -> AppsrcRecordingConfig {
+        // The active format may describe a full-resolution Bayer stream rather
+        // than the viewfinder frames actually supplied to the encoder.
+        let (width, height) = self
             .current_frame
             .as_ref()
-            .map(|f| (f.width, f.height))
-            .unwrap_or((width, height));
-        let appsrc_bitrate = self
-            .config
-            .bitrate_preset
-            .bitrate_kbps(appsrc_width, appsrc_height);
-        self.start_appsrc_recording(AppsrcRecordingConfig {
-            width: appsrc_width,
-            height: appsrc_height,
-            framerate,
+            .map(|frame| (frame.width, frame.height))
+            .unwrap_or((format.width, format.height));
+        // Gate both the device and its native rate together: disabled audio
+        // must never leave a rate that can accidentally constrain pulsesrc.
+        let audio = self
+            .available_audio_devices
+            .get(self.current_audio_device_index)
+            .filter(|_| self.config.record_audio);
+        AppsrcRecordingConfig {
+            width,
+            height,
+            framerate: format.framerate.map(|fps| fps.as_int()).unwrap_or(30),
             format: format.clone(),
             output_path,
-            sensor_rotation,
-            audio_device,
-            audio_source_rate_hz,
-            selected_encoder,
-            bitrate_kbps: appsrc_bitrate,
-        })
+            // Keep the orientation stable for the complete recording session.
+            sensor_rotation: self.capture_media_rotation(),
+            audio_device: audio.map(|device| device.node_name.clone()),
+            audio_source_rate_hz: audio.map(|device| device.sample_rate).unwrap_or(0),
+            selected_encoder: self
+                .available_video_encoders
+                .get(self.current_video_encoder_index)
+                .cloned(),
+            bitrate_kbps: self.config.bitrate_preset.bitrate_kbps(width, height),
+        }
     }
 
     /// Start recording using the appsrc pipeline (libcamera backend).
@@ -5115,6 +5050,56 @@ mod tests {
     }
 
     #[test]
+    fn recording_snapshot_keeps_viewfinder_dimensions_and_gates_audio_rate_with_device() {
+        use crate::backends::camera::types::CameraFormat;
+        gstreamer::init().unwrap();
+        let mut model = live_model();
+        model
+            .available_audio_devices
+            .push(crate::backends::audio::AudioDevice {
+                name: "Test microphone".into(),
+                serial: "test".into(),
+                node_name: "test.microphone".into(),
+                is_default: true,
+                channels: Vec::new(),
+                sample_format: "S16LE".into(),
+                sample_rate: 44_100,
+            });
+        let format = CameraFormat {
+            width: 4000,
+            height: 3000,
+            framerate: None,
+            hardware_accelerated: false,
+            pixel_format: "RGGB".into(),
+        };
+        for record_audio in [false, true] {
+            model.config.record_audio = record_audio;
+            let snapshot = model.appsrc_recording_config(&format, "recording.mp4".into());
+            assert_eq!((snapshot.width, snapshot.height), (64, 48));
+            assert_eq!(snapshot.framerate, 30);
+            assert_eq!(snapshot.format, format);
+            assert_eq!(snapshot.output_path, std::path::Path::new("recording.mp4"));
+            assert_eq!(snapshot.selected_encoder.unwrap().element_name, "x264enc");
+            assert_eq!(
+                snapshot.audio_device.as_deref(),
+                record_audio.then_some("test.microphone")
+            );
+            assert_eq!(
+                snapshot.audio_source_rate_hz,
+                if record_audio { 44_100 } else { 0 }
+            );
+        }
+        model.current_frame = None;
+        model.current_audio_device_index = 99;
+        model.current_video_encoder_index = 99;
+        let snapshot = model.appsrc_recording_config(&format, "fallback.mp4".into());
+        assert_eq!((snapshot.width, snapshot.height), (4000, 3000));
+        assert!(snapshot.audio_device.is_none());
+        assert_eq!(snapshot.audio_source_rate_hz, 0);
+        assert!(snapshot.selected_encoder.is_none());
+    }
+
+    #[test]
     fn photo_jobs_snapshot_demosaicing_at_capture_start() {
         use crate::app::state::AppModel;
         use crate::shaders::DemosaicMethod;
@@ -5132,6 +5117,79 @@ mod tests {
             assert_eq!(photo_config.demosaic_method, method);
             assert_eq!(app.burst_mode.demosaic_method, method);
             app.burst_mode.reset();
+        }
+    }
+
+    #[tokio::test]
+    async fn still_routes_preserve_crop_pixels_across_fit_cover_and_sensor_rotation() {
+        use crate::app::state::PhotoAspectRatio;
+        use crate::backends::camera::types::FrameData;
+
+        // Independent pixel oracle: square fit and square cover both keep
+        // sensor columns 16..48 of a 64x32 frame, regardless of quarter-turn.
+        // Power-of-two geometry avoids the existing fractional-pixel rounding;
+        // there are no UI bars in this fixture.
+        for fit in [false, true] {
+            for rotation in [
+                SensorRotation::None,
+                SensorRotation::Rotate90,
+                SensorRotation::Rotate180,
+                SensorRotation::Rotate270,
+            ] {
+                for route in 0..3 {
+                    let mut model = raw_queue_model();
+                    let save_dir = model.config.save_folder_name.clone();
+                    model.available_cameras[0].supports_multistream = route != 0;
+                    model.available_cameras[0].rotation = rotation;
+                    model.zoom_level = 1.0;
+                    model.ui_hidden = true;
+                    model.screen_width = 400.0;
+                    model.screen_height = 400.0;
+                    model.preview_fit_to_view = fit;
+                    model.photo_aspect_ratio = if fit {
+                        PhotoAspectRatio::Ratio1x1
+                    } else {
+                        PhotoAspectRatio::Native
+                    };
+                    let sensor = image::RgbaImage::from_fn(64, 32, |x, y| {
+                        image::Rgba([x as u8, y as u8, (x + y) as u8, 255])
+                    });
+                    let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+                    frame.width = 64;
+                    frame.height = 32;
+                    frame.stride = 64 * 4;
+                    frame.data = FrameData::from_owned_vec(sensor.clone().into_raw());
+                    model.current_frame = Some(Arc::new(frame.clone()));
+                    let mut stream =
+                        cosmic::iced::runtime::task::into_stream(model.capture_photo()).unwrap();
+                    if route != 0 {
+                        if route == 2 {
+                            frame.stride = 1; // Exercise the real preview fallback.
+                        }
+                        assert!(
+                            model
+                                .still_capture
+                                .publish(model.still_capture.pending().unwrap(), frame,)
+                        );
+                        let acquired = next_capture_message(&mut stream).await;
+                        assert!(matches!(acquired, super::Message::PhotoCaptureAcquired(1)));
+                        let _ = model.update(acquired);
+                    }
+                    let saved = next_capture_message(&mut stream).await;
+                    let super::Message::PhotoCaptureSaved(1, Ok(path)) = &saved else {
+                        panic!("route {route}, fit={fit}, rotation={rotation} must save");
+                    };
+                    let expected = image::imageops::crop_imm(&sensor, 16, 0, 32, 32).to_image();
+                    let actual = image::open(path).unwrap().to_rgba8();
+                    assert!(
+                        actual == expected,
+                        "route {route}, fit={fit}, rotation={rotation}: crop pixels differ"
+                    );
+                    let _ = model.update(saved);
+                    assert!(model.photo_jobs.is_empty());
+                    std::fs::remove_dir_all(save_dir).unwrap();
+                }
+            }
         }
     }
 

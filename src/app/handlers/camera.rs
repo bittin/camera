@@ -461,7 +461,7 @@ impl AppModel {
         self.available_cameras = cameras;
         self.camera_discovery_complete = true;
         self.current_camera_index = camera_index;
-        self.available_formats = formats.clone();
+        self.available_formats = formats;
 
         self.camera_dropdown_options = Self::build_camera_dropdown_labels(&self.available_cameras);
 
@@ -477,8 +477,6 @@ impl AppModel {
         // (issue #365).
         self.update_idle_inhibit();
 
-        let mut tasks: Vec<Task<cosmic::Action<Message>>> = Vec::new();
-
         // Probe video encoders in the background. Builds a short videotestsrc
         // pipeline per encoder to detect broken ones (e.g. V4L2 encoders that
         // register but don't actually work).
@@ -487,7 +485,7 @@ impl AppModel {
             .iter()
             .map(|e| e.element_name.clone())
             .collect();
-        tasks.push(Task::perform(
+        Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
                     crate::media::encoders::detection::probe_broken_encoders(&encoder_names)
@@ -496,9 +494,7 @@ impl AppModel {
                 .unwrap_or_default()
             },
             |broken| cosmic::Action::App(Message::BrokenEncodersDetected(broken)),
-        ));
-
-        Task::batch(tasks)
+        )
     }
 
     pub(crate) fn handle_broken_encoders_detected(

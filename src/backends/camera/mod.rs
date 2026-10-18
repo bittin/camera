@@ -104,16 +104,6 @@ pub trait CameraBackend: Send + Sync {
     /// * `Err(BackendError)` - Capture failed
     fn capture_photo(&self) -> BackendResult<CameraFrame>;
 
-    /// Request a still capture (non-blocking).
-    /// Returns Ok(()) if the request was accepted.
-    fn request_still_capture(&self) -> BackendResult<()>;
-
-    /// Poll for a still frame without blocking. Returns `None` if not yet available.
-    fn poll_still_frame(&self) -> Option<CameraFrame>;
-
-    /// Poll for the latest preview frame without blocking.
-    fn poll_preview_frame(&self) -> Option<CameraFrame>;
-
     // ===== Preview =====
 
     /// Get a receiver for preview frames
@@ -133,9 +123,6 @@ pub trait CameraBackend: Send + Sync {
 
     /// Get the currently active camera device (if initialized)
     fn current_device(&self) -> Option<&CameraDevice>;
-
-    /// Get the currently active format (if initialized)
-    fn current_format(&self) -> Option<&CameraFormat>;
 }
 
 /// Create a new backend instance

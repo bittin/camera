@@ -1768,8 +1768,12 @@ mod tests {
         });
     }
 
-    fn review_n1_gray_frame(w: usize, h: usize) -> crate::backends::camera::types::CameraFrame {
-        let pixels = [83u8; 3].repeat(w * h);
+    fn review_n1_gray_frame(
+        w: usize,
+        h: usize,
+        luma: u8,
+    ) -> crate::backends::camera::types::CameraFrame {
+        let pixels = [luma; 3].repeat(w * h);
         let mut compressor = turbojpeg::Compressor::new().unwrap();
         compressor.set_quality(100).unwrap();
         compressor.set_subsamp(turbojpeg::Subsamp::Gray).unwrap();
@@ -1797,7 +1801,7 @@ mod tests {
     #[test]
     fn review_n1_real_gray_jpeg_declares_only_backed_luminance() {
         for (w, h) in [(9, 4), (7, 13)] {
-            let frame = review_n1_gray_frame(w, h);
+            let frame = review_n1_gray_frame(w, h, 83);
             assert_eq!(
                 frame.format,
                 crate::backends::camera::types::PixelFormat::Gray8
@@ -1823,8 +1827,12 @@ mod tests {
         };
         pollster::block_on(async {
             let mut converter = crate::shaders::GpuConvertPipeline::new().await.unwrap();
-            for (w, h) in [(9, 4), (7, 13)] {
-                let frame = review_n1_gray_frame(w, h);
+            for (w, h, luma) in [(9, 4, 83), (7, 13, 83), (9, 4, 128)] {
+                let frame = review_n1_gray_frame(w, h, luma);
+                assert_eq!(
+                    frame.format,
+                    crate::backends::camera::types::PixelFormat::Gray8
+                );
                 converter
                     .convert(&crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap())
                     .unwrap();
@@ -1843,9 +1851,9 @@ mod tests {
                         .await
                         .unwrap();
                 for out in [converted, preview, recording] {
-                    assert_eq!(out, [83, 83, 83, 255].repeat(w * h));
+                    assert_eq!(out, [luma, luma, luma, 255].repeat(w * h));
                 }
-                assert_eq!(photo.image.as_raw(), &[83, 83, 83].repeat(w * h));
+                assert_eq!(photo.image.as_raw(), &[luma; 3].repeat(w * h));
             }
         });
     }
@@ -1857,66 +1865,12 @@ mod tests {
             return;
         };
         for (w, h) in [(9, 4), (7, 13)] {
-            let frame = review_n1_gray_frame(w, h);
+            let frame = review_n1_gray_frame(w, h, 83);
             assert_eq!(
                 crate::app::review_decoded_preview(&device, &queue, &frame),
                 [83, 83, 83, 255].repeat(w * h)
             );
         }
-    }
-
-    #[test]
-    fn review_r3_real_gray_mjpeg_all_consumers() {
-        let Some((_guard, device, queue)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu("review_r3_real_gray_mjpeg_all_consumers");
-            return;
-        };
-        pollster::block_on(async {
-            let pixels = [128u8; 3].repeat(36);
-            let mut compressor = turbojpeg::Compressor::new().unwrap();
-            compressor.set_quality(100).unwrap();
-            compressor.set_subsamp(turbojpeg::Subsamp::Gray).unwrap();
-            let jpeg = compressor
-                .compress_to_vec(turbojpeg::Image {
-                    pixels: &pixels[..],
-                    width: 9,
-                    height: 4,
-                    pitch: 27,
-                    format: turbojpeg::PixelFormat::RGB,
-                })
-                .unwrap();
-            let frame = super::decode_mjpeg_frame(
-                &mut turbojpeg::Decompressor::new().unwrap(),
-                &jpeg,
-                Instant::now(),
-                None,
-                &Default::default(),
-                1,
-                &FrameDataPool::new(1),
-            )
-            .unwrap();
-            assert_eq!(
-                frame.format,
-                crate::backends::camera::types::PixelFormat::Gray8
-            );
-            crate::shaders::GpuFrameInput::from_camera_frame(&frame).unwrap();
-            let preview = crate::app::review_decoded_preview(&device, &queue, &frame);
-            let recording = crate::pipelines::video::recorder::convert_frame_to_rgba(&frame)
-                .await
-                .unwrap();
-            let photo = crate::pipelines::photo::processing::PostProcessor::new(Default::default())
-                .process(Arc::new(frame))
-                .await
-                .unwrap();
-            for out in [&preview, &recording] {
-                for pixel in out.as_chunks::<4>().0 {
-                    assert_eq!(*pixel, [128, 128, 128, 255]);
-                }
-            }
-            for pixel in photo.image.pixels() {
-                assert_eq!(pixel.0, [128, 128, 128]);
-            }
-        });
     }
 
     #[test]

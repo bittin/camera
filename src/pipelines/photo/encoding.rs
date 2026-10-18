@@ -230,28 +230,18 @@ impl PhotoEncoder {
             Self::complete_host_metadata(&mut camera_metadata);
             let image = processed.image;
             let data = match format {
-                EncodingFormat::Jpeg => {
-                    let data = Self::encode_jpeg(&image, quality)?;
+                EncodingFormat::Jpeg | EncodingFormat::Png => {
+                    let (data, file_type) = if format == EncodingFormat::Jpeg {
+                        (Self::encode_jpeg(&image, quality)?, FileExtension::JPEG)
+                    } else {
+                        (
+                            Self::encode_png(&image)?,
+                            FileExtension::PNG { as_zTXt_chunk: false },
+                        )
+                    };
                     Self::embed_standard_metadata(
                         data,
-                        FileExtension::JPEG,
-                        processed.width,
-                        processed.height,
-                        &camera_metadata,
-                        MetadataFallback {
-                            image: &image,
-                            format,
-                            quality,
-                        },
-                    )
-                }
-                EncodingFormat::Png => {
-                    let data = Self::encode_png(&image)?;
-                    Self::embed_standard_metadata(
-                        data,
-                        FileExtension::PNG {
-                            as_zTXt_chunk: false,
-                        },
+                        file_type,
                         processed.width,
                         processed.height,
                         &camera_metadata,
@@ -658,8 +648,7 @@ impl PhotoEncoder {
         let raw_data = image.as_raw().clone();
         let raw_data_len = raw_data.len() as u32;
 
-        let version = env!("CARGO_PKG_VERSION");
-        let mut ifd = set_common_dng_tags(width, height, camera_metadata, version);
+        let mut ifd = set_common_dng_tags(width, height, camera_metadata);
 
         // RGB-specific tags
         ifd.insert(
@@ -766,8 +755,7 @@ impl PhotoEncoder {
             _ => return Err(format!("Not a Bayer format: {:?}", raw.format)),
         };
 
-        let version = env!("CARGO_PKG_VERSION");
-        let mut ifd = set_common_dng_tags(width, height, camera_metadata, version);
+        let mut ifd = set_common_dng_tags(width, height, camera_metadata);
 
         // DNG version 1.4.0.0
         ifd.insert(
@@ -918,7 +906,6 @@ fn set_common_dng_tags(
     width: u32,
     height: u32,
     camera_metadata: &CaptureMetadata,
-    _version: &str,
 ) -> dng::ifd::Ifd {
     use dng::ifd::{Ifd, IfdValue};
     use dng::tags::ifd as tiff_tags;
@@ -1166,6 +1153,62 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn jpeg_and_png_exports_preserve_encoded_bytes_and_metadata() {
+        let source = test_image(65, 33);
+        let metadata = CaptureMetadata {
+            device_make: Some("Example".into()),
+            device_model: Some("Camera".into()),
+            captured_at: Some(
+                DateTime::parse_from_rfc3339("2026-09-28T12:34:56.789+02:00").unwrap(),
+            ),
+            orientation: crate::pipelines::capture_metadata::CaptureOrientation::Rotate270,
+            ..Default::default()
+        };
+        for (format, file_type, data) in [
+            (
+                EncodingFormat::Jpeg,
+                FileExtension::JPEG,
+                PhotoEncoder::encode_jpeg(&source, EncodingQuality::High).unwrap(),
+            ),
+            (
+                EncodingFormat::Png,
+                FileExtension::PNG {
+                    as_zTXt_chunk: false,
+                },
+                PhotoEncoder::encode_png(&source).unwrap(),
+            ),
+        ] {
+            let expected = PhotoEncoder::embed_standard_metadata(
+                data,
+                file_type,
+                65,
+                33,
+                &metadata,
+                MetadataFallback {
+                    image: &source,
+                    format,
+                    quality: EncodingQuality::High,
+                },
+            );
+            let mut encoder = PhotoEncoder::new();
+            encoder.set_format(format);
+            encoder.set_camera_metadata(metadata.clone());
+            let actual = encoder
+                .encode(ProcessedImage {
+                    image: source.clone(),
+                    width: 65,
+                    height: 33,
+                })
+                .await
+                .unwrap();
+            assert_eq!(actual.data, expected, "{format:?}");
+            assert_eq!(actual.format, format);
+            assert_eq!((actual.width, actual.height), (65, 33));
+            assert_eq!(actual.captured_at, metadata.captured_at);
+        }
+    }
+
     #[test]
     fn avif_workers_leave_two_cpus_with_at_least_one_worker() {
         for (available, expected) in [(0, 1), (1, 1), (2, 1), (3, 1), (4, 2), (16, 14)] {
@@ -1211,7 +1254,6 @@ mod tests {
         let format: crate::config::PhotoOutputFormat =
             serde_json::from_str("\"Avif\"").expect("AVIF must be a selectable format");
         assert!(crate::config::PhotoOutputFormat::ALL.contains(&format));
-        assert_eq!(format.extension(), "avif");
         let mut encoder = PhotoEncoder::new();
         encoder.set_format(format.into());
         let captured_at = FixedOffset::east_opt(7200)

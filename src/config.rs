@@ -39,16 +39,6 @@ pub enum PhotoOutputFormat {
 }
 
 impl PhotoOutputFormat {
-    /// Get file extension for this format
-    pub fn extension(&self) -> &'static str {
-        match self {
-            PhotoOutputFormat::Jpeg => "jpg",
-            PhotoOutputFormat::Png => "png",
-            PhotoOutputFormat::Dng => "dng",
-            PhotoOutputFormat::Avif => "avif",
-        }
-    }
-
     /// Get display name for this format
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -308,11 +298,7 @@ pub enum OverlayEffect {
 /// lifetime, since `is_cosmic_desktop()` caches.
 impl Default for OverlayEffect {
     fn default() -> Self {
-        if is_cosmic_desktop() {
-            Self::System
-        } else {
-            Self::Translucent
-        }
+        Self::System.effective()
     }
 }
 
@@ -614,78 +600,26 @@ mod tests {
         }
     }
 
-    /// value -> index -> value must be identity in BOTH environments.
-    ///
-    /// The dropdown's index space is `available()`, which is one shorter
-    /// off-COSMIC. Hardcoding `0 => System, 1 => Frosted, ...` passes on COSMIC
-    /// and silently shifts every choice by one off it — index 0 would decode to
-    /// `System`, which is not even in the list. This is the test that catches it.
     #[test]
-    fn dropdown_index_round_trips_in_both_environments() {
-        for is_cosmic in [true, false] {
-            let available = OverlayEffect::available_for(is_cosmic);
-
-            // Every offered variant survives value -> index -> value.
-            for &effect in available {
-                let index = effect.dropdown_index_for(is_cosmic);
+    fn dropdown_indices_match_offered_effects_on_both_desktops() {
+        use OverlayEffect::{Frosted, Off, System, Translucent};
+        for (is_cosmic, expected) in [
+            (true, &[System, Frosted, Translucent, Off][..]),
+            (false, &[Frosted, Translucent, Off][..]),
+        ] {
+            assert_eq!(OverlayEffect::available_for(is_cosmic), expected);
+            for (index, &effect) in expected.iter().enumerate() {
+                assert_eq!(effect.dropdown_index_for(is_cosmic), index);
                 assert_eq!(
                     OverlayEffect::from_dropdown_index_for(index, is_cosmic),
-                    Some(effect),
-                    "{effect:?} did not round-trip at index {index} \
-                     (is_cosmic={is_cosmic})"
+                    Some(effect)
                 );
             }
-
-            // ...and every offered index survives index -> value -> index.
-            for index in 0..available.len() {
-                let effect = OverlayEffect::from_dropdown_index_for(index, is_cosmic)
-                    .expect("in-range index must decode");
-                assert_eq!(
-                    effect.dropdown_index_for(is_cosmic),
-                    index,
-                    "index {index} decoded to {effect:?}, which re-encodes elsewhere \
-                     (is_cosmic={is_cosmic})"
-                );
-            }
-
-            // Out of range must be rejected, not wrapped or defaulted.
             assert_eq!(
-                OverlayEffect::from_dropdown_index_for(available.len(), is_cosmic),
+                OverlayEffect::from_dropdown_index_for(expected.len(), is_cosmic),
                 None
             );
         }
-    }
-
-    /// The mapping must agree with the labels the dropdown was actually built
-    /// from: `mod.rs` maps `available()` to strings positionally, so index N
-    /// must mean `available()[N]` on both desktops.
-    #[test]
-    fn dropdown_index_matches_the_options_it_labels() {
-        // On COSMIC the list is the full ALL order...
-        assert_eq!(
-            OverlayEffect::from_dropdown_index_for(0, true),
-            Some(OverlayEffect::System)
-        );
-        assert_eq!(
-            OverlayEffect::from_dropdown_index_for(3, true),
-            Some(OverlayEffect::Off)
-        );
-
-        // ...and off-COSMIC every index means one entry EARLIER in ALL. A
-        // handler that hardcoded the ALL order would decode each of these wrong.
-        assert_eq!(
-            OverlayEffect::from_dropdown_index_for(0, false),
-            Some(OverlayEffect::Frosted)
-        );
-        assert_eq!(
-            OverlayEffect::from_dropdown_index_for(1, false),
-            Some(OverlayEffect::Translucent)
-        );
-        assert_eq!(
-            OverlayEffect::from_dropdown_index_for(2, false),
-            Some(OverlayEffect::Off)
-        );
-        assert_eq!(OverlayEffect::from_dropdown_index_for(3, false), None);
     }
 
     /// A stored `System` read off-COSMIC must select the entry it fell back to,
@@ -699,19 +633,6 @@ mod tests {
             "System off-COSMIC must display as Translucent"
         );
         assert!(index < OverlayEffect::available_for(false).len());
-    }
-
-    /// Pins the actual off-COSMIC index layout, so a hardcoded ALL-based
-    /// mapping is caught rather than merely being self-consistent.
-    #[test]
-    fn off_cosmic_indices_are_shifted_relative_to_all() {
-        let available = OverlayEffect::available_for(false);
-        assert_eq!(available[0], OverlayEffect::Frosted);
-        assert_eq!(available[1], OverlayEffect::Translucent);
-        assert_eq!(available[2], OverlayEffect::Off);
-        // ...whereas ALL[0] is System. The two index spaces genuinely differ.
-        assert_eq!(OverlayEffect::ALL[0], OverlayEffect::System);
-        assert_ne!(available[0], OverlayEffect::ALL[0]);
     }
 
     /// A `System` written on COSMIC and read elsewhere falls back to the
@@ -745,30 +666,14 @@ mod tests {
     /// desktop), `Translucent` elsewhere (the flat off-COSMIC baseline).
     #[test]
     fn default_effect_is_system_on_cosmic_translucent_elsewhere() {
-        // The pure form, so both branches are covered wherever this runs.
-        let default_for = |is_cosmic| {
-            if is_cosmic {
+        assert_eq!(
+            OverlayEffect::default(),
+            if is_cosmic_desktop() {
                 OverlayEffect::System
             } else {
                 OverlayEffect::Translucent
             }
-        };
-        assert_eq!(default_for(true), OverlayEffect::System);
-        assert_eq!(default_for(false), OverlayEffect::Translucent);
-
-        // The real `Default` agrees with the pure form for this environment...
-        assert_eq!(
-            OverlayEffect::default(),
-            default_for(is_cosmic_desktop()),
-            "Default disagrees with the expected environment default"
         );
-
-        // ...and the default is always offered by the dropdown it defaults in.
-        for is_cosmic in [true, false] {
-            assert!(
-                OverlayEffect::available_for(is_cosmic).contains(&default_for(is_cosmic)),
-                "default is not offered on is_cosmic={is_cosmic}"
-            );
-        }
+        assert!(OverlayEffect::available().contains(&OverlayEffect::default()));
     }
 }

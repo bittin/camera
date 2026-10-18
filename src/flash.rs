@@ -11,29 +11,6 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// Flash operating mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum FlashMode {
-    /// Flash LED is off
-    #[default]
-    Off,
-    /// Flash fires during photo capture (LED on briefly before shutter)
-    On,
-    /// Torch / flashlight mode (LED stays on continuously)
-    Torch,
-}
-
-impl FlashMode {
-    /// Cycle to the next mode: Off -> On -> Torch -> Off
-    pub fn next(self) -> Self {
-        match self {
-            FlashMode::Off => FlashMode::On,
-            FlashMode::On => FlashMode::Torch,
-            FlashMode::Torch => FlashMode::Off,
-        }
-    }
-}
-
 /// A flash LED device discovered via sysfs
 #[derive(Debug, Clone)]
 pub struct FlashDevice {
@@ -46,11 +23,6 @@ pub struct FlashDevice {
 }
 
 impl FlashDevice {
-    /// Get the device name (e.g. "white:flash")
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Set raw brightness value (0 = off, max_brightness = full)
     pub fn set_brightness(&self, value: u32) -> io::Result<()> {
         let clamped = value.min(self.max_brightness);
@@ -99,7 +71,7 @@ impl FlashHardware {
         };
 
         let mut devices = Vec::new();
-        let mut permission_failures: Vec<(String, PathBuf)> = Vec::new();
+        let mut permission_failures = Vec::new();
 
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -155,7 +127,7 @@ impl FlashHardware {
                         path = %brightness_path.display(),
                         "Flash LED found but not writable"
                     );
-                    permission_failures.push((name_str.to_string(), brightness_path));
+                    permission_failures.push(brightness_path);
                 }
             }
         }
@@ -189,7 +161,7 @@ impl FlashHardware {
     ///
     /// Dynamically detects the current username, the required group from
     /// file ownership, and whether `doas` or `sudo` is available.
-    fn build_permission_error(failures: &[(String, PathBuf)]) -> String {
+    fn build_permission_error(failures: &[PathBuf]) -> String {
         let username = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
 
         let escalation_tool = if Path::new("/usr/bin/doas").exists() {
@@ -201,7 +173,7 @@ impl FlashHardware {
         // Try to detect the group from the first failed brightness file
         let group = failures
             .first()
-            .and_then(|(_, path)| {
+            .and_then(|path| {
                 let meta = std::fs::metadata(path).ok()?;
                 let gid = meta.gid();
                 // Resolve GID to group name by reading /etc/group

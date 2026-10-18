@@ -13,14 +13,14 @@ fn failed_native_map_then_cached_demosaic_reuse_preserves_first_error() {
     engine.staging_for_test().destroy();
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let first = engine
-        .validate(&device)
+        .validate()
         .expect_err("destroyed buffer must fail mapping");
     eprintln!(
         "FIRST BACKEND DIAGNOSTIC: {:?}",
         pollster::block_on(scope.pop())
     );
     engine
-        .validate(&device)
+        .validate()
         .expect_err("unprepared retry must fail without already-mapped panic");
     eprintln!("FIRST MAP FAILURE: {first}");
     assert!(
@@ -35,6 +35,6 @@ fn failed_native_map_then_cached_demosaic_reuse_preserves_first_error() {
         bytemuck::cast_slice(&[0_u32, 0, 0.75_f32.to_bits(), 0]),
     );
     queue.submit([]);
-    assert_eq!(engine.validate(&device).unwrap(), 0.75);
-    assert_eq!(engine.validate(&device).unwrap(), 0.75);
+    assert_eq!(engine.validate().unwrap(), 0.75);
+    assert_eq!(engine.validate().unwrap(), 0.75);
 }

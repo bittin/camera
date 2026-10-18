@@ -404,24 +404,6 @@ pub struct BurstModeGpuPipeline {
 use gpu_helpers::BindingKind;
 
 impl BurstModeGpuPipeline {
-    /// Create a compute pipeline with common defaults
-    fn create_pipeline(
-        device: &wgpu::Device,
-        label: &str,
-        layout: &wgpu::PipelineLayout,
-        module: &wgpu::ShaderModule,
-        entry_point: &str,
-    ) -> wgpu::ComputePipeline {
-        device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(label),
-            layout: Some(layout),
-            module,
-            entry_point: Some(entry_point),
-            compilation_options: Default::default(),
-            cache: None,
-        })
-    }
-
     /// Create a GPU buffer with the specified usage pattern
     fn create_buffer(&self, label: &str, size: u64, kind: BufferKind) -> wgpu::Buffer {
         let usage = match kind {
@@ -673,49 +655,49 @@ impl BurstModeGpuPipeline {
         });
 
         // Create compute pipelines
-        let pyramid_downsample_gray = Self::create_pipeline(
+        let pyramid_downsample_gray = gpu_helpers::create_pipeline(
             &device,
             "pyramid_downsample_gray",
             &pyramid_pipeline_layout,
             &pyramid_module,
             "downsample_gray",
         );
-        let sharpness_tiles = Self::create_pipeline(
+        let sharpness_tiles = gpu_helpers::create_pipeline(
             &device,
             "sharpness_tiles",
             &sharpness_pipeline_layout,
             &sharpness_module,
             "compute_sharpness_tiles",
         );
-        let sharpness_reduce = Self::create_pipeline(
+        let sharpness_reduce = gpu_helpers::create_pipeline(
             &device,
             "sharpness_reduce",
             &sharpness_pipeline_layout,
             &sharpness_module,
             "reduce_sharpness",
         );
-        let align_tiles = Self::create_pipeline(
+        let align_tiles = gpu_helpers::create_pipeline(
             &device,
             "align_tiles",
             &align_pipeline_layout,
             &align_module,
             "align_tiles_parallel",
         );
-        let align_correct_upsampling = Self::create_pipeline(
+        let align_correct_upsampling = gpu_helpers::create_pipeline(
             &device,
             "align_correct_upsampling",
             &align_pipeline_layout,
             &align_module,
             "correct_upsampling_error",
         );
-        let rgb_to_luminance = Self::create_pipeline(
+        let rgb_to_luminance = gpu_helpers::create_pipeline(
             &device,
             "rgb_to_luminance",
             &luminance_pipeline_layout,
             &align_module,
             "rgb_to_luminance",
         );
-        let warp_frame = Self::create_pipeline(
+        let warp_frame = gpu_helpers::create_pipeline(
             &device,
             "warp_frame",
             &warp_pipeline_layout,
@@ -724,14 +706,14 @@ impl BurstModeGpuPipeline {
         );
 
         // Tonemap pipelines
-        let tonemap_local_lum = Self::create_pipeline(
+        let tonemap_local_lum = gpu_helpers::create_pipeline(
             &device,
             "tonemap_local_lum",
             &local_lum_pipeline_layout,
             &tonemap_module,
             "compute_local_luminance",
         );
-        let tonemap_apply = Self::create_pipeline(
+        let tonemap_apply = gpu_helpers::create_pipeline(
             &device,
             "tonemap_apply",
             &tonemap_pipeline_layout,
@@ -740,28 +722,28 @@ impl BurstModeGpuPipeline {
         );
 
         // Noise estimation pipelines
-        let noise_build_histogram = Self::create_pipeline(
+        let noise_build_histogram = gpu_helpers::create_pipeline(
             &device,
             "noise_build_histogram",
             &noise_pipeline_layout,
             &noise_module,
             "build_histogram",
         );
-        let noise_find_median = Self::create_pipeline(
+        let noise_find_median = gpu_helpers::create_pipeline(
             &device,
             "noise_find_median",
             &noise_pipeline_layout,
             &noise_module,
             "find_median_from_histogram",
         );
-        let noise_compute_mad = Self::create_pipeline(
+        let noise_compute_mad = gpu_helpers::create_pipeline(
             &device,
             "noise_compute_mad",
             &noise_pipeline_layout,
             &noise_module,
             "compute_mad_tiles",
         );
-        let noise_finalize = Self::create_pipeline(
+        let noise_finalize = gpu_helpers::create_pipeline(
             &device,
             "noise_finalize",
             &noise_pipeline_layout,
@@ -770,21 +752,21 @@ impl BurstModeGpuPipeline {
         );
 
         // CA estimation pipelines
-        let ca_init_bins = Self::create_pipeline(
+        let ca_init_bins = gpu_helpers::create_pipeline(
             &device,
             "ca_init_bins",
             &ca_pipeline_layout,
             &ca_module,
             "init_bins",
         );
-        let ca_estimate_offsets = Self::create_pipeline(
+        let ca_estimate_offsets = gpu_helpers::create_pipeline(
             &device,
             "ca_estimate_offsets",
             &ca_pipeline_layout,
             &ca_module,
             "estimate_ca_offsets",
         );
-        let ca_fit_model = Self::create_pipeline(
+        let ca_fit_model = gpu_helpers::create_pipeline(
             &device,
             "ca_fit_model",
             &ca_pipeline_layout,
@@ -804,7 +786,7 @@ impl BurstModeGpuPipeline {
                 bind_group_layouts: &[&bayer_finish_layout],
                 immediate_size: 0,
             });
-        let bayer_finish = Self::create_pipeline(
+        let bayer_finish = gpu_helpers::create_pipeline(
             &device,
             "bayer_finish",
             &bayer_finish_pipeline_layout,
@@ -2533,7 +2515,7 @@ impl BurstModeGpuPipeline {
                 method,
             );
             self.queue.submit([encoder.finish()]);
-            engine.validate(&self.device)?
+            engine.validate()?
         };
         crate::shaders::validate_bayer_colour(colour_gains, colour_correction_matrix, bound)
             .map_err(str::to_owned)?;
@@ -3884,27 +3866,7 @@ mod tests {
         assert!(!config.export_raw_frames);
     }
 
-    /// Validate that a WGSL shader compiles successfully using naga
-    fn validate_shader(name: &str, source: &str) {
-        let result = naga::front::wgsl::parse_str(source);
-        match result {
-            Ok(module) => {
-                // Validate the parsed module
-                let info = naga::valid::Validator::new(
-                    naga::valid::ValidationFlags::all(),
-                    naga::valid::Capabilities::all(),
-                )
-                .validate(&module);
-
-                if let Err(e) = info {
-                    panic!("Shader '{}' validation failed: {:?}", name, e);
-                }
-            }
-            Err(e) => {
-                panic!("Shader '{}' parse failed: {:?}", name, e);
-            }
-        }
-    }
+    use crate::test_gpu::validate_shader;
 
     #[test]
     fn test_pyramid_shader_validates() {

@@ -204,15 +204,7 @@ mod tests {
         }
     }
 
-    fn validate_shader(source: &str) {
-        let module = naga::front::wgsl::parse_str(source).expect("WGSL should parse");
-        naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .validate(&module)
-        .expect("WGSL should validate");
-    }
+    use crate::test_gpu::validate_shader;
 
     #[test]
     fn clipped_synthetic_highlight_is_neutral() {
@@ -311,12 +303,14 @@ mod tests {
             assert!(!adapter.contains("fn demosaic("));
             assert!(!adapter.contains("dot("));
         }
-        validate_shader(&super::compose_bayer_texture(include_str!(
-            "debayer_texture.wgsl"
-        )));
-        validate_shader(&compose_debayer(include_str!(
-            "burst_mode/bayer_finish.wgsl"
-        )));
+        validate_shader(
+            "debayer_texture",
+            &super::compose_bayer_texture(include_str!("debayer_texture.wgsl")),
+        );
+        validate_shader(
+            "bayer_finish",
+            &compose_debayer(include_str!("burst_mode/bayer_finish.wgsl")),
+        );
     }
 
     #[test]
@@ -392,19 +386,25 @@ mod tests {
 
     #[test]
     fn composed_raw_shaders_validate() {
-        validate_shader(&super::compose_bayer_texture(include_str!(
-            "debayer_texture.wgsl"
-        )));
-        validate_shader(&super::compose_bayer_texture(include_str!(
-            "debayer_photo.wgsl"
-        )));
-        validate_shader(&format!(
-            "{}\n{}",
-            super::BAYER_FINISH_FUNCTIONS,
-            include_str!("debayer_finish.wgsl")
-        ));
-        validate_shader(&compose_debayer(include_str!(
-            "burst_mode/bayer_finish.wgsl"
-        )));
+        validate_shader(
+            "debayer_texture",
+            &super::compose_bayer_texture(include_str!("debayer_texture.wgsl")),
+        );
+        validate_shader(
+            "debayer_photo",
+            &super::compose_bayer_texture(include_str!("debayer_photo.wgsl")),
+        );
+        validate_shader(
+            "debayer_finish",
+            &format!(
+                "{}\n{}",
+                super::BAYER_FINISH_FUNCTIONS,
+                include_str!("debayer_finish.wgsl")
+            ),
+        );
+        validate_shader(
+            "bayer_finish",
+            &compose_debayer(include_str!("burst_mode/bayer_finish.wgsl")),
+        );
     }
 }

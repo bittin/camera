@@ -181,8 +181,9 @@ fn advanced_photo_batches_are_fenced_and_byte_exact(method: DemosaicMethod) {
         crate::test_gpu::skip_no_gpu("advanced_photo_batches_are_fenced_and_byte_exact");
         return;
     };
-    let events = Events::default();
-    let subscriber = tracing_subscriber::registry().with(Capture(events.clone()));
+    let capture = Capture::default();
+    let events = &capture.0;
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
     let _subscriber = tracing::subscriber::set_default(subscriber);
     pollster::block_on(async {
         let mut photo = GpuConvertPipeline::new().await.unwrap();
@@ -239,19 +240,8 @@ fn advanced_photo_batches_are_fenced_and_byte_exact(method: DemosaicMethod) {
                                 )
                                 .unwrap();
                         }
-                        let count = |stage: &str| {
-                            events
-                                .lock()
-                                .unwrap()
-                                .iter()
-                                .filter(|e| {
-                                    e.get("message")
-                                        .is_some_and(|m| m == "Photo GPU batch completed")
-                                        && e.get("stage")
-                                            .is_some_and(|s| s.trim_matches('"') == stage)
-                                })
-                                .count()
-                        };
+                        let completed = capture.completed_stages();
+                        let count = |stage: &str| completed.iter().filter(|s| *s == stage).count();
                         // Test all missing stages together so RED shows both methods.
                         assert_eq!(
                             (
@@ -269,23 +259,13 @@ fn advanced_photo_batches_are_fenced_and_byte_exact(method: DemosaicMethod) {
                             "{method:?}: missing fenced bounded stages"
                         );
                         if matches!(layout, RawLayout::Csi2 { .. }) {
-                            check_batches(&events, "unpack", w, h, 1);
+                            check_batches(events, "unpack", w, h, 1);
                         }
                         assert_eq!(count("prepare"), 1);
                         assert_eq!(count("demosaic-status"), 1);
                         for stage in ["normalize", "colour", "finish"] {
-                            check_batches(&events, stage, w, h, 16);
+                            check_batches(events, stage, w, h, 16);
                         }
-                        let completed: Vec<String> = events
-                            .lock()
-                            .unwrap()
-                            .iter()
-                            .filter(|e| {
-                                e.get("message")
-                                    .is_some_and(|m| m == "Photo GPU batch completed")
-                            })
-                            .map(|e| e["stage"].trim_matches('"').to_owned())
-                            .collect();
                         let unpack_count = if matches!(layout, RawLayout::Csi2 { .. }) {
                             2
                         } else {

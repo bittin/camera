@@ -27,55 +27,35 @@ pub async fn load_latest_thumbnail(
     photos_dir: PathBuf,
     videos_dir: PathBuf,
 ) -> Option<GalleryThumbnailData> {
-    // Get list of photo and video files from both directories (using blocking std::fs)
-    let mut entries = tokio::task::spawn_blocking(move || {
-        let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-        // Scan photos directory for image files
-        if let Ok(entries) = std::fs::read_dir(&photos_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    let ext_str = ext.to_string_lossy().to_lowercase();
-                    if file_formats::is_image_extension(&ext_str)
-                        && let Ok(metadata) = entry.metadata()
-                        && let Ok(modified) = metadata.modified()
-                    {
-                        files.push((path, modified));
-                    }
-                }
-            }
-        }
-
-        // Scan videos directory for video files
-        if let Ok(entries) = std::fs::read_dir(&videos_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    let ext_str = ext.to_string_lossy().to_lowercase();
-                    if file_formats::is_video_extension(&ext_str)
-                        && let Ok(metadata) = entry.metadata()
-                        && let Ok(modified) = metadata.modified()
-                    {
-                        files.push((path, modified));
-                    }
-                }
-            }
-        }
-
-        files
+    let latest_path = tokio::task::spawn_blocking(move || {
+        let directories = [
+            (
+                photos_dir,
+                file_formats::is_image_extension as fn(&str) -> bool,
+            ),
+            (videos_dir, file_formats::is_video_extension),
+        ];
+        directories
+            .into_iter()
+            .flat_map(|(directory, accepts)| {
+                std::fs::read_dir(directory)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .filter_map(move |entry| {
+                        let path = entry.path();
+                        if !accepts(&path.extension()?.to_string_lossy()) {
+                            return None;
+                        }
+                        Some((path, entry.metadata().ok()?.modified().ok()?))
+                    })
+            })
+            // min keeps the first equal timestamp, like the previous stable sort.
+            .min_by_key(|(_, modified)| std::cmp::Reverse(*modified))
+            .map(|(path, _)| path)
     })
     .await
-    .ok()?;
-
-    if entries.is_empty() {
-        return None;
-    }
-
-    // Sort by modification time (newest first)
-    entries.sort_by_key(|b| std::cmp::Reverse(b.1));
-
-    let latest_path = entries.first()?.0.clone();
+    .ok()??;
     let extension = latest_path
         .extension()
         .and_then(|e| e.to_str())
@@ -268,6 +248,53 @@ fn encode_rgba_to_png(rgba_data: &[u8], width: u32, height: u32) -> Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn latest_thumbnail_ignores_wrong_directory_formats_and_missing_directories() {
+        let root = std::env::temp_dir().join(format!("camera-gallery-{}", uuid::Uuid::new_v4()));
+        let photos = root.join("photos");
+        let videos = root.join("videos");
+        std::fs::create_dir_all(&photos).unwrap();
+        std::fs::create_dir_all(&videos).unwrap();
+        let png = encode_rgba_to_png(&[20, 40, 60, 255], 1, 1).unwrap();
+        let expected = photos.join("new.PNG");
+        let older = photos.join("old.png");
+        std::fs::write(&expected, &png).unwrap();
+        std::fs::write(&older, &png).unwrap();
+        let old_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        std::fs::File::open(&older)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        std::fs::write(videos.join("not-a-video.png"), &png).unwrap();
+        std::fs::write(photos.join("not-an-image.txt"), b"ignored").unwrap();
+
+        // Equal timestamps retain the photo-first traversal order. An invalid
+        // video would fail decoding if it incorrectly displaced the photo.
+        let tied_video = videos.join("same-time.mp4");
+        std::fs::write(&tied_video, b"not selected").unwrap();
+        std::fs::File::open(&tied_video)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::fs::metadata(&expected).unwrap().modified().unwrap()),
+            )
+            .unwrap();
+        for video_dir in [videos, root.join("missing")] {
+            let (_, rgba, width, height, path) = load_latest_thumbnail(photos.clone(), video_dir)
+                .await
+                .unwrap();
+            assert_eq!(path, expected);
+            assert_eq!((width, height), (1, 1));
+            assert_eq!(&**rgba, &[20, 40, 60, 255]);
+        }
+        assert!(
+            load_latest_thumbnail(root.join("absent"), root.join("missing"))
+                .await
+                .is_none()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn latest_avif_thumbnail_applies_capture_orientation() {

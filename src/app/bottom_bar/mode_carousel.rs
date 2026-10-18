@@ -1124,17 +1124,12 @@ pub fn carousel_width_for_modes(modes: &[CameraMode]) -> f32 {
     let spacing = cosmic::theme::spacing();
     let pad_h = spacing.space_xs as f32;
 
-    let mut widths: Vec<f32> = modes
+    let widths: Vec<f32> = modes
         .iter()
         .map(|m| estimate_label_width(&mode_label(*m), pad_h))
         .collect();
 
-    if widths.len() <= 2 {
-        widths.iter().sum::<f32>() + (widths.len().saturating_sub(1)) as f32 * LABEL_GAP
-    } else {
-        widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        widths[0] + widths[1] + LABEL_GAP
-    }
+    content_long(&widths)
 }
 
 /// Collapsed space from a rotated carousel to each sibling button. Spacious
@@ -1940,6 +1935,32 @@ fn rubber_band_offset(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_carousel_width_matches_widget_metrics_for_every_mode_subset() {
+        let all = [
+            CameraMode::Photo,
+            CameraMode::Video,
+            CameraMode::Timelapse,
+            CameraMode::Virtual,
+            CameraMode::View,
+        ];
+        for mask in 0..(1 << all.len()) {
+            let modes: Vec<_> = all
+                .iter()
+                .enumerate()
+                .filter_map(|(index, mode)| ((mask & (1 << index)) != 0).then_some(*mode))
+                .collect();
+            let mut state = CarouselState::default();
+            recalculate_label_metrics(&modes, &mut state);
+            let mut sorted_widths = state.label_widths.clone();
+            sorted_widths.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let expected = sorted_widths.iter().take(2).sum::<f32>()
+                + if modes.len() > 1 { LABEL_GAP } else { 0.0 };
+            assert_eq!(carousel_width_for_modes(&modes), expected, "{modes:?}");
+            assert_eq!(content_long(&state.label_widths), expected, "{modes:?}");
+        }
+    }
 
     #[test]
     fn side_carousel_wheel_uses_vertical_scroll_delta() {

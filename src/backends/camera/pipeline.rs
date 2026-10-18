@@ -49,18 +49,7 @@ impl CapturePipeline {
             Self::PipeWire(_) => false,
         }
     }
-    pub(crate) fn request_still_capture(&self) {
-        match self {
-            Self::Native(p) => p.request_still_capture(),
-            Self::PipeWire(p) => p.request_still_capture(),
-        }
-    }
-    pub(crate) fn get_still_frame(&self) -> Option<CameraFrame> {
-        match self {
-            Self::Native(p) => p.get_still_frame(),
-            Self::PipeWire(p) => p.get_still_frame(),
-        }
-    }
+
     pub(crate) fn begin_still_capture(&self) -> super::still_capture::StillRequest {
         match self {
             Self::Native(p) => p.begin_still_capture(),

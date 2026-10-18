@@ -412,22 +412,23 @@ fn add_audio_branch_to_pipeline(
     audio_branch: &AudioBranch,
     audio_levels: &SharedAudioLevels,
 ) -> Result<(), String> {
+    let chain = [
+        &audio_branch.source,
+        &audio_branch.queue,
+        &audio_branch.convert,
+        &audio_branch.resample,
+        &audio_branch.capsfilter,
+        &audio_branch.compressor,
+        &audio_branch.makeup_gain,
+        &audio_branch.limiter,
+        &audio_branch.level,
+        &audio_branch.encoder,
+    ];
     pipeline
-        .add_many([
-            &audio_branch.source,
-            &audio_branch.queue,
-            &audio_branch.convert,
-            &audio_branch.resample,
-            &audio_branch.capsfilter,
-            &audio_branch.compressor,
-            &audio_branch.makeup_gain,
-            &audio_branch.limiter,
-            &audio_branch.level,
-            &audio_branch.encoder,
-        ])
+        .add_many(chain)
         .map_err(|e| format!("Failed to add audio elements to pipeline: {}", e))?;
 
-    VideoRecorder::link_audio_chain(audio_branch)?;
+    gst::Element::link_many(chain).map_err(|_| "Failed to link audio chain")?;
 
     let muxer = pipeline
         .by_name("recording-muxer")
@@ -1508,26 +1509,6 @@ impl VideoRecorder {
         }))
     }
 
-    /// Link audio chain:
-    /// source → queue → convert → resample → capsfilter(mono) → compressor → makeup_gain → limiter → level → encoder
-    fn link_audio_chain(audio_branch: &AudioBranch) -> Result<(), String> {
-        gst::Element::link_many([
-            &audio_branch.source,
-            &audio_branch.queue,
-            &audio_branch.convert,
-            &audio_branch.resample,
-            &audio_branch.capsfilter,
-            &audio_branch.compressor,
-            &audio_branch.makeup_gain,
-            &audio_branch.limiter,
-            &audio_branch.level,
-            &audio_branch.encoder,
-        ])
-        .map_err(|_| "Failed to link audio chain")?;
-
-        Ok(())
-    }
-
     /// Start recording (idempotent — no-op if already playing)
     pub fn start(&self) -> Result<(), String> {
         // Skip if already playing (e.g. JPEG zero-copy path starts eagerly)
@@ -1699,6 +1680,60 @@ struct AudioBranch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_audio_branch_adds_and_links_every_stage_in_order() {
+        use crate::media::encoders::audio::{AudioCodec, SelectedAudioEncoder};
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let muxer = gst::ElementFactory::make("webmmux")
+            .name("recording-muxer")
+            .build()
+            .unwrap();
+        pipeline.add(&muxer).unwrap();
+        let branch = VideoRecorder::create_audio_branch(
+            None,
+            48_000,
+            SelectedAudioEncoder {
+                encoder: gst::ElementFactory::make("opusenc").build().unwrap(),
+                codec: AudioCodec::Opus,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        add_audio_branch_to_pipeline(&pipeline, &branch, &SharedAudioLevels::default()).unwrap();
+        // Inspect the real graph independently of its construction list. NULL
+        // state is sufficient for linking and does not open a microphone.
+        let mut element = branch.source.clone();
+        for expected in [
+            "pulsesrc",
+            "queue",
+            "audioconvert",
+            "audioresample",
+            "capsfilter",
+            "audiodynamic",
+            "volume",
+            "audiodynamic",
+            "level",
+            "opusenc",
+            "webmmux",
+        ] {
+            assert_eq!(element.factory().unwrap().name(), expected);
+            assert_eq!(element.parent(), Some(pipeline.clone().upcast()));
+            if expected != "webmmux" {
+                element = element
+                    .static_pad("src")
+                    .unwrap()
+                    .peer()
+                    .unwrap()
+                    .parent_element()
+                    .unwrap();
+            }
+        }
+        assert_eq!(element, muxer);
+        assert_eq!(pipeline.children().len(), 11);
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+    }
 
     #[test]
     fn bayer_recording_retains_gpu_bilinear_reconstruction() {

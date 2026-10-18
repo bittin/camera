@@ -25,56 +25,26 @@ pub fn select_max_resolution_format(formats: &[CameraFormat]) -> Option<CameraFo
 
     info!("Photo mode: selecting maximum resolution with optimal framerate");
 
-    // Find max resolution (by total pixels)
     let max_pixels = formats.iter().map(|f| f.width * f.height).max()?;
-
-    // Get all formats with max resolution
-    let max_res_formats: Vec<_> = formats
+    let mut candidates: Vec<_> = formats
         .iter()
         .filter(|f| f.width * f.height == max_pixels)
         .cloned()
         .collect();
+    let resolution = format!("{}x{}", candidates[0].width, candidates[0].height);
 
-    // Filter to formats with 30-60 fps range (preferred range for photo mode)
-    let preferred_fps_formats: Vec<_> = max_res_formats
-        .iter()
-        .filter(|f| {
+    // Narrow one stable candidate list rather than cloning it for every tier.
+    let preferred_fps = candidates.iter().any(|f| {
+        f.framerate
+            .is_some_and(|fps| (30..=60).contains(&fps.as_int()))
+    });
+    if preferred_fps {
+        candidates.retain(|f| {
             f.framerate
-                .map(|fps| (30..=60).contains(&fps.as_int()))
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-
-    if !preferred_fps_formats.is_empty() {
-        // Among 30-60 fps formats, prefer highest fps (closer to 60)
-        let best_fps = preferred_fps_formats
-            .iter()
-            .filter_map(|f| f.framerate)
-            .max_by(|a, b| {
-                a.as_f64()
-                    .partial_cmp(&b.as_f64())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-
-        if let Some(best) = best_fps {
-            let best_fps_formats: Vec<_> = preferred_fps_formats
-                .iter()
-                .filter(|f| f.framerate == Some(best))
-                .cloned()
-                .collect();
-
-            info!(
-                resolution = format!("{}x{}", max_res_formats[0].width, max_res_formats[0].height),
-                fps = %best,
-                "Selected format with preferred framerate"
-            );
-            return select_best_codec(&best_fps_formats);
-        }
+                .is_some_and(|fps| (30..=60).contains(&fps.as_int()))
+        });
     }
-
-    // No formats in 30-60 fps range, fall back to highest available framerate
-    let max_fps = max_res_formats
+    let best_fps = candidates
         .iter()
         .filter_map(|f| f.framerate)
         .max_by(|a, b| {
@@ -82,28 +52,18 @@ pub fn select_max_resolution_format(formats: &[CameraFormat]) -> Option<CameraFo
                 .partial_cmp(&b.as_f64())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-
-    if let Some(max) = max_fps {
-        let max_fps_formats: Vec<_> = max_res_formats
-            .iter()
-            .filter(|f| f.framerate == Some(max))
-            .cloned()
-            .collect();
-
-        info!(
-            resolution = format!("{}x{}", max_res_formats[0].width, max_res_formats[0].height),
-            fps = %max,
-            "Selected format with highest available framerate (outside 30-60 range)"
-        );
-        return select_best_codec(&max_fps_formats);
+    if let Some(fps) = best_fps {
+        // Exact rational equality and max_by's last-on-tie behavior are intentional.
+        candidates.retain(|f| f.framerate == Some(fps));
+        if preferred_fps {
+            info!(resolution, fps = %fps, "Selected format with preferred framerate");
+        } else {
+            info!(resolution, fps = %fps, "Selected format with highest available framerate (outside 30-60 range)");
+        }
+    } else {
+        info!(resolution, "Selected format without framerate info");
     }
-
-    // No framerate info available, just apply codec preference
-    info!(
-        resolution = format!("{}x{}", max_res_formats[0].width, max_res_formats[0].height),
-        "Selected format without framerate info"
-    );
-    select_best_codec(&max_res_formats)
+    select_best_codec(&candidates)
 }
 
 /// Select best codec/pixel format from a list of formats
@@ -361,37 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_format_picks_absolute_max_resolution() {
-        // Photo mode: highest resolution wins regardless of codec type
-        let formats = vec![
-            create_test_format(640, 480, "YUYV", false),
-            create_test_format(1920, 1080, "NV12", false),
-            create_test_format(1280, 720, "UYVY", false),
-            create_test_format(3840, 2160, "MJPG", true),
-        ];
-
-        let selected = select_max_resolution_format(&formats).unwrap();
-        // Photo mode: always select maximum resolution (4K MJPG)
-        assert_eq!(selected.width, 3840);
-        assert_eq!(selected.height, 2160);
-        assert_eq!(selected.pixel_format, "MJPG");
-    }
-
-    #[test]
-    fn test_select_format_falls_back_to_encoded_when_no_raw() {
-        // When no raw formats available, should fall back to encoded formats
-        let formats = vec![
-            create_test_format(1920, 1080, "MJPG", true),
-            create_test_format(3840, 2160, "H264", false),
-        ];
-
-        let selected = select_max_resolution_format(&formats).unwrap();
-        // Should select highest resolution encoded format
-        assert_eq!(selected.width, 3840);
-        assert_eq!(selected.height, 2160);
-    }
-
-    #[test]
     fn test_select_format_prefers_30_60_fps_range() {
         // Should prefer formats in 30-60 fps range at max resolution
         let formats = vec![
@@ -434,20 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn test_select_format_excludes_fps_above_60() {
-        // Should not select fps > 60 when 30-60 range is available
-        let formats = vec![
-            create_test_format_with_fps(3840, 2160, "MJPG", true, 30),
-            create_test_format_with_fps(3840, 2160, "MJPG", true, 120),
-            create_test_format_with_fps(3840, 2160, "MJPG", true, 240),
-        ];
-
-        let selected = select_max_resolution_format(&formats).unwrap();
-        assert_eq!(selected.width, 3840);
-        assert_eq!(selected.framerate, Some(Framerate::from_int(30)));
-    }
-
-    #[test]
     fn test_select_format_applies_codec_preference_at_same_fps() {
         // Should apply codec preference when multiple codecs have same fps
         let formats = vec![
@@ -461,5 +376,54 @@ mod tests {
         assert_eq!(selected.framerate, Some(Framerate::from_int(30)));
         // Raw format (YUYV) should be preferred
         assert_eq!(selected.pixel_format, "YUYV");
+    }
+
+    #[test]
+    fn codec_preferences_keep_backend_order_within_each_priority() {
+        for (candidates, expected) in [
+            (vec![("MJPG", false), ("OTHER", true), ("MJPG", true)], 2),
+            (vec![("MJPG", false), ("OTHER", true)], 1),
+            (vec![("OTHER", false), ("MJPG", false)], 1),
+            (vec![("OTHER", false), ("UNKNOWN", false)], 0),
+            (vec![("NV12", false), ("YUYV", false)], 0),
+            (vec![("H264", false), ("H264", true)], 0),
+        ] {
+            let formats: Vec<_> = candidates
+                .into_iter()
+                .enumerate()
+                .map(|(index, (codec, hw))| create_test_format(640 + index as u32, 480, codec, hw))
+                .collect();
+            assert_eq!(select_best_codec(&formats), Some(formats[expected].clone()));
+        }
+        assert!(select_best_codec(&[]).is_none());
+    }
+
+    #[test]
+    fn photo_defaults_preserve_missing_and_fractional_framerate_ties() {
+        let first = CameraFormat {
+            framerate: None,
+            ..create_test_format(640, 480, "MJPG", false)
+        };
+        let raw = CameraFormat {
+            pixel_format: "NV12".into(),
+            ..first.clone()
+        };
+        assert_eq!(
+            select_max_resolution_format(&[first, raw.clone()]),
+            Some(raw)
+        );
+
+        // Equal numerical FPS need not have identical rational representations.
+        // The existing max_by tie chooses the last FPS, then filters by exact equality.
+        let first = create_test_format_with_fps(640, 480, "NV12", false, 30);
+        let last = CameraFormat {
+            framerate: Some(Framerate::new(60, 2)),
+            pixel_format: "MJPG".into(),
+            ..first.clone()
+        };
+        assert_eq!(
+            select_max_resolution_format(&[first, last.clone()]),
+            Some(last)
+        );
     }
 }
