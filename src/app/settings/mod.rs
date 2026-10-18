@@ -4,11 +4,11 @@
 //!
 //! This module handles settings drawer UI:
 //! - Main settings view
-//! - Camera backend settings
 
-pub mod camera_settings;
 mod touch_toggle;
 pub mod view;
+#[cfg(test)]
+pub(crate) mod widget_test_support;
 
 // Preference handlers live here alongside their settings views.
 

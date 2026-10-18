@@ -55,43 +55,33 @@ impl<'a> SlideH<'a> {
         }
     }
 
-    /// Compute the expanded viewport rectangle that covers the translated position.
-    fn expanded_viewport(&self, bounds: Rectangle) -> Rectangle {
+    fn translation(&self) -> Vector {
         let offset = f32::from_bits(self.slide_shared.load(std::sync::atomic::Ordering::Relaxed))
             * self.sign;
-        if self.vertical && offset < 0.0 {
-            Rectangle {
-                y: bounds.y + offset,
-                height: bounds.height - offset,
-                ..bounds
-            }
-        } else if self.vertical {
-            Rectangle {
-                height: bounds.height + offset,
-                ..bounds
-            }
-        } else if offset < 0.0 {
-            Rectangle {
-                x: bounds.x + offset,
-                width: bounds.width - offset,
-                ..bounds
-            }
+        if self.vertical {
+            Vector::new(0.0, offset)
         } else {
-            Rectangle {
-                width: bounds.width + offset,
-                ..bounds
-            }
+            Vector::new(offset, 0.0)
         }
     }
 
-    fn translated_event(&self, event: &Event, offset: f32) -> Event {
-        let translate = |position: cosmic::iced::Point| {
-            if self.vertical {
-                cosmic::iced::Point::new(position.x, position.y - offset)
-            } else {
-                cosmic::iced::Point::new(position.x - offset, position.y)
-            }
-        };
+    fn expanded_viewport(bounds: Rectangle, translation: Vector) -> Rectangle {
+        Rectangle {
+            x: bounds.x + translation.x.min(0.0),
+            y: bounds.y + translation.y.min(0.0),
+            width: bounds.width + translation.x.abs(),
+            height: bounds.height + translation.y.abs(),
+        }
+    }
+
+    fn adjusted_cursor(cursor: mouse::Cursor, translation: Vector) -> mouse::Cursor {
+        cursor.position().map_or(cursor, |position| {
+            mouse::Cursor::Available(position - translation)
+        })
+    }
+
+    fn translated_event(event: &Event, translation: Vector) -> Event {
+        let translate = |position: cosmic::iced::Point| position - translation;
         match event {
             Event::Touch(touch::Event::FingerPressed { id, position }) => {
                 Event::Touch(touch::Event::FingerPressed {
@@ -163,27 +153,11 @@ impl<'a> Widget<Message, Theme, Renderer> for SlideH<'a> {
         _viewport: &Rectangle,
     ) {
         use cosmic::iced::advanced::Renderer as _;
-        let offset = f32::from_bits(self.slide_shared.load(std::sync::atomic::Ordering::Relaxed))
-            * self.sign;
-        // Adjust cursor to match the visual translation so the child's
-        // hover detection aligns with where the button is drawn.
-        let adjusted_cursor = cursor.position().map_or(cursor, |pos| {
-            mouse::Cursor::Available(if self.vertical {
-                cosmic::iced::Point::new(pos.x, pos.y - offset)
-            } else {
-                cosmic::iced::Point::new(pos.x - offset, pos.y)
-            })
-        });
-        // Use with_layer() to expand the clipping region to cover the
-        // translated position. Parent containers clip viewport to their
-        // bounds, so with_translation alone can't render outside them.
-        let expanded = self.expanded_viewport(layout.bounds());
+        let translation = self.translation();
+        let adjusted_cursor = Self::adjusted_cursor(cursor, translation);
+        // Translation alone cannot escape the parent's clipping region.
+        let expanded = Self::expanded_viewport(layout.bounds(), translation);
         renderer.with_layer(expanded, |renderer| {
-            let translation = if self.vertical {
-                Vector::new(0.0, offset)
-            } else {
-                Vector::new(offset, 0.0)
-            };
             renderer.with_translation(translation, |renderer| {
                 self.child.as_widget().draw(
                     tree,
@@ -209,19 +183,10 @@ impl<'a> Widget<Message, Theme, Renderer> for SlideH<'a> {
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        // Offset cursor to match the visual translation so the child's
-        // hit-testing aligns with where the button is actually drawn.
-        let offset = f32::from_bits(self.slide_shared.load(std::sync::atomic::Ordering::Relaxed))
-            * self.sign;
-        let adjusted_cursor = cursor.position().map_or(cursor, |pos| {
-            mouse::Cursor::Available(if self.vertical {
-                cosmic::iced::Point::new(pos.x, pos.y - offset)
-            } else {
-                cosmic::iced::Point::new(pos.x - offset, pos.y)
-            })
-        });
-        let expanded = self.expanded_viewport(layout.bounds());
-        let translated_event = self.translated_event(event, offset);
+        let translation = self.translation();
+        let adjusted_cursor = Self::adjusted_cursor(cursor, translation);
+        let expanded = Self::expanded_viewport(layout.bounds(), translation);
+        let translated_event = Self::translated_event(event, translation);
         self.child.as_widget_mut().update(
             tree,
             &translated_event,
@@ -242,16 +207,9 @@ impl<'a> Widget<Message, Theme, Renderer> for SlideH<'a> {
         _viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        let offset = f32::from_bits(self.slide_shared.load(std::sync::atomic::Ordering::Relaxed))
-            * self.sign;
-        let adjusted_cursor = cursor.position().map_or(cursor, |pos| {
-            mouse::Cursor::Available(if self.vertical {
-                cosmic::iced::Point::new(pos.x, pos.y - offset)
-            } else {
-                cosmic::iced::Point::new(pos.x - offset, pos.y)
-            })
-        });
-        let expanded = self.expanded_viewport(layout.bounds());
+        let translation = self.translation();
+        let adjusted_cursor = Self::adjusted_cursor(cursor, translation);
+        let expanded = Self::expanded_viewport(layout.bounds(), translation);
         self.child
             .as_widget()
             .mouse_interaction(tree, layout, adjusted_cursor, &expanded, renderer)
@@ -374,5 +332,104 @@ impl<'a> Widget<Message, Theme, Renderer> for SlidePrimer<'a> {
 impl<'a> From<SlidePrimer<'a>> for cosmic::Element<'a, Message> {
     fn from(primer: SlidePrimer<'a>) -> Self {
         cosmic::Element::new(primer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::settings::widget_test_support as ui;
+    use cosmic::iced::Point;
+
+    #[test]
+    fn slide_translation_keeps_real_button_hit_testing_and_clipping_on_both_axes() {
+        let renderer = ui::renderer();
+        for vertical in [false, true] {
+            for sign in [-1.0, 1.0] {
+                let shared = Arc::new(AtomicU32::new(40.0f32.to_bits()));
+                let child = cosmic::widget::button::text("x")
+                    .width(20)
+                    .height(20)
+                    .padding(0)
+                    .on_press(Message::Noop)
+                    .into();
+                let slide = if vertical {
+                    SlideH::new_vertical(child, shared.clone(), sign)
+                } else {
+                    SlideH::new(child, shared.clone(), sign)
+                };
+                let translation = slide.translation();
+                let mut element: cosmic::Element<'_, Message> = slide.into();
+                let (mut tree, node) = ui::layout(&mut element, &renderer, Size::new(20.0, 20.0));
+                let node = node.move_to(Point::new(100.0, 100.0));
+                let target = node.bounds().center() + translation;
+                assert!(!node.bounds().contains(target));
+                assert!(SlideH::expanded_viewport(node.bounds(), translation).contains(target));
+                let messages = ui::click(&mut element, &mut tree, &node, &renderer, target);
+                assert!(
+                    matches!(messages.as_slice(), [Message::Noop]),
+                    "{messages:?}"
+                );
+                assert_eq!(
+                    element.as_widget().mouse_interaction(
+                        &tree,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(target),
+                        &node.bounds(),
+                        &renderer
+                    ),
+                    mouse::Interaction::Pointer
+                );
+                for cursor in [
+                    mouse::Cursor::Unavailable,
+                    mouse::Cursor::Levitating(target),
+                ] {
+                    assert_eq!(SlideH::adjusted_cursor(cursor, translation), cursor);
+                }
+                assert_eq!(
+                    SlideH::adjusted_cursor(mouse::Cursor::Available(target), translation)
+                        .position(),
+                    Some(node.bounds().center())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slide_inverse_maps_every_touch_phase_without_changing_finger_or_phase() {
+        let point = Point::new(12.0, 34.0);
+        let phases: [fn(Point) -> touch::Event; 4] = [
+            |position| touch::Event::FingerPressed {
+                id: touch::Finger(9),
+                position,
+            },
+            |position| touch::Event::FingerMoved {
+                id: touch::Finger(9),
+                position,
+            },
+            |position| touch::Event::FingerLifted {
+                id: touch::Finger(9),
+                position,
+            },
+            |position| touch::Event::FingerLost {
+                id: touch::Finger(9),
+                position,
+            },
+        ];
+        for translation in [
+            Vector::new(-40.0, 0.0),
+            Vector::new(40.0, 0.0),
+            Vector::new(0.0, -40.0),
+            Vector::new(0.0, 40.0),
+        ] {
+            for phase in phases {
+                let Event::Touch(mapped) =
+                    SlideH::translated_event(&Event::Touch(phase(point)), translation)
+                else {
+                    panic!("touch event changed kind");
+                };
+                assert_eq!(mapped, phase(point - translation));
+            }
+        }
     }
 }

@@ -78,6 +78,20 @@ fn disabled_text(value: String) -> Element<'static, Message> {
         .into()
 }
 
+/// Locked choices retain their selected text without an interactive dropdown.
+fn locked_choice<'a>(
+    locked: bool,
+    options: &'a [String],
+    selected: usize,
+    on_select: fn(usize) -> Message,
+) -> Element<'a, Message> {
+    if locked {
+        disabled_text(options.get(selected).cloned().unwrap_or_default())
+    } else {
+        widget::dropdown(options, Some(selected), on_select).into()
+    }
+}
+
 fn controls_position_index(position: crate::config::ControlsPosition) -> usize {
     crate::config::ControlsPosition::ALL
         .iter()
@@ -259,38 +273,20 @@ impl AppModel {
         let is_recording = self.recording.is_recording();
 
         // Default mode index (matches visible dropdown entries which may exclude Virtual)
-        let visible_default_modes: Vec<crate::app::state::CameraMode> = {
-            let mut modes = vec![
-                crate::app::state::CameraMode::Photo,
-                crate::app::state::CameraMode::Video,
-                crate::app::state::CameraMode::Timelapse,
-            ];
-            if self.config.virtual_camera_enabled {
-                modes.push(crate::app::state::CameraMode::Virtual);
-            }
-            modes
-        };
+        let visible_default_modes =
+            crate::app::dropdowns::default_modes(self.config.virtual_camera_enabled);
         let current_default_mode_index = visible_default_modes
             .iter()
             .position(|m| *m == self.config.default_mode)
             .unwrap_or(0);
 
         // Custom device row with label, info button, and dropdown
-        let device_control: Element<'_, Message> = if is_recording {
-            disabled_text(
-                self.camera_dropdown_options
-                    .get(self.current_camera_index)
-                    .cloned()
-                    .unwrap_or_default(),
-            )
-        } else {
-            widget::dropdown(
-                &self.camera_dropdown_options,
-                Some(self.current_camera_index),
-                Message::SelectCamera,
-            )
-            .into()
-        };
+        let device_control = locked_choice(
+            is_recording,
+            &self.camera_dropdown_options,
+            self.current_camera_index,
+            Message::SelectCamera,
+        );
 
         let device_label_with_info = widget::Row::new()
             .push(widget::text::body(fl!("settings-device")))
@@ -465,107 +461,61 @@ impl AppModel {
             .position(|e| *e == self.config.audio_encoder)
             .unwrap_or(0); // Default to Opus (index 0)
 
-        let mut video_section = if is_recording {
-            widget::settings::section()
-                .title(fl!("settings-video"))
-                .add(
-                    widget::settings::item::builder(fl!("settings-encoder")).control(
-                        disabled_text(
-                            self.video_encoder_dropdown_options
-                                .get(self.current_video_encoder_index)
-                                .cloned()
-                                .unwrap_or_default(),
-                        ),
-                    ),
-                )
-                .add(
-                    widget::settings::item::builder(fl!("settings-quality")).control(
-                        disabled_text(
-                            self.bitrate_preset_dropdown_options
-                                .get(current_bitrate_index)
-                                .cloned()
-                                .unwrap_or_default(),
-                        ),
-                    ),
-                )
-                .add(
-                    widget::settings::item::builder(fl!("settings-record-audio")).control(
-                        widget::toggler(self.config.record_audio)
-                            .on_toggle_maybe(None::<fn(bool) -> Message>),
-                    ),
-                )
+        let mut video_section = widget::settings::section()
+            .title(fl!("settings-video"))
+            .add(
+                widget::settings::item::builder(fl!("settings-encoder")).control(locked_choice(
+                    is_recording,
+                    &self.video_encoder_dropdown_options,
+                    self.current_video_encoder_index,
+                    Message::SelectVideoEncoder,
+                )),
+            )
+            .add(
+                widget::settings::item::builder(fl!("settings-quality")).control(locked_choice(
+                    is_recording,
+                    &self.bitrate_preset_dropdown_options,
+                    current_bitrate_index,
+                    Message::SelectBitratePreset,
+                )),
+            );
+        // Keep ListButton admission: it supplies whole-row input and list padding.
+        let audio_item = widget::settings::item::builder(fl!("settings-record-audio"));
+        video_section = if is_recording {
+            video_section.add(
+                audio_item.control(
+                    widget::toggler(self.config.record_audio)
+                        .on_toggle_maybe(None::<fn(bool) -> Message>),
+                ),
+            )
         } else {
-            widget::settings::section()
-                .title(fl!("settings-video"))
-                .add(
-                    widget::settings::item::builder(fl!("settings-encoder")).control(
-                        widget::dropdown(
-                            &self.video_encoder_dropdown_options,
-                            Some(self.current_video_encoder_index),
-                            Message::SelectVideoEncoder,
-                        ),
-                    ),
-                )
-                .add(
-                    widget::settings::item::builder(fl!("settings-quality")).control(
-                        widget::dropdown(
-                            &self.bitrate_preset_dropdown_options,
-                            Some(current_bitrate_index),
-                            Message::SelectBitratePreset,
-                        ),
-                    ),
-                )
-                .add(
-                    widget::settings::item::builder(fl!("settings-record-audio"))
-                        .toggler(self.config.record_audio, |_| Message::ToggleRecordAudio),
-                )
+            video_section
+                .add(audio_item.toggler(self.config.record_audio, |_| Message::ToggleRecordAudio))
         };
 
-        // Only show audio encoder and microphone selection when audio is enabled
+        // Only show audio encoder and microphone selection when audio is enabled.
         if self.config.record_audio {
-            if is_recording {
-                video_section = video_section
-                    .add(
-                        widget::settings::item::builder(fl!("settings-audio-encoder"))
-                            .description(fl!("settings-audio-encoder-description"))
-                            .control(disabled_text(
-                                self.audio_encoder_dropdown_options
-                                    .get(current_audio_encoder_index)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            )),
-                    )
-                    .add(
-                        widget::settings::item::builder(fl!("settings-microphone")).control(
-                            disabled_text(
-                                self.audio_dropdown_options
-                                    .get(self.current_audio_device_index)
-                                    .cloned()
-                                    .unwrap_or_default(),
-                            ),
+            video_section = video_section
+                .add(
+                    widget::settings::item::builder(fl!("settings-audio-encoder"))
+                        .description(fl!("settings-audio-encoder-description"))
+                        .control(locked_choice(
+                            is_recording,
+                            &self.audio_encoder_dropdown_options,
+                            current_audio_encoder_index,
+                            Message::SelectAudioEncoder,
+                        )),
+                )
+                .add(
+                    widget::settings::item::builder(fl!("settings-microphone")).control(
+                        locked_choice(
+                            is_recording,
+                            &self.audio_dropdown_options,
+                            self.current_audio_device_index,
+                            Message::SelectAudioDevice,
                         ),
-                    );
-            } else {
-                video_section = video_section
-                    .add(
-                        widget::settings::item::builder(fl!("settings-audio-encoder"))
-                            .description(fl!("settings-audio-encoder-description"))
-                            .control(widget::dropdown(
-                                &self.audio_encoder_dropdown_options,
-                                Some(current_audio_encoder_index),
-                                Message::SelectAudioEncoder,
-                            )),
-                    )
-                    .add(
-                        widget::settings::item::builder(fl!("settings-microphone")).control(
-                            widget::dropdown(
-                                &self.audio_dropdown_options,
-                                Some(self.current_audio_device_index),
-                                Message::SelectAudioDevice,
-                            ),
-                        ),
-                    );
-            }
+                    ),
+                );
         }
 
         if self.config.record_audio {
@@ -611,32 +561,18 @@ impl AppModel {
             .position(|i| *i == self.config.timelapse_interval)
             .unwrap_or(0);
 
-        let timelapse_section = if self.timelapse.is_running() {
-            widget::settings::section()
-                .title(fl!("settings-timelapse"))
-                .add(
-                    widget::settings::item::builder(fl!("settings-timelapse-interval"))
-                        .description(fl!("settings-timelapse-interval-description"))
-                        .control(disabled_text(
-                            self.timelapse_interval_dropdown_options
-                                .get(current_timelapse_interval_index)
-                                .cloned()
-                                .unwrap_or_default(),
-                        )),
-                )
-        } else {
-            widget::settings::section()
-                .title(fl!("settings-timelapse"))
-                .add(
-                    widget::settings::item::builder(fl!("settings-timelapse-interval"))
-                        .description(fl!("settings-timelapse-interval-description"))
-                        .control(widget::dropdown(
-                            &self.timelapse_interval_dropdown_options,
-                            Some(current_timelapse_interval_index),
-                            Message::SetTimelapseInterval,
-                        )),
-                )
-        };
+        let timelapse_section = widget::settings::section()
+            .title(fl!("settings-timelapse"))
+            .add(
+                widget::settings::item::builder(fl!("settings-timelapse-interval"))
+                    .description(fl!("settings-timelapse-interval-description"))
+                    .control(locked_choice(
+                        self.timelapse.is_running(),
+                        &self.timelapse_interval_dropdown_options,
+                        current_timelapse_interval_index,
+                        Message::SetTimelapseInterval,
+                    )),
+            );
 
         vec![timelapse_section.into()]
     }
@@ -803,6 +739,194 @@ impl AppModel {
 mod tests {
     use super::*;
     use crate::config::ControlsPosition;
+
+    #[test]
+    fn locked_choices_keep_text_and_cannot_open_or_publish() {
+        use crate::app::settings::widget_test_support as ui;
+        use cosmic::iced::advanced::Layout;
+        use cosmic::iced::{Size, Vector};
+        let renderer = ui::renderer();
+        let options = vec!["first".to_owned(), "second".to_owned()];
+        for selected in [0, 1, usize::MAX] {
+            let mut control = locked_choice(true, &options, selected, Message::SelectCamera);
+            let (mut tree, node) = ui::layout(&mut control, &renderer, Size::new(300.0, 100.0));
+            let values = ui::texts(&mut control, &mut tree, &node, &renderer);
+            assert_eq!(
+                values.iter().map(|(s, _)| s.as_str()).collect::<Vec<_>>(),
+                [options.get(selected).map(String::as_str).unwrap_or("")]
+            );
+            assert!(
+                ui::click(
+                    &mut control,
+                    &mut tree,
+                    &node,
+                    &renderer,
+                    node.bounds().center()
+                )
+                .is_empty()
+            );
+            assert!(
+                control
+                    .as_widget_mut()
+                    .overlay(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &node.bounds(),
+                        Vector::ZERO
+                    )
+                    .is_none()
+            );
+        }
+        // Exercise the enabled branch's actual menu callback, not a synthetic Message.
+        let mut control = locked_choice(false, &options, 1, Message::SelectCamera);
+        let (mut tree, node) = ui::layout(&mut control, &renderer, Size::new(300.0, 100.0));
+        assert!(
+            ui::click(
+                &mut control,
+                &mut tree,
+                &node,
+                &renderer,
+                node.bounds().center()
+            )
+            .is_empty()
+        );
+        let mut overlay = control
+            .as_widget_mut()
+            .overlay(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &cosmic::iced::Rectangle::with_size(Size::new(300.0, 300.0)),
+                Vector::ZERO,
+            )
+            .expect("enabled menu");
+        let menu = overlay
+            .as_overlay_mut()
+            .layout(&renderer, Size::new(300.0, 300.0));
+        let point = cosmic::iced::Point::new(menu.bounds().x + 12.0, menu.bounds().y + 12.0);
+        let mut messages = Vec::new();
+        for event in [
+            cosmic::iced::mouse::Event::CursorMoved { position: point },
+            cosmic::iced::mouse::Event::ButtonPressed(cosmic::iced::mouse::Button::Left),
+            cosmic::iced::mouse::Event::ButtonReleased(cosmic::iced::mouse::Button::Left),
+        ] {
+            overlay.as_overlay_mut().update(
+                &cosmic::iced::Event::Mouse(event),
+                Layout::new(&menu),
+                cosmic::iced::mouse::Cursor::Available(point),
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut cosmic::iced::advanced::Shell::new(&mut messages),
+            );
+        }
+        assert!(
+            matches!(messages.as_slice(), [Message::SelectCamera(0)]),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn video_sections_keep_whole_row_audio_input_and_recording_lock() {
+        use crate::app::settings::widget_test_support as ui;
+        use crate::app::state::RecordingState;
+        use cosmic::iced::Size;
+        let renderer = ui::renderer();
+        for recording in [false, true] {
+            for audio in [false, true] {
+                let mut app = AppModel::default();
+                app.config.record_audio = audio;
+                if recording {
+                    app.recording = RecordingState::Recording {
+                        session: 1,
+                        start_time: std::time::Instant::now(),
+                        file_path: String::new(),
+                        stop_sender: None,
+                        audio_levels: None,
+                    };
+                }
+                let mut section = app.video_sections().remove(0);
+                let (mut tree, node) =
+                    ui::layout(&mut section, &renderer, Size::new(600.0, 2000.0));
+                let texts = ui::texts(&mut section, &mut tree, &node, &renderer);
+                let has = |key: &str| {
+                    texts
+                        .iter()
+                        .any(|(text, _)| text == &crate::i18n::LANGUAGE_LOADER.get(key))
+                };
+                assert_eq!(has("settings-audio-encoder"), audio);
+                assert_eq!(has("settings-microphone"), audio);
+                assert_eq!(has("settings-mic-level"), audio);
+                let label = texts
+                    .iter()
+                    .find(|(s, _)| s == &fl!("settings-record-audio"))
+                    .unwrap()
+                    .1;
+                let messages = ui::click(&mut section, &mut tree, &node, &renderer, label.center());
+                if recording {
+                    assert!(messages.is_empty());
+                } else {
+                    assert!(
+                        matches!(messages.as_slice(), [Message::ToggleRecordAudio]),
+                        "{messages:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn timelapse_interval_locks_only_while_running_not_finalising() {
+        use crate::app::settings::widget_test_support as ui;
+        use crate::app::state::TimelapseState;
+        use cosmic::iced::Size;
+        let renderer = ui::renderer();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        for (state, locked) in [
+            (TimelapseState::Idle, false),
+            (
+                TimelapseState::Running {
+                    start_time: std::time::Instant::now(),
+                    shots_taken: 0,
+                    interval_ms: 1000,
+                    frame_sender: sender,
+                },
+                true,
+            ),
+            (
+                TimelapseState::Finalising {
+                    start_time: std::time::Instant::now(),
+                    shots_taken: 1,
+                },
+                false,
+            ),
+        ] {
+            let app = AppModel {
+                timelapse: state,
+                timelapse_interval_dropdown_options: vec![
+                    "test interval".into();
+                    TimelapseInterval::ALL.len()
+                ],
+                ..Default::default()
+            };
+            let selected = app.timelapse_interval_dropdown_options[0].clone();
+            let mut section = app.timelapse_sections().remove(0);
+            let (mut tree, node) = ui::layout(&mut section, &renderer, Size::new(600.0, 1000.0));
+            let texts = ui::texts(&mut section, &mut tree, &node, &renderer);
+            assert_eq!(texts.iter().any(|(text, _)| text == &selected), locked);
+            for key in [
+                "settings-timelapse",
+                "settings-timelapse-interval",
+                "settings-timelapse-interval-description",
+            ] {
+                assert!(
+                    texts
+                        .iter()
+                        .any(|(text, _)| text == &crate::i18n::LANGUAGE_LOADER.get(key))
+                );
+            }
+        }
+    }
 
     #[test]
     fn photo_demosaic_selection_tracks_every_option() {

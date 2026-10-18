@@ -156,13 +156,19 @@ impl AppModel {
 
         if self.insights.is_multistream {
             // Dual-stream: separate Preview and Capture sections
-            sections.push(self.build_preview_stream_section().into());
+            sections.push(
+                self.build_preview_stream_section(fl!("insights-stream-preview"))
+                    .into(),
+            );
             if self.insights.capture_stream.is_some() {
                 sections.push(self.build_capture_stream_section().into());
             }
         } else {
             // Single-stream: combined section
-            sections.push(self.build_combined_stream_section().into());
+            sections.push(
+                self.build_preview_stream_section(fl!("insights-stream-combined"))
+                    .into(),
+            );
         }
 
         // Recording section (shown when recording is active)
@@ -413,28 +419,12 @@ impl AppModel {
         section
     }
 
-    /// Build the combined single-stream section (Preview + Capture)
-    fn build_combined_stream_section(&self) -> widget::settings::Section<'_, Message> {
-        let mut section = widget::settings::section().title(fl!("insights-stream-combined"));
-
-        // Stream info if available
-        let has_stream = self.insights.preview_stream.is_some();
-        if let Some(stream) = &self.insights.preview_stream {
-            section = self.add_stream_items(section, stream);
-        }
-
-        // Format chain (skip resolution/framerate if stream info already shows them)
-        section = self.add_format_items(section, has_stream);
-
-        // Performance metrics
-        section = self.add_performance_items(section);
-
-        section
-    }
-
-    /// Build the Preview Stream section (dual-stream mode)
-    fn build_preview_stream_section(&self) -> widget::settings::Section<'_, Message> {
-        let mut section = widget::settings::section().title(fl!("insights-stream-preview"));
+    /// Preview metrics serve both the single-stream and dual-stream presentations.
+    fn build_preview_stream_section(
+        &self,
+        title: String,
+    ) -> widget::settings::Section<'_, Message> {
+        let mut section = widget::settings::section().title(title);
 
         // Stream info
         let has_stream = self.insights.preview_stream.is_some();
@@ -979,17 +969,9 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmic::iced::advanced::{layout, renderer::Headless, widget::Tree};
-    use cosmic::iced::{Font, Pixels, Size};
-
-    fn renderer() -> cosmic::Renderer {
-        pollster::block_on(cosmic::Renderer::new(
-            Font::DEFAULT,
-            Pixels(14.0),
-            Some("tiny-skia"),
-        ))
-        .expect("headless software renderer for text layout")
-    }
+    use crate::app::settings::widget_test_support::{self as ui, renderer};
+    use cosmic::iced::Size;
+    use cosmic::iced::advanced::{layout, widget::Tree};
 
     fn assert_content_fits(node: &layout::Node) {
         for child in node.children() {
@@ -1003,6 +985,51 @@ mod tests {
             );
             assert!(bounds.y + bounds.height <= node.size().height + 0.01);
             assert_content_fits(child);
+        }
+    }
+
+    #[test]
+    fn preview_section_titles_share_metrics_without_duplicating_stream_resolution() {
+        let renderer = renderer();
+        for has_stream in [false, true] {
+            let mut app = AppModel::default();
+            app.insights.format_chain.resolution = "format-resolution".into();
+            app.insights.format_chain.framerate = "30 fps".into();
+            app.insights.frame_latency_us = 1250;
+            if has_stream {
+                app.insights.preview_stream = Some(super::super::types::StreamInfo {
+                    role: "View-finder".into(),
+                    resolution: "stream-resolution".into(),
+                    pixel_format: "NV12".into(),
+                    ..Default::default()
+                });
+            }
+            let mut presentations = Vec::new();
+            for title in [
+                fl!("insights-stream-combined"),
+                fl!("insights-stream-preview"),
+            ] {
+                let mut element = app.build_preview_stream_section(title.clone()).into();
+                let (mut tree, node) =
+                    ui::layout(&mut element, &renderer, Size::new(600.0, 2000.0));
+                let texts: Vec<_> = ui::texts(&mut element, &mut tree, &node, &renderer)
+                    .into_iter()
+                    .map(|(text, _)| text)
+                    .collect();
+                assert_eq!(texts[0], title);
+                assert_eq!(texts.iter().filter(|text| *text == "30 fps").count(), 1);
+                assert_eq!(
+                    texts.iter().any(|text| text == "format-resolution"),
+                    !has_stream
+                );
+                assert_eq!(
+                    texts.iter().any(|text| text == "stream-resolution"),
+                    has_stream
+                );
+                assert_eq!(texts.iter().any(|text| text == "1.25 ms"), has_stream);
+                presentations.push(texts[1..].to_vec());
+            }
+            assert_eq!(presentations[0], presentations[1]);
         }
     }
 

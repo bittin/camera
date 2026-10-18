@@ -71,32 +71,6 @@ impl<'a> QrOverlayWidget<'a> {
             buttons,
         }
     }
-
-    /// Calculate button position for a detection
-    fn get_button_position(
-        &self,
-        detection: &QrDetection,
-        offset_x: f32,
-        offset_y: f32,
-        video_width: f32,
-        video_height: f32,
-    ) -> (f32, f32) {
-        let (x, y, width, height) = transform_detection_to_screen(
-            detection,
-            offset_x,
-            offset_y,
-            video_width,
-            video_height,
-            self.rotation,
-            self.mirrored,
-        );
-
-        // Button is centered below the QR box
-        let button_x = x + width / 2.0;
-        let button_y = y + height + BUTTON_GAP;
-
-        (button_x, button_y)
-    }
 }
 
 impl<'a> Widget<Message, Theme, Renderer> for QrOverlayWidget<'a> {
@@ -131,21 +105,25 @@ impl<'a> Widget<Message, Theme, Renderer> for QrOverlayWidget<'a> {
             self.rotation,
         );
 
-        // Pre-compute button positions to avoid borrow conflict with iter_mut
-        let positions: Vec<(f32, f32)> = self
+        let rotation = self.rotation;
+        let mirrored = self.mirrored;
+        let button_nodes: Vec<layout::Node> = self
             .detections
             .iter()
-            .map(|detection| {
-                self.get_button_position(detection, offset_x, offset_y, video_width, video_height)
-            })
-            .collect();
-
-        // Layout each button at its calculated position
-        let button_nodes: Vec<layout::Node> = positions
-            .into_iter()
             .zip(self.buttons.iter_mut())
             .zip(tree.children.iter_mut())
-            .map(|(((center_x, top_y), button), child_tree)| {
+            .map(|((detection, button), child_tree)| {
+                let (x, y, width, height) = transform_detection_to_screen(
+                    detection,
+                    offset_x,
+                    offset_y,
+                    video_width,
+                    video_height,
+                    rotation,
+                    mirrored,
+                );
+                let center_x = x + width / 2.0;
+                let top_y = y + height + BUTTON_GAP;
                 // Layout the button with its intrinsic size
                 let button_limits = layout::Limits::new(Size::ZERO, Size::new(200.0, 50.0));
                 let mut button_node =
@@ -332,5 +310,124 @@ impl<'a> Widget<Message, Theme, Renderer> for QrOverlayWidget<'a> {
 impl<'a> From<QrOverlayWidget<'a>> for Element<'a, Message, Theme, Renderer> {
     fn from(widget: QrOverlayWidget<'a>) -> Self {
         Element::new(widget)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::frame_processor::FrameRegion;
+    use crate::app::settings::widget_test_support as ui;
+
+    fn detections() -> Vec<QrDetection> {
+        [
+            (0.1, 0.1, 0.1, 0.1),
+            (0.65, 0.6, 0.1, 0.1),
+            (-0.1, 0.8, 0.001, 0.001),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, (x, y, width, height))| {
+            QrDetection::new(
+                FrameRegion {
+                    x,
+                    y,
+                    width,
+                    height,
+                },
+                format!("text {i}"),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn qr_button_layout_keeps_detection_order_origin_and_transformed_minimum_boxes() {
+        let renderer = ui::renderer();
+        let size = Size::new(640.0, 480.0);
+        let origin = Point::new(17.0, 31.0);
+        let insets = BarInsets {
+            top: 20.0,
+            bottom: 40.0,
+            left: 13.0,
+            right: 27.0,
+        };
+        for count in [0, 1, 3] {
+            for rotation in [
+                SensorRotation::None,
+                SensorRotation::Rotate90,
+                SensorRotation::Rotate180,
+                SensorRotation::Rotate270,
+            ] {
+                for mirrored in [false, true] {
+                    for blend in [0.0, 0.5, 1.0] {
+                        let detections: Vec<_> = detections().into_iter().take(count).collect();
+                        let mut overlay: cosmic::Element<'_, Message> = QrOverlayWidget::new(
+                            detections.clone(),
+                            640,
+                            480,
+                            blend,
+                            insets,
+                            rotation,
+                            mirrored,
+                        )
+                        .into();
+                        let (_, node) = ui::layout(&mut overlay, &renderer, size);
+                        let node = node.move_to(origin);
+                        assert_eq!(node.children().len(), count);
+                        let (ox, oy, vw, vh) =
+                            calculate_video_bounds(640.0, 480.0, 640, 480, blend, insets, rotation);
+                        for (child, detection) in Layout::new(&node).children().zip(&detections) {
+                            let (x, y, width, height) = transform_detection_to_screen(
+                                detection, ox, oy, vw, vh, rotation, mirrored,
+                            );
+                            let bounds = child.bounds();
+                            assert!(
+                                (bounds.center_x() - (origin.x + x + width / 2.0)).abs() < 0.001
+                            );
+                            assert!(
+                                (bounds.y - (origin.y + y + height + BUTTON_GAP)).abs() < 0.001
+                            );
+                            assert!(bounds.width <= 200.0 && bounds.height <= 50.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qr_child_buttons_publish_their_original_actions() {
+        let renderer = ui::renderer();
+        let mut detections = detections();
+        detections.truncate(2);
+        detections[0] =
+            QrDetection::new(detections[0].bounds.clone(), "https://example.com".into());
+        let mut overlay: cosmic::Element<'_, Message> = QrOverlayWidget::new(
+            detections,
+            640,
+            480,
+            1.0,
+            BarInsets::default(),
+            SensorRotation::None,
+            false,
+        )
+        .into();
+        let (mut tree, node) = ui::layout(&mut overlay, &renderer, Size::new(640.0, 480.0));
+        let mut messages = Vec::new();
+        for child in Layout::new(&node).children() {
+            messages.extend(ui::click(
+                &mut overlay,
+                &mut tree,
+                &node,
+                &renderer,
+                child.bounds().center(),
+            ));
+        }
+        assert!(
+            matches!(messages.as_slice(), [Message::QrOpenUrl(url), Message::QrCopyText(text)]
+            if url == "https://example.com" && text == "text 1"),
+            "{messages:?}"
+        );
     }
 }
