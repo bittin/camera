@@ -688,26 +688,14 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&root).unwrap();
-            let status = Command::new("ffmpeg")
-                .args([
-                    "-v",
-                    "error",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "color=c=red:s=16x16:r=2",
-                    "-t",
-                    "1",
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-y",
-                ])
-                .arg(root.join("clip.mp4"))
-                .status()
-                .expect("ffmpeg test prerequisite");
-            assert!(status.success());
+            super::super::motion_photo_ring::test_fixture::write_clip(
+                &root.join("clip.mp4"),
+                &super::super::motion_photo_ring::test_fixture::software_encoder(),
+                16,
+                16,
+                2,
+                2,
+            );
             Self(root)
         }
         fn image(&self, ext: &str) -> PathBuf {

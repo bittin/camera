@@ -429,8 +429,134 @@ fn mux_packets(path: &std::path::Path, packets: &[Packet], start: u64) -> Result
 }
 
 #[cfg(test)]
+pub(crate) mod test_fixture {
+    use super::*;
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
+
+    // Observe encoded output, not a fixed sleep or an EOS flush. Keep the real
+    // live queue's two-buffer, downstream-leaky policy in every fixture.
+    fn wait_for_packet(encoder: &MemoryEncoder, ready: impl Fn(&Packet) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            encoder.check_error().unwrap();
+            if encoder.ring.lock().unwrap().packets.iter().any(&ready) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "live encoder did not deliver fixture packet"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub(crate) fn push_frame(encoder: &mut MemoryEncoder, image: image::RgbImage, pts: u64) {
+        encoder.push(image, pts).unwrap();
+        wait_for_packet(encoder, |p| !p.audio && p.pts == pts);
+    }
+
+    pub(crate) fn add_synthetic_audio(encoder: &mut MemoryEncoder) {
+        let sink = memory_sink(encoder.ring.clone(), true);
+        encoder.pipeline.add(&sink).unwrap();
+        let audio = gst::ElementFactory::make("audiotestsrc")
+            .property("is-live", true)
+            .build()
+            .unwrap();
+        super::super::motion_photo_encoder::add_aac_branch(
+            &encoder.pipeline,
+            sink.upcast_ref(),
+            &audio,
+        )
+        .unwrap();
+        sink.sync_state_with_parent().unwrap();
+        encoder.audio = true;
+    }
+
+    pub(crate) fn wait_for_audio(encoder: &MemoryEncoder, pts: u64) {
+        wait_for_packet(encoder, |p| p.audio && p.pts >= pts);
+    }
+
+    pub(crate) fn software_encoder() -> EncoderInfo {
+        EncoderInfo {
+            element_name: "x264enc".into(),
+            display_name: "H.264".into(),
+            codec: crate::media::encoders::video::VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        }
+    }
+
+    pub(crate) fn write_clip(
+        path: &Path,
+        info: &EncoderInfo,
+        width: u32,
+        height: u32,
+        fps: u32,
+        frames: u8,
+    ) {
+        assert!(frames >= 2);
+        let mut encoder =
+            MemoryEncoder::new(info, width, height, fps, 800, None, Instant::now()).unwrap();
+        for i in 0..frames {
+            push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(width, height, image::Rgb([i * 30, 40, 90])),
+                u64::from(i) * (1_000_000_000 / u64::from(fps)),
+            );
+            assert!(
+                !path.exists(),
+                "continuous recorder must not write before snapshot"
+            );
+        }
+        // These short fixtures fit wholly inside the real snapshot's window.
+        // Put the shutter between the first two independently supplied frames.
+        let window = encoder
+            .snapshot_window(500_000_000 / u64::from(fps))
+            .unwrap();
+        assert_eq!(window.start, 0);
+        let expected_pts: Vec<u64> = (0..frames)
+            .map(|i| u64::from(i) * (1_000_000_000 / u64::from(fps)))
+            .collect();
+        assert_eq!(
+            window.packets.iter().map(|p| p.pts).collect::<Vec<_>>(),
+            expected_pts
+        );
+        window.write(path).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_memory_appsrc_drops_backlog_instead_of_retaining_unbounded_frames() {
+        let encoder = MemoryEncoder::new(
+            &test_fixture::software_encoder(),
+            64,
+            48,
+            10,
+            800,
+            None,
+            std::time::Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(
+            encoder
+                .source
+                .property_value("leaky-type")
+                .serialize()
+                .unwrap()
+                .as_str(),
+            "downstream"
+        );
+        assert_eq!(encoder.source.property::<u64>("max-buffers"), 2);
+        assert!(!encoder.source.property::<bool>("block"));
+        assert!(encoder.source.property::<bool>("is-live"));
+    }
 
     fn assert_continuous_codec_decodes_on_shutter_timeline(
         name: &str,
@@ -453,8 +579,7 @@ mod tests {
         let shutter = 4_000_000_000;
         let mut encoder = MemoryEncoder::new(&info, 64, 48, 10, 800, None, origin)
             .unwrap_or_else(|e| panic!("{name}: continuous encoder failed: {e}"));
-        // Run longer than retention, without EOS or files: this is the live
-        // encoded ring, not the short ClipEncoder fixture's flush-on-finish path.
+        // Advance the input timeline beyond retention, without EOS or files.
         for i in 0..55 {
             let pts = i * 100_000_000;
             let color = if pts < shutter {
@@ -462,30 +587,15 @@ mod tests {
             } else {
                 [10, 10, 220]
             };
-            encoder
-                .push(image::RgbImage::from_pixel(64, 48, image::Rgb(color)), pts)
-                .unwrap_or_else(|e| panic!("{name}: push at {pts} failed: {e}"));
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            test_fixture::push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(64, 48, image::Rgb(color)),
+                pts,
+            );
             assert!(
                 !path.exists(),
                 "{name}: continuous ring must not write disk"
             );
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !encoder
-            .ring
-            .lock()
-            .unwrap()
-            .packets
-            .iter()
-            .any(|p| !p.audio && p.pts == 5_400_000_000)
-        {
-            encoder.check_error().unwrap();
-            assert!(
-                std::time::Instant::now() < deadline,
-                "{name}: live encoder did not deliver the last frame without EOS"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert_eq!(encoder.pipeline.current_state(), gst::State::Playing);
         assert!(
@@ -501,20 +611,19 @@ mod tests {
         let window = encoder
             .snapshot_window(shutter)
             .unwrap_or_else(|e| panic!("{name}: warmed snapshot failed: {e}"));
-        let expected_times: Vec<f64> = window
-            .packets
-            .iter()
-            .filter(|p| !p.audio)
-            .map(|p| (p.pts - window.start) as f64 / 1e9)
-            .collect();
+        // Independent frame grid: [4s - 1.25s, 4s + 1.25s) selects
+        // input frames 28..=52. Never derive the oracle from snapshot output.
+        let expected_pts: Vec<u64> = (28..=52).map(|i| i * 100_000_000).collect();
+        let expected_times: Vec<f64> = (0..25).map(|i| f64::from(i) / 10.0).collect();
         assert!(window.packets.iter().all(|p| !p.audio));
+        assert_eq!(window.start, 2_800_000_000);
+        assert_eq!(
+            window.packets.iter().map(|p| p.pts).collect::<Vec<_>>(),
+            expected_pts
+        );
         assert!(
             window.packets.first().unwrap().key,
             "{name}: window must start on a keyframe"
-        );
-        assert!(
-            (24..=25).contains(&expected_times.len()),
-            "{name}: incomplete 2.5s window: {expected_times:?}"
         );
         let midpoint = encoder
             .write_window(&path, shutter)
@@ -522,10 +631,9 @@ mod tests {
             as f64
             / 1e9;
         assert!(
-            (1.15..=1.3).contains(&midpoint),
+            (midpoint - 1.2).abs() < 0.000_001,
             "{name}: shutter must be centered: {midpoint}"
         );
-        assert_eq!(midpoint, (shutter - window.start) as f64 / 1e9);
 
         let probe = std::process::Command::new("timeout")
             .args([
@@ -585,7 +693,7 @@ mod tests {
         for (actual, expected) in times.iter().zip(&expected_times) {
             assert!(
                 (actual - expected).abs() < 0.001,
-                "{name}: presentation timestamp {actual} differs from ring {expected}"
+                "{name}: presentation timestamp {actual} differs from input grid {expected}"
             );
         }
         assert!(
@@ -695,19 +803,17 @@ mod tests {
         let mut encoder = MemoryEncoder::new(&info, 64, 48, 10, 800, None, origin).unwrap();
         for i in 0..40 {
             let color = if i < 25 { [220, 10, 10] } else { [10, 10, 220] };
-            encoder
-                .push(
-                    image::RgbImage::from_pixel(64, 48, image::Rgb(color)),
-                    i * 100_000_000,
-                )
-                .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            test_fixture::push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(64, 48, image::Rgb(color)),
+                i * 100_000_000,
+            );
             assert!(!path.exists(), "continuous recording must never write disk");
         }
         let midpoint = encoder.write_window(&path, 2_500_000_000).unwrap();
-        assert!(
-            (1_100_000_000..=1_350_000_000).contains(&midpoint),
-            "warmed shutter must be near clip midpoint: {midpoint}"
+        assert_eq!(
+            midpoint, 1_200_000_000,
+            "input grid selects 1.3s as first frame"
         );
         let decode = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-xerror", "-i"])
@@ -774,30 +880,19 @@ mod tests {
         let origin = std::time::Instant::now();
         let path = std::env::temp_dir().join(format!("memory-aac-{}.mp4", uuid::Uuid::new_v4()));
         let mut encoder = MemoryEncoder::new(&info, 64, 48, 10, 800, None, origin).unwrap();
-        let sink = memory_sink(encoder.ring.clone(), true);
-        encoder.pipeline.add(&sink).unwrap();
-        let audio = gst::ElementFactory::make("audiotestsrc")
-            .property("is-live", true)
-            .build()
-            .unwrap();
-        super::super::motion_photo_encoder::add_aac_branch(
-            &encoder.pipeline,
-            sink.upcast_ref(),
-            &audio,
-        )
-        .unwrap();
-        sink.sync_state_with_parent().unwrap();
-        encoder.audio = true;
+        test_fixture::add_synthetic_audio(&mut encoder);
+        let mut last_pts = 0;
         for _ in 0..40 {
-            let pts = origin.elapsed().as_nanos() as u64;
-            encoder
-                .push(
-                    image::RgbImage::from_pixel(64, 48, image::Rgb([80, 40, 90])),
-                    pts,
-                )
-                .unwrap();
+            last_pts = origin.elapsed().as_nanos() as u64;
+            test_fixture::push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(64, 48, image::Rgb([80, 40, 90])),
+                last_pts,
+            );
+            // Real capture cadence keeps live synthetic audio aligned.
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        test_fixture::wait_for_audio(&encoder, last_pts);
         let midpoint = encoder.write_window(&path, 2_500_000_000).unwrap() as f64 / 1e9;
         let probe = std::process::Command::new("ffprobe")
             .args([
@@ -817,6 +912,7 @@ mod tests {
         let audio_stream = streams.iter().find(|s| s["codec_type"] == "audio").unwrap();
         assert_eq!(audio_stream["codec_name"], "aac");
         assert_eq!(audio_stream["sample_rate"], "48000");
+        assert_eq!(audio_stream["channels"], 1);
         let index = audio_stream["index"].as_u64().unwrap();
         let times: Vec<f64> = data["packets"]
             .as_array()
