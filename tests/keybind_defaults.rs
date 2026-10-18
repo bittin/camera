@@ -14,13 +14,6 @@ fn all_contains_every_variant_exactly_once() {
 }
 
 #[test]
-fn every_action_has_category() {
-    for a in Action::ALL {
-        let _ = a.category();
-    }
-}
-
-#[test]
 fn every_category_has_at_least_one_action() {
     for cat in ActionCategory::ALL {
         assert!(

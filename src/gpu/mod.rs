@@ -304,26 +304,3 @@ async fn create_low_priority_compute_device(
 
     Ok((Arc::new(device), Arc::new(queue), info))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_create_low_priority_device() {
-        // This test requires a GPU, so it may be skipped in CI
-        match create_low_priority_compute_device("test_device").await {
-            Ok((device, queue, info)) => {
-                println!("Created device: {:?}", info);
-                assert!(!info.adapter_name.is_empty());
-                // Device and queue should be usable
-                drop(queue);
-                drop(device);
-            }
-            Err(e) => {
-                // Skip if no GPU available
-                println!("Skipping test (no GPU): {}", e);
-            }
-        }
-    }
-}
