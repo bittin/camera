@@ -447,7 +447,9 @@ pub(crate) mod test_fixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "live encoder did not deliver fixture packet"
+                "live encoder did not deliver fixture packet: state={:?}, queued={}",
+                encoder.pipeline.current_state(),
+                encoder.source.current_level_buffers(),
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -459,6 +461,9 @@ pub(crate) mod test_fixture {
     }
 
     pub(crate) fn add_synthetic_audio(encoder: &mut MemoryEncoder) {
+        // Match production: assemble both branches before starting the graph.
+        // Adding an async sink during video preroll can strand it in Paused.
+        encoder.pipeline.set_state(gst::State::Null).unwrap();
         let sink = memory_sink(encoder.ring.clone(), true);
         encoder.pipeline.add(&sink).unwrap();
         let audio = gst::ElementFactory::make("audiotestsrc")
@@ -473,6 +478,7 @@ pub(crate) mod test_fixture {
         .unwrap();
         sink.sync_state_with_parent().unwrap();
         encoder.audio = true;
+        encoder.pipeline.set_state(gst::State::Playing).unwrap();
     }
 
     pub(crate) fn wait_for_audio(encoder: &MemoryEncoder, pts: u64) {
@@ -531,6 +537,30 @@ pub(crate) mod test_fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synthetic_audio_fixture_starts_both_streams_without_more_video_input() {
+        for _ in 0..8 {
+            let mut encoder = MemoryEncoder::new(
+                &test_fixture::software_encoder(),
+                64,
+                48,
+                10,
+                800,
+                None,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+            test_fixture::add_synthetic_audio(&mut encoder);
+            test_fixture::push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(64, 48, image::Rgb([80, 40, 90])),
+                0,
+            );
+            test_fixture::wait_for_audio(&encoder, 0);
+            assert_eq!(encoder.pipeline.current_state(), gst::State::Playing);
+        }
+    }
 
     #[test]
     fn live_memory_appsrc_drops_backlog_instead_of_retaining_unbounded_frames() {
