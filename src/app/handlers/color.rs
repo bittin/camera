@@ -167,71 +167,48 @@ impl AppModel {
         }
 
         // Apply defaults to camera
-        let contrast_default = controls.contrast.default;
-        let saturation_default = controls.saturation.default;
-        let sharpness_default = controls.sharpness.default;
-        let hue_default = controls.hue.default;
-        let wb_temp_default = controls.white_balance_temperature.default;
-        let has_contrast = controls.contrast.available;
-        let has_saturation = controls.saturation.available;
-        let has_sharpness = controls.sharpness.available;
-        let has_hue = controls.hue.available;
-        let has_wb_auto = controls.has_white_balance_auto;
-        let has_wb_temp = controls.white_balance_temperature.available;
+        let defaults = [
+            (
+                controls.contrast.available,
+                v4l2_controls::V4L2_CID_CONTRAST,
+                controls.contrast.default,
+            ),
+            (
+                controls.saturation.available,
+                v4l2_controls::V4L2_CID_SATURATION,
+                controls.saturation.default,
+            ),
+            (
+                controls.sharpness.available,
+                v4l2_controls::V4L2_CID_SHARPNESS,
+                controls.sharpness.default,
+            ),
+            (
+                controls.hue.available,
+                v4l2_controls::V4L2_CID_HUE,
+                controls.hue.default,
+            ),
+            (
+                controls.has_white_balance_auto,
+                v4l2_controls::V4L2_CID_AUTO_WHITE_BALANCE,
+                1,
+            ),
+            (
+                controls.white_balance_temperature.available,
+                v4l2_controls::V4L2_CID_WHITE_BALANCE_TEMPERATURE,
+                controls.white_balance_temperature.default,
+            ),
+        ];
 
         debug!("Resetting color settings to defaults for filter");
-        Task::perform(
-            async move {
-                if has_contrast {
-                    let _ = v4l2_controls::set_control(
-                        &device_path,
-                        v4l2_controls::V4L2_CID_CONTRAST,
-                        contrast_default,
-                    );
+        super::exposure::control_task(async move {
+            // Keep write order, skip unavailable controls, and continue after errors.
+            for (available, control_id, value) in defaults {
+                if available {
+                    let _ = v4l2_controls::set_control(&device_path, control_id, value);
                 }
-                if has_saturation {
-                    let _ = v4l2_controls::set_control(
-                        &device_path,
-                        v4l2_controls::V4L2_CID_SATURATION,
-                        saturation_default,
-                    );
-                }
-                if has_sharpness {
-                    let _ = v4l2_controls::set_control(
-                        &device_path,
-                        v4l2_controls::V4L2_CID_SHARPNESS,
-                        sharpness_default,
-                    );
-                }
-                if has_hue {
-                    let _ = v4l2_controls::set_control(
-                        &device_path,
-                        v4l2_controls::V4L2_CID_HUE,
-                        hue_default,
-                    );
-                }
-                if has_wb_auto {
-                    let _ = v4l2_controls::set_control(
-                        &device_path,
-                        v4l2_controls::V4L2_CID_AUTO_WHITE_BALANCE,
-                        1,
-                    );
-                }
-                if has_wb_temp {
-                    let _ = v4l2_controls::set_control(
-                        &device_path,
-                        v4l2_controls::V4L2_CID_WHITE_BALANCE_TEMPERATURE,
-                        wb_temp_default,
-                    );
-                }
-                Ok::<(), String>(())
-            },
-            |result| {
-                cosmic::Action::App(match result {
-                    Ok(_) => Message::ExposureControlApplied,
-                    Err(e) => Message::ExposureControlFailed(e),
-                })
-            },
-        )
+            }
+            Ok(())
+        })
     }
 }
