@@ -2,7 +2,7 @@
 
 //! Canvas-based composition guide overlay widget
 
-use crate::app::preview_geometry::BarInsets;
+use crate::app::preview_geometry::{BarInsets, frame_rect_on_screen};
 use crate::app::state::Message;
 use crate::config::CompositionGuide;
 use cosmic::iced::{Color, Length, Point, Rectangle};
@@ -44,42 +44,14 @@ impl GuideProgram {
     ///   canvas crop overlay (`OverlayBackgroundProgram`) frames, so the
     ///   guide lines align with the translucent crop bars exactly.
     fn cover_rect(&self, bounds: Rectangle) -> Rectangle {
-        let content_x = bounds.x + self.insets.left;
-        let content_y = bounds.y + self.insets.top;
-        let content_h = (bounds.height - self.insets.top - self.insets.bottom).max(0.0);
-        let content_w = (bounds.width - self.insets.left - self.insets.right).max(0.0);
-        let content_rect = Rectangle {
-            x: content_x,
-            y: content_y,
-            width: content_w,
-            height: content_h,
-        };
-        match self.aspect_crop_ratio {
-            None => content_rect,
-            Some(ratio) if content_h > 0.0 && content_w > 0.0 => {
-                let content_aspect = content_w / content_h;
-                if ratio > content_aspect {
-                    // Letterbox top/bottom inside the content area.
-                    let h = content_w / ratio;
-                    Rectangle {
-                        x: content_x,
-                        y: content_y + (content_h - h) / 2.0,
-                        width: content_w,
-                        height: h,
-                    }
-                } else {
-                    // Pillarbox the sides inside the content area.
-                    let w = content_h * ratio;
-                    Rectangle {
-                        x: content_x + (content_w - w) / 2.0,
-                        y: content_y,
-                        width: w,
-                        height: content_h,
-                    }
-                }
-            }
-            Some(_) => content_rect,
-        }
+        self.framed_rect(bounds, self.aspect_crop_ratio)
+    }
+
+    fn framed_rect(&self, bounds: Rectangle, ratio: Option<f32>) -> Rectangle {
+        let mut rect = frame_rect_on_screen(bounds.width, bounds.height, self.insets, ratio);
+        rect.x += bounds.x;
+        rect.y += bounds.y;
+        rect
     }
 
     /// Visible-video rectangle at the Contain endpoint. The image is
@@ -87,14 +59,11 @@ impl GuideProgram {
     /// bottom-bar scrim. The aspect-crop ratio (when set) drives the
     /// letterbox; otherwise the rotated sensor aspect does.
     fn contain_rect(&self, bounds: Rectangle) -> Rectangle {
-        let content_x = bounds.x + self.insets.left;
-        let content_y = bounds.y + self.insets.top;
-        let content_h = (bounds.height - self.insets.top - self.insets.bottom).max(0.0);
-        let content_w = (bounds.width - self.insets.left - self.insets.right).max(0.0);
-        if content_h <= 0.0 || content_w <= 0.0 || self.rotated_sensor_h <= 0.0 {
+        let content = self.framed_rect(bounds, None);
+        if content.height <= 0.0 || content.width <= 0.0 || self.rotated_sensor_h <= 0.0 {
             return Rectangle {
-                x: content_x,
-                y: content_y,
+                x: content.x,
+                y: content.y,
                 width: 0.0,
                 height: 0.0,
             };
@@ -102,24 +71,7 @@ impl GuideProgram {
         let frame_aspect = self
             .aspect_crop_ratio
             .unwrap_or(self.rotated_sensor_w / self.rotated_sensor_h);
-        let content_aspect = content_w / content_h;
-        if frame_aspect > content_aspect {
-            let h = content_w / frame_aspect;
-            Rectangle {
-                x: content_x,
-                y: content_y + (content_h - h) / 2.0,
-                width: content_w,
-                height: h,
-            }
-        } else {
-            let w = content_h * frame_aspect;
-            Rectangle {
-                x: content_x + (content_w - w) / 2.0,
-                y: content_y,
-                width: w,
-                height: content_h,
-            }
-        }
+        self.framed_rect(bounds, Some(frame_aspect))
     }
 
     /// Linearly interpolate the visible-video rectangle by `cover_blend` so
@@ -373,4 +325,90 @@ pub fn composition_canvas<'a>(
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guides_preserve_framing_origins_rotations_and_fit_interpolation() {
+        let insets = BarInsets {
+            top: 40.0,
+            bottom: 80.0,
+            left: 20.0,
+            right: 60.0,
+        };
+        let rect = |[x, y, width, height]: [f32; 4]| Rectangle {
+            x,
+            y,
+            width,
+            height,
+        };
+        // Independent endpoint witnesses, including a rotated sensor and
+        // collapsed content. Nonzero canvas origins must not be lost.
+        for (size, sensor, ratio, cover, contain) in [
+            (
+                [800.0, 600.0],
+                [640.0, 480.0],
+                None,
+                [31.0, 57.0, 720.0, 480.0],
+                [71.0, 57.0, 640.0, 480.0],
+            ),
+            (
+                [800.0, 600.0],
+                [480.0, 640.0],
+                None,
+                [31.0, 57.0, 720.0, 480.0],
+                [211.0, 57.0, 360.0, 480.0],
+            ),
+            (
+                [800.0, 600.0],
+                [640.0, 480.0],
+                Some(16.0 / 9.0),
+                [31.0, 94.5, 720.0, 405.0],
+                [31.0, 94.5, 720.0, 405.0],
+            ),
+            (
+                [800.0, 600.0],
+                [480.0, 640.0],
+                Some(1.0),
+                [151.0, 57.0, 480.0, 480.0],
+                [151.0, 57.0, 480.0, 480.0],
+            ),
+            (
+                [0.0, 600.0],
+                [640.0, 480.0],
+                None,
+                [31.0, 57.0, 0.0, 480.0],
+                [31.0, 57.0, 0.0, 0.0],
+            ),
+            (
+                [800.0, 600.0],
+                [640.0, 0.0],
+                None,
+                [31.0, 57.0, 720.0, 480.0],
+                [31.0, 57.0, 0.0, 0.0],
+            ),
+        ] {
+            let bounds = rect([11.0, 17.0, size[0], size[1]]);
+            let mut guide = GuideProgram {
+                guide: CompositionGuide::RuleOfThirds,
+                rotated_sensor_w: sensor[0],
+                rotated_sensor_h: sensor[1],
+                aspect_crop_ratio: ratio,
+                cover_blend: 0.0,
+                insets,
+            };
+            assert_eq!(guide.cover_rect(bounds), rect(cover));
+            assert_eq!(guide.contain_rect(bounds), rect(contain));
+            for blend in [-1.0_f32, 0.0, 0.25, 0.5, 1.0, 2.0] {
+                guide.cover_blend = blend;
+                let expected = std::array::from_fn(|i| {
+                    contain[i] + (cover[i] - contain[i]) * blend.clamp(0.0, 1.0)
+                });
+                assert_eq!(guide.visible_rect(bounds), rect(expected));
+            }
+        }
+    }
 }

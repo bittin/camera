@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-only
-//! One capture entry point for GUI, backend lifecycle, CLI and terminal.
+//! One capture entry point for GUI, CLI and terminal.
 use super::{
     libcamera::{NativeLibcameraPipeline, PipelineSharedState},
     pipewire::PipeWirePipeline,
@@ -43,31 +43,6 @@ impl CapturePipeline {
             Self::PipeWire(p) => p.preview_metrics.clone(),
         }
     }
-    pub(crate) fn is_multistream(&self) -> bool {
-        match self {
-            Self::Native(p) => p.is_multistream(),
-            Self::PipeWire(_) => false,
-        }
-    }
-
-    pub(crate) fn begin_still_capture(&self) -> super::still_capture::StillRequest {
-        match self {
-            Self::Native(p) => p.begin_still_capture(),
-            Self::PipeWire(p) => p.begin_still_capture(),
-        }
-    }
-    pub(crate) fn get_preview_frame(&self) -> Option<CameraFrame> {
-        match self {
-            Self::Native(p) => p.get_preview_frame(),
-            Self::PipeWire(p) => p.get_preview_frame(),
-        }
-    }
-    pub(crate) fn stop(&self) -> BackendResult<()> {
-        match self {
-            Self::Native(p) => p.stop(),
-            Self::PipeWire(p) => p.stop(),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -96,7 +71,6 @@ mod tests {
             frame_sender: tx,
             still_capture: still.clone(),
             recording_sender: Arc::new(Mutex::new(None)),
-            jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
         };
         assert!(

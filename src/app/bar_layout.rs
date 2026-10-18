@@ -126,11 +126,6 @@ impl crate::app::state::AppModel {
     }
 }
 
-/// Whether the device is held sideways, i.e. the bars move to the side edges.
-pub fn is_sideways(o: DisplayOrientation) -> bool {
-    matches!(o.degrees(), 90 | 270)
-}
-
 /// When a portrait bar is re-laid out as a sideways `Column`, does its portrait
 /// leading→trailing (left→right) order map onto the column top→bottom directly,
 /// or reversed?
@@ -349,14 +344,6 @@ mod tests {
         assert!(!sideways_column_reverses(
             bar_layout(DisplayOrientation::Rotate0).quarter
         ));
-    }
-
-    #[test]
-    fn is_sideways_only_for_quarter_turns() {
-        assert!(!is_sideways(DisplayOrientation::Rotate0));
-        assert!(!is_sideways(DisplayOrientation::Rotate180));
-        assert!(is_sideways(DisplayOrientation::Rotate90));
-        assert!(is_sideways(DisplayOrientation::Rotate270));
     }
 
     #[test]

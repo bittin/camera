@@ -10,7 +10,7 @@
 
 use crate::app::state::{FilterType, Message};
 use crate::app::video_primitive::{VideoFrame, VideoPrimitive};
-use crate::backends::camera::types::{CameraFrame, PixelFormat};
+use crate::backends::camera::types::CameraFrame;
 use cosmic::iced::advanced::widget::Tree;
 use cosmic::iced::advanced::widget::tree;
 use cosmic::iced::advanced::{Clipboard, Shell, Widget, layout};
@@ -85,6 +85,24 @@ pub struct VideoWidgetConfig {
     pub letterbox_color: [f32; 4],
 }
 
+impl VideoWidgetConfig {
+    pub(crate) fn primitive(&self, video_id: u64, frame: &CameraFrame) -> VideoPrimitive {
+        let mut primitive = VideoPrimitive::new(video_id);
+        primitive.filter_type = self.filter_type;
+        primitive.corner_radius = self.corner_radius;
+        primitive.mirror_horizontal = self.mirror_horizontal;
+        primitive.rotation = self.rotation;
+        primitive.crop_uv = self.crop_uv;
+        primitive.zoom_level = self.zoom_level;
+        primitive.letterbox_color = self.letterbox_color;
+
+        if let Some(frame) = VideoFrame::from_camera_frame(video_id, frame) {
+            primitive.update_frame(frame);
+        }
+        primitive
+    }
+}
+
 /// Video widget that renders camera frames using a custom GPU primitive
 pub struct VideoWidget {
     primitive: VideoPrimitive,
@@ -109,14 +127,7 @@ impl VideoWidget {
     /// * `frame` - The camera frame to display
     /// * `config` - Widget configuration options
     pub fn new(frame: Arc<CameraFrame>, config: VideoWidgetConfig) -> Self {
-        let mut primitive = VideoPrimitive::new(config.video_id);
-        primitive.filter_type = config.filter_type;
-        primitive.corner_radius = config.corner_radius;
-        primitive.mirror_horizontal = config.mirror_horizontal;
-        primitive.rotation = config.rotation;
-        primitive.crop_uv = config.crop_uv;
-        primitive.zoom_level = config.zoom_level;
-        primitive.letterbox_color = config.letterbox_color;
+        let primitive = config.primitive(config.video_id, &frame);
 
         // Calculate aspect ratio from frame dimensions, adjusted for crop and rotation
         // For 90° and 270° rotations, swap width and height
@@ -148,44 +159,6 @@ impl VideoWidget {
         } else {
             16.0 / 9.0 // Default aspect ratio
         };
-
-        // Create VideoFrame (supports RGBA and YUV formats)
-        // IMPORTANT: We share the FrameData without copying to maintain zero-copy from GStreamer
-        if frame.width > 0 && frame.height > 0 {
-            let stride = if frame.stride > 0 {
-                frame.stride
-            } else {
-                // Fallback based on format
-                match frame.format {
-                    PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA => frame.width * 4,
-                    PixelFormat::RGB24 => frame.width * 3, // 3 bytes per pixel
-                    PixelFormat::YUYV
-                    | PixelFormat::UYVY
-                    | PixelFormat::YVYU
-                    | PixelFormat::VYUY => {
-                        frame.width * 2 // 2 bytes per pixel
-                    }
-                    PixelFormat::NV12 | PixelFormat::NV21 | PixelFormat::I420 => frame.width, // Y plane stride
-                    PixelFormat::Gray8
-                    | PixelFormat::BayerRGGB
-                    | PixelFormat::BayerBGGR
-                    | PixelFormat::BayerGRBG
-                    | PixelFormat::BayerGBRG => frame.width, // 1 byte per pixel
-                }
-            };
-
-            let video_frame = VideoFrame {
-                id: config.video_id,
-                width: frame.width,
-                height: frame.height,
-                data: frame.data.clone(), // Clone FrameData - just refcount increment, no data copy
-                format: frame.format,
-                stride,
-                yuv_planes: frame.yuv_planes,
-            };
-
-            primitive.update_frame(video_frame);
-        }
 
         Self {
             primitive,

@@ -3409,8 +3409,9 @@ mod tests {
 
     #[test]
     fn hdr_bayer_honors_ccm_without_supplied_gains() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu("hdr_bayer_honors_ccm_without_supplied_gains");
+        let Some((_guard, _, _)) =
+            crate::test_gpu::compute_device_or_skip("hdr_bayer_honors_ccm_without_supplied_gains")
+        else {
             return;
         };
         pollster::block_on(async {
@@ -3450,8 +3451,9 @@ mod tests {
 
     #[test]
     fn hdr_ccm_without_gains_rejects_unsafe_arithmetic() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu("hdr_ccm_without_gains_rejects_unsafe_arithmetic");
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "hdr_ccm_without_gains_rejects_unsafe_arithmetic",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -3486,8 +3488,9 @@ mod tests {
 
     #[test]
     fn hdr_finish_without_gains_still_uses_shared_sensor_knee() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu("hdr_finish_without_gains_still_uses_shared_sensor_knee");
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "hdr_finish_without_gains_still_uses_shared_sensor_knee",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -3525,10 +3528,9 @@ mod tests {
 
     #[test]
     fn hdr_finish_highlight_knee_and_extremes_match_independent_reference() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu(
-                "hdr_finish_highlight_knee_and_extremes_match_independent_reference",
-            );
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "hdr_finish_highlight_knee_and_extremes_match_independent_reference",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -3575,10 +3577,9 @@ mod tests {
 
     #[test]
     fn hdr_finish_rejects_invalid_metadata_and_gpu_samples_before_dispatch() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu(
-                "hdr_finish_rejects_invalid_metadata_and_gpu_samples_before_dispatch",
-            );
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "hdr_finish_rejects_invalid_metadata_and_gpu_samples_before_dispatch",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -3696,10 +3697,9 @@ mod tests {
 
     #[test]
     fn hdr_linear_tonemap_handles_negative_and_overwhite_finitely() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu(
-                "hdr_linear_tonemap_handles_negative_and_overwhite_finitely",
-            );
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "hdr_linear_tonemap_handles_negative_and_overwhite_finitely",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -3728,10 +3728,9 @@ mod tests {
 
     #[test]
     fn hdr_finish_matches_single_frame_lattice_signed_ccm_all_patterns() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu(
-                "hdr_finish_matches_single_frame_lattice_signed_ccm_all_patterns",
-            );
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "hdr_finish_matches_single_frame_lattice_signed_ccm_all_patterns",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -3866,37 +3865,7 @@ mod tests {
         assert!(!config.export_raw_frames);
     }
 
-    use crate::test_gpu::validate_shader;
-
-    #[test]
-    fn test_pyramid_shader_validates() {
-        validate_shader("pyramid", PYRAMID_SHADER);
-    }
-
-    #[test]
-    fn test_sharpness_shader_validates() {
-        validate_shader("sharpness", SHARPNESS_SHADER);
-    }
-
-    #[test]
-    fn test_align_tile_shader_validates() {
-        validate_shader("align_tile", ALIGN_TILE_SHADER);
-    }
-
-    #[test]
-    fn test_warp_shader_validates() {
-        validate_shader("warp", WARP_SHADER);
-    }
-
-    #[test]
-    fn test_tonemap_shader_validates() {
-        validate_shader("tonemap", TONEMAP_SHADER);
-    }
-
-    #[test]
-    fn test_noise_estimate_shader_validates() {
-        validate_shader("noise_estimate", NOISE_ESTIMATE_SHADER);
-    }
+    // Shader validation is the labeled table in fft_gpu::tests.
 }
 
 #[cfg(test)]
@@ -3905,8 +3874,9 @@ mod demosaic_method_tests {
     use crate::shaders::DemosaicMethod;
     #[test]
     fn merged_hdr_routes_three_methods_with_original_cfa_phase() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu("merged_hdr_routes_three_methods_with_original_cfa_phase");
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "merged_hdr_routes_three_methods_with_original_cfa_phase",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -3973,8 +3943,9 @@ mod method_colour_tests {
     use crate::shaders::DemosaicMethod;
     #[test]
     fn hdr_all_methods_reject_extreme_ccm_and_nonfinite_input() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu("hdr_all_methods_reject_extreme_ccm_and_nonfinite_input");
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "hdr_all_methods_reject_extreme_ccm_and_nonfinite_input",
+        ) else {
             return;
         };
         pollster::block_on(async {
@@ -4046,10 +4017,9 @@ mod photo_workspace_memory_tests {
     use super::*;
     #[test]
     fn burst_photo_conversion_does_not_retain_singleton_frame_workspace() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu(
-                "burst_photo_conversion_does_not_retain_singleton_frame_workspace",
-            );
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "burst_photo_conversion_does_not_retain_singleton_frame_workspace",
+        ) else {
             return;
         };
         pollster::block_on(async {

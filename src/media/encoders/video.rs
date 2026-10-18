@@ -220,85 +220,202 @@ pub fn negotiate_raw_encoder_input_format(
     select_raw_encoder_input_format(&encoder_caps, &converter_caps, width, height, framerate)
 }
 
-/// Enumerate all available video encoders
-///
-/// Returns a list of available encoders sorted by priority
+/// Immutable facts shared by UI discovery and automatic selection.
+/// UI priorities and auto ranks are independent policy: in particular x264 is
+/// preferred over x265 automatically, and QSV/AMF are explicit/UI-only.
+struct EncoderSpec {
+    name: &'static str,
+    display_name: &'static str,
+    codec: VideoCodec,
+    hardware: bool,
+    ui_priority: u32,
+    auto_rank: Option<u8>,
+}
+
+const ENCODER_SPECS: &[EncoderSpec] = &[
+    EncoderSpec {
+        name: "vaav1enc",
+        display_name: "VA-API AV1 (HW)",
+        codec: VideoCodec::AV1,
+        hardware: true,
+        ui_priority: 1,
+        auto_rank: Some(0),
+    },
+    EncoderSpec {
+        name: "nvav1enc",
+        display_name: "NVIDIA AV1 (HW)",
+        codec: VideoCodec::AV1,
+        hardware: true,
+        ui_priority: 2,
+        auto_rank: Some(1),
+    },
+    EncoderSpec {
+        name: "qsvav1enc",
+        display_name: "Intel QSV AV1 (HW)",
+        codec: VideoCodec::AV1,
+        hardware: true,
+        ui_priority: 3,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "amfav1enc",
+        display_name: "AMD AMF AV1 (HW)",
+        codec: VideoCodec::AV1,
+        hardware: true,
+        ui_priority: 4,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "svtav1enc",
+        display_name: "SVT-AV1 (SW)",
+        codec: VideoCodec::AV1,
+        hardware: false,
+        ui_priority: 10,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "av1enc",
+        display_name: "AOM AV1 (SW)",
+        codec: VideoCodec::AV1,
+        hardware: false,
+        ui_priority: 11,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "vah265enc",
+        display_name: "VA-API H.265 (HW)",
+        codec: VideoCodec::HEVC,
+        hardware: true,
+        ui_priority: 21,
+        auto_rank: Some(2),
+    },
+    EncoderSpec {
+        name: "nvh265enc",
+        display_name: "NVIDIA H.265 (HW)",
+        codec: VideoCodec::HEVC,
+        hardware: true,
+        ui_priority: 22,
+        auto_rank: Some(3),
+    },
+    EncoderSpec {
+        name: "qsvh265enc",
+        display_name: "Intel QSV H.265 (HW)",
+        codec: VideoCodec::HEVC,
+        hardware: true,
+        ui_priority: 23,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "amfh265enc",
+        display_name: "AMD AMF H.265 (HW)",
+        codec: VideoCodec::HEVC,
+        hardware: true,
+        ui_priority: 24,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "v4l2h265enc",
+        display_name: "V4L2 H.265 (HW)",
+        codec: VideoCodec::HEVC,
+        hardware: true,
+        ui_priority: 25,
+        auto_rank: Some(4),
+    },
+    EncoderSpec {
+        name: "x265enc",
+        display_name: "x265 H.265 (SW)",
+        codec: VideoCodec::HEVC,
+        hardware: false,
+        ui_priority: 31,
+        auto_rank: Some(9),
+    },
+    EncoderSpec {
+        name: "vah264enc",
+        display_name: "VA-API H.264 (HW)",
+        codec: VideoCodec::H264,
+        hardware: true,
+        ui_priority: 41,
+        auto_rank: Some(5),
+    },
+    EncoderSpec {
+        name: "nvh264enc",
+        display_name: "NVIDIA H.264 (HW)",
+        codec: VideoCodec::H264,
+        hardware: true,
+        ui_priority: 42,
+        auto_rank: Some(6),
+    },
+    EncoderSpec {
+        name: "qsvh264enc",
+        display_name: "Intel QSV H.264 (HW)",
+        codec: VideoCodec::H264,
+        hardware: true,
+        ui_priority: 43,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "amfh264enc",
+        display_name: "AMD AMF H.264 (HW)",
+        codec: VideoCodec::H264,
+        hardware: true,
+        ui_priority: 44,
+        auto_rank: None,
+    },
+    EncoderSpec {
+        name: "v4l2h264enc",
+        display_name: "V4L2 H.264 (HW)",
+        codec: VideoCodec::H264,
+        hardware: true,
+        ui_priority: 45,
+        auto_rank: Some(7),
+    },
+    EncoderSpec {
+        name: "x264enc",
+        display_name: "x264 H.264 (SW)",
+        codec: VideoCodec::H264,
+        hardware: false,
+        ui_priority: 30,
+        auto_rank: Some(8),
+    },
+    EncoderSpec {
+        name: "openh264enc",
+        display_name: "OpenH264 H.264 (SW)",
+        codec: VideoCodec::H264,
+        hardware: false,
+        ui_priority: 32,
+        auto_rank: Some(10),
+    },
+];
+
+fn automatic_encoder_specs() -> Vec<&'static EncoderSpec> {
+    let mut specs: Vec<_> = ENCODER_SPECS
+        .iter()
+        .filter(|s| s.auto_rank.is_some())
+        .collect();
+    specs.sort_by_key(|s| s.auto_rank);
+    specs
+}
+
+/// Enumerate available, non-blacklisted encoders in UI priority order.
 pub fn enumerate_video_encoders() -> Vec<EncoderInfo> {
     let _ = gst::init();
 
-    let encoder_specs = [
-        // Hardware AV1
-        ("vaav1enc", "VA-API AV1 (HW)", VideoCodec::AV1, true, 1),
-        ("nvav1enc", "NVIDIA AV1 (HW)", VideoCodec::AV1, true, 2),
-        ("qsvav1enc", "Intel QSV AV1 (HW)", VideoCodec::AV1, true, 3),
-        ("amfav1enc", "AMD AMF AV1 (HW)", VideoCodec::AV1, true, 4),
-        // Software AV1
-        ("svtav1enc", "SVT-AV1 (SW)", VideoCodec::AV1, false, 10),
-        ("av1enc", "AOM AV1 (SW)", VideoCodec::AV1, false, 11),
-        // Hardware HEVC/H.265
-        ("vah265enc", "VA-API H.265 (HW)", VideoCodec::HEVC, true, 21),
-        ("nvh265enc", "NVIDIA H.265 (HW)", VideoCodec::HEVC, true, 22),
-        (
-            "qsvh265enc",
-            "Intel QSV H.265 (HW)",
-            VideoCodec::HEVC,
-            true,
-            23,
-        ),
-        (
-            "amfh265enc",
-            "AMD AMF H.265 (HW)",
-            VideoCodec::HEVC,
-            true,
-            24,
-        ),
-        ("v4l2h265enc", "V4L2 H.265 (HW)", VideoCodec::HEVC, true, 25),
-        // Software HEVC/H.265
-        ("x265enc", "x265 H.265 (SW)", VideoCodec::HEVC, false, 31),
-        // Hardware H.264
-        ("vah264enc", "VA-API H.264 (HW)", VideoCodec::H264, true, 41),
-        ("nvh264enc", "NVIDIA H.264 (HW)", VideoCodec::H264, true, 42),
-        (
-            "qsvh264enc",
-            "Intel QSV H.264 (HW)",
-            VideoCodec::H264,
-            true,
-            43,
-        ),
-        (
-            "amfh264enc",
-            "AMD AMF H.264 (HW)",
-            VideoCodec::H264,
-            true,
-            44,
-        ),
-        ("v4l2h264enc", "V4L2 H.264 (HW)", VideoCodec::H264, true, 45),
-        // Software H.264
-        ("x264enc", "x264 H.264 (SW)", VideoCodec::H264, false, 30),
-        (
-            "openh264enc",
-            "OpenH264 H.264 (SW)",
-            VideoCodec::H264,
-            false,
-            32,
-        ),
-    ];
-
     let mut available_encoders = Vec::new();
 
-    for (element_name, display_name, codec, is_hardware, priority) in &encoder_specs {
+    for spec in ENCODER_SPECS {
+        let element_name = spec.name;
         // Skip blacklisted encoders
-        if BLACKLISTED_ENCODERS.contains(element_name) {
+        if BLACKLISTED_ENCODERS.contains(&element_name) {
             continue;
         }
 
         if gst::ElementFactory::find(element_name).is_some() {
             available_encoders.push(EncoderInfo {
                 element_name: element_name.to_string(),
-                display_name: display_name.to_string(),
-                codec: *codec,
-                is_hardware: *is_hardware,
-                priority: *priority,
+                display_name: spec.display_name.to_string(),
+                codec: spec.codec,
+                is_hardware: spec.hardware,
+                priority: spec.ui_priority,
             });
         }
     }
@@ -321,16 +438,35 @@ pub fn create_encoder_from_info_with_bitrate(
         .build()
         .map_err(|e| format!("Failed to create encoder {}: {}", info.element_name, e))?;
 
+    configure_and_assemble(
+        encoder,
+        &info.element_name,
+        info.codec,
+        quality,
+        width,
+        height,
+        bitrate_override_kbps,
+    )
+}
+
+fn configure_and_assemble(
+    encoder: gst::Element,
+    name: &str,
+    codec: VideoCodec,
+    quality: VideoQuality,
+    width: u32,
+    height: u32,
+    bitrate_override_kbps: Option<u32>,
+) -> Result<SelectedVideoEncoder, String> {
     configure_video_encoder(
         &encoder,
-        &info.element_name,
+        name,
         quality,
         width,
         height,
         bitrate_override_kbps,
     );
-
-    assemble_video_encoder(encoder, info.codec)
+    assemble_video_encoder(encoder, codec)
 }
 
 fn assemble_video_encoder(
@@ -379,46 +515,25 @@ pub fn select_video_encoder_with_bitrate(
     gst::init().map_err(|e| format!("Failed to initialize GStreamer: {}", e))?;
 
     // Try encoders in priority order
-    let encoders = [
-        // Hardware AV1
-        ("vaav1enc", VideoCodec::AV1, true),
-        ("nvav1enc", VideoCodec::AV1, true),
-        // Hardware HEVC
-        ("vah265enc", VideoCodec::HEVC, true),
-        ("nvh265enc", VideoCodec::HEVC, true),
-        ("v4l2h265enc", VideoCodec::HEVC, true),
-        // Hardware H.264
-        ("vah264enc", VideoCodec::H264, true),
-        ("nvh264enc", VideoCodec::H264, true),
-        ("v4l2h264enc", VideoCodec::H264, true),
-        // Software H.264 (preferred — fast, widely compatible)
-        ("x264enc", VideoCodec::H264, false),
-        // Software HEVC
-        ("x265enc", VideoCodec::HEVC, false),
-        // Software H.264 (fallback)
-        ("openh264enc", VideoCodec::H264, false),
-    ];
-
-    for (encoder_name, codec, is_hardware) in &encoders {
+    for spec in automatic_encoder_specs() {
+        let encoder_name = spec.name;
         if let Ok(encoder) = gst::ElementFactory::make(encoder_name).build() {
             info!(
                 encoder = %encoder_name,
-                codec = ?codec,
-                hardware = is_hardware,
+                codec = ?spec.codec,
+                hardware = spec.hardware,
                 "Selected video encoder"
             );
 
-            // Configure encoder
-            configure_video_encoder(
-                &encoder,
+            return configure_and_assemble(
+                encoder,
                 encoder_name,
+                spec.codec,
                 quality,
                 width,
                 height,
                 bitrate_override_kbps,
             );
-
-            return assemble_video_encoder(encoder, *codec);
         }
     }
 
@@ -556,6 +671,73 @@ pub fn configure_video_encoder(
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn registry_keeps_distinct_automatic_and_ui_orders() {
+        let automatic: Vec<_> = automatic_encoder_specs().iter().map(|s| s.name).collect();
+        assert_eq!(
+            automatic,
+            [
+                "vaav1enc",
+                "nvav1enc",
+                "vah265enc",
+                "nvh265enc",
+                "v4l2h265enc",
+                "vah264enc",
+                "nvh264enc",
+                "v4l2h264enc",
+                "x264enc",
+                "x265enc",
+                "openh264enc",
+            ]
+        );
+        let mut ui: Vec<_> = ENCODER_SPECS
+            .iter()
+            .filter(|s| !BLACKLISTED_ENCODERS.contains(&s.name))
+            .collect();
+        ui.sort_by_key(|s| s.ui_priority);
+        assert_eq!(
+            ui.iter().map(|s| s.name).collect::<Vec<_>>(),
+            [
+                "vaav1enc",
+                "nvav1enc",
+                "qsvav1enc",
+                "amfav1enc",
+                "vah265enc",
+                "nvh265enc",
+                "qsvh265enc",
+                "amfh265enc",
+                "v4l2h265enc",
+                "x264enc",
+                "x265enc",
+                "openh264enc",
+                "vah264enc",
+                "nvh264enc",
+                "qsvh264enc",
+                "amfh264enc",
+                "v4l2h264enc",
+            ]
+        );
+        let names: std::collections::HashSet<_> = ENCODER_SPECS.iter().map(|s| s.name).collect();
+        assert_eq!(names.len(), ENCODER_SPECS.len());
+        let ranks: std::collections::HashSet<_> =
+            ENCODER_SPECS.iter().filter_map(|s| s.auto_rank).collect();
+        assert_eq!(ranks.len(), automatic.len());
+        for spec in ENCODER_SPECS {
+            let expected_codec = if spec.name.contains("av1") {
+                VideoCodec::AV1
+            } else if spec.name.contains("265") {
+                VideoCodec::HEVC
+            } else {
+                VideoCodec::H264
+            };
+            assert_eq!(spec.codec, expected_codec, "{}", spec.name);
+            assert_eq!(
+                spec.hardware,
+                !["svtav1enc", "av1enc", "x264enc", "x265enc", "openh264enc"].contains(&spec.name)
+            );
+        }
+    }
 
     #[test]
     fn aom_av1_bitrate_uses_kilobits_per_second() {

@@ -69,49 +69,16 @@ jobs:
           toolchain: 1.98.0
           components: rustfmt, clippy
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libdav1d-dev \
-            libglib2.0-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-plugins-ugly \
-            gstreamer1.0-libav \
-            ffmpeg \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libinput-dev \
-            libudev-dev \
-            libseat-dev \
-            libclang-dev \
-            cmake \
-            nasm \
-            meson \
-            ninja-build \
-            python3-jinja2 \
-            python3-yaml \
-            python3-ply \
-            libyaml-dev
-
-      # Built from source: ubuntu-latest (currently Ubuntu 24.04) ships only
-      # libcamera 0.2.0 in apt. Keep this pinned to the same release and commit as
-      # the Flatpak manifest until the runner packages libcamera 0.7.2 or newer.
-      - name: Build and install libcamera 0.7.2
-        run: |
-          git clone --depth 1 --branch v0.7.2 https://git.libcamera.org/libcamera/libcamera.git /tmp/libcamera
-          cd /tmp/libcamera
-          test "$(git rev-parse HEAD)" = 191e202178f02430b5942397c70d215cdd2056fa
-          meson setup build -Dprefix=/usr -Dpipelines=uvcvideo,simple -Dipas=simple -Dgstreamer=disabled -Dtest=false -Dcam=disabled -Dqcam=disabled -Dlc-compliance=disabled -Dtracing=disabled -Ddocumentation=disabled -Dpycamera=disabled
-          ninja -C build
-          sudo ninja -C build install
-          sudo ldconfig
+      - name: Set up native dependencies and libcamera 0.7.2
+        run: >-
+          bash scripts/ci-native-setup.sh
+          libglib2.0-dev
+          gstreamer1.0-plugins-base
+          gstreamer1.0-plugins-good
+          gstreamer1.0-plugins-bad
+          gstreamer1.0-plugins-ugly
+          gstreamer1.0-libav
+          ffmpeg
 
       - name: Install just
         uses: extractions/setup-just@v4
@@ -181,45 +148,9 @@ jobs:
           key: ${{ matrix.arch }}
           cache-all-crates: true
 
-      - name: Install system dependencies (native build)
+      - name: Set up native dependencies and libcamera 0.7.2 (native build)
         if: ${{ !matrix.use_cross }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config \
-            libdav1d-dev \
-            libglib2.0-dev \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libgstreamer-plugins-bad1.0-dev \
-            libwayland-dev \
-            libxkbcommon-dev \
-            libinput-dev \
-            libudev-dev \
-            libseat-dev \
-            libclang-dev \
-            cmake \
-            nasm \
-            meson \
-            ninja-build \
-            python3-jinja2 \
-            python3-yaml \
-            python3-ply \
-            libyaml-dev
-
-      # Built from source: ubuntu-latest (currently Ubuntu 24.04) ships only
-      # libcamera 0.2.0 in apt. Keep this pinned to the same release and commit as
-      # the Flatpak manifest until the runner packages libcamera 0.7.2 or newer.
-      - name: Build and install libcamera 0.7.2 (native build)
-        if: ${{ !matrix.use_cross }}
-        run: |
-          git clone --depth 1 --branch v0.7.2 https://git.libcamera.org/libcamera/libcamera.git /tmp/libcamera
-          cd /tmp/libcamera
-          test "$(git rev-parse HEAD)" = 191e202178f02430b5942397c70d215cdd2056fa
-          meson setup build -Dprefix=/usr -Dpipelines=uvcvideo,simple -Dipas=simple -Dgstreamer=disabled -Dtest=false -Dcam=disabled -Dqcam=disabled -Dlc-compliance=disabled -Dtracing=disabled -Ddocumentation=disabled -Dpycamera=disabled
-          ninja -C build
-          sudo ninja -C build install
-          sudo ldconfig
+        run: bash scripts/ci-native-setup.sh libglib2.0-dev
 
       - name: Install cross
         if: ${{ matrix.use_cross }}
@@ -227,42 +158,7 @@ jobs:
 
       - name: Install and verify podman
         if: ${{ matrix.use_cross }}
-        # Runner image ubuntu24/20260726.254 bumped podman 4.9.3 -> 5.8.4, and
-        # its podman cannot start a container with the crun that ships alongside:
-        #   error running container: from /usr/bin/crun ...: unknown version specified
-        # Every `cross` build died there, on whichever jobs happened to land on
-        # the new image. Rather than assume which component is at fault, smoke
-        # test the default runtime and only switch to runc when it is broken —
-        # so this keeps working once the image is fixed upstream.
-        run: |
-          set -euo pipefail
-          command -v podman >/dev/null 2>&1 || { sudo apt-get update && sudo apt-get install -y podman; }
-          echo "podman: $(podman --version)"
-          echo "crun:   $(crun --version 2>/dev/null | head -1 || echo 'not installed')"
-          echo "runc:   $(runc --version 2>/dev/null | head -1 || echo 'not installed')"
-
-          # A pull failure (Docker Hub rate limits) must not be mistaken for a
-          # broken runtime, so only the `run` result decides anything.
-          probe=docker.io/library/busybox:latest
-          if ! podman pull -q "$probe" >/dev/null 2>&1; then
-            echo "::warning::could not pull $probe; skipping OCI runtime check"
-            exit 0
-          fi
-
-          if podman run --rm "$probe" true; then
-            echo "Default OCI runtime works"
-            exit 0
-          fi
-
-          echo "Default OCI runtime cannot start a container; falling back to runc"
-          if ! command -v runc >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y runc
-          fi
-          mkdir -p ~/.config/containers
-          printf '[engine]\nruntime = "runc"\n' > ~/.config/containers/containers.conf
-          # Fail here rather than 10 minutes into the build if runc is no better.
-          podman run --rm "$probe" true
-          echo "Using runc"
+        run: bash scripts/ci-oci-probe.sh
 
       - name: Install just
         uses: extractions/setup-just@v4

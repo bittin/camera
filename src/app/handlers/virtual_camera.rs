@@ -388,7 +388,6 @@ impl AppModel {
         // streamed images to consumer apps.
         let mut manager = VirtualCameraManager::new();
         manager.set_filter(initial_filter);
-        manager.set_flip_horizontal(false);
 
         if let Err(e) = manager.start(width, height) {
             return Err(format!("Failed to start virtual camera: {}", e));
@@ -483,7 +482,6 @@ impl AppModel {
         // streamed video files to consumer apps.
         let mut manager = VirtualCameraManager::new();
         manager.set_filter(initial_filter);
-        manager.set_flip_horizontal(false);
 
         if let Err(e) = manager.start(width, height) {
             return Err(format!("Failed to start virtual camera: {}", e));

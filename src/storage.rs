@@ -8,19 +8,52 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-/// Gallery thumbnail data: image handle, RGBA bytes, width, height, and file path
-pub type GalleryThumbnailData = (
-    cosmic::widget::image::Handle,
-    Arc<Vec<u8>>,
-    u32,
-    u32,
-    PathBuf,
-);
+/// Immutable decoded gallery thumbnail. Clones share pixels, metadata and identity;
+/// loading a replacement gets a fresh identity, even for the same path and size.
+#[derive(Debug, Clone)]
+pub struct GalleryThumbnailData(Arc<GalleryThumbnail>);
+
+#[derive(Debug)]
+struct GalleryThumbnail {
+    id: uuid::Uuid,
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    path: PathBuf,
+}
+
+impl GalleryThumbnailData {
+    pub(crate) fn new(path: PathBuf, rgba: Vec<u8>, width: u32, height: u32) -> Self {
+        Self(Arc::new(GalleryThumbnail {
+            id: uuid::Uuid::new_v4(),
+            rgba,
+            width,
+            height,
+            path,
+        }))
+    }
+
+    pub(crate) fn id(&self) -> uuid::Uuid {
+        self.0.id
+    }
+
+    pub(crate) fn rgba(&self) -> &[u8] {
+        &self.0.rgba
+    }
+
+    pub(crate) fn dimensions(&self) -> (u32, u32) {
+        (self.0.width, self.0.height)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0.path
+    }
+}
 
 /// Load latest thumbnail for gallery button
 ///
 /// Scans both photo and video directories for files, finds the most recent one,
-/// and loads it as both an image handle and RGBA data for custom rendering.
+/// and loads its oriented RGBA pixels for custom rendering.
 /// For videos, extracts the first frame as a thumbnail.
 /// Returns gallery thumbnail data for the most recent file
 pub async fn load_latest_thumbnail(
@@ -66,13 +99,11 @@ pub async fn load_latest_thumbnail(
 
     // Check if it's a video file
     if file_formats::is_video_extension(&extension) {
-        let (handle, rgba, w, h) = load_video_thumbnail(latest_path.clone()).await?;
-        return Some((handle, rgba, w, h, latest_path));
+        return load_video_thumbnail(latest_path).await;
     }
 
     // Load image bytes
     let bytes = tokio::fs::read(&latest_path).await.ok()?;
-    let bytes_clone = bytes.clone();
 
     // Decode image to RGBA in blocking task
     let (rgba_data, width, height) = tokio::task::spawn_blocking(move || {
@@ -80,15 +111,14 @@ pub async fn load_latest_thumbnail(
 
         // JPEG: decode straight to a thumbnail-sized image with libjpeg-turbo's
         // scaled DCT decode. Decoding a 12 MP capture at full resolution to feed
-        // a 44 pt button costs ~68 ms and ~48 MB of RGBA (which the gallery
-        // primitive then copies again for the BGRA swizzle); the 1/8 scale decode
+        // a 44 pt button costs ~68 ms and ~48 MB of RGBA; the 1/8 scale decode
         // is ~26 ms and under 1 MB.
-        if let Some(scaled) = decode_jpeg_thumbnail(&bytes_clone) {
+        if let Some(scaled) = decode_jpeg_thumbnail(&bytes) {
             return Some(scaled);
         }
 
-        let mut img = image::load_from_memory(&bytes_clone).ok()?;
-        img.apply_orientation(embedded_image_orientation(&bytes_clone));
+        let mut img = image::load_from_memory(&bytes).ok()?;
+        img.apply_orientation(embedded_image_orientation(&bytes));
         let rgba = img.to_rgba8();
         let (width, height) = img.dimensions();
 
@@ -97,9 +127,12 @@ pub async fn load_latest_thumbnail(
     .await
     .ok()??;
 
-    let handle = cosmic::widget::image::Handle::from_bytes(bytes);
-
-    Some((handle, Arc::new(rgba_data), width, height, latest_path))
+    Some(GalleryThumbnailData::new(
+        latest_path,
+        rgba_data,
+        width,
+        height,
+    ))
 }
 
 /// Smallest thumbnail edge we decode to, in pixels.
@@ -196,13 +229,11 @@ fn orient_thumbnail(
 }
 
 /// Load a thumbnail from a video file by extracting the first frame
-async fn load_video_thumbnail(
-    video_path: PathBuf,
-) -> Option<(cosmic::widget::image::Handle, Arc<Vec<u8>>, u32, u32)> {
+async fn load_video_thumbnail(video_path: PathBuf) -> Option<GalleryThumbnailData> {
     debug!(path = ?video_path, "Extracting thumbnail from video");
 
     // Extract first frame from video in blocking task (uses GStreamer)
-    let result = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         use crate::backends::virtual_camera::load_preview_frame;
 
         match load_preview_frame(&video_path) {
@@ -211,10 +242,9 @@ async fn load_video_thumbnail(
                 let height = frame.height;
                 let rgba_data: Vec<u8> = frame.data.to_vec();
 
-                // Encode as PNG for the Handle
-                let png_bytes = encode_rgba_to_png(&rgba_data, width, height)?;
-
-                Some((png_bytes, rgba_data, width, height))
+                Some(GalleryThumbnailData::new(
+                    video_path, rgba_data, width, height,
+                ))
             }
             Err(e) => {
                 warn!(error = ?e, "Failed to extract video thumbnail");
@@ -223,15 +253,11 @@ async fn load_video_thumbnail(
         }
     })
     .await
-    .ok()??;
-
-    let (png_bytes, rgba_data, width, height) = result;
-    let handle = cosmic::widget::image::Handle::from_bytes(png_bytes);
-
-    Some((handle, Arc::new(rgba_data), width, height))
+    .ok()?
 }
 
 /// Encode RGBA data to PNG bytes
+#[cfg(test)]
 fn encode_rgba_to_png(rgba_data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
     use image::{ImageBuffer, Rgba};
 
@@ -248,6 +274,69 @@ fn encode_rgba_to_png(rgba_data: &[u8], width: u32, height: u32) -> Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnail_clones_share_and_release_the_only_retained_pixel_buffer() {
+        let pixels = vec![20, 40, 60, 255, 80, 100, 120, 255];
+        let pixel_ptr = pixels.as_ptr();
+        let thumbnail = GalleryThumbnailData::new("same.png".into(), pixels, 2, 1);
+        let weak = Arc::downgrade(&thumbnail.0);
+        let cloned = thumbnail.clone();
+        assert!(Arc::ptr_eq(&thumbnail.0, &cloned.0));
+        assert_eq!(thumbnail.id(), cloned.id());
+        assert_eq!(cloned.rgba().as_ptr(), pixel_ptr);
+        assert_eq!(cloned.rgba().len(), 8);
+        assert_eq!(cloned.dimensions(), (2, 1));
+        assert_eq!(Arc::strong_count(&thumbnail.0), 2);
+
+        let replacement = GalleryThumbnailData::new("same.png".into(), vec![0; 8], 2, 1);
+        assert_ne!(thumbnail.id(), replacement.id());
+        drop(thumbnail);
+        assert_eq!(cloned.rgba(), &[20, 40, 60, 255, 80, 100, 120, 255]);
+        drop(cloned);
+        assert!(weak.upgrade().is_none(), "no obsolete pixel owner survives");
+        assert_eq!(replacement.rgba(), &[0; 8]);
+    }
+
+    #[tokio::test]
+    async fn reloading_the_same_path_replaces_identity_and_pixels_without_mutating_clones() {
+        let root = std::env::temp_dir().join(format!("camera-gallery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("same.png");
+        std::fs::write(&path, encode_rgba_to_png(&[20, 40, 60, 255], 1, 1).unwrap()).unwrap();
+        let first = load_latest_thumbnail(root.clone(), root.join("missing"))
+            .await
+            .unwrap();
+        let retained = first.clone();
+        std::fs::write(
+            &path,
+            encode_rgba_to_png(&[180, 90, 30, 255], 1, 1).unwrap(),
+        )
+        .unwrap();
+        let second = load_latest_thumbnail(root.clone(), root.join("missing"))
+            .await
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(first.id(), retained.id());
+        assert_ne!(first.id(), second.id());
+        assert_eq!(second.path(), path);
+        assert_eq!(second.dimensions(), first.dimensions());
+        assert_eq!(retained.rgba(), &[20, 40, 60, 255]);
+        assert_eq!(second.rgba(), &[180, 90, 30, 255]);
+    }
+
+    #[test]
+    fn oriented_thumbnail_preserves_pixel_positions_and_aspect() {
+        let pixels: Vec<u8> = (1..=6).flat_map(|v| [v, 20, 40, 255]).collect();
+        let (oriented, width, height) =
+            orient_thumbnail(pixels, 3, 2, image::metadata::Orientation::Rotate90).unwrap();
+        assert_eq!((width, height), (2, 3));
+        let expected: Vec<u8> = [4, 1, 5, 2, 6, 3]
+            .into_iter()
+            .flat_map(|v| [v, 20, 40, 255])
+            .collect();
+        assert_eq!(oriented, expected);
+    }
 
     #[tokio::test]
     async fn latest_thumbnail_ignores_wrong_directory_formats_and_missing_directories() {
@@ -281,12 +370,12 @@ mod tests {
             )
             .unwrap();
         for video_dir in [videos, root.join("missing")] {
-            let (_, rgba, width, height, path) = load_latest_thumbnail(photos.clone(), video_dir)
+            let thumbnail = load_latest_thumbnail(photos.clone(), video_dir)
                 .await
                 .unwrap();
-            assert_eq!(path, expected);
-            assert_eq!((width, height), (1, 1));
-            assert_eq!(&**rgba, &[20, 40, 60, 255]);
+            assert_eq!(thumbnail.path(), expected);
+            assert_eq!(thumbnail.dimensions(), (1, 1));
+            assert_eq!(thumbnail.rgba(), &[20, 40, 60, 255]);
         }
         assert!(
             load_latest_thumbnail(root.join("absent"), root.join("missing"))
@@ -322,8 +411,10 @@ mod tests {
         assert_eq!(path.extension().unwrap(), "avif");
         let result = load_latest_thumbnail(photos, root.join("videos")).await;
         std::fs::remove_dir_all(&root).unwrap();
-        let (_, rgba, width, height, loaded_path) = result.expect("AVIF thumbnail missing");
-        assert_eq!(loaded_path, path);
+        let thumbnail = result.expect("AVIF thumbnail missing");
+        let (width, height) = thumbnail.dimensions();
+        let rgba = thumbnail.rgba();
+        assert_eq!(thumbnail.path(), path);
         assert_eq!((width, height), (33, 65));
         assert_eq!(rgba.len(), (width * height * 4) as usize);
         assert!(rgba[0].abs_diff(200) < 12);

@@ -46,54 +46,18 @@ impl BitratePreset {
     /// - 2K (2560x1440): Low=8, Medium=16, High=32 Mbps
     /// - 4K (3840x2160): Low=15, Medium=30, High=50 Mbps
     pub fn bitrate_kbps(&self, width: u32, _height: u32) -> u32 {
-        self.bitrate_for_tier(get_resolution_tier(width))
-    }
-
-    /// Get the bitrate for a specific resolution tier (for matrix display)
-    pub fn bitrate_for_tier(&self, tier: ResolutionTier) -> u32 {
-        match (tier, self) {
-            (ResolutionTier::SD, BitratePreset::Low) => 1_000,
-            (ResolutionTier::SD, BitratePreset::Medium) => 2_000,
-            (ResolutionTier::SD, BitratePreset::High) => 4_000,
-            (ResolutionTier::HD, BitratePreset::Low) => 2_500,
-            (ResolutionTier::HD, BitratePreset::Medium) => 5_000,
-            (ResolutionTier::HD, BitratePreset::High) => 10_000,
-            (ResolutionTier::FullHD, BitratePreset::Low) => 4_000,
-            (ResolutionTier::FullHD, BitratePreset::Medium) => 8_000,
-            (ResolutionTier::FullHD, BitratePreset::High) => 16_000,
-            (ResolutionTier::TwoK, BitratePreset::Low) => 8_000,
-            (ResolutionTier::TwoK, BitratePreset::Medium) => 16_000,
-            (ResolutionTier::TwoK, BitratePreset::High) => 32_000,
-            (ResolutionTier::FourK, BitratePreset::Low) => 15_000,
-            (ResolutionTier::FourK, BitratePreset::Medium) => 30_000,
-            (ResolutionTier::FourK, BitratePreset::High) => 50_000,
+        let (low, medium, high) = match width {
+            0..1280 => (1_000, 2_000, 4_000),
+            1280..1920 => (2_500, 5_000, 10_000),
+            1920..2560 => (4_000, 8_000, 16_000),
+            2560..3840 => (8_000, 16_000, 32_000),
+            _ => (15_000, 30_000, 50_000),
+        };
+        match self {
+            Self::Low => low,
+            Self::Medium => medium,
+            Self::High => high,
         }
-    }
-}
-
-/// Resolution tiers for bitrate calculation
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResolutionTier {
-    /// SD: 640x480 and below
-    SD,
-    /// HD: 1280x720
-    HD,
-    /// Full HD: 1920x1080
-    FullHD,
-    /// 2K: 2560x1440
-    TwoK,
-    /// 4K: 3840x2160 and above
-    FourK,
-}
-
-/// Get the resolution tier for a given width
-pub fn get_resolution_tier(width: u32) -> ResolutionTier {
-    match width {
-        w if w >= 3840 => ResolutionTier::FourK,
-        w if w >= 2560 => ResolutionTier::TwoK,
-        w if w >= 1920 => ResolutionTier::FullHD,
-        w if w >= 1280 => ResolutionTier::HD,
-        _ => ResolutionTier::SD,
     }
 }
 

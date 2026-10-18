@@ -29,65 +29,6 @@ var texture_blur: texture_2d<f32>;
 @group(0) @binding(1)
 var sampler_blur: sampler;
 
-struct ViewportUniform {
-    viewport_size: vec2<f32>,
-    content_fit_mode: f32,
-    filter_mode: u32,
-    // Panel corner radius in PHYSICAL px (0 = square).
-    corner_radius: f32,
-    mirror_horizontal: u32,
-    uv_offset: vec2<f32>,
-    uv_scale: vec2<f32>,
-    crop_uv_min: vec2<f32>,
-    crop_uv_max: vec2<f32>,
-    zoom_level: f32,
-    rotation: u32,
-    bar_top_height: f32,
-    bar_bottom_height: f32,
-    kawase_offset: f32,
-    // RGB multiplier. The transition blur darkens; the frosted chrome does not.
-    dim_factor: f32,
-    letterbox_color: vec4<f32>,
-    // The panel rect (x, y, w, h) in PHYSICAL px of the render target, i.e. the
-    // same space as `@builtin(position)`.
-    panel_rect: vec4<f32>,
-    // Film-grain amplitude. cosmic-comp uses 0.03 on its frosted surfaces; the
-    // transition blur passes 0 (see the note in `fs_main`).
-    noise: f32,
-    // The rect the preview IMAGE occupies — (min_x, min_y, max_x, max_y),
-    // normalized over this pass's own `tex_coords` space. Its complement is the
-    // letterbox. (0,0,1,1) means "no letterbox", and is skipped.
-    //
-    // A vec4 aligns to 16, so WGSL lands this at offset 128 on its own — exactly
-    // where the Rust struct's `_pad: [f32; 3]` leaves it. No explicit padding
-    // member here, because a `vec3<f32>` pad would ALSO align to 16 and push
-    // itself to 128, taking `content_rect` to 144.
-    content_rect: vec4<f32>,
-    bar_left_width: f32,
-    bar_right_width: f32,
-}
-
-@group(0) @binding(2)
-var<uniform> viewport: ViewportUniform;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-}
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-
-    let x = f32((vertex_index & 1u) << 2u) - 1.0;
-    let y = f32((vertex_index & 2u) << 1u) - 1.0;
-
-    out.position = vec4<f32>(x, -y, 0.0, 1.0);
-    out.tex_coords = vec2<f32>((x + 1.0) * 0.5, (y + 1.0) * 0.5);
-
-    return out;
-}
-
 // Verbatim from cosmic-comp `shaders/clipped_surface.frag:55-59` (which took it
 // from niri), name included, so our grain is theirs and not a lookalike.
 //

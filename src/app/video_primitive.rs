@@ -7,8 +7,14 @@
 //! - RGBA textures for native RGB processing
 //! - Persistent textures across frames
 
+#[path = "rendering.rs"]
+pub(super) mod rendering;
+use rendering::{encode_screen_triangle, fullscreen_pipeline, sampled_texture_layout};
+
 use crate::app::state::FilterType;
-use crate::backends::camera::types::{FrameData, FrameIdentity, PixelFormat, YuvPlanes};
+use crate::backends::camera::types::{
+    CameraFrame, FrameData, FrameIdentity, PixelFormat, YuvPlanes,
+};
 use cosmic::iced::Rectangle;
 
 /// Video ID for the normal camera preview (no blur).
@@ -175,6 +181,34 @@ pub struct VideoFrame {
 }
 
 impl VideoFrame {
+    /// Share the camera's storage and metadata without assigning new stride policy.
+    pub(crate) fn from_camera_frame(id: u64, frame: &CameraFrame) -> Option<Self> {
+        if frame.width == 0 || frame.height == 0 {
+            return None;
+        }
+        let stride = if frame.stride > 0 {
+            frame.stride
+        } else {
+            match frame.format {
+                PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA => frame.width * 4,
+                PixelFormat::RGB24 => frame.width * 3,
+                PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
+                    frame.width * 2
+                }
+                _ => frame.width,
+            }
+        };
+        Some(Self {
+            id,
+            width: frame.width,
+            height: frame.height,
+            data: frame.data.clone(),
+            format: frame.format,
+            stride,
+            yuv_planes: frame.yuv_planes,
+        })
+    }
+
     /// Get data slice for the main plane
     #[inline]
     pub fn data_slice(&self) -> &[u8] {
@@ -272,17 +306,15 @@ struct ViewportUniform {
     /// pass 2 uniform, which deliberately lies about `viewport_size`.
     ///
     /// Lands at offset 96 (a vec4 boundary, since `letterbox_color` ends there)
-    /// and leaves every existing field's offset untouched, so the WGSL structs
-    /// that don't declare it stay valid against the same buffer. Only
-    /// `video_shader_frosted.wgsl` and `video_shader.wgsl` declare it.
+    /// and leaves every existing field's offset untouched. The canonical WGSL
+    /// declaration preserves it even in stages that do not read it.
     panel_rect: [f32; 4],
     /// Final composite only: film-grain amplitude, ported from cosmic-comp's
     /// `clipped_surface.frag` (their `NOISE = 0.03`). See [`FROSTED_NOISE`].
     ///
     /// Appended after `panel_rect` for the same reason `panel_rect` was appended
-    /// after `letterbox_color`: every earlier offset is untouched, so the four
-    /// shaders that stop short of it stay valid against the same, larger buffer.
-    /// Only `video_shader_frosted.wgsl` declares it.
+    /// after `letterbox_color`: every earlier offset is untouched. All video
+    /// shaders now compose the same declaration from `video_uniform.wgsl`.
     noise: f32,
     /// Pads to the 16-byte boundary `content_rect` (a vec4) has to start on. A
     /// WGSL uniform's size must round up to a 16-byte multiple too, and `noise`
@@ -300,8 +332,8 @@ struct ViewportUniform {
     /// Kawase steps, the pre-blur, the sharp preview) is bit-for-bit unaffected.
     ///
     /// Appended last for the same reason `noise` and `panel_rect` were: every
-    /// earlier offset is untouched, so the five shaders that stop short of it stay
-    /// valid against the same, larger buffer.
+    /// earlier offset is untouched. The canonical WGSL declaration retains this
+    /// full ABI even in passes that only read a prefix.
     content_rect: [f32; 4],
     /// Left/right bar widths in pixels. Appended to preserve every existing
     /// uniform offset while extending Contain/Fit to side controls.
@@ -846,45 +878,6 @@ fn padded_copy_bytes_per_row(row_bytes: usize) -> usize {
         * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize
 }
 
-fn yuv_plane_layout_is_valid(
-    data_len: usize,
-    offset: usize,
-    declared_size: usize,
-    stride: usize,
-    row_bytes: usize,
-    rows: usize,
-) -> bool {
-    if row_bytes > stride {
-        return false;
-    }
-    let required_size = if rows == 0 {
-        Some(0)
-    } else {
-        stride
-            .checked_mul(rows - 1)
-            .and_then(|size| size.checked_add(row_bytes))
-    };
-    let Some(required_size) = required_size else {
-        return false;
-    };
-    required_size <= declared_size
-        && offset
-            .checked_add(declared_size)
-            .is_some_and(|end| end <= data_len)
-}
-
-fn i420_v_plane_is_valid(data_len: usize, layout: &YuvPlanes) -> bool {
-    layout.v_size > 0
-        && yuv_plane_layout_is_valid(
-            data_len,
-            layout.v_offset,
-            layout.v_size,
-            layout.v_stride as usize,
-            layout.uv_width as usize,
-            layout.uv_height as usize,
-        )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn copy_rows_to_upload(
     source: &[u8],
@@ -1026,7 +1019,6 @@ pub struct VideoPipeline {
     pipeline_frosted_composite: wgpu::RenderPipeline,
     pipeline_preblur: wgpu::RenderPipeline, // Lightweight blur for filter pre-processing
     bind_group_layout_rgba: wgpu::BindGroupLayout,
-    bind_group_layout_rgb: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     // Shared textures by video_id (single upload per source)
     textures: std::collections::HashMap<u64, VideoTexture>,
@@ -1044,10 +1036,9 @@ pub struct VideoPipeline {
     // work has not completed, unlike the old CPU-side write_texture duration.
     frames_skipped: std::sync::atomic::AtomicU32,
     upload_rings: std::collections::HashMap<u64, UploadRing>,
-    pending_uploads: Mutex<Vec<PendingUpload>>,
     // YUV→RGBA conversion compute pipeline
-    yuv_compute_pipeline: Option<wgpu::ComputePipeline>,
-    yuv_bind_group_layout: Option<wgpu::BindGroupLayout>,
+    yuv_compute_pipeline: wgpu::ComputePipeline,
+    yuv_bind_group_layout: wgpu::BindGroupLayout,
 
     // YUV textures per video_id
     yuv_textures: std::collections::HashMap<u64, YuvTextures>,
@@ -1061,19 +1052,6 @@ struct PreblurIntermediate {
     view: wgpu::TextureView,
     width: u32,
     height: u32,
-}
-
-/// One step of the Kawase ping-pong: the bind group it samples through, and the
-/// uniform buffer carrying that step's sub-rect size and offset.
-///
-/// Step `k` samples `view_a` when `k` is even and `view_b` when it is odd, and
-/// renders into the other one. Since a run is always `2 * passes` steps — an even
-/// number, whatever the frost level — the result always lands back in `view_a`,
-/// which is what makes `composite_binding` a single fixed binding rather than
-/// something that has to be re-pointed per level.
-struct KawaseStep {
-    bind_group: wgpu::BindGroup,
-    viewport_buffer: wgpu::Buffer,
 }
 
 /// One consumer's physical-screen-space blur targets, step uniforms and cache.
@@ -1095,7 +1073,7 @@ struct BlurTargets {
     width: u32,
     height: u32,
     /// `2 * MAX_KAWASE_PASSES` entries; a run uses the first `2 * passes`.
-    steps: Vec<KawaseStep>,
+    steps: Vec<FilterBinding>,
     /// Over `view_a`, for consumers with no per-panel data (the transition blur).
     composite_binding: FilterBinding,
     /// Set after this `video_id`'s chain runs; cleared by `prepare()` when a new
@@ -1396,83 +1374,34 @@ impl PrimitiveTrait for VideoPrimitive {
             // Update viewport buffer for this specific filter binding
             let binding_key = (self.video_id, filter_mode);
             if let Some(binding) = pipeline.bindings.get(&binding_key) {
-                if self.video_id == VIDEO_ID_BLUR || self.video_id == VIDEO_ID_FROSTED {
-                    // PASS 0 — the transform pass. It is now configured exactly
-                    // like the sharp preview's own uniform (`video_shader.wgsl`),
-                    // because it now does exactly the preview's job: the real
-                    // viewport, the live cover/contain blend, the bars, the crop,
-                    // the zoom, the rotation, the mirror, the filter, the
-                    // letterbox — all of it, into a screen-resolution target.
-                    //
-                    // This is the reversal at the heart of the rewrite. Pass 1
-                    // used to be told `viewport_size = the texture's own dims` and
-                    // `content_fit_mode = 0` (Contain), i.e. "render the frame
-                    // into a frame-shaped box"; the fit onto the screen was the
-                    // LAST pass's job, after the blurring. Both halves of that
-                    // were wrong: it made the blur happen in frame texels (a unit
-                    // no compositor parameter is written in), and it made pass 1
-                    // sample sharp sensor data through a wide kernel (the banding).
-                    //
-                    // `viewport_size` is LOGICAL px while the target is physical;
-                    // that is not a bug. The fit math only ever produces a
-                    // dimensionless UV scale — the px unit cancels between the
-                    // viewport and the zoom — so it is scale-invariant, and the
-                    // bars arrive in logical px from the widget.
-                    let pass0_uniform = ViewportUniform {
-                        viewport_size: [width, height],
-                        content_fit_mode,
-                        filter_mode,
-                        mirror_horizontal: if self.mirror_horizontal { 1 } else { 0 },
-                        crop_uv_min: crop_min,
-                        crop_uv_max: crop_max,
-                        // Digital zoom is baked in HERE, in the one pass that
-                        // samples the source frame — exactly like mirror /
-                        // rotation / crop above, and for the same reason: every
-                        // pass downstream works on this pass's output, which
-                        // already has it, so they leave `zoom_level` at the 1.0
-                        // default and must keep doing so or the zoom compounds.
-                        zoom_level: self.zoom_level,
-                        rotation: self.rotation,
-                        bar_top_height: insets.top,
-                        bar_bottom_height: insets.bottom,
-                        bar_left_width: insets.left,
-                        bar_right_width: insets.right,
-                        letterbox_color: self.letterbox_color,
-                        ..Default::default()
-                    };
-                    queue.write_buffer(
-                        &binding.viewport_buffer,
-                        0,
-                        bytemuck::cast_slice(&[pass0_uniform]),
-                    );
-                } else {
-                    // Regular video: use requested mode with UV adjustment for clipping
-                    let uniform_data = ViewportUniform {
-                        viewport_size: [width, height],
-                        content_fit_mode,
-                        filter_mode,
-                        corner_radius: corner_radius_px,
-                        panel_rect,
-                        mirror_horizontal: if self.mirror_horizontal { 1 } else { 0 },
-                        uv_offset: [stored_uv_offset.0, stored_uv_offset.1],
-                        uv_scale: [stored_uv_scale.0, stored_uv_scale.1],
-                        crop_uv_min: crop_min,
-                        crop_uv_max: crop_max,
-                        zoom_level: self.zoom_level,
-                        rotation: self.rotation,
-                        bar_top_height: insets.top,
-                        bar_bottom_height: insets.bottom,
-                        bar_left_width: insets.left,
-                        bar_right_width: insets.right,
-                        letterbox_color: self.letterbox_color,
-                        ..Default::default()
-                    };
-                    queue.write_buffer(
-                        &binding.viewport_buffer,
-                        0,
-                        bytemuck::cast_slice(&[uniform_data]),
-                    );
+                // Both sharp preview and blur pass 0 fit the source into screen
+                // space. Logical viewport/insets cancel into dimensionless UVs.
+                // Bake zoom exactly once; downstream intermediate passes stay identity.
+                let mut uniform = ViewportUniform {
+                    viewport_size: [width, height],
+                    content_fit_mode,
+                    filter_mode,
+                    mirror_horizontal: if self.mirror_horizontal { 1 } else { 0 },
+                    crop_uv_min: crop_min,
+                    crop_uv_max: crop_max,
+                    zoom_level: self.zoom_level,
+                    rotation: self.rotation,
+                    bar_top_height: insets.top,
+                    bar_bottom_height: insets.bottom,
+                    bar_left_width: insets.left,
+                    bar_right_width: insets.right,
+                    letterbox_color: self.letterbox_color,
+                    ..Default::default()
+                };
+                if self.video_id != VIDEO_ID_BLUR && self.video_id != VIDEO_ID_FROSTED {
+                    // Blur intermediates remain square/full; only the sharp path
+                    // applies draw-specific clipping and its physical silhouette here.
+                    uniform.corner_radius = corner_radius_px;
+                    uniform.panel_rect = panel_rect;
+                    uniform.uv_offset = [stored_uv_offset.0, stored_uv_offset.1];
+                    uniform.uv_scale = [stored_uv_scale.0, stored_uv_scale.1];
                 }
+                binding.write(queue, uniform);
 
                 // Update filter pre-blur intermediate viewport + create binding if needed.
                 // The preblur intermediate already has mirror/rotation/crop baked in
@@ -1572,11 +1501,7 @@ impl PrimitiveTrait for VideoPrimitive {
                             kawase_offset: offset as f32,
                             ..Default::default()
                         };
-                        queue.write_buffer(
-                            &step.viewport_buffer,
-                            0,
-                            bytemuck::cast_slice(&[uniform]),
-                        );
+                        step.write(queue, uniform);
                     };
                     for i in 0..passes {
                         write_step(i as usize, i, base_offset / f64::from(1u32 << i));
@@ -1651,7 +1576,7 @@ impl PrimitiveTrait for VideoPrimitive {
                                     "camera frosted composite viewport buffer",
                                     "camera frosted composite bind group",
                                 ),
-                                &pipeline.bind_group_layout_rgb,
+                                &pipeline.bind_group_layout_rgba,
                                 &targets.view_a,
                                 &pipeline.sampler,
                             );
@@ -1724,95 +1649,42 @@ impl PrimitiveTrait for VideoPrimitive {
     }
 }
 
-/// Fullscreen passes share fixed raster state, but never infer blend or layout.
-fn fullscreen_pipeline(
-    device: &wgpu::Device,
-    label: &str,
-    layout: &wgpu::PipelineLayout,
-    shader: &wgpu::ShaderModule,
-    entry: &str,
-    format: wgpu::TextureFormat,
-    blend: wgpu::BlendState,
-) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some(entry),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        multiview_mask: None,
-        cache: None,
-    })
+/// All video stages share the host ABI and fullscreen vertex. Filters are kept
+/// out of the composite: its upstream grain hash intentionally has the same name.
+fn video_shader(source: &str, texture_filters: bool) -> String {
+    let filters = if texture_filters {
+        format!(
+            "{}\n{}",
+            crate::shaders::FILTER_FUNCTIONS,
+            crate::shaders::TEXTURE_FILTER_FUNCTIONS
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        filters,
+        crate::shaders::GEOMETRY_FUNCTIONS,
+        include_str!("video_uniform.wgsl"),
+        rendering::FULLSCREEN_VERTEX,
+        include_str!("video_geometry.wgsl"),
+        source,
+    )
 }
 
 impl VideoPipeline {
     pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         // ===== Video Pipeline =====
         // Shader for video rendering with shared filter functions
-        let shader_source = format!(
-            "{}\n{}\n{}\n{}",
-            crate::shaders::FILTER_FUNCTIONS,
-            crate::shaders::TEXTURE_FILTER_FUNCTIONS,
-            crate::shaders::GEOMETRY_FUNCTIONS,
-            include_str!("video_shader.wgsl")
-        );
+        let shader_source = video_shader(include_str!("video_shader.wgsl"), true);
+
         let shader_rgba = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("camera video shader"),
             source: wgpu::ShaderSource::Wgsl(shader_source.into()),
         });
 
-        // Bind group layout for video texture, sampler, and viewport
         let bind_group_layout_rgba =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("camera video bind group layout"),
-                entries: &[
-                    // RGBA texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // Sampler
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // Viewport uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+            sampled_texture_layout(device, "camera video bind group layout");
 
         let pipeline_layout_rgba = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("camera video pipeline layout"),
@@ -1831,65 +1703,18 @@ impl VideoPipeline {
         );
 
         // ===== Blur Pipeline (for multi-pass blur) =====
-        let shader_blur_source = format!(
-            "{}\n{}\n{}",
-            crate::shaders::FILTER_FUNCTIONS,
-            crate::shaders::TEXTURE_FILTER_FUNCTIONS,
-            include_str!("video_shader_blur.wgsl")
-        );
+        let shader_blur_source = video_shader(include_str!("video_shader_blur.wgsl"), true);
+
         let shader_rgb_blur = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("camera blur shader"),
             source: wgpu::ShaderSource::Wgsl(shader_blur_source.into()),
-        });
-
-        // Bind group layout for blur texture, sampler, and viewport
-        let bind_group_layout_rgb =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("camera blur bind group layout"),
-                entries: &[
-                    // RGB texture
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // Sampler
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // Viewport uniform
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        let pipeline_layout_rgb = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("camera blur pipeline layout"),
-            bind_group_layouts: &[&bind_group_layout_rgb],
-            immediate_size: 0,
         });
 
         // Composite antialiased edges over the sharp preview; opaque blur is unchanged.
         let pipeline_rgb_blur = fullscreen_pipeline(
             device,
             "camera blur pipeline",
-            &pipeline_layout_rgb,
+            &pipeline_layout_rgba,
             &shader_rgb_blur,
             "fs_main",
             format,
@@ -1900,14 +1725,16 @@ impl VideoPipeline {
         // A verbatim port of cosmic-comp's blur kernels; see the shader header.
         let shader_kawase = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("camera kawase shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("video_shader_kawase.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                video_shader(include_str!("video_shader_kawase.wgsl"), false).into(),
+            ),
         });
         // Kawase alpha carries the normalization mask, so write it verbatim.
         let make_kawase = |label, entry| {
             fullscreen_pipeline(
                 device,
                 label,
-                &pipeline_layout_rgb,
+                &pipeline_layout_rgba,
                 &shader_kawase,
                 entry,
                 format,
@@ -1918,11 +1745,8 @@ impl VideoPipeline {
         let pipeline_kawase_up = make_kawase("camera kawase up pipeline", "fs_up");
 
         // ===== Frosted Composite Pipeline =====
-        let shader_frosted_source = format!(
-            "{}\n{}",
-            crate::shaders::GEOMETRY_FUNCTIONS,
-            include_str!("video_shader_frosted.wgsl")
-        );
+        let shader_frosted_source = video_shader(include_str!("video_shader_frosted.wgsl"), false);
+
         let shader_frosted = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("camera frosted composite shader"),
             source: wgpu::ShaderSource::Wgsl(shader_frosted_source.into()),
@@ -1930,7 +1754,7 @@ impl VideoPipeline {
         let pipeline_frosted_composite = fullscreen_pipeline(
             device,
             "camera frosted composite pipeline",
-            &pipeline_layout_rgb,
+            &pipeline_layout_rgba,
             &shader_frosted,
             "fs_main",
             format,
@@ -1941,7 +1765,9 @@ impl VideoPipeline {
         // Reuses the same bind group layout as the main RGBA pipeline (texture + sampler + viewport)
         let shader_preblur = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("camera preblur shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("video_shader_preblur.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                video_shader(include_str!("video_shader_preblur.wgsl"), false).into(),
+            ),
         });
 
         let pipeline_preblur = fullscreen_pipeline(
@@ -2058,7 +1884,6 @@ impl VideoPipeline {
             pipeline_frosted_composite,
             pipeline_preblur,
             bind_group_layout_rgba,
-            bind_group_layout_rgb,
             sampler,
             textures: std::collections::HashMap::new(),
             bindings: std::collections::HashMap::new(),
@@ -2066,9 +1891,8 @@ impl VideoPipeline {
             filter_preblur_intermediate: std::sync::RwLock::new(None),
             frames_skipped: std::sync::atomic::AtomicU32::new(0),
             upload_rings: std::collections::HashMap::new(),
-            pending_uploads: Mutex::new(Vec::new()),
-            yuv_compute_pipeline: Some(yuv_compute_pipeline),
-            yuv_bind_group_layout: Some(yuv_bind_group_layout),
+            yuv_compute_pipeline,
+            yuv_bind_group_layout,
             yuv_textures: std::collections::HashMap::new(),
             output_format: format,
         }
@@ -2158,7 +1982,7 @@ impl VideoPipeline {
         let gpu_copy_start = Instant::now();
 
         let staged = if frame.needs_gpu_conversion() {
-            self.stage_yuv_upload(device, queue, tex_id, &frame)
+            self.stage_validated_yuv_upload(device, queue, tex_id, &frame)
         } else {
             let texture = self
                 .textures
@@ -2186,7 +2010,7 @@ impl VideoPipeline {
             )
         };
 
-        if !staged {
+        let Some(staged) = staged else {
             let skipped = self.frames_skipped.fetch_add(1, Ordering::Relaxed) + 1;
             if skipped % 10 == 1 {
                 tracing::warn!(
@@ -2195,7 +2019,7 @@ impl VideoPipeline {
                 );
             }
             return;
-        }
+        };
 
         // Submit immediately from prepare rather than deferring until a
         // primitive's render call. iced may prepare an individually clipped
@@ -2204,9 +2028,9 @@ impl VideoPipeline {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("camera texture upload encoder"),
         });
-        let recycle = self.encode_pending_uploads(&mut encoder);
+        let recycle = self.encode_upload(&mut encoder, staged);
         queue.submit([encoder.finish()]);
-        Self::remap_uploads(recycle);
+        Self::remap_upload(recycle);
 
         self.textures
             .get_mut(&tex_id)
@@ -2306,7 +2130,7 @@ impl VideoPipeline {
         source: &[u8],
         planes: Vec<UploadPlane>,
         yuv_conversion: Option<(u64, u32, u32)>,
-    ) -> bool {
+    ) -> Option<PendingUpload> {
         let mut offsets = Vec::with_capacity(planes.len());
         let mut required = 0usize;
         for plane in &planes {
@@ -2314,13 +2138,8 @@ impl VideoPipeline {
                 * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as usize;
             let bytes_per_row = padded_copy_bytes_per_row(plane.row_bytes);
             offsets.push((required, bytes_per_row));
-            let Some(plane_bytes) = bytes_per_row.checked_mul(plane.rows) else {
-                return false;
-            };
-            let Some(next_required) = required.checked_add(plane_bytes) else {
-                return false;
-            };
-            required = next_required;
+            let plane_bytes = bytes_per_row.checked_mul(plane.rows)?;
+            required = required.checked_add(plane_bytes)?;
         }
         let capacity = required.max(4).div_ceil(4) as u64 * 4;
 
@@ -2360,9 +2179,7 @@ impl VideoPipeline {
             }
         }
 
-        let Some(index) = acquired else {
-            return false;
-        };
+        let index = acquired?;
         let slot = &ring.slots[index];
         let mut mapped = slot.buffer.get_mapped_range_mut(0..capacity);
         let mut copies = Vec::with_capacity(planes.len());
@@ -2381,7 +2198,7 @@ impl VideoPipeline {
             {
                 drop(mapped);
                 slot.state.store(UPLOAD_SLOT_READY, Ordering::Release);
-                return false;
+                return None;
             }
             copies.push(PendingTextureCopy {
                 texture: plane.texture,
@@ -2393,44 +2210,24 @@ impl VideoPipeline {
         drop(mapped);
         slot.buffer.unmap();
 
-        let pending = PendingUpload {
+        Some(PendingUpload {
             buffer: slot.buffer.clone(),
             capacity: slot.capacity,
             state: Arc::clone(&slot.state),
             copies,
             yuv_conversion,
-        };
-        match self.pending_uploads.lock() {
-            Ok(mut uploads) => uploads.push(pending),
-            Err(_) => {
-                slot.state.store(UPLOAD_SLOT_FAILED, Ordering::Release);
-                return false;
-            }
-        }
-        true
+        })
     }
 
-    /// Stage YUV planes in a reusable mapped buffer. The copies and conversion
-    /// are submitted immediately so clipped primitives cannot strand ring slots.
-    fn stage_yuv_upload(
+    /// Stage a frame already admitted by upload's pre-mutation gate. Copies and
+    /// conversion are submitted immediately so clipping cannot strand ring slots.
+    fn stage_validated_yuv_upload(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         tex_id: u64,
         frame: &VideoFrame,
-    ) -> bool {
-        if crate::backends::camera::types::validate_frame_layout(
-            frame.data_slice(),
-            frame.format,
-            frame.width,
-            frame.height,
-            frame.stride,
-            frame.yuv_planes.as_ref(),
-        )
-        .is_err()
-        {
-            return false;
-        }
+    ) -> Option<PendingUpload> {
         let (uv_width, uv_height) = frame
             .yuv_planes
             .as_ref()
@@ -2445,18 +2242,9 @@ impl VideoPipeline {
             frame.format,
         );
 
-        let output_view = match self.textures.get(&tex_id) {
-            Some(texture) => &texture.view,
-            None => return false,
-        };
-        let bind_group_layout = match &self.yuv_bind_group_layout {
-            Some(layout) => layout,
-            None => return false,
-        };
-        let yuv = match self.yuv_textures.get_mut(&tex_id) {
-            Some(textures) => textures,
-            None => return false,
-        };
+        let output_view = &self.textures.get(&tex_id)?.view;
+        let bind_group_layout = &self.yuv_bind_group_layout;
+        let yuv = self.yuv_textures.get_mut(&tex_id)?;
 
         let params = YuvConvertParams {
             width: frame.width,
@@ -2517,26 +2305,7 @@ impl VideoPipeline {
                 }]
             }
             PixelFormat::NV12 | PixelFormat::NV21 => {
-                let Some(layout) = frame.yuv_planes.as_ref() else {
-                    return false;
-                };
-                if !yuv_plane_layout_is_valid(
-                    data.len(),
-                    layout.y_offset,
-                    layout.y_size,
-                    frame.stride as usize,
-                    frame.width as usize,
-                    frame.height as usize,
-                ) || !yuv_plane_layout_is_valid(
-                    data.len(),
-                    layout.uv_offset,
-                    layout.uv_size,
-                    layout.uv_stride as usize,
-                    layout.uv_width as usize * 2,
-                    layout.uv_height as usize,
-                ) {
-                    return false;
-                }
+                let layout = frame.yuv_planes.as_ref()?;
                 vec![
                     UploadPlane {
                         texture: yuv.tex_y.clone(),
@@ -2557,27 +2326,7 @@ impl VideoPipeline {
                 ]
             }
             PixelFormat::I420 => {
-                let Some(layout) = frame.yuv_planes.as_ref() else {
-                    return false;
-                };
-                if !yuv_plane_layout_is_valid(
-                    data.len(),
-                    layout.y_offset,
-                    layout.y_size,
-                    frame.stride as usize,
-                    frame.width as usize,
-                    frame.height as usize,
-                ) || !yuv_plane_layout_is_valid(
-                    data.len(),
-                    layout.uv_offset,
-                    layout.uv_size,
-                    layout.uv_stride as usize,
-                    layout.uv_width as usize,
-                    layout.uv_height as usize,
-                ) || !i420_v_plane_is_valid(data.len(), layout)
-                {
-                    return false;
-                }
+                let layout = frame.yuv_planes.as_ref()?;
                 let mut planes = vec![
                     UploadPlane {
                         texture: yuv.tex_y.clone(),
@@ -2634,7 +2383,7 @@ impl VideoPipeline {
             | PixelFormat::BayerRGGB
             | PixelFormat::BayerBGGR
             | PixelFormat::BayerGRBG
-            | PixelFormat::BayerGBRG => return false,
+            | PixelFormat::BayerGBRG => return None,
         };
         self.stage_upload_planes(
             device,
@@ -2645,74 +2394,67 @@ impl VideoPipeline {
         )
     }
 
-    fn encode_pending_uploads(&self, encoder: &mut wgpu::CommandEncoder) -> Vec<UploadRecycle> {
-        let uploads = match self.pending_uploads.lock() {
-            Ok(mut pending) => std::mem::take(&mut *pending),
-            Err(_) => return Vec::new(),
-        };
-        let mut recycle = Vec::with_capacity(uploads.len());
-
-        for upload in uploads {
-            if upload
-                .state
-                .compare_exchange(
-                    UPLOAD_SLOT_STAGED,
-                    UPLOAD_SLOT_IN_FLIGHT,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
-            }
-
-            for copy in &upload.copies {
-                encoder.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &upload.buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: copy.buffer_offset,
-                            bytes_per_row: Some(copy.bytes_per_row),
-                            rows_per_image: None,
-                        },
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &copy.texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    copy.extent,
-                );
-            }
-
-            if let Some((tex_id, width, height)) = upload.yuv_conversion
-                && let (Some(pipeline), Some(textures)) = (
-                    self.yuv_compute_pipeline.as_ref(),
-                    self.yuv_textures.get(&tex_id),
-                )
-                && let Some(bind_group) = textures.convert_bind_group.as_ref()
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("yuv_convert_pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, Some(bind_group), &[]);
-                pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
-            }
-
-            recycle.push(UploadRecycle {
-                buffer: upload.buffer,
-                capacity: upload.capacity,
-                state: upload.state,
-            });
+    fn encode_upload(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        upload: PendingUpload,
+    ) -> Option<UploadRecycle> {
+        if upload
+            .state
+            .compare_exchange(
+                UPLOAD_SLOT_STAGED,
+                UPLOAD_SLOT_IN_FLIGHT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return None;
         }
-        recycle
+
+        for copy in &upload.copies {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &upload.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: copy.buffer_offset,
+                        bytes_per_row: Some(copy.bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &copy.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                copy.extent,
+            );
+        }
+
+        if let Some((tex_id, width, height)) = upload.yuv_conversion
+            && let Some(textures) = self.yuv_textures.get(&tex_id)
+            && let Some(bind_group) = textures.convert_bind_group.as_ref()
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("yuv_convert_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.yuv_compute_pipeline);
+            pass.set_bind_group(0, Some(bind_group), &[]);
+            pass.dispatch_workgroups(width.div_ceil(16), height.div_ceil(16), 1);
+        }
+
+        Some(UploadRecycle {
+            buffer: upload.buffer,
+            capacity: upload.capacity,
+            state: upload.state,
+        })
     }
 
-    fn remap_uploads(uploads: Vec<UploadRecycle>) {
-        for upload in uploads {
+    // Must be called only after the encoded upload has been submitted.
+    fn remap_upload(upload: Option<UploadRecycle>) {
+        if let Some(upload) = upload {
             upload
                 .buffer
                 .map_async(wgpu::MapMode::Write, 0..upload.capacity, move |result| {
@@ -2975,7 +2717,7 @@ impl VideoPipeline {
             FilterBinding::new(
                 device,
                 (label, label),
-                &self.bind_group_layout_rgb,
+                &self.bind_group_layout_rgba,
                 view,
                 &self.sampler,
             )
@@ -2984,18 +2726,11 @@ impl VideoPipeline {
         // One step per ping-pong hop, at the deepest level any frost setting can
         // ask for. Allocating all of them up front (rather than per level) keeps
         // step `k`'s source texture a function of `k`'s parity alone, which is
-        // what lets the composite always read `view_a` — see `KawaseStep`.
+        // what lets the composite always read `view_a` — every step owns an independent `FilterBinding`.
         let steps = (0..2 * MAX_KAWASE_PASSES)
             .map(|k| {
                 let src = if k % 2 == 0 { &view_a } else { &view_b };
-                let FilterBinding {
-                    bind_group,
-                    viewport_buffer,
-                } = make_binding("camera blur kawase step", src);
-                KawaseStep {
-                    bind_group,
-                    viewport_buffer,
-                }
+                make_binding("camera blur kawase step", src)
             })
             .collect();
 
@@ -3151,44 +2886,15 @@ impl VideoPipeline {
                 let blur_targets_guard = self.blur_targets.read().unwrap();
                 let Some(targets) = blur_targets_guard.get(&video_id) else {
                     // Fallback to single-pass if the targets aren't ready
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("camera video render pass fallback"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: target,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-
-                    // Use full widget bounds for viewport (prevents distortion in scrollables)
-                    render_pass.set_viewport(
-                        widget_bounds.0,
-                        widget_bounds.1,
-                        widget_bounds.2,
-                        widget_bounds.3,
-                        0.0,
-                        1.0,
+                    encode_screen_triangle(
+                        encoder,
+                        target,
+                        clip_bounds,
+                        widget_bounds,
+                        &self.pipeline_rgb_blur,
+                        &binding.bind_group,
+                        "camera video render pass fallback",
                     );
-
-                    // Use clip bounds for scissor (clips to visible portion)
-                    render_pass.set_scissor_rect(
-                        clip_bounds.x,
-                        clip_bounds.y,
-                        clip_bounds.width,
-                        clip_bounds.height,
-                    );
-
-                    render_pass.set_pipeline(&self.pipeline_rgb_blur);
-                    render_pass.set_bind_group(0, Some(&binding.bind_group), &[]);
-                    render_pass.draw(0..3, 0..1);
                     return;
                 };
 
@@ -3314,51 +3020,18 @@ impl VideoPipeline {
                 // part of the chain that runs per panel/bar at screen resolution,
                 // which is exactly why it is the part that must stay cheap.
                 {
-                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("camera blur composite"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: target,
-                            resolve_target: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Load,
-                                store: wgpu::StoreOp::Store,
-                            },
-                            depth_slice: None,
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-
-                    // The viewport is the preview rect the Kawase textures were
-                    // sized from, so the composite's texture mapping is identity.
-                    render_pass.set_viewport(
-                        widget_bounds.0,
-                        widget_bounds.1,
-                        widget_bounds.2,
-                        widget_bounds.3,
-                        0.0,
-                        1.0,
-                    );
-
-                    // Use clip bounds for scissor (clips to visible portion)
-                    render_pass.set_scissor_rect(
-                        clip_bounds.x,
-                        clip_bounds.y,
-                        clip_bounds.width,
-                        clip_bounds.height,
-                    );
-
-                    render_pass.set_pipeline(&self.pipeline_frosted_composite);
-                    // The frosted backdrop supplies its own binding so the shader
-                    // can round THIS panel's corners; the transition blur has no
-                    // per-panel data and uses the shared one.
                     let final_binding = frosted_final_binding
                         .map(|b| &b.bind_group)
                         .unwrap_or(&targets.composite_binding.bind_group);
-                    render_pass.set_bind_group(0, Some(final_binding), &[]);
-                    render_pass.draw(0..3, 0..1);
+                    encode_screen_triangle(
+                        encoder,
+                        target,
+                        clip_bounds,
+                        widget_bounds,
+                        &self.pipeline_frosted_composite,
+                        final_binding,
+                        "camera blur composite",
+                    );
                 }
             } else if needs_preblur {
                 // Multi-pass rendering: pre-blur → filter
@@ -3397,85 +3070,28 @@ impl VideoPipeline {
                         .unwrap_or(&binding.bind_group);
 
                     {
-                        let mut render_pass =
-                            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                                label: Some("camera video render pass (from preblur)"),
-                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                    view: target,
-                                    resolve_target: None,
-                                    ops: wgpu::Operations {
-                                        load: wgpu::LoadOp::Load,
-                                        store: wgpu::StoreOp::Store,
-                                    },
-                                    depth_slice: None,
-                                })],
-                                depth_stencil_attachment: None,
-                                timestamp_writes: None,
-                                occlusion_query_set: None,
-                                multiview_mask: None,
-                            });
-
-                        render_pass.set_viewport(
-                            widget_bounds.0,
-                            widget_bounds.1,
-                            widget_bounds.2,
-                            widget_bounds.3,
-                            0.0,
-                            1.0,
+                        encode_screen_triangle(
+                            encoder,
+                            target,
+                            clip_bounds,
+                            widget_bounds,
+                            &self.pipeline_rgba,
+                            pass2_bind_group,
+                            "camera video render pass (from preblur)",
                         );
-
-                        render_pass.set_scissor_rect(
-                            clip_bounds.x,
-                            clip_bounds.y,
-                            clip_bounds.width,
-                            clip_bounds.height,
-                        );
-
-                        render_pass.set_pipeline(&self.pipeline_rgba);
-                        render_pass.set_bind_group(0, Some(pass2_bind_group), &[]);
-                        render_pass.draw(0..3, 0..1);
                     }
                 }
             } else {
                 // Single-pass RGBA rendering for live preview
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("camera video render pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-
-                // Use full widget bounds for viewport (prevents distortion in scrollables)
-                render_pass.set_viewport(
-                    widget_bounds.0,
-                    widget_bounds.1,
-                    widget_bounds.2,
-                    widget_bounds.3,
-                    0.0,
-                    1.0,
+                encode_screen_triangle(
+                    encoder,
+                    target,
+                    clip_bounds,
+                    widget_bounds,
+                    &self.pipeline_rgba,
+                    &binding.bind_group,
+                    "camera video render pass",
                 );
-
-                // Use clip bounds for scissor (clips to visible portion)
-                render_pass.set_scissor_rect(
-                    clip_bounds.x,
-                    clip_bounds.y,
-                    clip_bounds.width,
-                    clip_bounds.height,
-                );
-
-                render_pass.set_pipeline(&self.pipeline_rgba);
-                render_pass.set_bind_group(0, Some(&binding.bind_group), &[]);
-                render_pass.draw(0..3, 0..1);
             }
         }
     }
@@ -3532,10 +3148,23 @@ pub(crate) mod tests {
 
     #[test]
     fn yuv_plane_layout_requires_declared_and_backing_bounds() {
-        assert!(yuv_plane_layout_is_valid(32, 4, 16, 8, 6, 2));
-        assert!(!yuv_plane_layout_is_valid(32, 4, 13, 8, 6, 2));
-        assert!(!yuv_plane_layout_is_valid(16, 4, 16, 8, 6, 2));
-        assert!(!yuv_plane_layout_is_valid(32, 4, 16, 5, 6, 2));
+        let valid = |len, offset, size, stride, row, rows| {
+            crate::backends::camera::types::checked_plane(
+                &vec![0; len],
+                offset,
+                size,
+                stride,
+                row,
+                rows,
+            )
+            .is_ok()
+        };
+        assert!(valid(32, 4, 16, 8, 6, 2));
+        assert!(!valid(32, 4, 13, 8, 6, 2));
+        assert!(!valid(16, 4, 16, 8, 6, 2));
+        assert!(!valid(32, 4, 16, 5, 6, 2));
+        assert!(!valid(32, usize::MAX, 16, 8, 6, 2));
+        assert!(!valid(32, 0, 32, usize::MAX, 6, 2));
     }
 
     #[test]
@@ -3554,11 +3183,22 @@ pub(crate) mod tests {
             uv_height: 2,
         };
 
-        assert!(!i420_v_plane_is_valid(24, &layout));
+        let valid = |layout: &YuvPlanes| {
+            crate::backends::camera::types::validate_frame_layout(
+                &[0; 24],
+                PixelFormat::I420,
+                4,
+                4,
+                4,
+                Some(layout),
+            )
+            .is_ok()
+        };
+        assert!(!valid(&layout));
         layout.v_size = 3;
-        assert!(!i420_v_plane_is_valid(24, &layout));
+        assert!(!valid(&layout));
         layout.v_size = 4;
-        assert!(i420_v_plane_is_valid(24, &layout));
+        assert!(valid(&layout));
     }
 
     #[test]
@@ -3592,25 +3232,29 @@ pub(crate) mod tests {
             13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, // row 1
         ];
 
-        assert!(pipeline.stage_upload_planes(
-            &device,
-            VIDEO_ID_NORMAL,
-            &source,
-            vec![UploadPlane {
-                texture: texture.clone(),
-                source_offset: 0,
-                source_stride: SOURCE_STRIDE,
-                row_bytes: WIDTH as usize * 4,
-                rows: HEIGHT as usize,
-                extent: wgpu::Extent3d {
-                    width: WIDTH,
-                    height: HEIGHT,
-                    depth_or_array_layers: 1,
-                },
-            }],
-            None,
-        ));
+        let staged = pipeline
+            .stage_upload_planes(
+                &device,
+                VIDEO_ID_NORMAL,
+                &source,
+                vec![UploadPlane {
+                    texture: texture.clone(),
+                    source_offset: 0,
+                    source_stride: SOURCE_STRIDE,
+                    row_bytes: WIDTH as usize * 4,
+                    rows: HEIGHT as usize,
+                    extent: wgpu::Extent3d {
+                        width: WIDTH,
+                        height: HEIGHT,
+                        depth_or_array_layers: 1,
+                    },
+                }],
+                None,
+            )
+            .expect("upload slot available");
+        assert_eq!(staged.state.load(Ordering::Acquire), UPLOAD_SLOT_STAGED);
 
+        let state = Arc::clone(&staged.state);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("reusable upload test readback"),
             size: u64::from(READBACK_STRIDE * HEIGHT),
@@ -3620,7 +3264,8 @@ pub(crate) mod tests {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("reusable upload test encoder"),
         });
-        let recycle = pipeline.encode_pending_uploads(&mut encoder);
+        let recycle = pipeline.encode_upload(&mut encoder, staged);
+        assert_eq!(state.load(Ordering::Acquire), UPLOAD_SLOT_IN_FLIGHT);
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -3643,7 +3288,7 @@ pub(crate) mod tests {
             },
         );
         queue.submit([encoder.finish()]);
-        VideoPipeline::remap_uploads(recycle);
+        VideoPipeline::remap_upload(recycle);
 
         let slice = readback.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -3656,6 +3301,7 @@ pub(crate) mod tests {
         );
         drop(data);
         readback.unmap();
+        assert_eq!(state.load(Ordering::Acquire), UPLOAD_SLOT_READY);
 
         assert!(
             pipeline.upload_rings[&VIDEO_ID_NORMAL]
@@ -3663,6 +3309,164 @@ pub(crate) mod tests {
                 .iter()
                 .any(|slot| slot.state.load(Ordering::Acquire) == UPLOAD_SLOT_READY)
         );
+    }
+
+    #[test]
+    fn owned_upload_work_preserves_ring_exhaustion_and_recovery() {
+        let Some((_gpu_test, device, queue)) = headless_device() else {
+            skip_no_gpu("owned_upload_work_preserves_ring_exhaustion_and_recovery");
+            return;
+        };
+        let mut pipeline = VideoPipeline::new(&device, wgpu::TextureFormat::Rgba8Unorm);
+        let texture = pipeline.create_texture(&device, 1, 2).texture;
+        let plane = || UploadPlane {
+            texture: texture.clone(),
+            source_offset: 0,
+            source_stride: 4,
+            row_bytes: 4,
+            rows: 1,
+            extent: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        };
+        // Source/destination copy rejection leaves the still-mapped slot reusable.
+        assert!(
+            pipeline
+                .stage_upload_planes(&device, 0, &[1; 3], vec![plane()], None)
+                .is_none()
+        );
+        assert!(
+            pipeline.upload_rings[&0]
+                .slots
+                .iter()
+                .all(|slot| slot.state.load(Ordering::Acquire) == UPLOAD_SLOT_READY)
+        );
+        let uploads: Vec<_> = (0..UPLOAD_RING_SIZE)
+            .map(|_| {
+                pipeline
+                    .stage_upload_planes(&device, 0, &[1; 4], vec![plane()], None)
+                    .unwrap()
+            })
+            .collect();
+        assert!(
+            pipeline
+                .stage_upload_planes(&device, 0, &[1; 4], vec![plane()], None)
+                .is_none()
+        );
+        let states: Vec<_> = uploads
+            .iter()
+            .map(|upload| Arc::clone(&upload.state))
+            .collect();
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let recycle: Vec<_> = uploads
+            .into_iter()
+            .map(|upload| pipeline.encode_upload(&mut encoder, upload))
+            .collect();
+        assert!(
+            states
+                .iter()
+                .all(|state| state.load(Ordering::Acquire) == UPLOAD_SLOT_IN_FLIGHT)
+        );
+        queue.submit([encoder.finish()]);
+        for upload in recycle {
+            VideoPipeline::remap_upload(upload);
+        }
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(
+            states
+                .iter()
+                .all(|state| state.load(Ordering::Acquire) == UPLOAD_SLOT_READY)
+        );
+
+        // A failed map owns its own state: replacing the slot must not mutate a
+        // handle retained by an older callback. Capacity growth also replaces it.
+        let ring = pipeline.upload_rings.get_mut(&0).unwrap();
+        let next = ring.next;
+        let old_state = Arc::clone(&ring.slots[next].state);
+        old_state.store(UPLOAD_SLOT_FAILED, Ordering::Release);
+        let mut upload = pipeline
+            .stage_upload_planes(&device, 0, &[1; 4], vec![plane()], None)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old_state, &upload.state));
+        assert_eq!(old_state.load(Ordering::Acquire), UPLOAD_SLOT_FAILED);
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let recycle = pipeline.encode_upload(&mut encoder, upload);
+        queue.submit([encoder.finish()]);
+        VideoPipeline::remap_upload(recycle);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+
+        let ring = pipeline.upload_rings.get_mut(&0).unwrap();
+        let next = ring.next;
+        let old_capacity = ring.slots[next].capacity;
+        let old_state = Arc::clone(&ring.slots[next].state);
+        let mut bigger = plane();
+        bigger.rows = 2;
+        bigger.extent.height = 2;
+        upload = pipeline
+            .stage_upload_planes(&device, 0, &[1; 8], vec![bigger], None)
+            .unwrap();
+        assert!(upload.capacity > old_capacity);
+        assert!(!Arc::ptr_eq(&old_state, &upload.state));
+        let state = Arc::clone(&upload.state);
+        let mut encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        let recycle = pipeline.encode_upload(&mut encoder, upload);
+        queue.submit([encoder.finish()]);
+        VideoPipeline::remap_upload(recycle);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        assert_eq!(state.load(Ordering::Acquire), UPLOAD_SLOT_READY);
+    }
+
+    /// Allocation-only fixture: no nested device acquisition or submission.
+    fn render_target(
+        device: &wgpu::Device,
+        label: &str,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> wgpu::Texture {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    fn clear_target(
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        color: wgpu::Color,
+        label: &str,
+    ) {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(color),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
     }
 
     /// Copy full RGBA targets without changing the caller's submission ordering.
@@ -4202,7 +4006,13 @@ pub(crate) mod tests {
             },
         );
 
-        assert!(pipeline.pending_uploads.lock().unwrap().is_empty());
+        assert!(
+            pipeline
+                .upload_rings
+                .values()
+                .flat_map(|ring| &ring.slots)
+                .all(|slot| slot.state.load(Ordering::Acquire) != UPLOAD_SLOT_STAGED)
+        );
         device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         assert!(
             pipeline.upload_rings[&VIDEO_ID_NORMAL]
@@ -4252,6 +4062,77 @@ pub(crate) mod tests {
         assert_eq!(size_of::<ViewportUniform>(), 160);
         assert_eq!(size_of::<ViewportUniform>() % 16, 0);
         assert_eq!(align_of::<ViewportUniform>(), 4);
+    }
+
+    #[test]
+    fn composed_video_uniform_matches_the_host_abi() {
+        let module = crate::test_gpu::validate_shader(
+            "video ABI",
+            &video_shader(include_str!("video_shader.wgsl"), true),
+        );
+        let (members, span) = module
+            .types
+            .iter()
+            .find_map(|(_, ty)| match &ty.inner {
+                naga::TypeInner::Struct { members, span }
+                    if ty.name.as_deref() == Some("ViewportUniform") =>
+                {
+                    Some((members, *span))
+                }
+                _ => None,
+            })
+            .expect("canonical video uniform");
+        assert_eq!(span as usize, std::mem::size_of::<ViewportUniform>());
+        macro_rules! check_members {
+            ($($field:ident),+ $(,)?) => {
+                $(assert_eq!(members.iter().find(|member| member.name.as_deref() == Some(stringify!($field))).unwrap().offset as usize,
+                    std::mem::offset_of!(ViewportUniform, $field), stringify!($field));)+
+            };
+        }
+        check_members!(
+            viewport_size,
+            content_fit_mode,
+            filter_mode,
+            corner_radius,
+            mirror_horizontal,
+            uv_offset,
+            uv_scale,
+            crop_uv_min,
+            crop_uv_max,
+            zoom_level,
+            rotation,
+            bar_top_height,
+            bar_bottom_height,
+            kawase_offset,
+            dim_factor,
+            letterbox_color,
+            panel_rect,
+            noise,
+            content_rect,
+            bar_left_width,
+            bar_right_width
+        );
+    }
+
+    #[test]
+    fn source_shaders_keep_their_crop_zoom_order() {
+        for (shader, crop_before_zoom) in [
+            (include_str!("video_shader.wgsl"), true),
+            (include_str!("video_shader_blur.wgsl"), true),
+            (include_str!("video_shader_preblur.wgsl"), false),
+        ] {
+            let crop = shader
+                .find("= mix(effective_crop_min, effective_crop_max,")
+                .unwrap();
+            let zoom = shader
+                .find("let inv_zoom = 1.0 / viewport.zoom_level;")
+                .unwrap();
+            assert_eq!(
+                crop < zoom,
+                crop_before_zoom,
+                "asymmetric crops distinguish preblur's existing zoom-before-remap order"
+            );
+        }
     }
 
     /// The unit square is the default, so every pass that never heard of
@@ -4400,16 +4281,28 @@ pub(crate) mod tests {
 
     #[test]
     fn every_transform_shader_mirrors_the_asymmetric_fit_pivot() {
-        for (name, shader) in [
-            ("preview", include_str!("video_shader.wgsl")),
-            ("blur", include_str!("video_shader_blur.wgsl")),
-            ("preblur", include_str!("video_shader_preblur.wgsl")),
+        for (name, shader, filters) in [
+            ("preview", include_str!("video_shader.wgsl"), true),
+            ("blur", include_str!("video_shader_blur.wgsl"), true),
+            ("preblur", include_str!("video_shader_preblur.wgsl"), false),
         ] {
             assert!(
-                shader
+                shader.contains("preview_geometry(in.tex_coords, textureDimensions("),
+                "{name} must call the canonical source-transform prefix"
+            );
+            let composed = video_shader(shader, filters);
+            assert!(
+                composed
                     .contains("select(center_x, 1.0 - center_x, viewport.mirror_horizontal == 1u)"),
                 "{name} must mirror the fit pivot with the sampled selfie image"
             );
+            crate::test_gpu::validate_shader(name, &composed);
+        }
+        for (name, shader) in [
+            ("frosted", include_str!("video_shader_frosted.wgsl")),
+            ("kawase", include_str!("video_shader_kawase.wgsl")),
+        ] {
+            crate::test_gpu::validate_shader(name, &video_shader(shader, false));
         }
     }
 
@@ -4645,20 +4538,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frosted corner test target"),
-            size: wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "frosted corner test target", N, N, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // An all-white frame: blurring white gives white, so the backdrop's
@@ -4695,22 +4575,12 @@ pub(crate) mod tests {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         // Pre-fill with red; the backdrop's final pass loads (not clears) it.
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("frosted corner test clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        clear_target(
+            &mut encoder,
+            &view,
+            wgpu::Color::RED,
+            "frosted corner test clear",
+        );
         primitive.render(
             &pipeline,
             &mut encoder,
@@ -4801,20 +4671,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("swatch corner test target"),
-            size: wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "swatch corner test target", N, N, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut primitive = VideoPrimitive::new(7);
@@ -4851,22 +4708,12 @@ pub(crate) mod tests {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("swatch corner test clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        clear_target(
+            &mut encoder,
+            &view,
+            wgpu::Color::RED,
+            "swatch corner test clear",
+        );
         primitive.render(
             &pipeline,
             &mut encoder,
@@ -4969,20 +4816,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("preview beside swatch target"),
-            size: wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "preview beside swatch target", N, N, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let viewport = Viewport::with_physical_size(cosmic::iced::Size::new(N, N), 1.0);
 
@@ -5045,22 +4879,12 @@ pub(crate) mod tests {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("preview beside swatch clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        clear_target(
+            &mut encoder,
+            &view,
+            wgpu::Color::RED,
+            "preview beside swatch clear",
+        );
 
         preview.render(
             &pipeline,
@@ -5332,30 +5156,11 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frosted sigma test target"),
-            size: wgpu::Extent3d {
-                width: n,
-                height: n,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "frosted sigma test target", n, n, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Black left of centre, white right of it: a clean step in x.
-        let mut data = vec![0u8; (src * src * 4) as usize];
-        for y in 0..src {
-            for x in (src / 2)..src {
-                let i = ((y * src + x) * 4) as usize;
-                data[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
-            }
-        }
+        let data = step_edge_frame(src);
 
         let mut primitive = VideoPrimitive::new(VIDEO_ID_FROSTED);
         primitive.blur_params = params;
@@ -5501,20 +5306,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("zoom alignment target"),
-            size: wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "zoom alignment target", N, N, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Opaque black frame with an opaque white square: the normal shader
@@ -5708,22 +5500,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let make_target = |label: &str| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: N,
-                    height: N,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            })
-        };
+        let make_target = |label: &str| render_target(&device, label, N, N, format);
         // Separate targets only so the two results can be measured apart; both
         // are drawn from the same encoder, in one frame, sharing one pipeline.
         let blur_target = make_target("collision test transition target");
@@ -6318,20 +6095,7 @@ pub(crate) mod tests {
         let (_gpu_test, device, queue) = headless_device()?;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("banding test target"),
-            size: wgpu::Extent3d {
-                width: n,
-                height: n,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "banding test target", n, n, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         let disc = disc_field(n, disc_r);
@@ -6574,20 +6338,7 @@ pub(crate) mod tests {
         let (_gpu_test, device, queue) = headless_device()?;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("kawase kernel test target"),
-            size: wgpu::Extent3d {
-                width: n,
-                height: n,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "kawase kernel test target", n, n, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         pipeline.upload(
@@ -6763,20 +6514,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("composite flat test target"),
-            size: wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "composite flat test target", N, N, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         let primitive = VideoPrimitive::new(video_id);
@@ -6926,20 +6664,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frosted scrim bar target"),
-            size: wgpu::Extent3d {
-                width: WW,
-                height: WH,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "frosted scrim bar target", WW, WH, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // A diagonal greyscale ramp: it survives any amount of blur with real
@@ -7053,22 +6778,12 @@ pub(crate) mod tests {
         // Clear to RED (green = 0 too): a bar that draws nothing at all must not
         // be able to pass as a bar that drew letterbox.
         {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("frosted scrim bar clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+            clear_target(
+                &mut encoder,
+                &view,
+                wgpu::Color::RED,
+                "frosted scrim bar clear",
+            );
         }
         for (clone, bar) in clones.iter().zip(bars.iter()) {
             let clip = Rectangle {
@@ -7140,20 +6855,7 @@ pub(crate) mod tests {
         let format = SURFACE_FORMAT;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("per-bar silhouette target"),
-            size: wgpu::Extent3d {
-                width: WW,
-                height: WH,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "per-bar silhouette target", WW, WH, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // All-white: a blur of white is white, so anything not white is the SDF.
@@ -7201,22 +6903,12 @@ pub(crate) mod tests {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("per-bar silhouette clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        clear_target(
+            &mut encoder,
+            &view,
+            wgpu::Color::RED,
+            "per-bar silhouette clear",
+        );
         for (clone, bar) in clones.iter().zip(bars.iter()) {
             clone.render(
                 &pipeline,
@@ -7466,20 +7158,7 @@ pub(crate) mod tests {
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
 
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("frosted letterbox target"),
-            size: wgpu::Extent3d {
-                width: N,
-                height: N,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "frosted letterbox target", N, N, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // A grey ramp well clear of 0 on every channel, so "the preview painted
@@ -7522,22 +7201,12 @@ pub(crate) mod tests {
 
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("frosted letterbox clear"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        clear_target(
+            &mut encoder,
+            &view,
+            wgpu::Color::RED,
+            "frosted letterbox clear",
+        );
         primitive.render(
             &pipeline,
             &mut encoder,
@@ -7718,20 +7387,7 @@ pub(crate) mod tests {
         let (_gpu_test, device, queue) = headless_device()?;
         let format = wgpu::TextureFormat::Rgba8Unorm;
         let mut pipeline = VideoPipeline::new(&device, format);
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("device scrim bar target"),
-            size: wgpu::Extent3d {
-                width: RT_W,
-                height: RT_H,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
+        let target = render_target(&device, "device scrim bar target", RT_W, RT_H, format);
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
         // A diagonal ramp: whatever the blur does to it, it keeps real variance,
@@ -7826,22 +7482,12 @@ pub(crate) mod tests {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("device scrim bar clear"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::RED),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+            clear_target(
+                &mut encoder,
+                &view,
+                wgpu::Color::RED,
+                "device scrim bar clear",
+            );
         }
         let clips = [
             Rectangle {

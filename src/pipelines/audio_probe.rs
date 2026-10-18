@@ -3,11 +3,10 @@
 //! Lightweight audio-level probe used by the Settings drawer to show a
 //! microphone meter before recording starts.
 //!
-//! Spins up a minimal GStreamer pipeline that mirrors the recorder's audio
-//! branch (minus the encoder and muxer): pulsesrc → audioconvert → mono
-//! capsfilter → level → fakesink. The source's native sample rate flows
-//! through unchanged — no `audioresample` element, so the meter reflects
-//! exactly what the recording will capture. The shared
+//! Mirrors the recorder's processing chain: pulsesrc → audioconvert →
+//! audioresample → mono/rate caps → compressor → makeup gain → limiter →
+//! output level → fakesink. The defensive resampler handles sources that
+//! cannot negotiate the requested Opus-compatible rate. The shared
 //! [`install_level_sync_handler`] writes peak/RMS values into a
 //! [`SharedAudioLevels`] mutex that the UI then snapshots on a 100 ms tick.
 //!
@@ -39,6 +38,25 @@ impl AudioLevelProbe {
     /// compatible rate the recorder will use, so the meter reflects what the
     /// recording actually captures.
     pub fn start(device: Option<&str>, source_rate_hz: u32) -> Result<Self, String> {
+        let pipeline = Self::build_pipeline(device, source_rate_hz)?;
+
+        let levels: SharedAudioLevels = Default::default();
+        install_level_sync_handler(&pipeline, &levels);
+
+        let probe = Self {
+            pipeline,
+            levels,
+            device: device.map(|d| d.to_string()),
+        };
+        probe
+            .pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| format!("Failed to start probe pipeline: {e}"))?;
+        Ok(probe)
+    }
+
+    /// Build in NULL state; keep probe timestamp policy distinct from recording.
+    fn build_pipeline(device: Option<&str>, source_rate_hz: u32) -> Result<gst::Pipeline, String> {
         let device_str = device
             .map(|d| format!("device=\"{}\" ", d.replace('"', "\\\"")))
             .unwrap_or_default();
@@ -80,18 +98,7 @@ impl AudioLevelProbe {
             .dynamic_cast::<gst::Pipeline>()
             .map_err(|_| "Failed to cast probe element to Pipeline".to_string())?;
 
-        let levels: SharedAudioLevels = Default::default();
-        install_level_sync_handler(&pipeline, &levels);
-
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| format!("Failed to start probe pipeline: {e}"))?;
-
-        Ok(Self {
-            pipeline,
-            levels,
-            device: device.map(|d| d.to_string()),
-        })
+        Ok(pipeline)
     }
 
     /// Cloned `Arc` handle to the live level data.
@@ -107,12 +114,8 @@ impl AudioLevelProbe {
 
     /// Stop the pipeline and release GStreamer resources.
     pub fn stop(self) {
-        if let Some(bus) = self.pipeline.bus() {
-            bus.unset_sync_handler();
-        }
-        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
-            warn!(error = %e, "Failed to stop probe pipeline cleanly");
-        }
+        // Use the same teardown as ordinary Drop, exactly once.
+        drop(self);
     }
 }
 
@@ -121,6 +124,121 @@ impl Drop for AudioLevelProbe {
         if let Some(bus) = self.pipeline.bus() {
             bus.unset_sync_handler();
         }
-        let _ = self.pipeline.set_state(gst::State::Null);
+        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
+            warn!(error = %e, "Failed to stop probe pipeline cleanly");
+        }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_graph_matches_recorded_processing_but_keeps_its_timestamp_policy() {
+        gst::init().unwrap();
+        let pipeline = AudioLevelProbe::build_pipeline(None, 44_100).unwrap();
+        let mut element = pipeline.by_name("probe-src").unwrap();
+        assert!(element.property::<bool>("do-timestamp"));
+        assert!(!element.property::<bool>("provide-clock"));
+        assert_eq!(
+            element.property::<i64>("buffer-time"),
+            PULSESRC_BUFFER_TIME_US
+        );
+        assert_eq!(
+            element
+                .property_value("slave-method")
+                .serialize()
+                .unwrap()
+                .as_str(),
+            PULSESRC_SLAVE_METHOD
+        );
+        for expected in [
+            "pulsesrc",
+            "audioconvert",
+            "audioresample",
+            "capsfilter",
+            "audiodynamic",
+            "volume",
+            "audiodynamic",
+            "level",
+            "fakesink",
+        ] {
+            assert_eq!(element.factory().unwrap().name(), expected);
+            if expected == "capsfilter" {
+                let caps = element.property::<gst::Caps>("caps");
+                let structure = caps.structure(0).unwrap();
+                assert_eq!(structure.get::<i32>("channels").unwrap(), 1);
+                assert_eq!(structure.get::<i32>("rate").unwrap(), 48_000);
+            }
+            if expected == "volume" {
+                assert_eq!(element.property::<f64>("volume"), dynamics::MAKEUP_GAIN);
+            }
+            if expected == "audiodynamic" {
+                let limiter = element
+                    .static_pad("src")
+                    .unwrap()
+                    .peer()
+                    .unwrap()
+                    .parent_element()
+                    .unwrap()
+                    .factory()
+                    .unwrap()
+                    .name()
+                    == "level";
+                assert_eq!(
+                    element.property::<f32>("threshold"),
+                    if limiter {
+                        dynamics::LIMITER_THRESHOLD
+                    } else {
+                        dynamics::COMPRESSOR_THRESHOLD
+                    }
+                );
+                assert_eq!(
+                    element.property::<f32>("ratio"),
+                    if limiter {
+                        dynamics::LIMITER_RATIO
+                    } else {
+                        dynamics::COMPRESSOR_RATIO
+                    }
+                );
+            }
+            if expected != "fakesink" {
+                element = element
+                    .static_pad("src")
+                    .unwrap()
+                    .peer()
+                    .unwrap()
+                    .parent_element()
+                    .unwrap();
+            }
+        }
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert_eq!(pipeline.children().len(), 9);
+    }
+
+    #[test]
+    fn explicit_stop_and_drop_release_bus_handler_ownership() {
+        gst::init().unwrap();
+        for explicit in [false, true] {
+            let pipeline = gst::Pipeline::new();
+            let levels: SharedAudioLevels = Default::default();
+            let weak = std::sync::Arc::downgrade(&levels);
+            install_level_sync_handler(&pipeline, &levels);
+            let probe = AudioLevelProbe {
+                pipeline: pipeline.clone(),
+                levels,
+                device: None,
+            };
+            if explicit {
+                probe.stop();
+            } else {
+                drop(probe);
+            }
+            assert!(
+                weak.upgrade().is_none(),
+                "teardown must release the sync handler even with a retained pipeline"
+            );
+            assert_eq!(pipeline.current_state(), gst::State::Null);
+        }
     }
 }

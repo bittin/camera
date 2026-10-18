@@ -967,23 +967,9 @@ impl CameraFrame {
     }
 }
 
-/// Frame sent to the recording pipeline.
-///
-/// The recording path can receive either:
-/// - `Decoded`: a CPU-decoded `CameraFrame` (legacy path, all pixel formats)
-/// - `Jpeg`: raw MJPEG bytes for GPU-accelerated decode via VA-API (`vajpegdec`)
-#[derive(Clone)]
-pub enum RecordingFrame {
-    Decoded(Arc<CameraFrame>),
-    Jpeg {
-        data: FrameData,
-        width: u32,
-        height: u32,
-        sensor_timestamp_ns: Option<u64>,
-        /// libcamera frame sequence number (for debug tracing)
-        sequence: Option<u32>,
-    },
-}
+/// Shared decoded frame sent to the recording pipeline.
+/// Pixels retain their capture storage until every consumer releases them.
+pub type RecordingFrame = Arc<CameraFrame>;
 
 /// Frame receiver type for preview streams
 pub type FrameReceiver = cosmic::iced::futures::channel::mpsc::Receiver<CameraFrame>;
@@ -1022,7 +1008,7 @@ impl std::error::Error for BackendError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{FrameData, FrameDataPool, RecordingFrame};
+    use super::{FrameData, FrameDataPool};
 
     #[test]
     fn owned_vec_keeps_its_pixel_allocation() {
@@ -1033,26 +1019,6 @@ mod tests {
 
         assert_eq!(data.as_ptr(), original_ptr);
         assert_eq!(data.as_ref(), &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn recording_jpeg_can_share_an_owned_capture_allocation() {
-        let jpeg = vec![0xff, 0xd8, 1, 2, 3, 0xff, 0xd9];
-        let original_ptr = jpeg.as_ptr();
-        let data = FrameData::from_owned_vec(jpeg);
-
-        let frame = RecordingFrame::Jpeg {
-            data: data.clone(),
-            width: 1,
-            height: 1,
-            sensor_timestamp_ns: None,
-            sequence: None,
-        };
-
-        let RecordingFrame::Jpeg { data, .. } = frame else {
-            panic!("expected JPEG recording frame");
-        };
-        assert_eq!(data.as_ref().as_ptr(), original_ptr);
     }
 
     #[test]

@@ -156,13 +156,19 @@ impl AppModel {
 
         if self.insights.is_multistream {
             // Dual-stream: separate Preview and Capture sections
-            sections.push(self.build_preview_stream_section().into());
+            sections.push(
+                self.build_preview_stream_section(fl!("insights-stream-preview"))
+                    .into(),
+            );
             if self.insights.capture_stream.is_some() {
                 sections.push(self.build_capture_stream_section().into());
             }
         } else {
             // Single-stream: combined section
-            sections.push(self.build_combined_stream_section().into());
+            sections.push(
+                self.build_preview_stream_section(fl!("insights-stream-combined"))
+                    .into(),
+            );
         }
 
         // Recording section (shown when recording is active)
@@ -174,8 +180,8 @@ impl AppModel {
         sections.push(self.build_audio_section().into());
 
         // Per-frame metadata section (libcamera only)
-        if self.insights.has_libcamera_metadata {
-            sections.push(self.build_metadata_section().into());
+        if let Some(metadata) = &self.insights.frame_metadata {
+            sections.push(Self::build_metadata_section(metadata).into());
         }
 
         // V4L2 device formats sections (one per pixel format)
@@ -413,28 +419,12 @@ impl AppModel {
         section
     }
 
-    /// Build the combined single-stream section (Preview + Capture)
-    fn build_combined_stream_section(&self) -> widget::settings::Section<'_, Message> {
-        let mut section = widget::settings::section().title(fl!("insights-stream-combined"));
-
-        // Stream info if available
-        let has_stream = self.insights.preview_stream.is_some();
-        if let Some(stream) = &self.insights.preview_stream {
-            section = self.add_stream_items(section, stream);
-        }
-
-        // Format chain (skip resolution/framerate if stream info already shows them)
-        section = self.add_format_items(section, has_stream);
-
-        // Performance metrics
-        section = self.add_performance_items(section);
-
-        section
-    }
-
-    /// Build the Preview Stream section (dual-stream mode)
-    fn build_preview_stream_section(&self) -> widget::settings::Section<'_, Message> {
-        let mut section = widget::settings::section().title(fl!("insights-stream-preview"));
+    /// Preview metrics serve both the single-stream and dual-stream presentations.
+    fn build_preview_stream_section(
+        &self,
+        title: String,
+    ) -> widget::settings::Section<'_, Message> {
+        let mut section = widget::settings::section().title(title);
 
         // Stream info
         let has_stream = self.insights.preview_stream.is_some();
@@ -581,12 +571,14 @@ impl AppModel {
     /// Build the per-frame metadata section (libcamera only)
     ///
     /// Shows all metadata fields with "N/A" when a value is not reported by the ISP.
-    fn build_metadata_section(&self) -> widget::settings::Section<'_, Message> {
+    fn build_metadata_section(
+        metadata: &crate::backends::camera::types::FrameMetadata,
+    ) -> widget::settings::Section<'_, Message> {
         let na = fl!("insights-meta-na");
         let mut section = widget::settings::section().title(fl!("insights-metadata"));
 
         // Exposure
-        let text = match self.insights.meta_exposure_us {
+        let text = match metadata.exposure_time {
             Some(us) if us >= 1_000_000 => format!("{:.2} s", us as f64 / 1_000_000.0),
             Some(us) if us >= 1_000 => format!("{:.2} ms", us as f64 / 1_000.0),
             Some(us) => format!("{} \u{00b5}s", us),
@@ -598,8 +590,8 @@ impl AppModel {
         // Analogue Gain
         section = section.add(
             insight_item(fl!("insights-meta-analogue-gain")).control(diagnostic_text(
-                self.insights
-                    .meta_analogue_gain
+                metadata
+                    .analogue_gain
                     .map_or_else(|| na.clone(), |g| format!("{:.2}x", g)),
             )),
         );
@@ -607,8 +599,8 @@ impl AppModel {
         // Digital Gain
         section = section.add(
             insight_item(fl!("insights-meta-digital-gain")).control(diagnostic_text(
-                self.insights
-                    .meta_digital_gain
+                metadata
+                    .digital_gain
                     .map_or_else(|| na.clone(), |g| format!("{:.2}x", g)),
             )),
         );
@@ -616,8 +608,8 @@ impl AppModel {
         // Colour Temperature
         section = section.add(
             insight_item(fl!("insights-meta-colour-temp")).control(diagnostic_text(
-                self.insights
-                    .meta_colour_temperature
+                metadata
+                    .colour_temperature
                     .map_or_else(|| na.clone(), |t| format!("{} K", t)),
             )),
         );
@@ -625,8 +617,8 @@ impl AppModel {
         // WB Gains
         section = section.add(
             insight_item(fl!("insights-meta-colour-gains")).control(diagnostic_text(
-                self.insights
-                    .meta_colour_gains
+                metadata
+                    .colour_gains
                     .map_or_else(|| na.clone(), |g| format!("{:.2}, {:.2}", g[0], g[1])),
             )),
         );
@@ -634,8 +626,8 @@ impl AppModel {
         // Black Level
         section = section.add(
             insight_item(fl!("insights-meta-black-level")).control(diagnostic_text(
-                self.insights
-                    .meta_black_level
+                metadata
+                    .black_level
                     .map_or_else(|| na.clone(), |bl| format!("{:.4}", bl)),
             )),
         );
@@ -643,8 +635,8 @@ impl AppModel {
         // Illuminance (Lux)
         section = section.add(
             insight_item(fl!("insights-meta-lux")).control(diagnostic_text(
-                self.insights
-                    .meta_lux
+                metadata
+                    .lux
                     .map_or_else(|| na.clone(), |l| format!("{:.0} lux", l)),
             )),
         );
@@ -652,8 +644,8 @@ impl AppModel {
         // Lens Position
         section = section.add(
             insight_item(fl!("insights-meta-lens-position")).control(diagnostic_text(
-                self.insights
-                    .meta_lens_position
+                metadata
+                    .lens_position
                     .map_or_else(|| na.clone(), |p| format!("{:.2} dioptres", p)),
             )),
         );
@@ -661,8 +653,8 @@ impl AppModel {
         // Focus FoM
         section = section.add(
             insight_item(fl!("insights-meta-focus-fom")).control(diagnostic_text(
-                self.insights
-                    .meta_focus_fom
+                metadata
+                    .focus_fom
                     .map_or_else(|| na.clone(), |f| format!("{}", f)),
             )),
         );
@@ -670,8 +662,8 @@ impl AppModel {
         // Sequence
         section = section.add(
             insight_item(fl!("insights-meta-sequence")).control(diagnostic_text(
-                self.insights
-                    .meta_sequence
+                metadata
+                    .sequence
                     .map_or_else(|| na.clone(), |s| format!("{}", s)),
             )),
         );
@@ -979,17 +971,9 @@ impl AppModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmic::iced::advanced::{layout, renderer::Headless, widget::Tree};
-    use cosmic::iced::{Font, Pixels, Size};
-
-    fn renderer() -> cosmic::Renderer {
-        pollster::block_on(cosmic::Renderer::new(
-            Font::DEFAULT,
-            Pixels(14.0),
-            Some("tiny-skia"),
-        ))
-        .expect("headless software renderer for text layout")
-    }
+    use crate::app::settings::widget_test_support::{self as ui, renderer};
+    use cosmic::iced::Size;
+    use cosmic::iced::advanced::{layout, widget::Tree};
 
     fn assert_content_fits(node: &layout::Node) {
         for child in node.children() {
@@ -1003,6 +987,51 @@ mod tests {
             );
             assert!(bounds.y + bounds.height <= node.size().height + 0.01);
             assert_content_fits(child);
+        }
+    }
+
+    #[test]
+    fn preview_section_titles_share_metrics_without_duplicating_stream_resolution() {
+        let renderer = renderer();
+        for has_stream in [false, true] {
+            let mut app = AppModel::default();
+            app.insights.format_chain.resolution = "format-resolution".into();
+            app.insights.format_chain.framerate = "30 fps".into();
+            app.insights.frame_latency_us = 1250;
+            if has_stream {
+                app.insights.preview_stream = Some(super::super::types::StreamInfo {
+                    role: "View-finder".into(),
+                    resolution: "stream-resolution".into(),
+                    pixel_format: "NV12".into(),
+                    ..Default::default()
+                });
+            }
+            let mut presentations = Vec::new();
+            for title in [
+                fl!("insights-stream-combined"),
+                fl!("insights-stream-preview"),
+            ] {
+                let mut element = app.build_preview_stream_section(title.clone()).into();
+                let (mut tree, node) =
+                    ui::layout(&mut element, &renderer, Size::new(600.0, 2000.0));
+                let texts: Vec<_> = ui::texts(&mut element, &mut tree, &node, &renderer)
+                    .into_iter()
+                    .map(|(text, _)| text)
+                    .collect();
+                assert_eq!(texts[0], title);
+                assert_eq!(texts.iter().filter(|text| *text == "30 fps").count(), 1);
+                assert_eq!(
+                    texts.iter().any(|text| text == "format-resolution"),
+                    !has_stream
+                );
+                assert_eq!(
+                    texts.iter().any(|text| text == "stream-resolution"),
+                    has_stream
+                );
+                assert_eq!(texts.iter().any(|text| text == "1.25 ms"), has_stream);
+                presentations.push(texts[1..].to_vec());
+            }
+            assert_eq!(presentations[0], presentations[1]);
         }
     }
 

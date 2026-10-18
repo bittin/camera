@@ -117,7 +117,7 @@ pub async fn run_timelapse_encoder(
     let input_chain = create_encoder_input_chain(&encoder_input)?;
     let parser = video_enc.parser;
     let muxer_elem = video_enc.muxer;
-    let muxer_cfg = create_muxer(muxer_elem, final_output.clone())?;
+    let muxer_cfg = create_muxer(muxer_elem, &final_output)?;
     apply_video_tags_to_muxer(&muxer_cfg.muxer, &capture_metadata);
 
     // Add elements

@@ -180,7 +180,7 @@ The pipeline automatically:
 - Aligns all frames to the reference using GPU-accelerated pyramid alignment
 - Merges frames using FFT-based frequency domain denoising
 - Applies tone mapping with shadow recovery
-- Outputs as DNG
+- Outputs as JPEG
 
 ### Terminal Mode (For the Brave)
 
@@ -214,7 +214,7 @@ just run-debug
 # Format code
 just fmt
 
-# Run all checks (format, cargo check, tests)
+# Run all checks (format, clippy, cargo check, tests)
 just check
 
 # Run clippy lints
@@ -243,7 +243,7 @@ cross build --release --target aarch64-unknown-linux-gnu
 |--------|-----------|------|
 | `aarch64-unknown-linux-gnu` | `docker/Dockerfile.aarch64` | Ubuntu 25.04 |
 | `armv7-unknown-linux-gnueabihf` | `docker/Dockerfile.armhf` | Ubuntu 25.04 |
-| `riscv64gc-unknown-linux-gnu` | `docker/Dockerfile.riscv64` | Ubuntu 25.04 |
+| `riscv64gc-unknown-linux-gnu` | `docker/Dockerfile.riscv64` | Ubuntu 24.04 |
 | `x86_64-unknown-linux-gnu` | `docker/Dockerfile.x86_64` | Ubuntu 25.04 |
 | `x86_64-unknown-linux-musl` | `docker/Dockerfile.x86_64-musl` | Alpine |
 | `aarch64-unknown-linux-musl` | `docker/Dockerfile.aarch64-musl` | Alpine + clang |

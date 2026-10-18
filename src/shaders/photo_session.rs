@@ -73,10 +73,6 @@ impl FrameResources {
     }
 }
 
-struct SessionState {
-    resources: FrameResources,
-}
-
 pub(crate) struct PhotoSession {
     width: u32,
     height: u32,
@@ -87,7 +83,7 @@ pub(crate) struct PhotoSession {
     unpack_size: u64,
     staging_size: u64,
     active: AtomicBool,
-    state: Mutex<SessionState>,
+    state: Mutex<FrameResources>,
 }
 
 impl std::fmt::Debug for PhotoSession {
@@ -172,9 +168,7 @@ impl PhotoSession {
             unpack_size,
             staging_size,
             active: AtomicBool::new(true),
-            state: Mutex::new(SessionState {
-                resources: FrameResources::default(),
-            }),
+            state: Mutex::new(FrameResources::default()),
         }))
     }
 
@@ -221,7 +215,7 @@ impl PhotoSession {
 
     #[cfg(test)]
     pub(super) fn has_workspace(&self) -> bool {
-        self.state.lock().unwrap().resources.tex_y.is_some()
+        self.state.lock().unwrap().tex_y.is_some()
     }
 
     pub(super) fn end(&self) {
@@ -231,7 +225,7 @@ impl PhotoSession {
 
     pub(super) fn discard(&self) {
         let mut state = self.state.lock().unwrap();
-        state.resources = FrameResources::default();
+        *state = FrameResources::default();
     }
 
     pub(super) fn prepare(&self, pipeline: &mut GpuConvertPipeline) -> Result<(), String> {
@@ -246,9 +240,7 @@ impl PhotoSession {
         {
             return Err("Photo reservation exceeds GPU capabilities".into());
         }
-        if !self.active.load(Ordering::Acquire)
-            || self.state.lock().unwrap().resources.tex_y.is_some()
-        {
+        if !self.active.load(Ordering::Acquire) || self.state.lock().unwrap().tex_y.is_some() {
             return Ok(());
         }
         // Temporarily borrow the converter's allocator without evicting preview/recording state.
@@ -264,7 +256,7 @@ impl PhotoSession {
         previous.swap(pipeline);
         let mut state = self.state.lock().unwrap();
         if self.active.load(Ordering::Acquire) {
-            state.resources = prepared;
+            *state = prepared;
         }
         info!(
             width = self.width,
@@ -293,7 +285,7 @@ impl PhotoSession {
         if !self.active.load(Ordering::Acquire) {
             return false;
         }
-        state.resources.swap(pipeline);
+        state.swap(pipeline);
         true
     }
 
@@ -309,7 +301,7 @@ impl PhotoSession {
             && pipeline.packed_input_buffer_size <= self.packed_size
             && pipeline.unpack_output_buffer_size <= self.unpack_size
         {
-            state.resources.swap(pipeline);
+            state.swap(pipeline);
         }
     }
 }

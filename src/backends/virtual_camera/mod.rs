@@ -39,7 +39,7 @@ pub use gpu_filter::GpuFilterRenderer;
 pub use pipeline::VirtualCameraPipeline;
 
 use crate::app::FilterType;
-use crate::backends::camera::types::{BackendError, BackendResult, CameraFrame};
+use crate::backends::camera::types::{BackendError, BackendResult, CameraFrame, FrameData};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -60,9 +60,6 @@ pub struct VirtualCameraManager {
     current_filter: FilterType,
     /// Whether currently streaming
     streaming: bool,
-
-    /// Whether to horizontally flip output (for file sources, to counteract app auto-mirroring)
-    flip_horizontal: bool,
 }
 
 impl VirtualCameraManager {
@@ -72,18 +69,7 @@ impl VirtualCameraManager {
             pipeline: None,
             current_filter: FilterType::Standard,
             streaming: false,
-
-            flip_horizontal: false,
         }
-    }
-
-    /// Set whether to horizontally flip the output
-    ///
-    /// This should be enabled for file sources to counteract the automatic
-    /// mirroring that many video conferencing apps apply to camera sources.
-    pub fn set_flip_horizontal(&mut self, flip: bool) {
-        self.flip_horizontal = flip;
-        debug!(flip, "Virtual camera horizontal flip changed");
     }
 
     /// Start streaming to virtual camera
@@ -199,15 +185,7 @@ impl VirtualCameraManager {
                 // Apply filter if renderer is available
                 if let Some(renderer) = guard.as_mut() {
                     match renderer.apply_filter(frame, self.current_filter) {
-                        Ok(mut rgba_data) => {
-                            // Apply horizontal flip if needed (for file sources)
-                            if self.flip_horizontal {
-                                Self::flip_horizontal_rgba(
-                                    &mut rgba_data,
-                                    frame.width as usize,
-                                    frame.height as usize,
-                                );
-                            }
+                        Ok(rgba_data) => {
                             // Pass owned Vec directly - zero-copy to GStreamer
                             return pipeline.push_frame_rgba(rgba_data, frame.width, frame.height);
                         }
@@ -233,57 +211,22 @@ impl VirtualCameraManager {
         pipeline: &VirtualCameraPipeline,
         frame: &CameraFrame,
     ) -> BackendResult<()> {
-        // Extract RGBA data with stride handling
-        let width = frame.width as usize;
-        let height = frame.height as usize;
-        let stride = frame.stride as usize;
-        let row_bytes = width * 4; // RGBA = 4 bytes per pixel
-
-        // If stride matches expected row size and no flip needed, use data directly
-        if stride == row_bytes && !self.flip_horizontal {
-            return pipeline.push_frame_rgba(frame.data.clone(), frame.width, frame.height);
-        }
-
-        // Copy data (and apply horizontal flip if needed)
-        let mut rgba_data = vec![0u8; row_bytes * height];
-        for y in 0..height {
-            let src_start = y * stride;
-            let dst_start = y * row_bytes;
-
-            if self.flip_horizontal {
-                // Copy row with horizontal flip (reverse pixel order)
-                for x in 0..width {
-                    let src_pixel = src_start + x * 4;
-                    let dst_pixel = dst_start + (width - 1 - x) * 4;
-                    rgba_data[dst_pixel..dst_pixel + 4]
-                        .copy_from_slice(&frame.data[src_pixel..src_pixel + 4]);
-                }
-            } else {
-                // Copy row without flip
-                rgba_data[dst_start..dst_start + row_bytes]
-                    .copy_from_slice(&frame.data[src_start..src_start + row_bytes]);
-            }
-        }
-
-        // Pass owned Vec - zero-copy to GStreamer
-        pipeline.push_frame_rgba(rgba_data, frame.width, frame.height)
+        pipeline.push_frame_rgba(Self::passthrough_data(frame), frame.width, frame.height)
     }
 
-    /// Flip RGBA data horizontally in place
-    fn flip_horizontal_rgba(data: &mut [u8], width: usize, height: usize) {
-        let row_bytes = width * 4;
-        for y in 0..height {
-            let row_start = y * row_bytes;
-            // Swap pixels from left and right sides
-            for x in 0..width / 2 {
-                let left_pixel = row_start + x * 4;
-                let right_pixel = row_start + (width - 1 - x) * 4;
-                // Swap 4 bytes (RGBA)
-                for i in 0..4 {
-                    data.swap(left_pixel + i, right_pixel + i);
-                }
-            }
+    /// Preserve pixel order and share tight frames; compact only padded rows.
+    fn passthrough_data(frame: &CameraFrame) -> FrameData {
+        let row_bytes = frame.width as usize * 4;
+        let stride = frame.stride as usize;
+        if stride == row_bytes {
+            return frame.data.clone();
         }
+        let mut data = Vec::with_capacity(row_bytes * frame.height as usize);
+        for y in 0..frame.height as usize {
+            let start = y * stride;
+            data.extend_from_slice(&frame.data[start..start + row_bytes]);
+        }
+        FrameData::from_owned_vec(data)
     }
 }
 
@@ -299,6 +242,45 @@ impl Drop for VirtualCameraManager {
             && let Err(e) = self.stop()
         {
             error!(?e, "Failed to stop virtual camera on drop");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backends::camera::types::PixelFormat;
+
+    #[test]
+    fn file_passthrough_preserves_asymmetric_pixels_and_tight_storage() {
+        let expected = vec![1, 2, 3, 255, 4, 5, 6, 128, 7, 8, 9, 64, 10, 11, 12, 0];
+        for stride in [8, 12] {
+            let mut bytes = expected[..8].to_vec();
+            if stride == 12 {
+                bytes.extend_from_slice(&[99; 4]);
+            }
+            bytes.extend_from_slice(&expected[8..]);
+            if stride == 12 {
+                bytes.extend_from_slice(&[99; 4]);
+            }
+            let frame = CameraFrame {
+                width: 2,
+                height: 2,
+                stride,
+                data: FrameData::from_owned_vec(bytes),
+                format: PixelFormat::RGBA,
+                yuv_planes: None,
+                captured_at: std::time::Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            };
+            let output = VirtualCameraManager::passthrough_data(&frame);
+            assert_eq!(output.as_ref(), expected.as_slice());
+            if stride == 8 {
+                assert_eq!(output.as_ptr(), frame.data.as_ptr());
+            }
+            drop(frame);
+            assert_eq!(output.as_ref(), expected.as_slice());
         }
     }
 }

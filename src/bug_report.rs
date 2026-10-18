@@ -883,67 +883,20 @@ impl BugReportGenerator {
         if let Some(ref meta) = insights.frame_metadata {
             Self::format_frame_metadata(&mut info, meta);
         } else {
-            // Fall back to the InsightsState copies (e.g. non-libcamera backends)
-            info.push_str(&format!(
-                "- **Exposure:** {}\n",
-                insights
-                    .meta_exposure_us
-                    .map_or_else(|| na.to_string(), Self::format_exposure)
-            ));
-            info.push_str(&format!(
-                "- **Analogue Gain:** {}\n",
-                insights
-                    .meta_analogue_gain
-                    .map_or_else(|| na.to_string(), |g| format!("{:.2}x", g))
-            ));
-            info.push_str(&format!(
-                "- **Digital Gain:** {}\n",
-                insights
-                    .meta_digital_gain
-                    .map_or_else(|| na.to_string(), |g| format!("{:.2}x", g))
-            ));
-            info.push_str(&format!(
-                "- **Colour Temp:** {}\n",
-                insights
-                    .meta_colour_temperature
-                    .map_or_else(|| na.to_string(), |t| format!("{} K", t))
-            ));
-            info.push_str(&format!(
-                "- **WB Gains (R, B):** {}\n",
-                insights
-                    .meta_colour_gains
-                    .map_or_else(|| na.to_string(), |g| format!("{:.2}, {:.2}", g[0], g[1]))
-            ));
-            info.push_str(&format!(
-                "- **Black Level:** {}\n",
-                insights
-                    .meta_black_level
-                    .map_or_else(|| na.to_string(), |bl| format!("{:.4}", bl))
-            ));
-            info.push_str(&format!(
-                "- **Illuminance:** {}\n",
-                insights
-                    .meta_lux
-                    .map_or_else(|| na.to_string(), |l| format!("{:.0} lux", l))
-            ));
-            info.push_str(&format!(
-                "- **Lens Position:** {}\n",
-                insights
-                    .meta_lens_position
-                    .map_or_else(|| na.to_string(), |p| format!("{:.2} dioptres", p))
-            ));
-            info.push_str(&format!(
-                "- **Focus FoM:** {}\n",
-                insights
-                    .meta_focus_fom
-                    .map_or_else(|| na.to_string(), |f| format!("{}", f))
-            ));
-            info.push_str(&format!(
-                "- **Sequence:** {}\n",
-                insights
-                    .meta_sequence
-                    .map_or_else(|| na.to_string(), |s| format!("{}", s))
-            ));
+            for label in [
+                "Exposure",
+                "Analogue Gain",
+                "Digital Gain",
+                "Colour Temp",
+                "WB Gains (R, B)",
+                "Black Level",
+                "Illuminance",
+                "Lens Position",
+                "Focus FoM",
+                "Sequence",
+            ] {
+                info.push_str(&format!("- **{label}:** {na}\n"));
+            }
         }
 
         // Recording diagnostics
@@ -1201,6 +1154,84 @@ impl BugReportGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_report_preserves_absent_partial_and_full_snapshots() {
+        use crate::backends::camera::types::FrameMetadata;
+
+        gstreamer::init().unwrap();
+        let populated = FrameMetadata {
+            exposure_time: Some(1250),
+            analogue_gain: Some(2.5),
+            digital_gain: Some(1.25),
+            colour_temperature: Some(6500),
+            colour_gains: Some([1.5, 1.75]),
+            black_level: Some(0.0625),
+            lux: Some(123.0),
+            lens_position: Some(2.25),
+            focus_fom: Some(321),
+            sequence: Some(42),
+            sensor_timestamp: Some(2_000_000_000),
+            ..Default::default()
+        };
+        for metadata in [None, Some(FrameMetadata::default()), Some(populated)] {
+            let present = metadata.is_some();
+            let filled = metadata.as_ref().is_some_and(|m| m.sequence.is_some());
+            let insights = InsightsState {
+                frame_metadata: metadata,
+                ..Default::default()
+            };
+            let report = BugReportGenerator::format_insights(&insights, &Config::default(), None);
+            let (_, actual) = report
+                .split_once("### Frame Metadata (libcamera)\n\n")
+                .unwrap();
+            let mut expected = if filled {
+                concat!(
+                    "- **Exposure:** 1.25 ms\n",
+                    "- **Analogue Gain:** 2.50x\n",
+                    "- **Digital Gain:** 1.25x\n",
+                    "- **Colour Temp:** 6500 K\n",
+                    "- **WB Gains (R, B):** 1.50, 1.75\n",
+                    "- **Black Level:** 0.0625\n",
+                    "- **Illuminance:** 123 lux\n",
+                    "- **Lens Position:** 2.25 dioptres\n",
+                    "- **Focus FoM:** 321\n",
+                    "- **Sequence:** 42\n"
+                )
+                .to_string()
+            } else {
+                [
+                    "Exposure",
+                    "Analogue Gain",
+                    "Digital Gain",
+                    "Colour Temp",
+                    "WB Gains (R, B)",
+                    "Black Level",
+                    "Illuminance",
+                    "Lens Position",
+                    "Focus FoM",
+                    "Sequence",
+                ]
+                .map(|field| format!("- **{field}:** N/A\n"))
+                .concat()
+            };
+            if present {
+                expected.push_str(if filled {
+                    "- **Sensor Timestamp:** 2000000000 ns (2.000 s)\n"
+                } else {
+                    "- **Sensor Timestamp:** N/A\n"
+                });
+                expected.push_str(concat!(
+                    "- **AF State:** N/A\n",
+                    "- **AE State:** N/A\n",
+                    "- **AWB State:** N/A\n",
+                    "- **Colour Correction Matrix:** N/A\n"
+                ));
+            }
+            expected.push('\n');
+            assert_eq!(actual, expected, "present={present}, filled={filled}");
+        }
+    }
 
     #[test]
     fn env_or_unset_reports_missing_vars() {

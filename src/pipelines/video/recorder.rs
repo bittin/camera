@@ -4,7 +4,7 @@
 //!
 //! This module implements video recording with:
 //! - Automatic hardware encoder detection and selection
-//! - Preview continues during recording (tee-based pipeline)
+//! - Preview continues through independent shared-frame delivery
 //! - Audio integration
 //! - Quality presets
 
@@ -61,7 +61,7 @@ pub struct RecorderConfig<'a> {
     pub audio_device: Option<&'a str>,
     /// Native sample rate (Hz) of the selected audio source. Used to pin the
     /// audio capsfilter so PulseAudio passes through unchanged when Opus
-    /// accepts the rate, and avoids a GStreamer `audioresample` element.
+    /// accepts the rate. A defensive resampler handles negotiation exceptions.
     /// `0` means "unknown" and falls back to 48 kHz.
     pub audio_source_rate_hz: u32,
     /// Specific encoder info (if None, auto-select)
@@ -136,16 +136,6 @@ fn decoded_video_processing_chain_for_encoder(
     chain
 }
 
-fn jpeg_video_processing_chain_for_encoder(
-    width: u32,
-    height: u32,
-    input: &VideoEncoderInput,
-) -> (String, u32, u32) {
-    let needs_scaling = input.width != width || input.height != height;
-    let processing = decoded_video_processing_chain_for_encoder(input, needs_scaling);
-    (processing, input.width, input.height)
-}
-
 fn video_tags(metadata: &crate::pipelines::capture_metadata::CaptureMetadata) -> gst::TagList {
     let mut tags = gst::TagList::new();
     let tags = tags.get_mut().expect("new tag list must be writable");
@@ -211,11 +201,8 @@ pub(super) fn apply_video_tags_to_muxer(
     tag_setter.merge_tags(&video_tags(metadata), gst::TagMergeMode::ReplaceAll);
 }
 
-/// Build the optional PA-source-volume guard for a recording. Returns `None`
-/// when audio is disabled, no device was picked (PA default-source path), or
-/// PA can't be reached. Centralised so both recorder entry points
-/// (`new_from_appsrc`, `new_from_appsrc_jpeg`) keep their guard semantics in
-/// sync.
+/// Restore the selected PA source's prior volume when recording ends.
+/// Disabled audio, the default source, and unreachable PA need no guard.
 fn build_pulse_volume_guard(
     enable_audio: bool,
     audio_device: Option<&str>,
@@ -226,13 +213,7 @@ fn build_pulse_volume_guard(
     audio_device.and_then(crate::backends::audio::PulseSourceVolumeGuard::normalize_for_recording)
 }
 
-/// Shared state from the common recorder preparation phase.
-///
-/// Both `new_from_appsrc` and `new_from_appsrc_jpeg` begin with the same
-/// sequence: encoder selection, input negotiation, audio branch creation, and
-/// output path resolution. This struct captures the results so each
-/// constructor only handles its format-specific pipeline description and
-/// pusher spawn.
+/// Prepared encoders, audio branch, timing, and output for appsrc recording.
 struct RecorderSetup {
     audio_elements: Option<AudioBranch>,
     encoder_name: String,
@@ -243,12 +224,7 @@ struct RecorderSetup {
     frame_duration_ns: i64,
 }
 
-/// Common setup for both appsrc recorder constructors.
-///
-/// Handles encoder selection, input negotiation, audio branch creation,
-/// and output path resolution. Format-specific encoder overrides
-/// (e.g. NVIDIA domain matching) should be applied to the returned
-/// [`RecorderSetup`] before building the pipeline description.
+/// Select encoders, negotiate input, create audio, and resolve the output path.
 fn prepare_recorder(
     encoder_info: Option<&crate::media::encoders::video::EncoderInfo>,
     encoder_config: &EncoderConfig,
@@ -261,11 +237,11 @@ fn prepare_recorder(
     let encoders = select_encoders(encoder_config, encoder_info, enable_audio)?;
 
     let audio_elements = if let Some(audio_encoder_config) = encoders.audio {
-        VideoRecorder::create_audio_branch(
+        Some(VideoRecorder::create_audio_branch(
             audio_device,
             audio_source_rate_hz,
             audio_encoder_config,
-        )?
+        )?)
     } else {
         None
     };
@@ -589,33 +565,6 @@ fn compute_pts(
     PtsResult::Pts(pts)
 }
 
-/// Install a read-only PTS/DTS trace probe on a named element's src pad.
-///
-/// Logs timestamps at `debug!()` level for the first 5 frames and every
-/// [`LOG_EVERY_N_FRAMES`] frames thereafter.
-fn install_pts_trace_probe(element: &gst::Element, stage: &'static str) {
-    let Some(src_pad) = element.static_pad("src") else {
-        return;
-    };
-    let frame_count = std::sync::Arc::new(AtomicU64::new(0));
-    let fc = frame_count.clone();
-    src_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
-        let n = fc.fetch_add(1, Ordering::Relaxed);
-        if (n < 5 || n.is_multiple_of(LOG_EVERY_N_FRAMES))
-            && let Some(buffer) = info.buffer()
-        {
-            debug!(
-                frame = n,
-                pts_ms = buffer.pts().map(|p| p.mseconds()),
-                dts_ms = buffer.dts().map(|d| d.mseconds()),
-                stage,
-                "PTS trace"
-            );
-        }
-        gst::PadProbeReturn::Ok
-    });
-}
-
 /// Install muxer sink pad probes that fix PTS=NONE (copies DTS → PTS).
 ///
 /// NVENC encoders (nvh265enc/nvh264enc) add a 3 600 000 s offset to PTS/DTS
@@ -721,120 +670,6 @@ pub(crate) async fn convert_frame_to_rgba(frame: &CameraFrame) -> Result<Vec<u8>
         .read_rgba_to_cpu(frame.width, frame.height)
         .await
         .map_err(|e| format!("Failed to read RGBA from GPU: {}", e))
-}
-
-/// Frame data prepared by a format-specific closure for the common pusher loop.
-struct PusherFrame {
-    buffer: gst::Buffer,
-    sensor_ts: Option<u64>,
-    sequence: Option<u32>,
-}
-
-/// Spawn a tokio task that reads `RecordingFrame`s from a channel, prepares
-/// them via `prepare_frame`, and pushes them into the GStreamer `appsrc`.
-///
-/// The `prepare_frame` closure extracts format-specific data from each
-/// `RecordingFrame` and creates a `gst::Buffer`. Return `None` to skip a
-/// frame (e.g. wrong variant). The common loop handles PTS computation,
-/// buffer timestamping, stats updates, periodic logging, and EOS teardown.
-fn spawn_pusher<F>(
-    appsrc: gst_app::AppSrc,
-    mut frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
-    framerate: u32,
-    label: &'static str,
-    mut prepare_frame: F,
-) -> tokio::task::JoinHandle<()>
-where
-    F: FnMut(RecordingFrame, &gst_app::AppSrc) -> Option<PusherFrame> + Send + 'static,
-{
-    tokio::spawn(async move {
-        info!(label, "Appsrc pusher task started");
-
-        let start_epoch_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        RECORDING_STATS
-            .pusher_start_epoch_ns
-            .store(start_epoch_ns, Ordering::Relaxed);
-
-        let mut frame_count: u64 = 0;
-        let mut capture_frame_count: u64 = 0;
-        let start_time = std::time::Instant::now();
-        let frame_duration_ns = 1_000_000_000u64 / framerate as u64;
-        let mut pipeline_playing = false;
-        let mut ts_offset: Option<(u64, u64)> = None;
-
-        while let Some(rec_frame) = frame_rx.recv().await {
-            let Some(PusherFrame {
-                mut buffer,
-                sensor_ts,
-                sequence,
-            }) = prepare_frame(rec_frame, &appsrc)
-            else {
-                continue;
-            };
-
-            let capture_index = capture_frame_count;
-            capture_frame_count += 1;
-            if appsrc_queue_is_full(&appsrc) {
-                RECORDING_STATS
-                    .pusher_skipped
-                    .fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
-
-            let pts_ns = match compute_pts(
-                &appsrc,
-                sensor_ts,
-                capture_index,
-                frame_duration_ns,
-                &mut pipeline_playing,
-                &mut ts_offset,
-            ) {
-                PtsResult::Pts(pts) => pts,
-                PtsResult::Skip => continue,
-            };
-
-            {
-                let buf_ref = buffer.get_mut().unwrap();
-                buf_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
-                buf_ref.set_duration(gst::ClockTime::from_nseconds(frame_duration_ns));
-            }
-
-            RECORDING_STATS.last_pts_ns.store(pts_ns, Ordering::Relaxed);
-
-            if appsrc.push_buffer(buffer).is_err() {
-                warn!(label, "Failed to push buffer to appsrc, stopping pusher");
-                break;
-            }
-
-            RECORDING_STATS
-                .pusher_pushed
-                .fetch_add(1, Ordering::Relaxed);
-            frame_count += 1;
-            if frame_count.is_multiple_of(LOG_EVERY_N_FRAMES) {
-                let elapsed = start_time.elapsed().as_secs_f64();
-                debug!(
-                    label,
-                    frames = frame_count,
-                    seq = ?sequence,
-                    sensor_ts_ms = ?sensor_ts.map(|t| t / 1_000_000),
-                    pts_ms = pts_ns / 1_000_000,
-                    elapsed_secs = format!("{:.1}", elapsed),
-                    effective_fps = format!("{:.1}", frame_count as f64 / elapsed),
-                    "Pusher progress"
-                );
-            }
-        }
-
-        info!(
-            label,
-            total_frames = frame_count,
-            "Frame channel closed, sending EOS to appsrc"
-        );
-        let _ = appsrc.end_of_stream();
-    })
 }
 
 impl VideoRecorder {
@@ -1028,10 +863,7 @@ impl VideoRecorder {
             let mut ts_offset: Option<(u64, u64)> = None;
 
             while let Some(rec_frame) = frame_rx.recv().await {
-                let frame = match rec_frame {
-                    RecordingFrame::Decoded(f) => f,
-                    RecordingFrame::Jpeg { .. } => continue,
-                };
+                let frame = rec_frame;
 
                 let capture_index = capture_frame_count;
                 capture_frame_count += 1;
@@ -1140,212 +972,6 @@ impl VideoRecorder {
         })
     }
 
-    /// Create a VA-API JPEG zero-copy recording pipeline.
-    ///
-    /// Instead of CPU-decoding MJPEG and converting to NV12, this pipeline sends
-    /// raw JPEG bytes through `appsrc` → `vajpegdec` (GPU decode) → `vah265enc`.
-    /// The GPU decoder outputs NV12 in VA-API memory that the encoder consumes
-    /// zero-copy, eliminating both the turbojpeg CPU decode and the I420→NV12
-    /// software conversion from the recording path.
-    ///
-    /// Falls back to `None` if the pipeline cannot be constructed (caller should
-    /// retry with the legacy `new_from_appsrc` path).
-    pub fn new_from_appsrc_jpeg(
-        config: AppsrcRecorderConfig<'_>,
-        va_jpeg_dec: &str,
-        frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
-    ) -> Result<Self, String> {
-        let AppsrcRecorderConfig {
-            base:
-                RecorderConfig {
-                    width,
-                    height,
-                    framerate,
-                    output_path,
-                    encoder_config,
-                    enable_audio,
-                    audio_device,
-                    audio_source_rate_hz,
-                    encoder_info,
-                    capture_metadata,
-                    audio_levels,
-                },
-            pixel_format: _,
-            live_filter_code,
-        } = config;
-
-        if live_filter_code.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-            return Err(
-                "VA-API JPEG pipeline does not support filters; falling back to legacy".to_string(),
-            );
-        }
-
-        info!(
-            width,
-            height,
-            framerate,
-            va_jpeg_dec,
-            output = %output_path.display(),
-            audio = enable_audio,
-            "Creating VA-API JPEG zero-copy recording pipeline"
-        );
-
-        // Boost PA source volume to 100% before pulsesrc opens — see
-        // `PulseSourceVolumeGuard` and the matching block in `new_from_appsrc`.
-        let pulse_volume_guard = build_pulse_volume_guard(enable_audio, audio_device);
-
-        let mut setup = prepare_recorder(
-            encoder_info,
-            &encoder_config,
-            enable_audio,
-            audio_device,
-            audio_source_rate_hz,
-            output_path,
-            framerate,
-        )?;
-
-        // Match encoder to decoder memory domain to avoid implicit GPU memory
-        // transfers that cause frame stalls:
-        //   nvjpegdec (CUDA memory)   → nvh265enc/nvh264enc (CUDA memory)
-        //   vajpegdec (VA-API memory) → vah265enc/vah264enc (VA-API memory)
-        let is_nvidia_decoder = va_jpeg_dec.starts_with("nv");
-        if is_nvidia_decoder && !setup.encoder_name.starts_with("nv") {
-            use crate::media::encoders::detection::probe_single_encoder;
-            if probe_single_encoder("nvh265enc") {
-                warn!(
-                    decoder = va_jpeg_dec,
-                    selected = %setup.encoder_name,
-                    override_to = "nvh265enc",
-                    "Overriding encoder to match NVIDIA decoder memory domain"
-                );
-                setup.encoder_name = "nvh265enc".to_string();
-                setup.encoder_input = named_encoder_input("nvh265enc", &encoder_config, framerate)?;
-                setup.parser_str = "! h265parse".to_string();
-                setup.muxer_name = "mp4mux".to_string();
-            } else if probe_single_encoder("nvh264enc") {
-                warn!(
-                    decoder = va_jpeg_dec,
-                    selected = %setup.encoder_name,
-                    override_to = "nvh264enc",
-                    "Overriding encoder to match NVIDIA decoder memory domain"
-                );
-                setup.encoder_name = "nvh264enc".to_string();
-                setup.encoder_input = named_encoder_input("nvh264enc", &encoder_config, framerate)?;
-                setup.parser_str = "! h264parse".to_string();
-                setup.muxer_name = "mp4mux".to_string();
-            } else {
-                warn!(
-                    decoder = va_jpeg_dec,
-                    "NVIDIA encoders not functional, using selected encoder with potential memory transfer"
-                );
-            }
-        }
-
-        let (processing_chain, final_width, final_height) =
-            jpeg_video_processing_chain_for_encoder(width, height, &setup.encoder_input);
-        let pipeline_desc = format!(
-            "appsrc name=camera-appsrc \
-               caps=image/jpeg,width={w},height={h},framerate={fps}/1 \
-               is-live=true do-timestamp=false format=time \
-               min-latency={lat} max-latency={lat} \
-             ! queue max-size-buffers=60 max-size-time=3000000000 \
-             ! {decoder} name=jpeg-decoder \
-             {processing} \
-             ! {encoder} name=recording-encoder \
-             {parser} \
-             ! {muxer} name=recording-muxer \
-             ! filesink location={loc}",
-            w = width,
-            h = height,
-            fps = framerate,
-            lat = setup.frame_duration_ns,
-            decoder = va_jpeg_dec,
-            processing = processing_chain,
-            encoder = setup.encoder_name,
-            parser = setup.parser_str,
-            muxer = setup.muxer_name,
-            loc = setup.output_path.display(),
-        );
-
-        info!(desc = %pipeline_desc, "Launching JPEG zero-copy pipeline");
-
-        if setup.audio_elements.is_some() {
-            info!("A/V sync: audio branch active, video PTS compensated in compute_pts");
-        }
-
-        let (pipeline, appsrc) = build_recorder_pipeline(
-            &pipeline_desc,
-            &setup.encoder_name,
-            &encoder_config,
-            final_width,
-            final_height,
-            setup.audio_elements.as_ref(),
-            &audio_levels,
-        )?;
-        apply_video_tags(&pipeline, &capture_metadata);
-
-        // JPEG-specific PTS verification probes
-        if let Some(decoder) = pipeline.by_name("jpeg-decoder") {
-            install_pts_trace_probe(&decoder, "decoder-out");
-        }
-        if let Some(enc_element) = pipeline.by_name("recording-encoder") {
-            install_pts_trace_probe(&enc_element, "encoder-out");
-        }
-
-        let pusher_handle = Self::spawn_appsrc_jpeg_pusher(appsrc, frame_rx, framerate);
-
-        publish_recording_diagnostics(RecordingDiagnostics {
-            mode: format!("JPEG zero-copy ({} → {})", va_jpeg_dec, setup.encoder_name),
-            pipeline_string: pipeline_desc.clone(),
-            encoder: setup.encoder_name.clone(),
-            resolution: format!("{}x{}", final_width, final_height),
-            framerate,
-        });
-
-        let recorder = VideoRecorder {
-            pipeline,
-            file_path: setup.output_path,
-            _pulse_volume_guard: pulse_volume_guard,
-            pusher_handle: Some(pusher_handle),
-        };
-
-        // Eagerly start the pipeline so failures (e.g. NVIDIA encoder not
-        // functional in a flatpak sandbox) are caught here and the caller
-        // can fall back to the legacy appsrc path.
-        recorder.start()?;
-
-        Ok(recorder)
-    }
-
-    /// Spawn the JPEG (zero-copy) pusher task.
-    ///
-    /// Passes raw JPEG bytes straight through via [`spawn_pusher`].
-    fn spawn_appsrc_jpeg_pusher(
-        appsrc: gst_app::AppSrc,
-        frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
-        framerate: u32,
-    ) -> tokio::task::JoinHandle<()> {
-        spawn_pusher(
-            appsrc,
-            frame_rx,
-            framerate,
-            "JPEG recorder",
-            |rec_frame, _appsrc| match rec_frame {
-                RecordingFrame::Jpeg {
-                    data,
-                    sensor_timestamp_ns,
-                    sequence,
-                    ..
-                } => Some(PusherFrame {
-                    buffer: gst::Buffer::from_slice(data),
-                    sensor_ts: sensor_timestamp_ns,
-                    sequence,
-                }),
-                RecordingFrame::Decoded(_) => None,
-            },
-        )
-    }
-
     /// Create audio branch elements
     ///
     /// Uses `pulsesrc` (PipeWire's PulseAudio compatibility layer) for reliable
@@ -1354,15 +980,14 @@ impl VideoRecorder {
     ///
     /// All input channels are mixed down to mono via a capsfilter. The same
     /// capsfilter pins the sample rate to `opus_target_rate(audio_source_rate_hz)`
-    /// — the source's native rate when Opus can encode it, else 48 kHz — so
-    /// no `audioresample` element is needed in the GStreamer graph; PulseAudio
-    /// handles any conversion internally and `opusenc` always sees a rate it
-    /// accepts.
+    /// — the source's native rate when Opus can encode it, else 48 kHz.
+    /// PulseAudio normally converts internally; a defensive `audioresample`
+    /// handles sources that cannot negotiate that rate.
     fn create_audio_branch(
         audio_device: Option<&str>,
         audio_source_rate_hz: u32,
         audio_encoder_config: crate::media::encoders::audio::SelectedAudioEncoder,
-    ) -> Result<Option<AudioBranch>, String> {
+    ) -> Result<AudioBranch, String> {
         let mut source_builder = gst::ElementFactory::make("pulsesrc")
             // Resample against the pipeline clock so audio stays synchronized
             // without `skew` advancing the capture pointer and dropping mic
@@ -1495,7 +1120,7 @@ impl VideoRecorder {
 
         let encoder = audio_encoder_config.encoder;
 
-        Ok(Some(AudioBranch {
+        Ok(AudioBranch {
             source,
             queue,
             convert,
@@ -1506,12 +1131,12 @@ impl VideoRecorder {
             limiter,
             level,
             encoder,
-        }))
+        })
     }
 
     /// Start recording (idempotent — no-op if already playing)
     pub fn start(&self) -> Result<(), String> {
-        // Skip if already playing (e.g. JPEG zero-copy path starts eagerly)
+        // Starting an already-playing recorder is idempotent.
         if self.pipeline.current_state() == gst::State::Playing {
             info!("Pipeline already playing, skipping start");
             return Ok(());
@@ -1671,8 +1296,7 @@ struct AudioBranch {
     limiter: gst::Element,
     /// Level meter after compressor + makeup gain so the UI reads the actual
     /// recorded signal level. The pre-mix per-channel meter was removed to
-    /// cut CPU pressure on weak ARM hardware — same reason `audioresample`
-    /// is gone (source rate flows through unchanged).
+    /// cut CPU pressure on weak ARM hardware; the defensive resampler remains.
     level: gst::Element,
     encoder: gst::Element,
 }
@@ -1683,7 +1307,7 @@ mod tests {
 
     #[test]
     fn recording_audio_branch_adds_and_links_every_stage_in_order() {
-        use crate::media::encoders::audio::{AudioCodec, SelectedAudioEncoder};
+        use crate::media::encoders::audio::SelectedAudioEncoder;
         gst::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let muxer = gst::ElementFactory::make("webmmux")
@@ -1696,12 +1320,57 @@ mod tests {
             48_000,
             SelectedAudioEncoder {
                 encoder: gst::ElementFactory::make("opusenc").build().unwrap(),
-                codec: AudioCodec::Opus,
             },
         )
-        .unwrap()
         .unwrap();
         add_audio_branch_to_pipeline(&pipeline, &branch, &SharedAudioLevels::default()).unwrap();
+        assert_eq!(
+            branch.source.property::<i64>("buffer-time"),
+            PULSESRC_BUFFER_TIME_US
+        );
+        assert!(!branch.source.property::<bool>("provide-clock"));
+        assert!(!branch.source.property::<bool>("do-timestamp"));
+        assert_eq!(
+            branch
+                .source
+                .property_value("slave-method")
+                .serialize()
+                .unwrap()
+                .as_str(),
+            PULSESRC_SLAVE_METHOD
+        );
+        let caps = branch.capsfilter.property::<gst::Caps>("caps");
+        assert_eq!(
+            caps.structure(0).unwrap().get::<i32>("channels").unwrap(),
+            1
+        );
+        assert_eq!(
+            caps.structure(0).unwrap().get::<i32>("rate").unwrap(),
+            48_000
+        );
+        use crate::pipelines::audio_level::dynamics;
+        assert_eq!(
+            branch.compressor.property::<f32>("threshold"),
+            dynamics::COMPRESSOR_THRESHOLD
+        );
+        assert_eq!(
+            branch.compressor.property::<f32>("ratio"),
+            dynamics::COMPRESSOR_RATIO
+        );
+        assert_eq!(
+            branch.makeup_gain.property::<f64>("volume"),
+            dynamics::MAKEUP_GAIN
+        );
+        assert_eq!(
+            branch.limiter.property::<f32>("threshold"),
+            dynamics::LIMITER_THRESHOLD
+        );
+        assert_eq!(
+            branch.limiter.property::<f32>("ratio"),
+            dynamics::LIMITER_RATIO
+        );
+        assert!(branch.level.property::<bool>("post-messages"));
+        assert_eq!(branch.level.property::<u64>("interval"), 100_000_000);
         // Inspect the real graph independently of its construction list. NULL
         // state is sufficient for linking and does not open a microphone.
         let mut element = branch.source.clone();
@@ -1892,16 +1561,13 @@ mod tests {
     }
 
     #[test]
-    fn jpeg_v4l2_processing_applies_negotiated_format_and_aligned_dimensions() {
+    fn decoded_v4l2_processing_applies_negotiated_format_and_aligned_dimensions() {
         let input = VideoEncoderInput {
             width: 1440,
             height: 1088,
-            format: Some("NV12".to_string()),
+            format: Some("NV12".into()),
         };
-        let (processing, width, height) =
-            jpeg_video_processing_chain_for_encoder(1436, 1080, &input);
-
-        assert_eq!((width, height), (1440, 1088));
+        let processing = decoded_video_processing_chain_for_encoder(&input, true);
         assert!(processing.contains("videoscale"));
         assert!(processing.contains("width=1440,height=1088"));
         assert!(processing.contains("format=NV12"));

@@ -1,13 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Selected-codec configuration shared by the continuous memory recorder.
-//! The file encoder below is a test-only mux/codec compatibility fixture.
 use crate::media::encoders::video::{EncoderInfo, VideoQuality, configure_video_encoder};
-#[cfg(test)]
-use crate::pipelines::video::encoder_selection::prepare_video_encoder_input;
 use gst::prelude::*;
 use gstreamer as gst;
-#[cfg(test)]
-use gstreamer_app as gst_app;
 #[cfg(test)]
 use std::path::Path;
 
@@ -96,215 +91,15 @@ pub(super) fn add_aac_branch(
 }
 
 #[cfg(test)]
-pub(crate) struct ClipEncoder {
-    pipeline: gst::Pipeline,
-    source: gst_app::AppSrc,
-    audio_source: Option<gst::Element>,
-    framerate: u32,
-}
-#[cfg(test)]
-impl ClipEncoder {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        path: &Path,
-        info: &EncoderInfo,
-        width: u32,
-        height: u32,
-        framerate: u32,
-        bitrate: u32,
-        audio_device: Option<&str>,
-        origin: std::time::Instant,
-    ) -> Result<Self, String> {
-        validate_encoder(info)?;
-        gst::init().map_err(|e| e.to_string())?;
-        let pipeline = gst::Pipeline::new();
-        let result = Self::build(
-            &pipeline,
-            path,
-            info,
-            width,
-            height,
-            framerate,
-            bitrate,
-            audio_device,
-            origin,
-        );
-        if result.is_err() {
-            let _ = pipeline.set_state(gst::State::Null);
-        }
-        result
-    }
-    #[allow(clippy::too_many_arguments)]
-    fn build(
-        pipeline: &gst::Pipeline,
-        path: &Path,
-        info: &EncoderInfo,
-        width: u32,
-        height: u32,
-        framerate: u32,
-        bitrate: u32,
-        audio_device: Option<&str>,
-        origin: std::time::Instant,
-    ) -> Result<Self, String> {
-        let make = |name: &str| {
-            gst::ElementFactory::make(name)
-                .build()
-                .map_err(|e| e.to_string())
-        };
-        let encoder = make(&info.element_name)?;
-        configure_clip_video_encoder(&encoder, info, width, height, bitrate)?;
-        // Match MemoryEncoder's intra-only, zero-latency x264 configuration.
-        // Reordering in this short fixture would test MP4 edit-list behavior,
-        // rather than the continuous recorder's shared capture timeline.
-        if info.element_name == "x264enc" {
-            encoder.set_property_from_str("tune", "zerolatency");
-            encoder.set_property("bframes", 0u32);
-            encoder.set_property("key-int-max", 1u32);
-        }
-        let input = prepare_video_encoder_input(
-            &encoder,
-            &info.element_name,
-            width & !1,
-            height & !1,
-            framerate,
-        )?;
-        let source = gst_app::AppSrc::builder()
-            .caps(
-                &gst::Caps::builder("video/x-raw")
-                    .field("format", "RGB")
-                    .field("width", width as i32)
-                    .field("height", height as i32)
-                    .field("framerate", gst::Fraction::new(framerate as i32, 1))
-                    .build(),
-            )
-            .format(gst::Format::Time)
-            .is_live(true)
-            .block(false)
-            .max_buffers(3)
-            .build();
-        source.set_property_from_str("leaky-type", "downstream");
-        let convert = make("videoconvert")?;
-        let scale = make("videoscale")?;
-        let caps = gst::ElementFactory::make("capsfilter")
-            .property("caps", input.caps(framerate))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let parser = make(
-            info.codec
-                .parser_name()
-                .ok_or("Selected codec has no MP4 parser")?,
-        )?;
-        let muxer = make("mp4mux")?;
-        let sink = gst::ElementFactory::make("filesink")
-            .property(
-                "location",
-                path.to_str().ok_or("Non-UTF8 Motion Photo path")?,
-            )
-            .build()
-            .map_err(|e| e.to_string())?;
-        let chain = [
-            source.upcast_ref(),
-            &convert,
-            &scale,
-            &caps,
-            &encoder,
-            &parser,
-            &muxer,
-            &sink,
-        ];
-        pipeline.add_many(chain).map_err(|e| e.to_string())?;
-        gst::Element::link_many(chain).map_err(|e| e.to_string())?;
-        let audio_source = if let Some(device) = audio_device {
-            let audio = gst::ElementFactory::make("pulsesrc")
-                .property("device", device)
-                .build()
-                .map_err(|e| e.to_string())?;
-            add_aac_branch(pipeline, &muxer, &audio)?;
-            Some(audio)
-        } else {
-            None
-        };
-        // Audio sources timestamp against pipeline running time. Anchor that
-        // clock to the shutter too, including processing/build startup latency;
-        // buffered video retains its actual capture PTS rather than being rebased.
-        let clock = gst::SystemClock::obtain();
-        pipeline.use_clock(Some(&clock));
-        pipeline.set_start_time(gst::ClockTime::NONE);
-        pipeline.set_base_time(clock.time().saturating_sub(gst::ClockTime::from_nseconds(
-            origin.elapsed().as_nanos() as u64,
-        )));
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| e.to_string())?;
-        Ok(Self {
-            pipeline: pipeline.clone(),
-            source,
-            audio_source,
-            framerate,
-        })
-    }
-    pub(crate) fn push(&mut self, image: image::RgbImage, pts: u64) -> Result<(), String> {
-        // GStreamer raw RGB rows are aligned to four bytes.
-        let row = image.width() as usize * 3;
-        let stride = (row + 3) & !3;
-        let mut bytes = vec![0; stride * image.height() as usize];
-        for (src, dst) in image
-            .as_raw()
-            .chunks_exact(row)
-            .zip(bytes.chunks_exact_mut(stride))
-        {
-            dst[..row].copy_from_slice(src);
-        }
-        let mut buffer = gst::Buffer::from_mut_slice(bytes);
-        let b = buffer
-            .get_mut()
-            .ok_or("Motion Photo buffer is not writable")?;
-        b.set_pts(gst::ClockTime::from_nseconds(pts));
-        b.set_duration(gst::ClockTime::from_nseconds(
-            1_000_000_000 / self.framerate as u64,
-        ));
-        self.source
-            .push_buffer(buffer)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
-    }
-    pub(crate) fn finish(self) -> Result<(), String> {
-        self.source.end_of_stream().map_err(|e| e.to_string())?;
-        if let Some(audio) = &self.audio_source {
-            audio.send_event(gst::event::Eos::new());
-        }
-        let bus = self
-            .pipeline
-            .bus()
-            .ok_or("Motion Photo pipeline has no bus")?;
-        match bus.timed_pop_filtered(
-            gst::ClockTime::from_seconds(5),
-            &[gst::MessageType::Eos, gst::MessageType::Error],
-        ) {
-            Some(message) => match message.view() {
-                gst::MessageView::Eos(_) => Ok(()),
-                gst::MessageView::Error(e) => Err(format!(
-                    "Motion Photo encoding failed: {} ({:?})",
-                    e.error(),
-                    e.debug()
-                )),
-                _ => unreachable!(),
-            },
-            None => Err("Motion Photo encoder did not finalize within five seconds".into()),
-        }
-    }
-}
-#[cfg(test)]
-impl Drop for ClipEncoder {
-    fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::media::encoders::video::{EncoderInfo, VideoCodec};
+    use crate::pipelines::motion_photo_ring::{
+        MemoryEncoder,
+        test_fixture::{
+            add_synthetic_audio, push_frame, software_encoder, wait_for_audio, write_clip,
+        },
+    };
 
     /// Recover the appended MP4 using the published directory, not the input size.
     fn check_packaged_clip_decodes_in_both_still_formats(clip: &Path) {
@@ -371,47 +166,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn software_encoder() -> EncoderInfo {
-        EncoderInfo {
-            element_name: "x264enc".into(),
-            display_name: "H.264".into(),
-            codec: VideoCodec::H264,
-            is_hardware: false,
-            priority: 0,
-        }
-    }
-
-    #[test]
-    fn live_clip_appsrc_drops_backlog_instead_of_retaining_unbounded_frames() {
-        let path = std::env::temp_dir().join(format!(
-            "motion-photo-buffer-test-{}.mp4",
-            uuid::Uuid::new_v4()
-        ));
-        let encoder = ClipEncoder::new(
-            &path,
-            &software_encoder(),
-            64,
-            48,
-            10,
-            800,
-            None,
-            std::time::Instant::now(),
-        )
-        .unwrap();
-        assert_ne!(
-            encoder
-                .source
-                .property_value("leaky-type")
-                .serialize()
-                .unwrap()
-                .as_str(),
-            "none"
-        );
-        assert_eq!(encoder.source.property::<u64>("max-buffers"), 3);
-        drop(encoder);
-        let _ = std::fs::remove_file(path);
-    }
-
     #[test]
     fn delayed_start_keeps_audio_on_the_video_shutter_timeline() {
         check_delayed_start_timestamps(false);
@@ -423,56 +177,43 @@ mod tests {
     }
 
     fn check_delayed_start_timestamps(buffered: bool) {
-        let origin = std::time::Instant::now();
-        let buffered_pts = origin.elapsed().as_nanos() as u64;
-        std::thread::sleep(std::time::Duration::from_millis(600));
+        // Model 600ms of processing/build latency without sleeping to guess
+        // pipeline readiness. Frame timestamps remain on the capture epoch.
+        let origin = std::time::Instant::now() - std::time::Duration::from_millis(600);
+        let buffered_pts = 0;
         let path =
             std::env::temp_dir().join(format!("motion-photo-clock-{}.mp4", uuid::Uuid::new_v4()));
         let mut encoder =
-            ClipEncoder::new(&path, &software_encoder(), 64, 48, 10, 800, None, origin).unwrap();
-        // This finite clock fixture asserts that every submitted frame survives.
-        // Bound its queue to all six frames plus the optional buffered frame,
-        // instead of using the separately tested live-preview dropping policy.
-        // Keep push nonblocking so preroll negotiation cannot stall the feeder.
-        encoder.source.set_property_from_str("leaky-type", "none");
-        encoder.source.set_property("max-buffers", 7u64);
-        let muxer = encoder
-            .pipeline
-            .iterate_elements()
-            .into_iter()
-            .flatten()
-            .find(|e| e.factory().is_some_and(|f| f.name() == "mp4mux"))
-            .unwrap();
-        let audio = gst::ElementFactory::make("audiotestsrc")
-            .property("is-live", true)
-            .build()
-            .unwrap();
+            MemoryEncoder::new(&software_encoder(), 64, 48, 10, 800, None, origin).unwrap();
         let audio_started = origin.elapsed().as_secs_f64();
-        add_aac_branch(&encoder.pipeline, &muxer, &audio).unwrap();
-        encoder.audio_source = Some(audio);
+        add_synthetic_audio(&mut encoder);
         let mut captured = Vec::new();
         if buffered {
-            captured.push(buffered_pts as f64 / 1e9);
-            encoder
-                .push(
-                    image::RgbImage::from_pixel(64, 48, image::Rgb([60, 40, 90])),
-                    buffered_pts,
-                )
-                .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            captured.push(0.0);
+            push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(64, 48, image::Rgb([60, 40, 90])),
+                buffered_pts,
+            );
         }
         for _ in 0..6 {
             let pts = origin.elapsed().as_nanos() as u64;
             captured.push(pts as f64 / 1e9);
-            encoder
-                .push(
-                    image::RgbImage::from_pixel(64, 48, image::Rgb([60, 40, 90])),
-                    pts,
-                )
-                .unwrap();
+            push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(64, 48, image::Rgb([60, 40, 90])),
+                pts,
+            );
+            // Capture cadence, not an asynchronous encoder-readiness barrier.
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        encoder.finish().unwrap();
+        let last_pts = (captured.last().unwrap() * 1e9) as u64;
+        wait_for_audio(&encoder, last_pts);
+        encoder
+            .snapshot_window(last_pts - 50_000_000)
+            .unwrap()
+            .write(&path)
+            .unwrap();
         let probe = std::process::Command::new("ffprobe")
             .args([
                 "-v",
@@ -532,41 +273,23 @@ mod tests {
             "motion-photo-aac-test-{}.mp4",
             uuid::Uuid::new_v4()
         ));
-        let mut encoder = ClipEncoder::new(
-            &path,
-            &software_encoder(),
-            64,
-            48,
-            10,
-            800,
-            None,
-            std::time::Instant::now(),
-        )
-        .unwrap();
-        let muxer = encoder
-            .pipeline
-            .iterate_elements()
-            .into_iter()
-            .flatten()
-            .find(|e| e.factory().is_some_and(|f| f.name() == "mp4mux"))
-            .unwrap();
-        let audio = gst::ElementFactory::make("audiotestsrc")
-            .property("is-live", true)
-            .build()
-            .unwrap();
-        add_aac_branch(&encoder.pipeline, &muxer, &audio).unwrap();
-        audio.sync_state_with_parent().unwrap();
-        encoder.audio_source = Some(audio);
+        let origin = std::time::Instant::now();
+        let mut encoder =
+            MemoryEncoder::new(&software_encoder(), 64, 48, 10, 800, None, origin).unwrap();
+        add_synthetic_audio(&mut encoder);
         for i in 0..6 {
-            encoder
-                .push(
-                    image::RgbImage::from_pixel(64, 48, image::Rgb([60, 40, 90])),
-                    i * 100_000_000,
-                )
-                .unwrap();
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            push_frame(
+                &mut encoder,
+                image::RgbImage::from_pixel(64, 48, image::Rgb([60, 40, 90])),
+                i * 100_000_000,
+            );
         }
-        encoder.finish().unwrap();
+        wait_for_audio(&encoder, 500_000_000);
+        encoder
+            .snapshot_window(50_000_000)
+            .unwrap()
+            .write(&path)
+            .unwrap();
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.windows(4).any(|x| x == b"mp4a"));
         assert!(!bytes.windows(4).any(|x| x == b"Opus"));
@@ -607,26 +330,7 @@ mod tests {
                 codec,
                 ..software_encoder()
             };
-            let mut encoder = ClipEncoder::new(
-                &path,
-                &info,
-                64,
-                48,
-                10,
-                800,
-                None,
-                std::time::Instant::now(),
-            )
-            .unwrap();
-            for i in 0..3 {
-                encoder
-                    .push(
-                        image::RgbImage::from_pixel(64, 48, image::Rgb([60, 40, 90])),
-                        i * 100_000_000,
-                    )
-                    .unwrap();
-            }
-            encoder.finish().unwrap();
+            write_clip(&path, &info, 64, 48, 10, 3);
             let bytes = std::fs::read(&path).unwrap();
             assert_eq!(&bytes[4..8], b"ftyp");
             assert!(bytes.windows(4).any(|x| x == sample));
@@ -651,17 +355,7 @@ mod tests {
     fn incompatible_explicit_encoder_is_rejected_without_substitution() {
         let mut info = software_encoder();
         info.element_name = "vp9enc".into();
-        let path = std::env::temp_dir().join("must-not-create-motion-photo.mp4");
-        let result = ClipEncoder::new(
-            &path,
-            &info,
-            64,
-            48,
-            10,
-            800,
-            None,
-            std::time::Instant::now(),
-        );
+        let result = MemoryEncoder::new(&info, 64, 48, 10, 800, None, std::time::Instant::now());
         assert!(matches!(result, Err(ref e) if e.contains("AVC, HEVC or AV1")));
     }
 
@@ -670,22 +364,7 @@ mod tests {
         gstreamer::init().unwrap();
         let path =
             std::env::temp_dir().join(format!("motion-photo-test-{}.mp4", uuid::Uuid::new_v4()));
-        let mut encoder = ClipEncoder::new(
-            &path,
-            &software_encoder(),
-            64,
-            48,
-            10,
-            800,
-            None,
-            std::time::Instant::now(),
-        )
-        .unwrap();
-        for i in 0..6 {
-            let image = image::RgbImage::from_pixel(64, 48, image::Rgb([i * 30, 40, 90]));
-            encoder.push(image, u64::from(i) * 100_000_000).unwrap();
-        }
-        encoder.finish().unwrap();
+        write_clip(&path, &software_encoder(), 64, 48, 10, 6);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[4..8], b"ftyp");
         assert!(bytes.windows(4).any(|x| x == b"moov"));

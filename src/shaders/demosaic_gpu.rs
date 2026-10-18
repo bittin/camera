@@ -22,6 +22,8 @@ pub(crate) struct GpuDemosaic {
 pub(crate) struct DemosaicPrograms {
     pipelines: Vec<wgpu::ComputePipeline>,
     layout: wgpu::BindGroupLayout,
+    // HDR-only: ordinary photo construction/warmup must not compile this adapter.
+    merged_adapter: std::sync::OnceLock<wgpu::ComputePipeline>,
 }
 impl DemosaicPrograms {
     fn new(device: &wgpu::Device) -> Self {
@@ -79,7 +81,11 @@ impl DemosaicPrograms {
                 })
             })
             .collect();
-        Self { pipelines, layout }
+        Self {
+            pipelines,
+            layout,
+            merged_adapter: std::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -440,17 +446,19 @@ impl GpuDemosaic {
         planes: &wgpu::Buffer,
         pattern: u32,
     ) {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("merged CFA adapter"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("bayer_planes.wgsl").into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("merged CFA adapter"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
+        let pipeline = self.programs.merged_adapter.get_or_init(|| {
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("merged CFA adapter"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("bayer_planes.wgsl").into()),
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("merged CFA adapter"),
+                layout: None,
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
         });
         queue.write_buffer(
             &self.uniform,
@@ -480,7 +488,7 @@ impl GpuDemosaic {
             label: Some("merged CFA adapter"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(self.width.div_ceil(16), self.height.div_ceil(16), 1);
     }

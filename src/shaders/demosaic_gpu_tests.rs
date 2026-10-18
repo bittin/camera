@@ -1,6 +1,71 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // GPU demosaic resource and arithmetic validation.
 use super::*;
+
+#[test]
+fn merged_adapter_is_lazy_and_shared_across_frame_engines() {
+    let Some((_guard, device, queue)) = crate::test_gpu::headless_device() else {
+        crate::test_gpu::skip_no_gpu("merged_adapter_is_lazy_and_shared_across_frame_engines");
+        return;
+    };
+    use wgpu::util::DeviceExt;
+    let first = GpuDemosaic::new(&device, 8, 6).unwrap();
+    let programs = first.programs.clone();
+    assert!(programs.merged_adapter.get().is_none());
+    run(
+        &device,
+        &queue,
+        &first,
+        &[0.25; 8 * 6],
+        8,
+        6,
+        0,
+        DemosaicMethod::Rcd,
+    )
+    .unwrap();
+    assert!(
+        programs.merged_adapter.get().is_none(),
+        "ordinary demosaic compiled HDR adapter"
+    );
+    let mut identity = None;
+    for (width, height) in [(8, 6), (10, 8)] {
+        let engine =
+            GpuDemosaic::with_programs(&device, width, height, Some(programs.clone())).unwrap();
+        for pattern in 0..4 {
+            let planes = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("merged adapter identity fixture"),
+                contents: bytemuck::cast_slice(&vec![0.25f32; (width * height) as usize]),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            let output = texture(&device, width, height, "merged adapter output");
+            let mut encoder = device.create_command_encoder(&Default::default());
+            engine.encode_merged(&device, &queue, &mut encoder, &planes, pattern);
+            engine.encode(
+                &device,
+                &queue,
+                &mut encoder,
+                &output,
+                pattern,
+                DemosaicMethod::Rcd,
+            );
+            queue.submit([encoder.finish()]);
+            engine.validate().unwrap();
+            let pipeline = programs.merged_adapter.get().unwrap() as *const _;
+            if let Some(identity) = identity {
+                assert_eq!(
+                    pipeline, identity,
+                    "adapter recompiled for frame/CFA change"
+                );
+            }
+            identity = Some(pipeline);
+        }
+    }
+    drop(first);
+    assert!(
+        programs.merged_adapter.get().is_some(),
+        "frame retirement dropped compiled adapter"
+    );
+}
 #[allow(clippy::too_many_arguments)]
 fn run(
     device: &wgpu::Device,

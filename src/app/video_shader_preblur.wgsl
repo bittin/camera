@@ -5,11 +5,8 @@
 // smooth input (e.g., Pencil edge detection). Much lighter than the transition
 // blur shader — just enough to suppress sensor noise for clean spatial operations.
 //
-// IMPORTANT: The UV transform chain (mirror → rotation → crop → cover → zoom)
-// is intentionally duplicated from video_shader.wgsl. This pass bakes all
-// transforms into the intermediate texture so the second pass (filter application)
-// can use identity transforms. If the transform logic in video_shader.wgsl
-// changes, it must be updated here as well.
+// The common prefix is composed from video_geometry.wgsl. Crop/zoom ordering
+// below deliberately remains local: this preblur zooms BEFORE its crop remap.
 
 @group(0) @binding(0)
 var texture_source: texture_2d<f32>;
@@ -17,112 +14,14 @@ var texture_source: texture_2d<f32>;
 @group(0) @binding(1)
 var sampler_source: sampler;
 
-struct ViewportUniform {
-    viewport_size: vec2<f32>,
-    content_fit_mode: f32,      // 0.0 = Contain, 1.0 = Cover
-    filter_mode: u32,
-    corner_radius: f32,
-    mirror_horizontal: u32,
-    uv_offset: vec2<f32>,
-    uv_scale: vec2<f32>,
-    crop_uv_min: vec2<f32>,
-    crop_uv_max: vec2<f32>,
-    zoom_level: f32,
-    rotation: u32,
-    bar_top_height: f32,
-    bar_bottom_height: f32,
-    kawase_offset: f32,        // Unused here — read by the Kawase passes
-    dim_factor: f32,           // Unused here — applied by the frosted composite
-    letterbox_color: vec4<f32>, // unused here; struct must match the shared ViewportUniform
-    panel_rect: vec4<f32>,
-    noise: f32,
-    content_rect: vec4<f32>,
-    bar_left_width: f32,
-    bar_right_width: f32,
-}
-
-@group(0) @binding(2)
-var<uniform> viewport: ViewportUniform;
-
-struct VertexOutput {
-    @builtin(position) position: vec4<f32>,
-    @location(0) tex_coords: vec2<f32>,
-}
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-    let x = f32((vertex_index & 1u) << 2u) - 1.0;
-    let y = f32((vertex_index & 2u) << 1u) - 1.0;
-    out.position = vec4<f32>(x, -y, 0.0, 1.0);
-    out.tex_coords = vec2<f32>((x + 1.0) * 0.5, (y + 1.0) * 0.5);
-    return out;
-}
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Pass through UV transforms (mirror, rotation, crop) so the intermediate
     // texture contains the correctly oriented, cropped image.
-    var uv = viewport.uv_offset + in.tex_coords * viewport.uv_scale;
-
-    if (viewport.mirror_horizontal == 1u) {
-        uv.x = 1.0 - uv.x;
-    }
-
-    if (viewport.rotation == 1u) {
-        uv = vec2<f32>(1.0 - uv.y, uv.x);
-    } else if (viewport.rotation == 2u) {
-        uv = vec2<f32>(1.0 - uv.x, 1.0 - uv.y);
-    } else if (viewport.rotation == 3u) {
-        uv = vec2<f32>(uv.y, 1.0 - uv.x);
-    }
-
-    // Cover/Contain blend with bar-aware centering and a blended crop region.
-    // See video_shader.wgsl for the rationale.
-    let blend = viewport.content_fit_mode;
-    let effective_crop_min = mix(viewport.crop_uv_min, vec2<f32>(0.0, 0.0), blend);
-    let effective_crop_max = mix(viewport.crop_uv_max, vec2<f32>(1.0, 1.0), blend);
-    {
-        let raw_tex_size = vec2<f32>(textureDimensions(texture_source));
-        var tex_size = raw_tex_size;
-        if (viewport.rotation == 1u || viewport.rotation == 3u) {
-            tex_size = vec2<f32>(raw_tex_size.y, raw_tex_size.x);
-        }
-        // crop_range is in texture-orientation; swap to display before multiplying.
-        // See video_shader.wgsl for the rationale.
-        var crop_range = effective_crop_max - effective_crop_min;
-        if (viewport.rotation == 1u || viewport.rotation == 3u) {
-            crop_range = vec2<f32>(crop_range.y, crop_range.x);
-        }
-        let effective_tex = tex_size * crop_range;
-        let content_width = viewport.viewport_size.x - viewport.bar_left_width - viewport.bar_right_width;
-        let content_height = viewport.viewport_size.y - viewport.bar_top_height - viewport.bar_bottom_height;
-        let content_center_x = (viewport.bar_left_width + content_width * 0.5) / viewport.viewport_size.x;
-        let content_center_y = (viewport.bar_top_height + content_height * 0.5) / viewport.viewport_size.y;
-        let contain_zoom = min(content_width / effective_tex.x, content_height / effective_tex.y);
-        let cover_zoom = max(viewport.viewport_size.x / effective_tex.x, viewport.viewport_size.y / effective_tex.y);
-        let zoom = mix(contain_zoom, cover_zoom, blend);
-        let center_x = mix(content_center_x, 0.5, blend);
-        let center_y = mix(content_center_y, 0.5, blend);
-        var scale = vec2<f32>(
-            viewport.viewport_size.x / (effective_tex.x * zoom),
-            viewport.viewport_size.y / (effective_tex.y * zoom),
-        );
-        if (viewport.rotation == 1u || viewport.rotation == 3u) {
-            scale = vec2<f32>(scale.y, scale.x);
-        }
-        // Rotate the screen-space pivot into texture-UV space — see video_shader.wgsl.
-        let pivot_x = select(center_x, 1.0 - center_x, viewport.mirror_horizontal == 1u);
-        var pivot = vec2<f32>(pivot_x, center_y);
-        if (viewport.rotation == 1u) {
-            pivot = vec2<f32>(1.0 - pivot.y, pivot.x);
-        } else if (viewport.rotation == 2u) {
-            pivot = vec2<f32>(1.0 - pivot.x, 1.0 - pivot.y);
-        } else if (viewport.rotation == 3u) {
-            pivot = vec2<f32>(pivot.y, 1.0 - pivot.x);
-        }
-        uv = (uv - pivot) * scale + vec2<f32>(0.5, 0.5);
-    }
+    let geometry = preview_geometry(in.tex_coords, textureDimensions(texture_source));
+    var uv = geometry.uv;
+    let effective_crop_min = geometry.crop_min;
+    let effective_crop_max = geometry.crop_max;
 
     // Discard letterbox before the crop remap — see video_shader.wgsl for the
     // rationale (post-remap check can falsely keep fragments inside the crop).

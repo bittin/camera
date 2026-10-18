@@ -11,7 +11,6 @@ use crate::backends::camera::types::{
 };
 use crate::constants::{file_formats, virtual_camera as vc_timing};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -205,6 +204,16 @@ fn extract_frame_from_sample(sample: &gstreamer::Sample) -> BackendResult<Camera
         .get::<i32>("height")
         .map_err(|_| BackendError::Other("No height in caps".into()))? as u32;
 
+    copy_sample_frame(sample, width, height)
+}
+
+/// Copy while the sample is mapped; retained frames own their pixel allocation.
+/// Callers deliberately choose caps dimensions or cached decoder dimensions.
+fn copy_sample_frame(
+    sample: &gstreamer::Sample,
+    width: u32,
+    height: u32,
+) -> BackendResult<CameraFrame> {
     let buffer = sample
         .buffer()
         .ok_or_else(|| BackendError::Other("No buffer in sample".into()))?;
@@ -214,7 +223,7 @@ fn extract_frame_from_sample(sample: &gstreamer::Sample) -> BackendResult<Camera
     let data: Vec<u8> = map.as_slice().to_vec();
 
     Ok(CameraFrame {
-        data: FrameData::from_copied(Arc::from(data.into_boxed_slice())),
+        data: FrameData::from_owned_vec(data),
         width,
         height,
         stride: width * 4,
@@ -367,7 +376,7 @@ pub fn load_image_as_frame(path: &Path) -> BackendResult<CameraFrame> {
     info!(width, height, "Image loaded successfully");
 
     Ok(CameraFrame {
-        data: FrameData::from_copied(Arc::from(data.into_boxed_slice())),
+        data: FrameData::from_owned_vec(data),
         width,
         height,
         stride: width * 4, // RGBA = 4 bytes per pixel
@@ -576,21 +585,7 @@ impl VideoDecoder {
 
     /// Convert a GStreamer sample to a CameraFrame using decoder dimensions
     fn sample_to_frame(&self, sample: gstreamer::Sample) -> Option<CameraFrame> {
-        let buffer = sample.buffer()?;
-        let map = buffer.map_readable().ok()?;
-        let data: Vec<u8> = map.as_slice().to_vec();
-
-        Some(CameraFrame {
-            data: FrameData::from_copied(Arc::from(data.into_boxed_slice())),
-            width: self.width,
-            height: self.height,
-            stride: self.width * 4,
-            format: PixelFormat::RGBA,
-            yuv_planes: None,
-            captured_at: Instant::now(),
-            sensor_timestamp_ns: None,
-            libcamera_metadata: None,
-        })
+        copy_sample_frame(&sample, self.width, self.height).ok()
     }
 
     /// Get the preroll frame (first frame available immediately after pipeline starts)
@@ -781,6 +776,78 @@ impl Drop for VideoDecoder {
 #[cfg(test)]
 mod orientation_tests {
     use super::*;
+
+    #[test]
+    fn sample_copy_owns_pixels_and_preserves_each_dimension_policy() {
+        gstreamer::init().unwrap();
+        let bytes = vec![1, 2, 3, 255, 4, 5, 6, 128, 7, 8, 9, 64, 10, 11, 12, 0];
+        let mut buffer = gstreamer::Buffer::from_mut_slice(bytes.clone());
+        buffer
+            .get_mut()
+            .unwrap()
+            .set_pts(gstreamer::ClockTime::from_seconds(42));
+        let caps = gstreamer::Caps::builder("video/x-raw")
+            .field("format", "RGBA")
+            .field("width", 2i32)
+            .field("height", 2i32)
+            .build();
+        let sample = gstreamer::Sample::builder()
+            .buffer(&buffer)
+            .caps(&caps)
+            .build();
+        let before = Instant::now();
+        let extracted = extract_frame_from_sample(&sample).unwrap();
+        // Playback deliberately uses its cached dimensions, not sample caps.
+        // No pipeline is started and no audio source or sink is opened.
+        let decoder = VideoDecoder {
+            video_pipeline: gstreamer::Pipeline::new(),
+            video_appsink: gstreamer_app::AppSink::builder().build(),
+            audio_pipeline: None,
+            width: 4,
+            height: 1,
+            has_audio: false,
+        };
+        let playback = decoder.sample_to_frame(sample.clone()).unwrap();
+        assert!(
+            decoder
+                .sample_to_frame(gstreamer::Sample::builder().build())
+                .is_none()
+        );
+        let after = Instant::now();
+        assert_eq!(
+            (extracted.width, extracted.height, extracted.stride),
+            (2, 2, 8)
+        );
+        assert_eq!(
+            (playback.width, playback.height, playback.stride),
+            (4, 1, 16)
+        );
+        drop(sample);
+        drop(buffer);
+        drop(decoder);
+        for frame in [extracted, playback] {
+            assert_eq!(frame.data.as_ref(), bytes.as_slice());
+            assert_eq!(frame.format, PixelFormat::RGBA);
+            assert!(frame.captured_at >= before && frame.captured_at <= after);
+            assert!(
+                frame.sensor_timestamp_ns.is_none(),
+                "file PTS is not a sensor timestamp"
+            );
+            assert!(frame.yuv_planes.is_none());
+        }
+    }
+
+    #[test]
+    fn sample_copy_preserves_result_and_optional_error_policies() {
+        gstreamer::init().unwrap();
+        let sample = gstreamer::Sample::builder().build();
+        assert!(
+            matches!(extract_frame_from_sample(&sample), Err(BackendError::Other(message)) if message == "No caps on sample")
+        );
+        assert!(
+            matches!(copy_sample_frame(&sample, 2, 2), Err(BackendError::Other(message)) if message == "No buffer in sample")
+        );
+    }
 
     #[tokio::test]
     async fn avif_file_source_applies_all_capture_orientations() {

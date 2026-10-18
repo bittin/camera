@@ -6,24 +6,9 @@
 //! providing multi-stream capture capabilities (preview + raw still capture)
 //! with per-frame metadata (exposure, gain, colour temperature).
 //!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────┐
-//! │   LibcameraBackend  │  ← Implements CameraBackend trait
-//! └──────────┬──────────┘
-//!            │
-//!            ▼
-//! ┌──────────────────────┐
-//! │NativeLibcameraPipeline│  ← Direct libcamera-rs
-//! └──────────┬───────────┘
-//!            │
-//!            ▼
-//!   ┌────────┴────────┐
-//!   │   libcamera-rs  │  ← Native bindings
-//!   │  (CameraManager)│
-//!   └─────────────────┘
-//! ```
+//! Discovery and format queries use [`LibcameraBackend`]. GUI subscriptions and
+//! CLI/terminal handles own capture pipelines independently; the discovery
+//! backend retains no active camera or preview frame.
 //!
 //! # Multi-Stream Capture
 //!
@@ -123,21 +108,8 @@ static CACHED_FORMATS: std::sync::LazyLock<
     std::sync::RwLock<std::collections::HashMap<String, Vec<CameraFormat>>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashMap::new()));
 
-/// libcamera backend using native libcamera-rs bindings
-///
-/// Provides:
-/// - Multi-stream capture (preview + raw still-capture simultaneously)
-/// - Full libcamera property access (model, location, rotation)
-/// - Per-frame metadata (exposure, gain, colour temperature)
-/// - Direct buffer control without GStreamer overhead
-pub struct LibcameraBackend {
-    /// Current device info
-    current_device: Option<CameraDevice>,
-    /// Selected native or PipeWire fallback pipeline
-    pipeline: Option<CapturePipeline>,
-    /// Frame receiver for preview stream (given to UI once)
-    frame_receiver: Mutex<Option<FrameReceiver>>,
-}
+/// Discovery and format queries for native and PipeWire fallback cameras.
+pub struct LibcameraBackend;
 
 impl Default for LibcameraBackend {
     fn default() -> Self {
@@ -146,39 +118,8 @@ impl Default for LibcameraBackend {
 }
 
 impl LibcameraBackend {
-    /// Create a new libcamera backend
     pub fn new() -> Self {
-        Self {
-            current_device: None,
-            pipeline: None,
-            frame_receiver: Mutex::new(None),
-        }
-    }
-
-    /// Check if libcamera is available (cameras detected)
-    fn is_libcamera_available() -> bool {
-        // If a capture pipeline is active, libcamera is definitely available
-        if native::is_capture_active() {
-            return true;
-        }
-        let _lock = CAMERA_MANAGER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        CameraManager::new()
-            .map(|mgr| !mgr.cameras().is_empty())
-            .unwrap_or(false)
-    }
-
-    /// Get still capture format (highest resolution available, prefer Bayer)
-    fn get_still_format(&self, device: &CameraDevice) -> Option<CameraFormat> {
-        let formats = self.get_formats(device, false);
-        // Prefer Bayer (raw) format at highest resolution for capture
-        let bayer_format = formats
-            .iter()
-            .filter(|f| f.pixel_format.starts_with("Bayer"))
-            .max_by_key(|f| f.width * f.height)
-            .cloned();
-        bayer_format.or_else(|| formats.into_iter().max_by_key(|f| f.width * f.height))
+        Self
     }
 }
 
@@ -661,165 +602,6 @@ impl CameraBackend for LibcameraBackend {
 
         formats
     }
-
-    fn initialize(&mut self, device: &CameraDevice, format: &CameraFormat) -> BackendResult<()> {
-        info!(
-            device = %device.name,
-            format = %format,
-            "Initializing camera backend (native preferred, PipeWire fallback)"
-        );
-
-        // Shutdown any existing pipeline
-        if self.is_initialized() {
-            self.shutdown()?;
-        }
-
-        // Create frame channel
-        let (sender, receiver) = cosmic::iced::futures::channel::mpsc::channel(
-            crate::constants::latency::FRAME_CHANNEL_CAPACITY,
-        );
-
-        // Determine still capture format (highest resolution)
-        let still_format = self
-            .get_still_format(device)
-            .unwrap_or_else(|| format.clone());
-
-        info!(
-            preview = %format,
-            still = %still_format,
-            multistream = device.supports_multistream,
-            "Multi-stream formats selected"
-        );
-
-        // Create native pipeline
-        let pipeline = CapturePipeline::new(
-            &device.path,
-            format,
-            false,
-            PipelineSharedState {
-                frame_sender: sender,
-                still_capture: Default::default(),
-                recording_sender: Arc::new(Mutex::new(None)),
-                jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
-                cancel_flag: Arc::new(AtomicBool::new(false)),
-            },
-        )?;
-
-        let is_multistream = pipeline.is_multistream();
-        // Store state
-        self.pipeline = Some(pipeline);
-        *self.frame_receiver.lock().unwrap() = Some(receiver);
-        let mut current_device = device.clone();
-        current_device.supports_multistream = is_multistream;
-        self.current_device = Some(current_device);
-
-        info!("Camera backend initialized with selected capture pipeline");
-        Ok(())
-    }
-
-    fn shutdown(&mut self) -> BackendResult<()> {
-        info!("Shutting down libcamera backend");
-
-        if let Some(pipeline) = self.pipeline.take() {
-            pipeline.stop()?;
-            // Pipeline Drop will handle thread join and hardware release
-        }
-
-        *self.frame_receiver.lock().unwrap() = None;
-        self.current_device = None;
-
-        info!("libcamera backend shut down");
-        Ok(())
-    }
-
-    fn is_initialized(&self) -> bool {
-        self.pipeline.is_some()
-    }
-
-    fn switch_camera(&mut self, device: &CameraDevice) -> BackendResult<()> {
-        info!(device = %device.name, "Switching camera");
-
-        // Shut down first to release CameraManager before querying formats
-        if self.is_initialized() {
-            self.shutdown()?;
-        }
-
-        let formats = self.get_formats(device, false);
-        if formats.is_empty() {
-            return Err(BackendError::FormatNotSupported(
-                "No formats available".to_string(),
-            ));
-        }
-
-        // Select a reasonable preview format (1080p or lower for performance)
-        let format = formats
-            .iter()
-            .find(|f| f.width <= 1920 && f.height <= 1080)
-            .or(formats.first())
-            .cloned()
-            .ok_or_else(|| BackendError::Other("No suitable format".to_string()))?;
-
-        self.initialize(device, &format)
-    }
-
-    fn apply_format(&mut self, format: &CameraFormat) -> BackendResult<()> {
-        info!(format = %format, "Applying format");
-
-        let device = self
-            .current_device
-            .clone()
-            .ok_or_else(|| BackendError::Other("No active device".to_string()))?;
-
-        self.initialize(&device, format)
-    }
-
-    fn capture_photo(&self) -> BackendResult<CameraFrame> {
-        debug!("Capturing photo via native libcamera pipeline");
-
-        let pipeline = self
-            .pipeline
-            .as_ref()
-            .ok_or_else(|| BackendError::Other("Pipeline not initialized".to_string()))?;
-
-        // This blocking caller owns its ticket, independently of the poll API.
-        let request = pipeline.begin_still_capture();
-
-        // Wait for still frame (with timeout)
-        let start = std::time::Instant::now();
-        let timeout = std::time::Duration::from_secs(2);
-
-        while start.elapsed() < timeout {
-            if let Some(frame) = request.take() {
-                info!(
-                    width = frame.width,
-                    height = frame.height,
-                    format = ?frame.format,
-                    "Still frame captured"
-                );
-                return Ok(frame);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        drop(request);
-        // Timeout - fall back to preview frame
-        warn!("Still capture timeout, using preview frame");
-        pipeline
-            .get_preview_frame()
-            .ok_or_else(|| BackendError::Other("No frame available".to_string()))
-    }
-
-    fn get_preview_receiver(&self) -> Option<FrameReceiver> {
-        self.frame_receiver.lock().unwrap().take()
-    }
-
-    fn is_available(&self) -> bool {
-        Self::is_libcamera_available() || !super::pipewire::append_fallbacks(Vec::new()).is_empty()
-    }
-
-    fn current_device(&self) -> Option<&CameraDevice> {
-        self.current_device.as_ref()
-    }
 }
 
 // =========================================================================
@@ -860,7 +642,6 @@ pub fn create_pipeline(
             frame_sender: sender,
             still_capture: Default::default(),
             recording_sender: Arc::clone(&recording_sender),
-            jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
             cancel_flag: Arc::new(AtomicBool::new(false)),
         },
     )
@@ -933,7 +714,7 @@ mod tests {
     fn live_uvc_negotiates_single_stream_despite_stale_dual_hint() {
         use super::super::CameraBackend;
         use futures::StreamExt;
-        let mut backend = super::LibcameraBackend::new();
+        let backend = super::LibcameraBackend::new();
         let mut device = backend
             .enumerate_cameras()
             .into_iter()
@@ -946,12 +727,20 @@ mod tests {
         let formats = backend.get_formats(&device, false);
         let format = formats.first().expect("webcam format");
         device.supports_multistream = true;
-        backend
-            .initialize(&device, format)
-            .expect("single-stream fallback");
-        assert!(!backend.current_device().unwrap().supports_multistream);
+        let (sender, mut receiver) = futures::channel::mpsc::channel(1);
+        let pipeline = super::CapturePipeline::new(
+            &device.path,
+            format,
+            device.supports_multistream,
+            super::PipelineSharedState {
+                frame_sender: sender,
+                still_capture: Default::default(),
+                recording_sender: Default::default(),
+                cancel_flag: Default::default(),
+            },
+        )
+        .expect("single-stream fallback");
         assert_eq!(super::cached_stream_capability(&device.path), Some(false));
-        let mut receiver = backend.get_preview_receiver().unwrap();
         let frame = futures::executor::block_on(receiver.next()).expect("live webcam frame");
         assert_eq!((frame.width, frame.height), (format.width, format.height));
         assert!(!frame.data.is_empty());
@@ -959,7 +748,7 @@ mod tests {
             "Negotiated single-stream app frame: {}x{} {:?}",
             frame.width, frame.height, frame.format
         );
-        backend.shutdown().unwrap();
+        drop(pipeline);
     }
 
     #[test]
@@ -1011,10 +800,7 @@ mod tests {
     fn pipewire_fallback_discovers_live_camera() {
         use super::super::CameraBackend;
         let devices = super::LibcameraBackend::new().enumerate_cameras();
-        assert!(
-            super::LibcameraBackend::new().is_available(),
-            "fallback must make backend available"
-        );
+
         assert!(
             devices.iter().any(|d| d.path.starts_with("pipewire:")),
             "unsupported native camera must be discovered through PipeWire: {devices:?}"

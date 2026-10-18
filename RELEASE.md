@@ -31,17 +31,18 @@ The workflow will:
 
 1. **Determine the version** - Uses your input or auto-increments from the latest tag
 2. **Generate release notes** - Fetches "What's Changed" from merged PRs since the last release
-3. **Update metainfo.xml** - Adds a new `<release>` entry with the changelog
-4. **Commit the change** - Pushes the updated metainfo to the main branch
+3. **Update release metadata** - Updates the package version in Cargo.toml, adds a `<release>` entry to metainfo.xml, updates Cargo.lock, and regenerates cargo-sources.json
+4. **Commit the changes** - Pushes those four files to the selected workflow branch (normally main)
 5. **Create the git tag** - Tags the commit with the new version (e.g., `v0.1.7`)
 
 This triggers the **Release** workflow, which:
 
-1. **Builds binaries** - For x86_64, aarch64, and riscv64
-2. **Builds Flatpak bundles** - For x86_64 and aarch64
+1. **Builds binaries** - For x86_64, aarch64, armhf, and riscv64 with glibc, plus x86_64 and aarch64 with musl
+2. **Builds Flatpak bundles** - For x86_64; aarch64 is built only on a manual Release run with `build_aarch64_flatpak` enabled
 3. **Generates APKBUILD** - Alpine Linux package recipe with correct sha512sum
 4. **Creates GitHub Release** - With all artifacts and release notes
-5. **Publishes to Flathub** - Updates the Flathub repository (if `FLATHUB_TOKEN` is configured)
+
+Flathub publication is maintained separately; these workflows do not update the Flathub repository.
 
 ## Version Numbering
 
@@ -59,16 +60,17 @@ Examples:
 ## Prerequisites
 
 ### For GitHub Releases
-No additional setup required. The workflow uses the default `GITHUB_TOKEN`.
+
+Configure the repository secret `RELEASE_TOKEN` with permission to push release
+commits and tags. **Create Release** uses it at checkout: a tag pushed with the
+default `GITHUB_TOKEN` would not trigger the **Release** workflow. The **Release**
+workflow itself uses `GITHUB_TOKEN` with `contents: write` to publish artifacts.
 
 ### For Flathub Publishing
-The `FLATHUB_TOKEN` secret must be configured in the repository settings:
 
-1. Create a GitHub Personal Access Token with `repo` scope
-2. The token must have write access to the [flathub/io.github.cosmic_utils.camera](https://github.com/flathub/io.github.cosmic_utils.camera) repository
-3. Add it as a repository secret named `FLATHUB_TOKEN`
-
-If the secret is not set, the Flathub publishing step will be skipped.
+Update the [Flathub repository](https://github.com/flathub/io.github.cosmic_utils.camera)
+separately. There is no `FLATHUB_TOKEN` integration in these workflows. Keep the
+committed `cargo-sources.json` synchronized with Cargo.lock before tagging.
 
 ## Troubleshooting
 
@@ -79,10 +81,10 @@ git tag --sort=-v:refname | head -10
 ```
 
 ### Release Notes Are Empty
-Release notes are generated from merged pull requests. If there are no PRs since the last release, a default message "Bug fixes and improvements." will be used.
+Release notes are generated from merged pull requests using merge dates rather than merge-commit SHAs. During **Create Release** preparation, no matching PRs produces the fallback "Bug fixes and improvements." The final **Release** workflow reconstructs the PR list independently and appends installation instructions; it does not use that fallback.
 
 ### Flathub Build Fails
-If the Flathub build fails after publishing:
+If a separately submitted Flathub update fails:
 1. Check the [Flathub Buildbot](https://buildbot.flathub.org/#/apps/io.github.cosmic_utils.camera)
 2. Common issues: missing dependencies, cargo source hash mismatches
 3. You may need to manually fix the Flathub repository
@@ -92,13 +94,18 @@ If the Flathub build fails after publishing:
 If the automated workflow fails, you can create a release manually:
 
 ```bash
-# 1. Update metainfo.xml manually with the new version and date
-# 2. Commit the change
-git add resources/io.github.cosmic_utils.camera.metainfo.xml
-git commit -m "Release v0.1.7: update metainfo.xml"
+# 1. Update the package version in Cargo.toml and the version/date/changelog
+#    in resources/io.github.cosmic_utils.camera.metainfo.xml.
+# 2. Refresh the package lock entry and generated Flatpak sources.
+cargo update --workspace
+just flatpak-cargo-sources
+just check
+# 3. Commit the release inputs together.
+git add Cargo.toml Cargo.lock cargo-sources.json resources/io.github.cosmic_utils.camera.metainfo.xml
+git commit -m "Release v0.1.7: update version and metainfo"
 git push origin main
 
-# 3. Create and push the tag
+# 4. Create and push the tag
 git tag -a v0.1.7 -m "Release v0.1.7"
 git push origin v0.1.7
 ```
@@ -115,9 +122,9 @@ Each release includes:
 | `camera-aarch64-linux.tar.gz` | Linux binary for ARM64 |
 | `camera-armhf-linux.tar.gz` | Linux binary for armhf (32-bit) |
 | `camera-riscv64-linux.tar.gz` | Linux binary for RISC-V 64 |
-| `camera-x86_64-musl-linux.tar.gz` | Linux binary for x86_64 (musl/static) |
-| `camera-aarch64-musl-linux.tar.gz` | Linux binary for ARM64 (musl/static) |
+| `camera-x86_64-musl-linux.tar.gz` | Linux binary for x86_64 (musl, dynamically linked) |
+| `camera-aarch64-musl-linux.tar.gz` | Linux binary for ARM64 (musl, dynamically linked) |
 | `camera-x86_64.flatpak` | Flatpak bundle for x86_64 |
-| `camera-aarch64.flatpak` | Flatpak bundle for ARM64 |
+| `camera-aarch64.flatpak` | Flatpak bundle for ARM64 (manual opt-in only) |
 | `camera-vX.Y.Z-source.zip` | Source code archive |
 | `APKBUILD` | Alpine Linux package build recipe |

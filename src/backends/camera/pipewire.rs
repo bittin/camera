@@ -3,15 +3,16 @@
 //! `pw-dump` is a runtime prerequisite; streaming is exclusively `pipewiresrc`.
 use super::libcamera::PipelineSharedState;
 use super::preview_metrics::{PreviewMetrics, StreamDiagnostics};
-use super::still_capture::{StillCapture, StillRequest};
 use super::types::*;
 
 use gstreamer as gst;
 use gstreamer_video::prelude::*;
 use serde_json::Value;
 use std::process::{Command, Stdio};
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -23,8 +24,6 @@ pub(crate) struct PipeWirePipeline {
     pub(crate) preview_metrics: Arc<PreviewMetrics>,
     stop_flag: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
-    latest_preview: Arc<Mutex<Option<CameraFrame>>>,
-    still_capture: Arc<StillCapture>,
 }
 
 fn build_stream(
@@ -207,13 +206,10 @@ impl PipeWirePipeline {
             build_stream(source, format).map_err(BackendError::InitializationFailed)?;
         let preview_metrics = PreviewMetrics::start(&device.path);
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let latest_preview = Arc::new(Mutex::new(None));
         let mut result = Self {
             preview_metrics: Arc::clone(&preview_metrics),
             stop_flag: Arc::clone(&stop_flag),
             thread: None,
-            latest_preview: Arc::clone(&latest_preview),
-            still_capture: Arc::clone(&shared.still_capture),
         };
         let serial = serial.to_owned();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
@@ -305,21 +301,12 @@ impl PipeWirePipeline {
                                     if let Some(tx) = init_tx.take() {
                                         let _ = tx.send(Ok(()));
                                     }
-                                    preview_metrics.record_frame(&frame);
-                                    *latest_preview.lock().unwrap() = Some(frame.clone());
-                                    if let Some(ticket) = still_ticket {
-                                        shared.still_capture.publish(ticket, frame.clone());
-                                    }
-                                    if let Some(tx) =
-                                        shared.recording_sender.lock().unwrap().as_ref()
-                                    {
-                                        let _ = tx.try_send(RecordingFrame::Decoded(Arc::new(
-                                            frame.clone(),
-                                        )));
-                                    }
-                                    if shared.frame_sender.try_send(frame).is_err() {
-                                        preview_metrics.record_drops(1);
-                                    }
+                                    dispatch_frame(
+                                        frame,
+                                        still_ticket,
+                                        &mut shared,
+                                        &preview_metrics,
+                                    );
                                 }
                                 Err(e) => {
                                     failure = Some(e);
@@ -352,12 +339,6 @@ impl PipeWirePipeline {
         Ok(result)
     }
 
-    pub(crate) fn begin_still_capture(&self) -> StillRequest {
-        self.still_capture.request()
-    }
-    pub(crate) fn get_preview_frame(&self) -> Option<CameraFrame> {
-        self.latest_preview.lock().ok()?.clone()
-    }
     pub(crate) fn stop(&self) -> BackendResult<()> {
         self.preview_metrics.stop();
         self.stop_flag.store(true, Ordering::Release);
@@ -370,6 +351,26 @@ impl Drop for PipeWirePipeline {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Publish a copied frame without retaining a second latest-preview slot.
+/// The ticket was observed before sample copying; never resnapshot it here.
+fn dispatch_frame(
+    frame: CameraFrame,
+    still_ticket: Option<super::still_capture::StillTicket>,
+    shared: &mut PipelineSharedState,
+    preview_metrics: &PreviewMetrics,
+) {
+    preview_metrics.record_frame(&frame);
+    if let Some(ticket) = still_ticket {
+        shared.still_capture.publish(ticket, frame.clone());
+    }
+    if let Some(tx) = shared.recording_sender.lock().unwrap().as_ref() {
+        let _ = tx.try_send(Arc::new(frame.clone()));
+    }
+    if shared.frame_sender.try_send(frame).is_err() {
+        preview_metrics.record_drops(1);
     }
 }
 
@@ -952,7 +953,6 @@ mod tests {
                 frame_sender,
                 still_capture: Default::default(),
                 recording_sender: Arc::new(Mutex::new(None)),
-                jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
             },
             receiver,
@@ -1073,6 +1073,45 @@ mod tests {
     }
 
     #[test]
+    fn copied_sample_reaches_still_recording_and_preview_under_backpressure() {
+        let metrics = PreviewMetrics::start("pipewire-dispatch-consumers-test");
+        let sample = rgba_sample((1..=16).collect(), 0, 8);
+        let frame = sample_to_frame(&sample, None).unwrap();
+        let (mut shared, mut preview) = shared_state();
+        let (tx, mut recording) = tokio::sync::mpsc::channel(1);
+        *shared.recording_sender.lock().unwrap() = Some(tx);
+        let request = shared.still_capture.request();
+        let ticket = shared.still_capture.pending();
+        dispatch_frame(frame.clone(), ticket, &mut shared, &metrics);
+        let still = request.take().unwrap();
+        let delivered = preview.try_recv().unwrap();
+        let recorded = recording.try_recv().unwrap();
+        for output in [&still, &delivered, recorded.as_ref()] {
+            assert_eq!(output.data.as_ref(), &(1..=16).collect::<Vec<_>>());
+            assert_eq!(output.data.as_ptr(), frame.data.as_ptr());
+            assert_eq!(output.captured_at, frame.captured_at);
+        }
+        // Fill both bounded queues. Still publication must remain independent.
+        while shared.frame_sender.try_send(frame.clone()).is_ok() {}
+        let tx = shared.recording_sender.lock().unwrap().clone().unwrap();
+        tx.try_send(Arc::new(frame.clone())).unwrap();
+        let stale = shared.still_capture.request();
+        let stale_ticket = shared.still_capture.pending();
+        drop(stale);
+        let fresh = shared.still_capture.request();
+        let fresh_ticket = shared.still_capture.pending();
+        dispatch_frame(frame.clone(), stale_ticket, &mut shared, &metrics);
+        assert!(fresh.take().is_none());
+        assert_eq!(shared.still_capture.pending(), fresh_ticket);
+        dispatch_frame(frame, fresh_ticket, &mut shared, &metrics);
+        let retained = fresh.take().unwrap();
+        assert_eq!(metrics.snapshot().dropped_frames, 2);
+        drop(shared);
+        drop(sample);
+        assert_eq!(retained.data.as_ref(), &(1..=16).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn rgba_copy_respects_video_meta_offset_and_row_padding() {
         let sample = rgba_sample(
             vec![
@@ -1157,9 +1196,9 @@ mod tests {
 
     #[test]
     #[ignore = "requires a live PipeWire V4L2 camera"]
-    fn live_backend_photo_format_change_switch_and_shutdown() {
+    fn live_pipeline_photo_format_change_restart_and_shutdown() {
         use super::super::CameraBackend;
-        let mut backend = super::super::libcamera::LibcameraBackend::new();
+        let backend = super::super::libcamera::LibcameraBackend::new();
         let devices = backend.enumerate_cameras();
         let device = devices
             .iter()
@@ -1170,9 +1209,28 @@ mod tests {
             .iter()
             .find(|f| f.width == 640 && f.height == 480)
             .unwrap_or(&formats[0]);
-        backend.initialize(device, small).unwrap();
-        assert!(backend.is_initialized());
-        let photo = backend.capture_photo().unwrap();
+        let start_pipeline = |format: &CameraFormat| {
+            let (shared, receiver) = shared_state();
+            let still = shared.still_capture.clone();
+            let pipeline =
+                super::super::pipeline::CapturePipeline::new(&device.path, format, false, shared)
+                    .unwrap();
+            (pipeline, still, receiver)
+        };
+        let capture = |still: &Arc<super::super::still_capture::StillCapture>| {
+            let request = still.request();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(frame) = request.take() {
+                    break frame;
+                }
+                assert!(Instant::now() < deadline, "ticketed still timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let (pipeline, still, mut receiver) = start_pipeline(small);
+        let photo = capture(&still);
+        assert!(receiver.try_recv().is_ok());
         assert_eq!((photo.width, photo.height), (small.width, small.height));
         let first = PreviewMetrics::active_for(&device.path).unwrap().snapshot();
         let mut insights = crate::app::insights::InsightsState::default();
@@ -1191,7 +1249,7 @@ mod tests {
                 .unwrap()
                 .contains("pipewiresrc")
         );
-        assert!(!insights.has_libcamera_metadata);
+        assert!(insights.frame_metadata.is_none());
         println!(
             "Live Insights: backend={}, frame_count={}, source_format={}, bytes={}, copy_us={:?}",
             insights.backend_type,
@@ -1204,27 +1262,30 @@ mod tests {
             .iter()
             .find(|f| f.width == 1280 && f.height == 720)
             .unwrap_or(&formats[0]);
-        backend.apply_format(larger).unwrap();
-        let photo = backend.capture_photo().unwrap();
+        drop(pipeline);
+        let (pipeline, still, _receiver) = start_pipeline(larger);
+        let photo = capture(&still);
         assert_eq!((photo.width, photo.height), (larger.width, larger.height));
         let second = PreviewMetrics::active_for(&device.path).unwrap().snapshot();
         assert_ne!(first.generation, second.generation);
         insights.refresh_preview(&device.path, Some(&second), Instant::now());
         assert_eq!(insights.frame_size_decoded, photo.data.len());
-        backend.switch_camera(device).unwrap();
-        assert!(backend.capture_photo().is_ok());
+        drop(pipeline);
+        let (pipeline, still, _receiver) = start_pipeline(small);
+        assert!(!capture(&still).data.is_empty());
         let stop = Instant::now();
-        backend.shutdown().unwrap();
-        backend.shutdown().unwrap();
+        let super::super::pipeline::CapturePipeline::PipeWire(fallback) = &pipeline else {
+            panic!("PipeWire discovery must select the fallback pipeline");
+        };
+        fallback.stop().unwrap();
+        fallback.stop().unwrap();
+        drop(pipeline);
         assert!(stop.elapsed() < Duration::from_secs(2));
-        assert!(!backend.is_initialized());
         assert!(PreviewMetrics::active_for(&device.path).is_none());
         insights.refresh_preview(&device.path, None, Instant::now());
         assert!(insights.full_pipeline_string.is_none());
         assert!(insights.copy_time_us.is_none());
         assert!(insights.dropped_frames.is_none());
-        assert!(backend.current_device().is_none());
-        assert!(backend.get_preview_receiver().is_none());
         println!(
             "PipeWire backend: photo {}x{}, format change {}x{}, switch/restart + idempotent shutdown verified",
             small.width, small.height, larger.width, larger.height
@@ -1268,7 +1329,7 @@ mod tests {
             old_request.take().is_none(),
             "pipeline restart must not expose previous camera's still frame"
         );
-        let request = pipeline.begin_still_capture();
+        let request = still_capture.request();
         let deadline = Instant::now() + Duration::from_secs(2);
         let still = loop {
             if let Some(frame) = request.take() {
@@ -1283,11 +1344,11 @@ mod tests {
         assert_eq!((still.width, still.height), (format.width, format.height));
         assert!(old_request.take().is_none());
         assert!(!still_capture.has_request());
-        assert!(matches!(
-            recording.try_recv().unwrap(),
-            RecordingFrame::Decoded(_)
-        ));
-        assert!(pipeline.get_preview_frame().is_some());
+        assert!(!recording.try_recv().unwrap().data.is_empty());
+        assert!(
+            receiver.try_recv().is_ok(),
+            "preview arrives through its channel"
+        );
         // Watch real delivery backpressure instead of inferring zero losses.
         let metrics = pipeline.preview_metrics();
         let deadline = Instant::now() + Duration::from_secs(2);

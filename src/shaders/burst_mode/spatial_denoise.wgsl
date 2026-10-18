@@ -46,13 +46,9 @@ var<storage, read_write> output_image: array<f32>;
 @group(0) @binding(2)
 var<uniform> params: SpatialDenoiseParams;
 
-// Weight accumulator for proper normalization after 4-pass overlap
-@group(0) @binding(3)
-var<storage, read_write> weight_accum: array<f32>;
-
 // Shared memory for tile data (complex RGBA)
-var<workgroup> tile_re: array<array<vec4<f32>, 16>, 16>;
-var<workgroup> tile_im: array<array<vec4<f32>, 16>, 16>;
+var<workgroup> ref_re: array<array<vec4<f32>, 16>, 16>;
+var<workgroup> ref_im: array<array<vec4<f32>, 16>, 16>;
 var<workgroup> temp_re: array<array<vec4<f32>, 16>, 16>;
 var<workgroup> temp_im: array<array<vec4<f32>, 16>, 16>;
 
@@ -60,9 +56,7 @@ var<workgroup> temp_im: array<array<vec4<f32>, 16>, 16>;
 // Utility functions
 //=============================================================================
 
-fn get_pixel_idx(x: u32, y: u32) -> u32 {
-    return (y * params.width + x) * 4u;
-}
+// get_pixel_idx is composed from fft_inverse.wgsl.
 
 fn load_pixel(x: i32, y: i32) -> vec4<f32> {
     let cx = clamp(x, 0, i32(params.width) - 1);
@@ -119,7 +113,7 @@ fn raised_cosine_window(x: u32, y: u32) -> f32 {
 
 //-----------------------------------------------------------------------------
 // 1D Radix-4 FFT along a column (forward direction)
-// Input is real-only (tile_im is zero), output to temp_re/temp_im
+// Input is real-only (ref_im is zero), output to temp_re/temp_im
 //-----------------------------------------------------------------------------
 fn fft_1d_col_forward(col: u32) {
     let angle = -2.0 * PI / TILE_SIZE_F;
@@ -140,22 +134,22 @@ fn fft_1d_col_forward(col: u32) {
             let coefIm = sin(angle * f32(dn) * f32(dy));
 
             // DFT0: index dy (0, 4, 8, 12)
-            var dataRe = tile_re[dy][col];
+            var dataRe = ref_re[dy][col];
             Re0 += coefRe * dataRe;
             Im0 += coefIm * dataRe;
 
             // DFT1: index dy+1 (1, 5, 9, 13)
-            dataRe = tile_re[dy + 1u][col];
+            dataRe = ref_re[dy + 1u][col];
             Re2 += coefRe * dataRe;
             Im2 += coefIm * dataRe;
 
             // DFT2: index dy+2 (2, 6, 10, 14)
-            dataRe = tile_re[dy + 2u][col];
+            dataRe = ref_re[dy + 2u][col];
             Re1 += coefRe * dataRe;
             Im1 += coefIm * dataRe;
 
             // DFT3: index dy+3 (3, 7, 11, 15)
-            dataRe = tile_re[dy + 3u][col];
+            dataRe = ref_re[dy + 3u][col];
             Re3 += coefRe * dataRe;
             Im3 += coefIm * dataRe;
         }
@@ -202,7 +196,7 @@ fn fft_1d_col_forward(col: u32) {
 
 //-----------------------------------------------------------------------------
 // 1D Radix-4 FFT along a row (forward direction)
-// Input from temp_re/temp_im (column FFT output), output to tile_re/tile_im
+// Input from temp_re/temp_im (column FFT output), output to ref_re/ref_im
 //-----------------------------------------------------------------------------
 fn fft_1d_row_forward(row: u32) {
     let angle = -2.0 * PI / TILE_SIZE_F;
@@ -275,179 +269,20 @@ fn fft_1d_row_forward(row: u32) {
         let out3Im = Im11 + sin(angle * f32(dm + TILE_SIZE_34)) * Re33 + cos(angle * f32(dm + TILE_SIZE_34)) * Im33;
 
         // Store to tile arrays (frequency domain)
-        tile_re[row][dm] = out0Re;
-        tile_im[row][dm] = out0Im;
-        tile_re[row][dm + TILE_SIZE_14] = out1Re;
-        tile_im[row][dm + TILE_SIZE_14] = out1Im;
-        tile_re[row][dm + TILE_SIZE_24] = out2Re;
-        tile_im[row][dm + TILE_SIZE_24] = out2Im;
-        tile_re[row][dm + TILE_SIZE_34] = out3Re;
-        tile_im[row][dm + TILE_SIZE_34] = out3Im;
+        ref_re[row][dm] = out0Re;
+        ref_im[row][dm] = out0Im;
+        ref_re[row][dm + TILE_SIZE_14] = out1Re;
+        ref_im[row][dm + TILE_SIZE_14] = out1Im;
+        ref_re[row][dm + TILE_SIZE_24] = out2Re;
+        ref_im[row][dm + TILE_SIZE_24] = out2Im;
+        ref_re[row][dm + TILE_SIZE_34] = out3Re;
+        ref_im[row][dm + TILE_SIZE_34] = out3Im;
     }
 }
 
-//-----------------------------------------------------------------------------
-// 1D Radix-4 FFT along a row (backward/inverse direction)
-// Input from tile_re/tile_im (Wiener filtered), output to temp_re/temp_im
-//-----------------------------------------------------------------------------
-fn fft_1d_row_backward(row: u32) {
-    let angle = -2.0 * PI / TILE_SIZE_F;
+// fft_1d_row_backward is composed from fft_inverse.wgsl.
 
-    for (var dm = 0u; dm < TILE_SIZE_14; dm++) {
-        var Re0 = vec4<f32>(0.0);
-        var Im0 = vec4<f32>(0.0);
-        var Re1 = vec4<f32>(0.0);
-        var Im1 = vec4<f32>(0.0);
-        var Re2 = vec4<f32>(0.0);
-        var Im2 = vec4<f32>(0.0);
-        var Re3 = vec4<f32>(0.0);
-        var Im3 = vec4<f32>(0.0);
-
-        for (var dx = 0u; dx < TILE_SIZE; dx += 4u) {
-            let coefRe = cos(angle * f32(dm) * f32(dx));
-            let coefIm = sin(angle * f32(dm) * f32(dx));
-
-            // Inverse: conjugate multiply (swap sign of imaginary coefficient)
-            // DFT0
-            var dataRe = tile_re[row][dx];
-            var dataIm = tile_im[row][dx];
-            Re0 += coefRe * dataRe + coefIm * dataIm;
-            Im0 += coefIm * dataRe - coefRe * dataIm;
-
-            // DFT1
-            dataRe = tile_re[row][dx + 1u];
-            dataIm = tile_im[row][dx + 1u];
-            Re2 += coefRe * dataRe + coefIm * dataIm;
-            Im2 += coefIm * dataRe - coefRe * dataIm;
-
-            // DFT2
-            dataRe = tile_re[row][dx + 2u];
-            dataIm = tile_im[row][dx + 2u];
-            Re1 += coefRe * dataRe + coefIm * dataIm;
-            Im1 += coefIm * dataRe - coefRe * dataIm;
-
-            // DFT3
-            dataRe = tile_re[row][dx + 3u];
-            dataIm = tile_im[row][dx + 3u];
-            Re3 += coefRe * dataRe + coefIm * dataIm;
-            Im3 += coefIm * dataRe - coefRe * dataIm;
-        }
-
-        // First butterfly
-        var coefRe = cos(angle * 2.0 * f32(dm));
-        var coefIm = sin(angle * 2.0 * f32(dm));
-        let Re00 = Re0 + coefRe * Re1 - coefIm * Im1;
-        let Im00 = Im0 + coefIm * Re1 + coefRe * Im1;
-        let Re22 = Re2 + coefRe * Re3 - coefIm * Im3;
-        let Im22 = Im2 + coefIm * Re3 + coefRe * Im3;
-
-        coefRe = cos(angle * 2.0 * f32(dm + TILE_SIZE_14));
-        coefIm = sin(angle * 2.0 * f32(dm + TILE_SIZE_14));
-        let Re11 = Re0 + coefRe * Re1 - coefIm * Im1;
-        let Im11 = Im0 + coefIm * Re1 + coefRe * Im1;
-        let Re33 = Re2 + coefRe * Re3 - coefIm * Im3;
-        let Im33 = Im2 + coefIm * Re3 + coefRe * Im3;
-
-        // Second butterfly
-        let out0Re = Re00 + cos(angle * f32(dm)) * Re22 - sin(angle * f32(dm)) * Im22;
-        let out0Im = Im00 + sin(angle * f32(dm)) * Re22 + cos(angle * f32(dm)) * Im22;
-
-        let out1Re = Re11 + cos(angle * f32(dm + TILE_SIZE_14)) * Re33 - sin(angle * f32(dm + TILE_SIZE_14)) * Im33;
-        let out1Im = Im11 + sin(angle * f32(dm + TILE_SIZE_14)) * Re33 + cos(angle * f32(dm + TILE_SIZE_14)) * Im33;
-
-        let out2Re = Re00 + cos(angle * f32(dm + TILE_SIZE_24)) * Re22 - sin(angle * f32(dm + TILE_SIZE_24)) * Im22;
-        let out2Im = Im00 + sin(angle * f32(dm + TILE_SIZE_24)) * Re22 + cos(angle * f32(dm + TILE_SIZE_24)) * Im22;
-
-        let out3Re = Re11 + cos(angle * f32(dm + TILE_SIZE_34)) * Re33 - sin(angle * f32(dm + TILE_SIZE_34)) * Im33;
-        let out3Im = Im11 + sin(angle * f32(dm + TILE_SIZE_34)) * Re33 + cos(angle * f32(dm + TILE_SIZE_34)) * Im33;
-
-        // Store with negated Im for column pass (inverse FFT convention)
-        temp_re[row][dm] = out0Re;
-        temp_im[row][dm] = -out0Im;
-        temp_re[row][dm + TILE_SIZE_14] = out1Re;
-        temp_im[row][dm + TILE_SIZE_14] = -out1Im;
-        temp_re[row][dm + TILE_SIZE_24] = out2Re;
-        temp_im[row][dm + TILE_SIZE_24] = -out2Im;
-        temp_re[row][dm + TILE_SIZE_34] = out3Re;
-        temp_im[row][dm + TILE_SIZE_34] = -out3Im;
-    }
-}
-
-//-----------------------------------------------------------------------------
-// 1D Radix-4 FFT along a column (backward/inverse direction)
-// Input from temp_re/temp_im (row inverse output), output to tile_re (real only)
-//-----------------------------------------------------------------------------
-fn fft_1d_col_backward(col: u32) {
-    let angle = -2.0 * PI / TILE_SIZE_F;
-
-    for (var dn = 0u; dn < TILE_SIZE_14; dn++) {
-        var Re0 = vec4<f32>(0.0);
-        var Im0 = vec4<f32>(0.0);
-        var Re1 = vec4<f32>(0.0);
-        var Im1 = vec4<f32>(0.0);
-        var Re2 = vec4<f32>(0.0);
-        var Im2 = vec4<f32>(0.0);
-        var Re3 = vec4<f32>(0.0);
-        var Im3 = vec4<f32>(0.0);
-
-        for (var dy = 0u; dy < TILE_SIZE; dy += 4u) {
-            let coefRe = cos(angle * f32(dn) * f32(dy));
-            let coefIm = sin(angle * f32(dn) * f32(dy));
-
-            // DFT0
-            var dataRe = temp_re[dy][col];
-            var dataIm = temp_im[dy][col];
-            Re0 += coefRe * dataRe + coefIm * dataIm;
-            Im0 += coefIm * dataRe - coefRe * dataIm;
-
-            // DFT1
-            dataRe = temp_re[dy + 1u][col];
-            dataIm = temp_im[dy + 1u][col];
-            Re2 += coefRe * dataRe + coefIm * dataIm;
-            Im2 += coefIm * dataRe - coefRe * dataIm;
-
-            // DFT2
-            dataRe = temp_re[dy + 2u][col];
-            dataIm = temp_im[dy + 2u][col];
-            Re1 += coefRe * dataRe + coefIm * dataIm;
-            Im1 += coefIm * dataRe - coefRe * dataIm;
-
-            // DFT3
-            dataRe = temp_re[dy + 3u][col];
-            dataIm = temp_im[dy + 3u][col];
-            Re3 += coefRe * dataRe + coefIm * dataIm;
-            Im3 += coefIm * dataRe - coefRe * dataIm;
-        }
-
-        // First butterfly
-        var coefRe = cos(angle * 2.0 * f32(dn));
-        var coefIm = sin(angle * 2.0 * f32(dn));
-        let Re00 = Re0 + coefRe * Re1 - coefIm * Im1;
-        let Im00 = Im0 + coefIm * Re1 + coefRe * Im1;
-        let Re22 = Re2 + coefRe * Re3 - coefIm * Im3;
-        let Im22 = Im2 + coefIm * Re3 + coefRe * Im3;
-
-        coefRe = cos(angle * 2.0 * f32(dn + TILE_SIZE_14));
-        coefIm = sin(angle * 2.0 * f32(dn + TILE_SIZE_14));
-        let Re11 = Re0 + coefRe * Re1 - coefIm * Im1;
-        let Im11 = Im0 + coefIm * Re1 + coefRe * Im1;
-        let Re33 = Re2 + coefRe * Re3 - coefIm * Im3;
-        let Im33 = Im2 + coefIm * Re3 + coefRe * Im3;
-
-        // Second butterfly - only compute real part (output is real after IFFT)
-        let out0Re = Re00 + cos(angle * f32(dn)) * Re22 - sin(angle * f32(dn)) * Im22;
-        let out1Re = Re11 + cos(angle * f32(dn + TILE_SIZE_14)) * Re33 - sin(angle * f32(dn + TILE_SIZE_14)) * Im33;
-        let out2Re = Re00 + cos(angle * f32(dn + TILE_SIZE_24)) * Re22 - sin(angle * f32(dn + TILE_SIZE_24)) * Im22;
-        let out3Re = Re11 + cos(angle * f32(dn + TILE_SIZE_34)) * Re33 - sin(angle * f32(dn + TILE_SIZE_34)) * Im33;
-
-        // Normalize by N² and store final spatial-domain output
-        let norm = 1.0 / (TILE_SIZE_F * TILE_SIZE_F);
-        tile_re[dn][col] = out0Re * norm;
-        tile_re[dn + TILE_SIZE_14][col] = out1Re * norm;
-        tile_re[dn + TILE_SIZE_24][col] = out2Re * norm;
-        tile_re[dn + TILE_SIZE_34][col] = out3Re * norm;
-    }
-}
+// fft_1d_col_backward is composed from fft_inverse.wgsl.
 
 //=============================================================================
 // Wiener filter with frequency-dependent noise shaping
@@ -463,7 +298,7 @@ fn wiener_shrinkage(row: u32, col: u32, base_noise: f32) {
     let noise_var = base_noise * base_noise * frame_scale * shape_factor * shape_factor * params.strength;
 
     // Signal magnitude squared
-    let mag_sq = tile_re[row][col] * tile_re[row][col] + tile_im[row][col] * tile_im[row][col];
+    let mag_sq = ref_re[row][col] * ref_re[row][col] + ref_im[row][col] * ref_im[row][col];
 
     // Wiener filter: signal / (signal + noise)
     // For vec4, apply element-wise
@@ -471,8 +306,8 @@ fn wiener_shrinkage(row: u32, col: u32, base_noise: f32) {
     let weight = mag_sq / denom;
 
     // Apply shrinkage
-    tile_re[row][col] = tile_re[row][col] * weight;
-    tile_im[row][col] = tile_im[row][col] * weight;
+    ref_re[row][col] = ref_re[row][col] * weight;
+    ref_im[row][col] = ref_im[row][col] * weight;
 }
 
 //=============================================================================
@@ -503,8 +338,8 @@ fn spatial_denoise(
     // Load tile into shared memory (with edge clamping for negative offsets)
     // NO analysis window - synthesis-only WOLA for proper reconstruction
     let pixel = load_pixel(px, py);
-    tile_re[ly][lx] = pixel;
-    tile_im[ly][lx] = vec4<f32>(0.0);
+    ref_re[ly][lx] = pixel;
+    ref_im[ly][lx] = vec4<f32>(0.0);
     workgroupBarrier();
 
     // Forward FFT using radix-4 (O(N log N) complexity)
@@ -537,7 +372,7 @@ fn spatial_denoise(
     if (px >= 0 && py >= 0 && u32(px) < params.width && u32(py) < params.height) {
         let window = raised_cosine_window(lx, ly);
         let out_idx = get_pixel_idx(u32(px), u32(py));
-        let denoised = tile_re[ly][lx];
+        let denoised = ref_re[ly][lx];
 
         // Apply window and accumulate
         output_image[out_idx] = output_image[out_idx] + denoised.x * window;
@@ -567,9 +402,6 @@ fn spatial_denoise_init(@builtin(global_invocation_id) global_id: vec3<u32>) {
     output_image[idx + 1u] = 0.0;
     output_image[idx + 2u] = 0.0;
     output_image[idx + 3u] = 0.0;
-
-    let weight_idx = y * params.width + x;
-    weight_accum[weight_idx] = 0.0;
 }
 
 //=============================================================================

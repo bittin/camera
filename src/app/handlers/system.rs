@@ -125,14 +125,10 @@ impl AppModel {
         &mut self,
         data: Option<crate::storage::GalleryThumbnailData>,
     ) -> Task<cosmic::Action<Message>> {
-        if let Some((handle, rgba, width, height, path)) = data {
-            self.gallery_thumbnail = Some(handle);
-            self.gallery_thumbnail_rgba = Some((rgba, width, height));
-            self.last_media_path = Some(path.display().to_string());
-        } else {
-            self.gallery_thumbnail = None;
-            self.gallery_thumbnail_rgba = None;
+        if let Some(thumbnail) = &data {
+            self.last_media_path = Some(thumbnail.path().display().to_string());
         }
+        self.gallery_thumbnail = data;
         Task::none()
     }
 
@@ -258,17 +254,10 @@ impl AppModel {
         &mut self,
         index: usize,
     ) -> Task<cosmic::Action<Message>> {
-        use crate::app::state::CameraMode;
-
-        // Build the same visible modes list as the dropdown
-        let mut visible_modes = vec![CameraMode::Photo, CameraMode::Video, CameraMode::Timelapse];
-        if self.config.virtual_camera_enabled {
-            visible_modes.push(CameraMode::Virtual);
-        }
-
-        let mode = match visible_modes.get(index) {
-            Some(&m) => m,
-            None => return Task::none(),
+        let Some(&mode) =
+            crate::app::dropdowns::default_modes(self.config.virtual_camera_enabled).get(index)
+        else {
+            return Task::none();
         };
 
         info!(?mode, "Setting default launch mode");
@@ -331,7 +320,7 @@ impl AppModel {
         let source = if self.recording.is_recording() {
             self.recording.audio_levels().cloned()
         } else {
-            self.probe_audio_levels.clone()
+            self.audio_probe.as_ref().map(|probe| probe.levels())
         };
 
         self.audio_levels_snapshot =
@@ -921,17 +910,6 @@ impl AppModel {
             if self.insights.backend_type == "libcamera"
                 && let Some(meta) = &frame.libcamera_metadata
             {
-                self.insights.has_libcamera_metadata = true;
-                self.insights.meta_exposure_us = meta.exposure_time;
-                self.insights.meta_analogue_gain = meta.analogue_gain;
-                self.insights.meta_digital_gain = meta.digital_gain;
-                self.insights.meta_colour_temperature = meta.colour_temperature;
-                self.insights.meta_sequence = meta.sequence;
-                self.insights.meta_colour_gains = meta.colour_gains;
-                self.insights.meta_black_level = meta.black_level;
-                self.insights.meta_lens_position = meta.lens_position;
-                self.insights.meta_lux = meta.lux;
-                self.insights.meta_focus_fom = meta.focus_fom;
                 self.insights.frame_metadata = Some(meta.clone());
             }
         }
@@ -1186,28 +1164,25 @@ impl AppModel {
         }
 
         // Frame metadata
+        let metadata = ins.frame_metadata.as_ref();
         map.insert(
             "frame_metadata".into(),
             serde_json::json!({
-                "has_libcamera_metadata": ins.has_libcamera_metadata,
-                "exposure_us": ins.meta_exposure_us,
-                "analogue_gain": ins.meta_analogue_gain,
-                "digital_gain": ins.meta_digital_gain,
-                "colour_temperature": ins.meta_colour_temperature,
-                "sequence": ins.meta_sequence,
-                "colour_gains": ins.meta_colour_gains,
-                "black_level": ins.meta_black_level,
-                "lens_position": ins.meta_lens_position,
-                "lux": ins.meta_lux,
-                "focus_fom": ins.meta_focus_fom,
+                "has_libcamera_metadata": metadata.is_some(),
+                "exposure_us": metadata.and_then(|m| m.exposure_time),
+                "analogue_gain": metadata.and_then(|m| m.analogue_gain),
+                "digital_gain": metadata.and_then(|m| m.digital_gain),
+                "colour_temperature": metadata.and_then(|m| m.colour_temperature),
+                "sequence": metadata.and_then(|m| m.sequence),
+                "colour_gains": metadata.and_then(|m| m.colour_gains),
+                "black_level": metadata.and_then(|m| m.black_level),
+                "lens_position": metadata.and_then(|m| m.lens_position),
+                "lux": metadata.and_then(|m| m.lux),
+                "focus_fom": metadata.and_then(|m| m.focus_fom),
             }),
         );
 
         serde_json::to_string_pretty(&serde_json::Value::Object(map)).unwrap_or_default()
-    }
-
-    pub(crate) fn persist_config(&mut self) {
-        self.persist_config_async();
     }
 }
 
@@ -1282,6 +1257,118 @@ fn frame_metadata_to_json(
 #[cfg(test)]
 mod tests {
     use super::{file_manager_dbus_args, portal_gallery_item};
+
+    #[test]
+    fn gallery_updates_keep_payload_identity_and_last_path_when_cleared() {
+        use crate::app::state::AppModel;
+        use crate::storage::GalleryThumbnailData;
+        let thumbnail = GalleryThumbnailData::new("synthetic.jpg".into(), vec![7, 8, 9, 255], 1, 1);
+        let mut model = AppModel::default();
+        drop(model.handle_gallery_thumbnail_loaded(Some(thumbnail.clone())));
+        assert_eq!(
+            model.gallery_thumbnail.as_ref().unwrap().id(),
+            thumbnail.id()
+        );
+        assert_eq!(model.last_media_path.as_deref(), Some("synthetic.jpg"));
+        drop(model.handle_gallery_thumbnail_loaded(None));
+        assert!(model.gallery_thumbnail.is_none());
+        assert_eq!(model.last_media_path.as_deref(), Some("synthetic.jpg"));
+    }
+
+    #[test]
+    fn insights_metadata_export_preserves_presence_values_and_null_fields() {
+        use crate::app::state::AppModel;
+        use crate::backends::camera::types::{CameraFrame, FrameData, FrameMetadata, PixelFormat};
+        let mut model = AppModel::default();
+        model.insights.backend_type = "libcamera";
+        let metadata = FrameMetadata {
+            exposure_time: Some(1000),
+            analogue_gain: Some(2.0),
+            colour_temperature: Some(6000),
+            sequence: Some(17),
+            colour_gains: Some([1.5, 1.25]),
+            ..Default::default()
+        };
+        model.current_frame = Some(std::sync::Arc::new(CameraFrame {
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: PixelFormat::RGBA,
+            data: FrameData::from_owned_vec(vec![0, 0, 0, 255]),
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            yuv_planes: None,
+            libcamera_metadata: Some(metadata),
+        }));
+        model.update_insights_frame_metadata();
+        let export = |model: &AppModel| {
+            serde_json::from_str::<serde_json::Value>(&model.build_insights_json()).unwrap()["frame_metadata"].clone()
+        };
+        assert_eq!(
+            export(&model),
+            serde_json::json!({
+                "has_libcamera_metadata": true, "exposure_us": 1000, "analogue_gain": 2.0,
+                "digital_gain": null, "colour_temperature": 6000, "sequence": 17,
+                "colour_gains": [1.5, 1.25], "black_level": null, "lens_position": null,
+                "lux": null, "focus_fom": null,
+            })
+        );
+        model.insights.backend_type = "PipeWire (V4L2)";
+        model.update_insights_frame_metadata();
+        assert!(model.insights.frame_metadata.is_none());
+        assert_eq!(
+            export(&model),
+            serde_json::json!({
+                "has_libcamera_metadata": false, "exposure_us": null, "analogue_gain": null,
+                "digital_gain": null, "colour_temperature": null, "sequence": null,
+                "colour_gains": null, "black_level": null, "lens_position": null,
+                "lux": null, "focus_fom": null,
+            })
+        );
+    }
+
+    #[test]
+    fn audio_tick_snapshots_the_owned_source_and_clears_missing_or_poisoned_levels() {
+        use crate::app::state::{AppModel, RecordingState};
+        use crate::pipelines::audio_level::{AudioLevels, SharedAudioLevels};
+        let levels: SharedAudioLevels = Default::default();
+        levels.lock().unwrap().input_rms_db = vec![-12.0, -24.0];
+        let (stop, _receiver) = tokio::sync::oneshot::channel();
+        let mut model = AppModel {
+            recording: RecordingState::start(1, String::new(), stop, Some(levels.clone())),
+            ..Default::default()
+        };
+        drop(model.handle_audio_level_tick());
+        assert_eq!(
+            model.current_audio_levels().unwrap().input_rms_db,
+            vec![-12.0, -24.0]
+        );
+        levels.lock().unwrap().input_rms_db = vec![-6.0];
+        assert_eq!(
+            model.current_audio_levels().unwrap().input_rms_db,
+            vec![-12.0, -24.0]
+        );
+        drop(model.handle_audio_level_tick());
+        assert_eq!(
+            model.current_audio_levels().unwrap().input_rms_db,
+            vec![-6.0]
+        );
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = levels.lock().unwrap();
+            panic!("poison levels");
+        });
+        drop(model.handle_audio_level_tick());
+        assert!(model.current_audio_levels().is_none());
+        model.recording = RecordingState::Idle;
+        model.audio_levels_snapshot = Some(AudioLevels::default());
+        drop(model.handle_audio_level_tick());
+        assert!(model.current_audio_levels().is_none());
+        // No probe is started for a closed settings drawer, even with audio enabled.
+        model.config.record_audio = true;
+        model.core.window.show_context = false;
+        model.sync_audio_probe();
+        assert!(model.audio_probe.is_none());
+    }
 
     #[test]
     fn demosaic_handler_persists_each_method_and_reset_restores_bilinear() {

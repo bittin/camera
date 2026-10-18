@@ -21,7 +21,7 @@
 //! │                      │  init   │  CameraManager        │
 //! │  stop_flag ──────────┼────────►│  ActiveCamera         │
 //! │  still_capture ─────┼────────►│  FrameBuffers         │
-//! │  latest_preview ◄────┼─────────│  Request loop         │
+//! │                      │         │  Request loop         │
 //! │  still_capture ◄────┼─────────│                       │
 //! │  frame_sender   ◄────┼─────────│  (all libcamera ops)  │
 //! └──────────────────────┘         └───────────────────────┘
@@ -34,7 +34,7 @@ pub(crate) mod pixel_formats;
 pub use diagnostics::is_capture_active;
 
 use crate::backends::camera::preview_metrics::PreviewMetrics;
-use crate::backends::camera::still_capture::{StillCapture, StillRequest};
+use crate::backends::camera::still_capture::StillCapture;
 use crate::backends::camera::types::*;
 use capture_thread::{CaptureThreadInitResult, CaptureThreadParams, capture_thread_main};
 use diagnostics::clear_global_diagnostics;
@@ -48,7 +48,6 @@ pub(crate) struct PipelineSharedState {
     pub(crate) frame_sender: FrameSender,
     pub(crate) still_capture: Arc<StillCapture>,
     pub(crate) recording_sender: Arc<Mutex<Option<tokio::sync::mpsc::Sender<RecordingFrame>>>>,
-    pub(crate) jpeg_recording_mode: Arc<AtomicBool>,
     /// Cancel flag from the subscription — allows the capture thread to abort
     /// before creating a CameraManager if a newer mode switch superseded this one.
     pub(crate) cancel_flag: Arc<AtomicBool>,
@@ -62,13 +61,9 @@ pub(crate) struct NativeLibcameraPipeline {
     pub(crate) preview_metrics: Arc<PreviewMetrics>,
     /// Capture processing thread (owns all libcamera objects)
     capture_thread: Option<JoinHandle<()>>,
-    /// Accepted stream layout, not the discovery hint.
-    is_multistream: bool,
+
     /// Stop flag for capture thread
     stop_flag: Arc<AtomicBool>,
-    still_capture: Arc<StillCapture>,
-    /// Latest preview frame
-    latest_preview: Arc<Mutex<Option<CameraFrame>>>,
     /// Preview frame counter
     preview_frame_count: Arc<AtomicU64>,
     /// Still frame counter
@@ -105,7 +100,6 @@ impl NativeLibcameraPipeline {
 
         // Shared state
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let latest_preview = Arc::new(Mutex::new(None));
         let preview_frame_count = Arc::new(AtomicU64::new(0));
         let still_frame_count = Arc::new(AtomicU64::new(0));
 
@@ -120,13 +114,11 @@ impl NativeLibcameraPipeline {
             preview_height: preview_format.height,
             limit_preview,
             stop_flag: Arc::clone(&stop_flag),
-            latest_preview: Arc::clone(&latest_preview),
             still_capture: Arc::clone(&shared.still_capture),
             preview_frame_count: Arc::clone(&preview_frame_count),
             still_frame_count: Arc::clone(&still_frame_count),
             frame_sender: shared.frame_sender,
             recording_sender: Arc::clone(&shared.recording_sender),
-            jpeg_recording_mode: Arc::clone(&shared.jpeg_recording_mode),
             cancel_flag: Arc::clone(&shared.cancel_flag),
         };
 
@@ -156,31 +148,13 @@ impl NativeLibcameraPipeline {
 
         Ok(Self {
             capture_thread: Some(capture_thread),
-            is_multistream: init_result.is_multistream,
+
             preview_metrics,
             stop_flag,
-            still_capture: shared.still_capture,
-            latest_preview,
             preview_frame_count,
             still_frame_count,
             _recording_sender: shared.recording_sender,
         })
-    }
-
-    pub(crate) fn is_multistream(&self) -> bool {
-        self.is_multistream
-    }
-
-    pub(crate) fn begin_still_capture(&self) -> StillRequest {
-        self.still_capture.request()
-    }
-
-    /// Get the latest preview frame
-    pub(crate) fn get_preview_frame(&self) -> Option<CameraFrame> {
-        self.latest_preview
-            .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
     }
 
     /// Get frame counts for debugging
@@ -189,15 +163,6 @@ impl NativeLibcameraPipeline {
             self.preview_frame_count.load(Ordering::Relaxed),
             self.still_frame_count.load(Ordering::Relaxed),
         )
-    }
-
-    /// Stop the pipeline
-    pub(crate) fn stop(&self) -> BackendResult<()> {
-        info!("Stopping native libcamera pipeline");
-        self.preview_metrics.stop();
-        clear_global_diagnostics();
-        self.stop_flag.store(true, Ordering::Release);
-        Ok(())
     }
 }
 
@@ -232,11 +197,9 @@ mod tests {
     fn pipeline_without_hardware(metrics: Arc<PreviewMetrics>) -> NativeLibcameraPipeline {
         NativeLibcameraPipeline {
             preview_metrics: metrics,
-            is_multistream: false,
+
             capture_thread: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
-            still_capture: Default::default(),
-            latest_preview: Arc::new(Mutex::new(None)),
             preview_frame_count: Arc::new(AtomicU64::new(0)),
             still_frame_count: Arc::new(AtomicU64::new(0)),
             _recording_sender: Arc::new(Mutex::new(None)),
@@ -244,19 +207,31 @@ mod tests {
     }
 
     #[test]
-    fn native_pipeline_drop_clears_preview_session_with_retained_tracker() {
-        let metrics = PreviewMetrics::start("native-pipeline-drop-test");
-        let pipeline = pipeline_without_hardware(Arc::clone(&metrics));
+    fn native_pipeline_retains_recording_sender_after_worker_exit() {
+        let metrics = PreviewMetrics::start("native-recording-owner-test");
+        let pipeline = pipeline_without_hardware(metrics);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        *pipeline._recording_sender.lock().unwrap() = Some(tx);
+        // The fixture has no running worker: pipeline ownership alone keeps
+        // the recording channel alive, including after an unexpected exit.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
         drop(pipeline);
-        assert!(PreviewMetrics::active_for("native-pipeline-drop-test").is_none());
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[test]
-    fn native_pipeline_stop_clears_preview_session_immediately() {
-        let metrics = PreviewMetrics::start("native-pipeline-stop-test");
+    fn native_pipeline_drop_clears_preview_session_with_retained_tracker() {
+        let metrics = PreviewMetrics::start("native-pipeline-drop-test");
         let pipeline = pipeline_without_hardware(Arc::clone(&metrics));
-        pipeline.stop().unwrap();
-        assert!(pipeline.stop_flag.load(Ordering::Acquire));
-        assert!(PreviewMetrics::active_for("native-pipeline-stop-test").is_none());
+        let stop_flag = Arc::clone(&pipeline.stop_flag);
+        drop(pipeline);
+        assert!(stop_flag.load(Ordering::Acquire));
+        assert!(PreviewMetrics::active_for("native-pipeline-drop-test").is_none());
     }
 }

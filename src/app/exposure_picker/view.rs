@@ -21,6 +21,12 @@ const SLIDER_WIDTH_COLOR: f32 = 120.0;
 const VALUE_WIDTH_EXPOSURE: f32 = 50.0;
 const VALUE_WIDTH_COLOR: f32 = 40.0;
 const CONTROL_SPACING: u16 = 8;
+const EXPOSURE_WIDTHS: (f32, f32) = (SLIDER_WIDTH_EXPOSURE, VALUE_WIDTH_EXPOSURE);
+const COLOR_WIDTHS: (f32, f32) = (SLIDER_WIDTH_COLOR, VALUE_WIDTH_COLOR);
+
+fn integer_text(value: i32) -> String {
+    value.to_string()
+}
 
 impl AppModel {
     /// Build the exposure picker overlay
@@ -92,7 +98,14 @@ impl AppModel {
             column = column.push(self.build_ev_row(settings_data));
         }
         if controls.backlight_compensation.available {
-            column = column.push(self.build_backlight_row(settings_data));
+            column = column.push(Self::build_slider_row(
+                fl!("exposure-backlight"),
+                settings_data.and_then(|s| s.backlight_compensation),
+                &controls.backlight_compensation,
+                EXPOSURE_WIDTHS,
+                integer_text,
+                Message::SetBacklightCompensation,
+            ));
         }
 
         // Focus controls (available in both auto and manual modes)
@@ -109,25 +122,35 @@ impl AppModel {
     ) -> widget::Column<'a, Message, cosmic::Theme> {
         let controls = &self.available_exposure_controls;
 
-        // Exposure Time
-        if controls.exposure_time.available {
-            column = column.push(self.build_exposure_time_row(settings_data));
-        } else {
-            column = column.push(Self::build_unsupported_row(fl!("exposure-time")));
-        }
-
-        // Gain
-        if controls.gain.available {
-            column = column.push(self.build_gain_row(settings_data));
-        } else {
-            column = column.push(Self::build_unsupported_row(fl!("exposure-gain")));
-        }
-
-        // ISO
-        if controls.iso.available {
-            column = column.push(self.build_iso_row(settings_data));
-        } else {
-            column = column.push(Self::build_unsupported_row(fl!("exposure-iso")));
+        // Unsupported manual controls stay visible, in the same order.
+        for (label, current, range, format, message) in [
+            (
+                fl!("exposure-time"),
+                settings_data.and_then(|s| s.exposure_time),
+                &controls.exposure_time,
+                format_exposure_time as fn(i32) -> String,
+                Message::SetExposureTime as fn(i32) -> Message,
+            ),
+            (
+                fl!("exposure-gain"),
+                settings_data.and_then(|s| s.gain),
+                &controls.gain,
+                integer_text,
+                Message::SetGain,
+            ),
+            (
+                fl!("exposure-iso"),
+                settings_data.and_then(|s| s.iso),
+                &controls.iso,
+                integer_text,
+                Message::SetIsoSensitivity,
+            ),
+        ] {
+            column = column.push(if range.available {
+                Self::build_slider_row(label, current, range, EXPOSURE_WIDTHS, format, message)
+            } else {
+                Self::build_unsupported_row(label)
+            });
         }
 
         // EV Compensation
@@ -189,24 +212,24 @@ impl AppModel {
     /// Build a generic slider row using ControlRange
     fn build_slider_row<'a, F>(
         label: String,
-        current: i32,
+        current: Option<i32>,
         range: &ControlRange,
-        slider_width: f32,
-        value_width: f32,
+        widths: (f32, f32),
         format_value: impl Fn(i32) -> String,
         message_fn: F,
     ) -> Element<'a, Message>
     where
         F: 'a + Fn(i32) -> Message,
     {
+        let current = current.unwrap_or(range.default);
         let min = range.min as f32;
         let max = range.max as f32;
         let clamped = (current as f32).clamp(min, max);
 
         let slider = widget::slider(min..=max, clamped, move |v| message_fn(v as i32))
-            .width(Length::Fixed(slider_width));
+            .width(Length::Fixed(widths.0));
 
-        Self::build_control_row(label, format_value(current), value_width, slider)
+        Self::build_control_row(label, format_value(current), widths.1, slider)
     }
 
     /// Build a row for unsupported controls
@@ -248,86 +271,6 @@ impl AppModel {
             format!("{:+.1}", current as f32 / 1000.0),
             VALUE_WIDTH_EXPOSURE,
             slider,
-        )
-    }
-
-    /// Build backlight compensation row
-    fn build_backlight_row(
-        &self,
-        settings_data: Option<&super::ExposureSettings>,
-    ) -> Element<'_, Message> {
-        let range = &self.available_exposure_controls.backlight_compensation;
-        let current = settings_data
-            .and_then(|s| s.backlight_compensation)
-            .unwrap_or(range.default);
-
-        Self::build_slider_row(
-            fl!("exposure-backlight"),
-            current,
-            range,
-            SLIDER_WIDTH_EXPOSURE,
-            VALUE_WIDTH_EXPOSURE,
-            |v| format!("{}", v),
-            Message::SetBacklightCompensation,
-        )
-    }
-
-    /// Build exposure time row
-    fn build_exposure_time_row(
-        &self,
-        settings_data: Option<&super::ExposureSettings>,
-    ) -> Element<'_, Message> {
-        let range = &self.available_exposure_controls.exposure_time;
-        let current = settings_data
-            .and_then(|s| s.exposure_time)
-            .unwrap_or(range.default);
-
-        Self::build_slider_row(
-            fl!("exposure-time"),
-            current,
-            range,
-            SLIDER_WIDTH_EXPOSURE,
-            VALUE_WIDTH_EXPOSURE,
-            format_exposure_time,
-            Message::SetExposureTime,
-        )
-    }
-
-    /// Build gain row
-    fn build_gain_row(
-        &self,
-        settings_data: Option<&super::ExposureSettings>,
-    ) -> Element<'_, Message> {
-        let range = &self.available_exposure_controls.gain;
-        let current = settings_data.and_then(|s| s.gain).unwrap_or(range.default);
-
-        Self::build_slider_row(
-            fl!("exposure-gain"),
-            current,
-            range,
-            SLIDER_WIDTH_EXPOSURE,
-            VALUE_WIDTH_EXPOSURE,
-            |v| format!("{}", v),
-            Message::SetGain,
-        )
-    }
-
-    /// Build ISO row
-    fn build_iso_row(
-        &self,
-        settings_data: Option<&super::ExposureSettings>,
-    ) -> Element<'_, Message> {
-        let range = &self.available_exposure_controls.iso;
-        let current = settings_data.and_then(|s| s.iso).unwrap_or(range.default);
-
-        Self::build_slider_row(
-            fl!("exposure-iso"),
-            current,
-            range,
-            SLIDER_WIDTH_EXPOSURE,
-            VALUE_WIDTH_EXPOSURE,
-            |v| format!("{}", v),
-            Message::SetIsoSensitivity,
         )
     }
 
@@ -403,33 +346,42 @@ impl AppModel {
 
         if controls.focus.available {
             if controls.has_focus_auto {
-                column = column.push(self.build_focus_auto_row(settings_data));
+                column = column.push(Self::build_auto_manual_row(
+                    fl!("focus-auto"),
+                    settings_data.and_then(|s| s.focus_auto).unwrap_or(false),
+                    |_| Message::ToggleFocusAuto,
+                ));
             }
 
             // Show manual slider when auto focus is off (or unavailable)
             let is_auto = settings_data.and_then(|s| s.focus_auto).unwrap_or(false);
             if !is_auto || !controls.has_focus_auto {
-                column = column.push(self.build_focus_slider_row(settings_data));
+                column = column.push(Self::build_slider_row(
+                    fl!("focus-position"),
+                    settings_data.and_then(|s| s.focus_absolute),
+                    &controls.focus,
+                    EXPOSURE_WIDTHS,
+                    integer_text,
+                    Message::SetFocusAbsolute,
+                ));
             }
         }
 
         column
     }
 
-    /// Build auto focus toggle row
-    fn build_focus_auto_row(
-        &self,
-        settings_data: Option<&super::ExposureSettings>,
-    ) -> Element<'_, Message> {
-        let enabled = settings_data.and_then(|s| s.focus_auto).unwrap_or(false);
-
+    fn build_auto_manual_row(
+        label: String,
+        enabled: bool,
+        on_toggle: fn(bool) -> Message,
+    ) -> Element<'static, Message> {
         widget::Row::new()
             .push(
-                widget::text(fl!("focus-auto"))
+                widget::text(label)
                     .size(13)
                     .width(Length::Fixed(LABEL_WIDTH)),
             )
-            .push(widget::toggler(enabled).on_toggle(|_| Message::ToggleFocusAuto))
+            .push(widget::toggler(enabled).on_toggle(on_toggle))
             .push(
                 widget::text(if enabled {
                     fl!("color-auto")
@@ -442,27 +394,6 @@ impl AppModel {
             .align_y(Alignment::Center)
             .width(Length::Shrink)
             .into()
-    }
-
-    /// Build manual focus slider row
-    fn build_focus_slider_row(
-        &self,
-        settings_data: Option<&super::ExposureSettings>,
-    ) -> Element<'_, Message> {
-        let range = &self.available_exposure_controls.focus;
-        let current = settings_data
-            .and_then(|s| s.focus_absolute)
-            .unwrap_or(range.default);
-
-        Self::build_slider_row(
-            fl!("focus-position"),
-            current,
-            range,
-            SLIDER_WIDTH_EXPOSURE,
-            VALUE_WIDTH_EXPOSURE,
-            |v| format!("{}", v),
-            Message::SetFocusAbsolute,
-        )
     }
 
     // =========================================================================
@@ -524,62 +455,45 @@ impl AppModel {
     ) -> widget::Column<'a, Message, cosmic::Theme> {
         let controls = &self.available_exposure_controls;
 
-        if controls.contrast.available {
-            column = column.push(self.build_color_slider_row(
+        for (label, current, range, message) in [
+            (
                 fl!("color-contrast"),
                 settings_data.and_then(|s| s.contrast),
                 &controls.contrast,
-                Message::SetContrast,
-            ));
-        }
-        if controls.saturation.available {
-            column = column.push(self.build_color_slider_row(
+                Message::SetContrast as fn(i32) -> Message,
+            ),
+            (
                 fl!("color-saturation"),
                 settings_data.and_then(|s| s.saturation),
                 &controls.saturation,
                 Message::SetSaturation,
-            ));
-        }
-        if controls.sharpness.available {
-            column = column.push(self.build_color_slider_row(
+            ),
+            (
                 fl!("color-sharpness"),
                 settings_data.and_then(|s| s.sharpness),
                 &controls.sharpness,
                 Message::SetSharpness,
-            ));
-        }
-        if controls.hue.available {
-            column = column.push(self.build_color_slider_row(
+            ),
+            (
                 fl!("color-hue"),
                 settings_data.and_then(|s| s.hue),
                 &controls.hue,
                 Message::SetHue,
-            ));
+            ),
+        ] {
+            if range.available {
+                column = column.push(Self::build_slider_row(
+                    label,
+                    current,
+                    range,
+                    COLOR_WIDTHS,
+                    integer_text,
+                    message,
+                ));
+            }
         }
 
         column
-    }
-
-    /// Build a color control slider row
-    fn build_color_slider_row<'a, F>(
-        &self,
-        label: String,
-        current: Option<i32>,
-        range: &ControlRange,
-        message_fn: F,
-    ) -> Element<'a, Message>
-    where
-        F: 'a + Fn(i32) -> Message,
-    {
-        Self::build_slider_row(
-            label,
-            current.unwrap_or(range.default),
-            range,
-            SLIDER_WIDTH_COLOR,
-            VALUE_WIDTH_COLOR,
-            |v| format!("{}", v),
-            message_fn,
-        )
     }
 
     /// Add white balance controls
@@ -591,7 +505,13 @@ impl AppModel {
         let controls = &self.available_exposure_controls;
 
         if controls.has_white_balance_auto {
-            column = column.push(self.build_auto_white_balance_row(settings_data));
+            column = column.push(Self::build_auto_manual_row(
+                fl!("color-white-balance"),
+                settings_data
+                    .and_then(|s| s.white_balance_auto)
+                    .unwrap_or(true),
+                |_| Message::ToggleAutoWhiteBalance,
+            ));
         }
 
         if controls.white_balance_temperature.available {
@@ -599,62 +519,18 @@ impl AppModel {
                 .and_then(|s| s.white_balance_auto)
                 .unwrap_or(true);
             if !is_auto || !controls.has_white_balance_auto {
-                column = column.push(self.build_white_balance_temp_row(settings_data));
+                column = column.push(Self::build_slider_row(
+                    fl!("color-temperature"),
+                    settings_data.and_then(|s| s.white_balance_temperature),
+                    &controls.white_balance_temperature,
+                    (SLIDER_WIDTH_COLOR, VALUE_WIDTH_EXPOSURE),
+                    |v| format!("{v}K"),
+                    Message::SetWhiteBalanceTemperature,
+                ));
             }
         }
 
         column
-    }
-
-    /// Build auto white balance toggle row
-    fn build_auto_white_balance_row(
-        &self,
-        settings_data: Option<&super::ColorSettings>,
-    ) -> Element<'_, Message> {
-        let enabled = settings_data
-            .and_then(|s| s.white_balance_auto)
-            .unwrap_or(true);
-
-        widget::Row::new()
-            .push(
-                widget::text(fl!("color-white-balance"))
-                    .size(13)
-                    .width(Length::Fixed(LABEL_WIDTH)),
-            )
-            .push(widget::toggler(enabled).on_toggle(|_| Message::ToggleAutoWhiteBalance))
-            .push(
-                widget::text(if enabled {
-                    fl!("color-auto")
-                } else {
-                    fl!("color-manual")
-                })
-                .size(12),
-            )
-            .spacing(CONTROL_SPACING)
-            .align_y(Alignment::Center)
-            .width(Length::Shrink)
-            .into()
-    }
-
-    /// Build white balance temperature row
-    fn build_white_balance_temp_row(
-        &self,
-        settings_data: Option<&super::ColorSettings>,
-    ) -> Element<'_, Message> {
-        let range = &self.available_exposure_controls.white_balance_temperature;
-        let current = settings_data
-            .and_then(|s| s.white_balance_temperature)
-            .unwrap_or(range.default);
-
-        Self::build_slider_row(
-            fl!("color-temperature"),
-            current,
-            range,
-            SLIDER_WIDTH_COLOR,
-            VALUE_WIDTH_EXPOSURE,
-            |v| format!("{}K", v),
-            Message::SetWhiteBalanceTemperature,
-        )
     }
 }
 
@@ -666,5 +542,201 @@ fn format_exposure_time(time_100us: i32) -> String {
         format!("1/{}s", denominator)
     } else {
         format!("{:.1}s", seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::settings::widget_test_support as ui;
+    use cosmic::iced::{Size, advanced::Layout};
+
+    #[test]
+    fn numeric_rows_keep_unclamped_text_default_widths_and_unsnapped_messages() {
+        let renderer = ui::renderer();
+        let range = ControlRange::new(0, 100, 7, 23);
+        for current in [None, Some(-10), Some(110)] {
+            for widths in [
+                EXPOSURE_WIDTHS,
+                COLOR_WIDTHS,
+                (SLIDER_WIDTH_COLOR, VALUE_WIDTH_EXPOSURE),
+            ] {
+                let mut row = AppModel::build_slider_row(
+                    "Gain".into(),
+                    current,
+                    &range,
+                    widths,
+                    integer_text,
+                    Message::SetGain,
+                );
+                let (mut tree, node) = ui::layout(&mut row, &renderer, Size::new(400.0, 100.0));
+                let texts = ui::texts(&mut row, &mut tree, &node, &renderer);
+                assert_eq!(texts[1].0, current.unwrap_or(23).to_string());
+                assert_eq!(node.children()[0].size().width, LABEL_WIDTH);
+                assert_eq!(node.children()[1].size().width, widths.0);
+                assert_eq!(node.children()[2].size().width, widths.1);
+                let center = Layout::new(&node)
+                    .children()
+                    .nth(1)
+                    .unwrap()
+                    .bounds()
+                    .center();
+                let messages = ui::click(&mut row, &mut tree, &node, &renderer, center);
+                assert!(
+                    matches!(messages.as_slice(), [Message::SetGain(50)]),
+                    "{messages:?}"
+                );
+            }
+        }
+        assert_eq!(format_exposure_time(100), "1/100s");
+        assert_eq!(format_exposure_time(5000), "0.5s");
+        assert_eq!(format_exposure_time(10000), "1.0s");
+    }
+
+    #[test]
+    fn manual_controls_keep_unsupported_order_and_image_rows_keep_message_order() {
+        let renderer = ui::renderer();
+        let mut app = AppModel::default();
+        let mut manual: Element<'_, Message> =
+            app.add_manual_controls(widget::Column::new(), None).into();
+        let (mut tree, node) = ui::layout(&mut manual, &renderer, Size::new(400.0, 1000.0));
+        assert_eq!(node.children().len(), 6);
+        let texts = ui::texts(&mut manual, &mut tree, &node, &renderer);
+        for (pair, key) in texts.as_chunks::<2>().0.iter().zip([
+            "exposure-time",
+            "exposure-gain",
+            "exposure-iso",
+            "exposure-ev",
+            "exposure-metering",
+            "exposure-auto-priority",
+        ]) {
+            assert_eq!(pair[0].0, crate::i18n::LANGUAGE_LOADER.get(key));
+            assert_eq!(pair[1].0, fl!("exposure-not-supported"));
+        }
+        drop(manual);
+        app.available_exposure_controls.exposure_time = ControlRange::new(0, 100, 7, 23);
+        app.available_exposure_controls.gain = ControlRange::new(0, 100, 7, 23);
+        app.available_exposure_controls.iso = ControlRange::new(0, 100, 7, 23);
+        let mut manual: Element<'_, Message> =
+            app.add_manual_controls(widget::Column::new(), None).into();
+        let (mut tree, node) = ui::layout(&mut manual, &renderer, Size::new(400.0, 1000.0));
+        let mut messages = Vec::new();
+        for row in Layout::new(&node).children().take(3) {
+            let center = row.children().nth(1).unwrap().bounds().center();
+            messages.extend(ui::click(&mut manual, &mut tree, &node, &renderer, center));
+        }
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    Message::SetExposureTime(50),
+                    Message::SetGain(50),
+                    Message::SetIsoSensitivity(50)
+                ]
+            ),
+            "{messages:?}"
+        );
+        drop(manual);
+        app.available_exposure_controls.contrast = ControlRange::new(0, 100, 7, 23);
+        app.available_exposure_controls.saturation = ControlRange::new(0, 100, 7, 23);
+        app.available_exposure_controls.sharpness = ControlRange::new(0, 100, 7, 23);
+        app.available_exposure_controls.hue = ControlRange::new(0, 100, 7, 23);
+        let mut images: Element<'_, Message> =
+            app.add_image_controls(widget::Column::new(), None).into();
+        let (mut tree, node) = ui::layout(&mut images, &renderer, Size::new(400.0, 1000.0));
+        assert_eq!(node.children().len(), 4);
+        let mut messages = Vec::new();
+        for row in Layout::new(&node).children() {
+            let center = row.children().nth(1).unwrap().bounds().center();
+            messages.extend(ui::click(&mut images, &mut tree, &node, &renderer, center));
+        }
+        assert!(
+            matches!(
+                messages.as_slice(),
+                [
+                    Message::SetContrast(50),
+                    Message::SetSaturation(50),
+                    Message::SetSharpness(50),
+                    Message::SetHue(50)
+                ]
+            ),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn focus_and_white_balance_keep_distinct_missing_snapshot_defaults_and_gates() {
+        let renderer = ui::renderer();
+        let mut app = AppModel::default();
+        for has_auto in [false, true] {
+            for available in [false, true] {
+                app.available_exposure_controls.has_focus_auto = has_auto;
+                app.available_exposure_controls.has_white_balance_auto = has_auto;
+                app.available_exposure_controls.focus = ControlRange {
+                    available,
+                    ..ControlRange::new(0, 100, 1, 25)
+                };
+                app.available_exposure_controls.white_balance_temperature = ControlRange {
+                    available,
+                    ..ControlRange::new(1000, 8000, 100, 4500)
+                };
+                let mut focus: Element<'_, Message> =
+                    app.add_focus_controls(widget::Column::new(), None).into();
+                let (mut tree, node) = ui::layout(&mut focus, &renderer, Size::new(400.0, 1000.0));
+                assert_eq!(
+                    node.children().len(),
+                    if available {
+                        1 + usize::from(has_auto)
+                    } else {
+                        0
+                    }
+                );
+                if available && has_auto {
+                    let texts = ui::texts(&mut focus, &mut tree, &node, &renderer);
+                    assert!(texts.iter().any(|(text, _)| text == &fl!("color-manual")));
+                    let toggle = Layout::new(&node)
+                        .children()
+                        .next()
+                        .unwrap()
+                        .children()
+                        .nth(1)
+                        .unwrap()
+                        .bounds()
+                        .center();
+                    assert!(matches!(
+                        ui::click(&mut focus, &mut tree, &node, &renderer, toggle).as_slice(),
+                        [Message::ToggleFocusAuto]
+                    ));
+                }
+                let mut wb: Element<'_, Message> = app
+                    .add_white_balance_controls(widget::Column::new(), None)
+                    .into();
+                let (mut tree, node) = ui::layout(&mut wb, &renderer, Size::new(400.0, 1000.0));
+                assert_eq!(
+                    node.children().len(),
+                    usize::from(has_auto) + usize::from(available && !has_auto)
+                );
+                if has_auto {
+                    let texts = ui::texts(&mut wb, &mut tree, &node, &renderer);
+                    assert!(texts.iter().any(|(text, _)| text == &fl!("color-auto")));
+                    let toggle = Layout::new(&node)
+                        .children()
+                        .next()
+                        .unwrap()
+                        .children()
+                        .nth(1)
+                        .unwrap()
+                        .bounds()
+                        .center();
+                    assert!(matches!(
+                        ui::click(&mut wb, &mut tree, &node, &renderer, toggle).as_slice(),
+                        [Message::ToggleAutoWhiteBalance]
+                    ));
+                } else if available {
+                    let texts = ui::texts(&mut wb, &mut tree, &node, &renderer);
+                    assert!(texts.iter().any(|(text, _)| text == "4500K"));
+                }
+            }
+        }
     }
 }

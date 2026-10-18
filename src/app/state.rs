@@ -788,9 +788,7 @@ pub struct AppModel {
     /// check this flag and exit the process once the file is finalized.
     pub pending_close: bool,
     /// Latest gallery thumbnail (cached)
-    pub gallery_thumbnail: Option<cosmic::widget::image::Handle>,
-    /// Gallery thumbnail RGBA data for custom rendering (Arc for cheap cloning)
-    pub gallery_thumbnail_rgba: Option<(Arc<Vec<u8>>, u32, u32)>,
+    pub gallery_thumbnail: Option<crate::storage::GalleryThumbnailData>,
     /// Currently selected resolution in the picker (width for grouping)
     pub picker_selected_resolution: Option<u32>,
     /// V4L2 device path the user is trying to switch to (set when switching
@@ -860,9 +858,6 @@ pub struct AppModel {
     /// Live pre-recording audio level probe (Some only while the settings
     /// drawer is open with audio recording enabled and no real recording).
     pub audio_probe: Option<crate::pipelines::audio_probe::AudioLevelProbe>,
-    /// Shared levels owned by `audio_probe`. Mirrors `audio_probe.levels()`
-    /// when the probe is alive; `None` otherwise.
-    pub probe_audio_levels: Option<crate::pipelines::audio_level::SharedAudioLevels>,
     /// 100 ms snapshot of whichever level source is currently active
     /// (recorder during recording, probe otherwise). The render path reads
     /// this without locking any mutex.
@@ -945,6 +940,19 @@ pub struct FitFrom {
     /// row sits flush above the carousel); the capture-area height
     /// otherwise. Drives the column layout above the bottom bar.
     pub capture_area_height: f32,
+}
+
+impl FitFrom {
+    /// Interpolate all fit channels from the same progress sample.
+    pub(crate) fn interpolate(self, target: Self, eased: f32) -> Self {
+        let lerp = |from, to| from + (to - from) * eased;
+        Self {
+            blend: lerp(self.blend, target.blend),
+            top_ui_height: lerp(self.top_ui_height, target.top_ui_height),
+            bottom_ui_height: lerp(self.bottom_ui_height, target.bottom_ui_height),
+            capture_area_height: lerp(self.capture_area_height, target.capture_area_height),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1160,7 +1168,7 @@ pub enum PhotoAspectRatio {
 
 impl PhotoAspectRatio {
     /// Cycle to next aspect ratio: Native → 4:3 → 16:9 → 2:1 → 1:1 → Native
-    pub fn next_for_frame(&self, _frame_width: u32, _frame_height: u32) -> Self {
+    pub fn next(&self) -> Self {
         match self {
             PhotoAspectRatio::Native => PhotoAspectRatio::Ratio4x3,
             PhotoAspectRatio::Ratio4x3 => PhotoAspectRatio::Ratio16x9,
@@ -1456,8 +1464,6 @@ pub enum Message {
     WhiteBalanceToggled(Option<i32>),
     /// Exposure control change failed
     ExposureControlFailed(String),
-    /// Base exposure time captured (for non-advanced EV slider)
-    ExposureBaseTimeCaptured(i32),
     /// Set backlight compensation value
     SetBacklightCompensation(i32),
     /// Set manual focus position (absolute)
@@ -1537,8 +1543,6 @@ pub enum Message {
     SetPanAbsolute(i32),
     /// Set V4L2 tilt absolute position (V4L2 cameras)
     SetTiltAbsolute(i32),
-    /// Set V4L2 zoom absolute position
-    SetZoomAbsolute(i32),
     /// Reset pan/tilt to center position
     ResetPanTilt,
 
@@ -1565,8 +1569,6 @@ pub enum Message {
     ToggleMotionPhotoCapture,
     /// Set burst mode frame count (0 = Auto, 1 = 4 frames, 2 = 6 frames, 3 = 8 frames)
     SetBurstModeFrameCount(usize),
-    /// Burst mode capture progress update (overall_progress 0.0-1.0)
-    BurstModeProgress(f32),
     /// Burst mode frames collected, ready to process
     BurstModeFramesCollected,
     /// Burst mode raw frames captured via capture_photo() (multistream mode)
@@ -1859,24 +1861,18 @@ impl TransitionState {
     /// stays disabled for all of it, so it is added to every camera switch in
     /// full. It only needs to cover auto-exposure settling, not the pipeline
     /// restart (the blur is already up for that).
-    pub fn start(&mut self) -> cosmic::Task<Message> {
+    pub fn start(&mut self) {
         self.start_with_duration(crate::constants::latency::CAMERA_SWITCH_BLUR_HOLD_MS, true)
     }
 
     /// Start a transition with custom blur duration
     /// Used for HDR+ completion (shorter blur) vs camera switches (longer blur)
-    pub fn start_with_duration(
-        &mut self,
-        duration_ms: u64,
-        disable_ui: bool,
-    ) -> cosmic::Task<Message> {
+    pub fn start_with_duration(&mut self, duration_ms: u64, disable_ui: bool) {
         self.in_transition = true;
         self.ui_disabled = disable_ui;
         self.blur_duration_ms = duration_ms;
         self.transition_start_time = Some(Instant::now());
         self.first_frame_time = None; // Reset - waiting for first new frame
-
-        cosmic::Task::none()
     }
 
     /// Called when a new frame arrives during transition.
@@ -1960,7 +1956,6 @@ impl AppModel {
             let device_changed = probe.device().map(str::to_string) != desired_device;
             if !want || device_changed {
                 probe.stop();
-                self.probe_audio_levels = None;
             } else {
                 // Still valid — put it back.
                 self.audio_probe = Some(probe);
@@ -1974,15 +1969,91 @@ impl AppModel {
                 desired_rate_hz,
             ) {
                 Ok(probe) => {
-                    self.probe_audio_levels = Some(probe.levels());
                     self.audio_probe = Some(probe);
                 }
                 Err(e) => {
                     tracing::info!(error = %e, "Audio level probe failed to start");
-                    self.probe_audio_levels = None;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod transition_and_aspect_tests {
+    use super::*;
+
+    #[test]
+    fn fit_channels_share_endpoint_and_midpoint_progress() {
+        let from = FitFrom {
+            blend: 0.0,
+            top_ui_height: 10.0,
+            bottom_ui_height: 40.0,
+            capture_area_height: 80.0,
+        };
+        let target = FitFrom {
+            blend: 1.0,
+            top_ui_height: 0.0,
+            bottom_ui_height: 20.0,
+            capture_area_height: 0.0,
+        };
+        for (eased, expected) in [
+            (0.0, [0.0, 10.0, 40.0, 80.0]),
+            (0.5, [0.5, 5.0, 30.0, 40.0]),
+            (1.0, [1.0, 0.0, 20.0, 0.0]),
+        ] {
+            let actual = from.interpolate(target, eased);
+            assert_eq!(
+                [
+                    actual.blend,
+                    actual.top_ui_height,
+                    actual.bottom_ui_height,
+                    actual.capture_area_height
+                ],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn aspect_cycle_offers_every_ratio_without_needing_a_frame() {
+        use PhotoAspectRatio::*;
+        let mut ratio = Native;
+        for expected in [Ratio4x3, Ratio16x9, Ratio2x1, Ratio1x1, Native] {
+            ratio = ratio.next();
+            assert_eq!(ratio, expected);
+        }
+    }
+
+    #[test]
+    fn transition_start_resets_waiting_state_and_keeps_real_first_frame_task() {
+        let mut transition = TransitionState::default();
+        transition.start();
+        assert!(transition.in_transition && transition.ui_disabled);
+        assert_eq!(
+            transition.blur_duration_ms,
+            crate::constants::latency::CAMERA_SWITCH_BLUR_HOLD_MS
+        );
+        let started = transition.transition_start_time.unwrap();
+        assert!(transition.first_frame_time.is_none());
+        assert!(transition.should_blur());
+        assert!(
+            transition
+                .on_frame_received(started - std::time::Duration::from_millis(1))
+                .is_none()
+        );
+        assert!(transition.first_frame_time.is_none());
+        assert!(transition.on_frame_received(started).is_some());
+        assert!(transition.on_frame_received(started).is_none());
+        transition.start_with_duration(200, false);
+        assert!(transition.in_transition && !transition.ui_disabled);
+        assert_eq!(transition.blur_duration_ms, 200);
+        assert!(transition.first_frame_time.is_none());
+        let restarted = transition.transition_start_time;
+        transition.clear();
+        assert!(!transition.in_transition && !transition.ui_disabled);
+        assert_eq!(transition.transition_start_time, restarted);
+        assert!(!transition.should_blur());
     }
 }
 

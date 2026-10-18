@@ -10,15 +10,6 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use tracing::{debug, info};
 
-/// Audio codec types in priority order
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioCodec {
-    /// Opus codec (preferred - best quality, all channels)
-    Opus,
-    /// AAC codec (fallback - good compatibility)
-    AAC,
-}
-
 /// Audio channel configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioChannels {
@@ -70,8 +61,6 @@ impl AudioQuality {
 pub struct SelectedAudioEncoder {
     /// The encoder element
     pub encoder: gst::Element,
-    /// Codec being used
-    pub codec: AudioCodec,
 }
 
 /// Sample rates accepted by `opusenc` (libopus is fixed to this set).
@@ -81,9 +70,9 @@ pub const OPUS_SUPPORTED_RATES: &[u32] = &[8000, 12000, 16000, 24000, 48000];
 ///
 /// If the source's native rate is one Opus accepts, use it as-is — that
 /// preserves the source rate end-to-end with no resampling work anywhere.
-/// Otherwise fall back to 48 kHz, the highest Opus rate; PulseAudio will do
-/// the conversion internally so we still avoid a GStreamer `audioresample`
-/// element. `0` (unknown) falls back to 48 kHz for safety.
+/// Otherwise fall back to 48 kHz, the highest Opus rate. PulseAudio normally
+/// converts internally; the graph retains a defensive resampler for sources
+/// that cannot negotiate that rate. `0` (unknown) also falls back to 48 kHz.
 pub fn opus_target_rate(source_rate_hz: u32) -> u32 {
     if source_rate_hz != 0 && OPUS_SUPPORTED_RATES.contains(&source_rate_hz) {
         source_rate_hz
@@ -124,10 +113,7 @@ pub fn select_audio_encoder(
 
         configure_opus_encoder(&encoder, quality);
 
-        return Ok(SelectedAudioEncoder {
-            encoder,
-            codec: AudioCodec::Opus,
-        });
+        return Ok(SelectedAudioEncoder { encoder });
     }
 
     // Try AAC encoders as fallback
@@ -144,10 +130,7 @@ pub fn select_audio_encoder(
 
             configure_aac_encoder(&encoder, encoder_name, quality);
 
-            return Ok(SelectedAudioEncoder {
-                encoder,
-                codec: AudioCodec::AAC,
-            });
+            return Ok(SelectedAudioEncoder { encoder });
         }
     }
 

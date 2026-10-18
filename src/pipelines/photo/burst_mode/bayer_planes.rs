@@ -90,36 +90,20 @@ pub(crate) fn extract_bayer_planes(frame: &CameraFrame) -> Result<BayerPlanes, S
     // Validate before normalization/allocation. Keep WB/CCM unapplied here:
     // extraction subtracts black exactly once; GPU finishing applies colour.
     if let Some(meta) = meta {
-        if meta
-            .colour_gains
-            .is_some_and(|g| g.iter().any(|v| !v.is_finite() || *v <= 0.0))
-            || meta
-                .colour_correction_matrix
-                .is_some_and(|m| m.iter().flatten().any(|v| !v.is_finite()))
-        {
-            return Err("Invalid Bayer colour metadata".into());
-        }
-        // Bound every WB product and partial CCM sum in f64, without accepting
-        // cancellation. MAX/16 matches canonical float conversion headroom.
-        let gains = meta.colour_gains.unwrap_or([1.0, 1.0]);
-        let weights = [f64::from(gains[0]), 1.0, f64::from(gains[1])];
-        let ccm = meta.colour_correction_matrix.unwrap_or([
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-        ]);
-        let limit = f64::from(f32::MAX) / 16.0;
-        if weights.iter().any(|v| *v > limit)
-            || ccm.iter().any(|row| {
-                row.iter()
-                    .zip(weights)
-                    .map(|(c, w)| f64::from(*c).abs() * w)
-                    .sum::<f64>()
-                    > limit
-            })
-        {
-            return Err("Unsafe Bayer colour arithmetic".into());
-        }
+        // This precheck historically uses a unit sample bound, not the actual
+        // signed extraction range. Finishing validates its reconstructed bound.
+        crate::shaders::validate_bayer_colour(
+            meta.colour_gains,
+            meta.colour_correction_matrix,
+            1.0,
+        )
+        .map_err(|error| {
+            if error == "Invalid Bayer colour metadata or samples" {
+                "Invalid Bayer colour metadata".to_owned()
+            } else {
+                error.to_owned()
+            }
+        })?;
     }
 
     // HDR planes represent rectangular complete 2x2 quads: do not silently crop
@@ -696,7 +680,24 @@ mod tests {
         for value in [f32::NAN, f32::INFINITY, 0.0, -1.0, f32::MAX] {
             let mut input = base.clone();
             input.libcamera_metadata.as_mut().unwrap().colour_gains = Some([value, 1.0]);
-            assert!(extract_bayer_planes(&input).is_err());
+            assert_eq!(
+                extract_bayer_planes(&input).err().unwrap(),
+                if value == f32::MAX {
+                    "Unsafe Bayer colour arithmetic"
+                } else {
+                    "Invalid Bayer colour metadata"
+                }
+            );
+            // Metadata errors precede even malformed CFA geometry.
+            input.width = 1;
+            assert_eq!(
+                extract_bayer_planes(&input).err().unwrap(),
+                if value == f32::MAX {
+                    "Unsafe Bayer colour arithmetic"
+                } else {
+                    "Invalid Bayer colour metadata"
+                }
+            );
         }
         for value in [f32::NAN, f32::INFINITY, f32::MAX] {
             let mut input = base.clone();

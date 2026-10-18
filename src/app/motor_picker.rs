@@ -76,9 +76,6 @@ impl AppModel {
             column = column.push(tilt_row);
         }
 
-        // Note: Zoom control is handled separately via normal camera zoom
-        // (hardware zoom is preferred, shader zoom is fallback)
-
         // Build picker panel with semi-transparent themed background. When
         // frosted glass is active, `frosted_panel` stacks a live-blurred preview
         // backdrop behind the translucent panel.
@@ -126,16 +123,6 @@ impl AppModel {
                 v4l2_controls::set_control(&path, v4l2_controls::V4L2_CID_TILT_ABSOLUTE, value)
         {
             warn!("Failed to set tilt: {}", e);
-        }
-    }
-
-    /// Set V4L2 zoom absolute position
-    pub fn set_v4l2_zoom(&self, value: i32) {
-        if let Some(path) = self.get_v4l2_device_path()
-            && let Err(e) =
-                v4l2_controls::set_control(&path, v4l2_controls::V4L2_CID_ZOOM_ABSOLUTE, value)
-        {
-            warn!("Failed to set zoom: {}", e);
         }
     }
 
