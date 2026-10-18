@@ -3180,6 +3180,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn photo_and_recording_snapshot_keep_the_same_default_source_geometry() {
+        use crate::app::state::{CameraMode, RecordingState};
+        use crate::backends::camera::types::{CameraFormat, FrameData, Framerate};
+
+        let mut model = raw_queue_model();
+        model.available_cameras[0].supports_multistream = false;
+        model.available_formats = [(160, 120), (120, 160)]
+            .into_iter()
+            .map(|(width, height)| CameraFormat {
+                width,
+                height,
+                framerate: Some(Framerate::from_int(30)),
+                pixel_format: "NV12".into(),
+                hardware_accelerated: false,
+            })
+            .collect();
+        model.screen_width = 600.0;
+        model.screen_height = 800.0;
+        let save_dir = model.config.save_folder_name.clone();
+        let (stop_sender, mut stop_receiver) = tokio::sync::oneshot::channel();
+        let mut stop_sender = Some(stop_sender);
+
+        for mode in [CameraMode::Photo, CameraMode::Video] {
+            model.mode = mode;
+            model.select_format_from_cache(mode);
+            if mode == CameraMode::Video {
+                model.recording = RecordingState::start(
+                    1,
+                    "synthetic.mp4".into(),
+                    stop_sender.take().unwrap(),
+                    None,
+                );
+            }
+            let format = model.active_format.as_ref().unwrap();
+            let mut frame = model.current_frame.as_ref().unwrap().as_ref().clone();
+            frame.width = format.width;
+            frame.height = format.height;
+            frame.stride = format.width * 4;
+            frame.data =
+                FrameData::from_copied(vec![80; (frame.stride * frame.height) as usize].into());
+            model.current_frame = Some(Arc::new(frame));
+
+            let mut stream =
+                cosmic::iced::runtime::task::into_stream(model.handle_capture()).unwrap();
+            let saved = next_capture_message(&mut stream).await;
+            let super::Message::PhotoCaptureSaved(_, Ok(path)) = &saved else {
+                panic!("photo must save in {mode:?}");
+            };
+            assert_eq!(
+                image::open(path).unwrap().to_rgb8().dimensions(),
+                (160, 120)
+            );
+            let _ = model.update(saved);
+            assert_eq!(model.recording.is_recording(), mode == CameraMode::Video);
+            assert!(model.photo_jobs.is_empty());
+        }
+        assert_eq!(
+            stop_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+        std::fs::remove_dir_all(save_dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn ordinary_photo_processing_waits_for_the_app_queue() {
         for raw in [false, true] {
             let mut model = raw_queue_model();

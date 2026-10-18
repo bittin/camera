@@ -131,45 +131,34 @@ pub fn is_raw_format(pixel_format: &str) -> bool {
 
 /// Select format for first-time video mode usage
 /// Selects highest resolution with at least 25 fps, preferring highest framerate up to 60 fps
+/// Equal-resolution/framerate ties use Photo's codec preference and backend order.
 pub fn select_first_time_video_format(formats: &[CameraFormat]) -> Option<CameraFormat> {
-    use std::collections::HashMap;
+    let mut video_formats: Vec<_> = formats
+        .iter()
+        .filter(|f| f.framerate.is_some_and(|fps| fps.as_int() >= 25))
+        .collect();
 
-    // Group formats by resolution
-    let mut resolution_groups: HashMap<(u32, u32), Vec<&CameraFormat>> = HashMap::new();
-    for format in formats {
-        if let Some(fps) = format.framerate {
-            // Only consider formats with at least 25 fps
-            if fps.as_int() >= 25 {
-                resolution_groups
-                    .entry((format.width, format.height))
-                    .or_default()
-                    .push(format);
-            }
-        }
-    }
-
-    if resolution_groups.is_empty() {
+    if video_formats.is_empty() {
         // No formats with >= 25 fps, fall back to any format
         return formats.first().cloned();
     }
 
-    // Find the highest resolution (by pixel count)
-    let highest_resolution = resolution_groups
-        .keys()
-        .max_by_key(|(w, h)| w * h)
-        .copied()?;
-
-    // Get formats for the highest resolution
-    let formats_at_highest_res = resolution_groups.get(&highest_resolution)?;
+    // Preserve backend order when equal pixel counts have different dimensions,
+    // as Photo mode does, rather than choosing an orientation by hash iteration.
+    let max_pixels = video_formats
+        .iter()
+        .map(|f| u64::from(f.width) * u64::from(f.height))
+        .max()?;
+    video_formats.retain(|f| u64::from(f.width) * u64::from(f.height) == max_pixels);
 
     // Among these, find the one with the best framerate:
     // - Prefer 60 fps if available
     // - Otherwise, highest fps <= 60
     // - If all fps > 60, pick the one closest to 60
-    let best_format = formats_at_highest_res
+    let best_fps = video_formats
         .iter()
-        .filter_map(|f| f.framerate.map(|fps| (f, fps)))
-        .min_by_key(|(_, fps)| {
+        .filter_map(|f| f.framerate)
+        .min_by_key(|fps| {
             let int_fps = fps.as_int();
             if int_fps == 60 {
                 0i32 // Perfect match - highest priority
@@ -178,11 +167,14 @@ pub fn select_first_time_video_format(formats: &[CameraFormat]) -> Option<Camera
             } else {
                 (int_fps - 60 + 1000) as i32 // Deprioritize fps > 60, but still consider them
             }
-        })
-        .map(|(f, _)| *f)
-        .cloned();
+        })?;
 
-    best_format.or_else(|| formats.first().cloned())
+    let best_formats: Vec<_> = video_formats
+        .into_iter()
+        .filter(|f| f.framerate == Some(best_fps))
+        .cloned()
+        .collect();
+    select_best_codec(&best_formats)
 }
 
 #[cfg(test)]
@@ -278,6 +270,72 @@ mod tests {
         assert_eq!(max_res.width, 3840);
         assert_eq!(max_res.height, 2160);
         assert_eq!(max_res.pixel_format, "MJPG");
+    }
+
+    #[test]
+    fn video_defaults_match_photo_for_equal_resolution_orientations() {
+        let formats = vec![
+            create_test_format(1600, 1200, "NV12", false),
+            create_test_format(1200, 1600, "NV12", false),
+            create_test_format(1280, 720, "NV12", false),
+        ];
+        let photo = select_max_resolution_format(&formats).unwrap();
+        for _ in 0..128 {
+            assert_eq!(
+                select_first_time_video_format(&formats),
+                Some(photo.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn video_defaults_match_photo_codec_preference_at_equal_fps() {
+        let formats = vec![
+            create_test_format(1600, 1200, "MJPG", true),
+            create_test_format(1600, 1200, "H264", true),
+            create_test_format(1600, 1200, "NV12", false),
+        ];
+        assert_eq!(
+            select_first_time_video_format(&formats),
+            select_max_resolution_format(&formats)
+        );
+    }
+
+    #[test]
+    fn video_defaults_retain_resolution_and_framerate_priorities() {
+        for (candidates, expected) in [
+            (vec![(1920, 1080, 15), (1280, 720, 30)], 1),
+            (vec![(1920, 1080, 25), (1280, 720, 60)], 0),
+            (vec![(1600, 1200, 30), (1200, 1600, 60)], 1),
+            (vec![(1600, 1200, 120), (1600, 1200, 60)], 1),
+            (vec![(1600, 1200, 120), (1600, 1200, 90)], 1),
+            (vec![(1600, 1200, 25), (1600, 1200, 30)], 1),
+        ] {
+            let formats: Vec<_> = candidates
+                .into_iter()
+                .map(|(w, h, fps)| create_test_format_with_fps(w, h, "NV12", false, fps))
+                .collect();
+            assert_eq!(
+                select_first_time_video_format(&formats),
+                Some(formats[expected].clone())
+            );
+        }
+    }
+
+    #[test]
+    fn video_defaults_preserve_fallback_without_recording_framerates() {
+        assert!(select_first_time_video_format(&[]).is_none());
+        let formats = vec![
+            CameraFormat {
+                framerate: None,
+                ..create_test_format(640, 480, "NV12", false)
+            },
+            create_test_format_with_fps(1600, 1200, "NV12", false, 15),
+        ];
+        assert_eq!(
+            select_first_time_video_format(&formats),
+            Some(formats[0].clone())
+        );
     }
 
     #[test]
