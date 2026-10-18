@@ -97,7 +97,7 @@ fn noise_shape_factor(freq_x: u32, freq_y: u32) -> f32 {
 
 //=============================================================================
 // COMMON UTILITY: Raised cosine window
-// See common.wgsl for reference. Keep in sync with fft_merge.wgsl.
+// Keep in sync with fft_merge.wgsl.
 // Formula: HDR+ paper page 8 - modified raised cosine ½ - ½cos(2π(x + ½)/n)
 // With 50% overlap (n/2 step), windows sum to 1.0 at every position
 //=============================================================================

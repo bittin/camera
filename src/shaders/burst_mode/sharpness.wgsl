@@ -52,7 +52,7 @@ fn get_luminance(x: i32, y: i32) -> f32 {
 }
 
 // COMMON UTILITY: BT.601 RGB to luminance conversion
-// See common.wgsl for reference. Keep in sync across all shaders that use this.
+// Keep in sync across all shaders that use this.
 // Formula: Y = 0.299*R + 0.587*G + 0.114*B
 fn get_luminance_rgb(x: i32, y: i32) -> f32 {
     let cx = clamp(x, 0, i32(params.width) - 1);
@@ -178,60 +178,4 @@ fn reduce_sharpness(
         let avg_sharpness = select(0.0, total_sum / total_count, total_count > 0.0);
         sharpness_output[0] = avg_sharpness;
     }
-}
-
-//=============================================================================
-// Alternative: Simple per-pixel sharpness (no reduction, for debugging)
-//=============================================================================
-
-@group(0) @binding(0)
-var<storage, read> simple_input: array<f32>;
-
-@group(0) @binding(1)
-var<storage, read_write> simple_output: array<f32>;
-
-struct SimpleParams {
-    width: u32,
-    height: u32,
-    _padding0: u32,
-    _padding1: u32,
-}
-
-@group(0) @binding(2)
-var<uniform> simple_params: SimpleParams;
-
-fn get_simple_lum(x: i32, y: i32) -> f32 {
-    let cx = clamp(x, 0, i32(simple_params.width) - 1);
-    let cy = clamp(y, 0, i32(simple_params.height) - 1);
-    let idx = (u32(cy) * simple_params.width + u32(cx)) * 4u;
-    return simple_input[idx + 1u];  // Green channel
-}
-
-@compute @workgroup_size(16, 16)
-fn compute_sharpness_map(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = gid.x;
-    let y = gid.y;
-
-    if (x >= simple_params.width || y >= simple_params.height) {
-        return;
-    }
-
-    var sharpness = 0.0;
-
-    if (x >= 1u && y >= 1u && x < simple_params.width - 1u && y < simple_params.height - 1u) {
-        let center = get_simple_lum(i32(x), i32(y));
-        let left = get_simple_lum(i32(x) - 1, i32(y));
-        let right = get_simple_lum(i32(x) + 1, i32(y));
-        let top = get_simple_lum(i32(x), i32(y) - 1);
-        let bottom = get_simple_lum(i32(x), i32(y) + 1);
-
-        sharpness = abs(4.0 * center - left - right - top - bottom);
-    }
-
-    // Output as grayscale (store in all RGB channels)
-    let out_idx = (y * simple_params.width + x) * 4u;
-    simple_output[out_idx] = sharpness;
-    simple_output[out_idx + 1u] = sharpness;
-    simple_output[out_idx + 2u] = sharpness;
-    simple_output[out_idx + 3u] = 1.0;
 }
