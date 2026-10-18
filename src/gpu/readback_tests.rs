@@ -107,10 +107,6 @@ fn cached_production_readbacks_use_owned_lifecycle() {
         ("convert", include_str!("../shaders/gpu_convert.rs")),
         ("filter", include_str!("../shaders/gpu_filter.rs")),
         (
-            "histogram",
-            include_str!("../shaders/histogram_pipeline.rs"),
-        ),
-        (
             "virtual filter",
             include_str!("../backends/virtual_camera/gpu_filter.rs"),
         ),
