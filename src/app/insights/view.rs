@@ -180,8 +180,8 @@ impl AppModel {
         sections.push(self.build_audio_section().into());
 
         // Per-frame metadata section (libcamera only)
-        if self.insights.has_libcamera_metadata {
-            sections.push(self.build_metadata_section().into());
+        if let Some(metadata) = &self.insights.frame_metadata {
+            sections.push(Self::build_metadata_section(metadata).into());
         }
 
         // V4L2 device formats sections (one per pixel format)
@@ -571,12 +571,14 @@ impl AppModel {
     /// Build the per-frame metadata section (libcamera only)
     ///
     /// Shows all metadata fields with "N/A" when a value is not reported by the ISP.
-    fn build_metadata_section(&self) -> widget::settings::Section<'_, Message> {
+    fn build_metadata_section(
+        metadata: &crate::backends::camera::types::FrameMetadata,
+    ) -> widget::settings::Section<'_, Message> {
         let na = fl!("insights-meta-na");
         let mut section = widget::settings::section().title(fl!("insights-metadata"));
 
         // Exposure
-        let text = match self.insights.meta_exposure_us {
+        let text = match metadata.exposure_time {
             Some(us) if us >= 1_000_000 => format!("{:.2} s", us as f64 / 1_000_000.0),
             Some(us) if us >= 1_000 => format!("{:.2} ms", us as f64 / 1_000.0),
             Some(us) => format!("{} \u{00b5}s", us),
@@ -588,8 +590,8 @@ impl AppModel {
         // Analogue Gain
         section = section.add(
             insight_item(fl!("insights-meta-analogue-gain")).control(diagnostic_text(
-                self.insights
-                    .meta_analogue_gain
+                metadata
+                    .analogue_gain
                     .map_or_else(|| na.clone(), |g| format!("{:.2}x", g)),
             )),
         );
@@ -597,8 +599,8 @@ impl AppModel {
         // Digital Gain
         section = section.add(
             insight_item(fl!("insights-meta-digital-gain")).control(diagnostic_text(
-                self.insights
-                    .meta_digital_gain
+                metadata
+                    .digital_gain
                     .map_or_else(|| na.clone(), |g| format!("{:.2}x", g)),
             )),
         );
@@ -606,8 +608,8 @@ impl AppModel {
         // Colour Temperature
         section = section.add(
             insight_item(fl!("insights-meta-colour-temp")).control(diagnostic_text(
-                self.insights
-                    .meta_colour_temperature
+                metadata
+                    .colour_temperature
                     .map_or_else(|| na.clone(), |t| format!("{} K", t)),
             )),
         );
@@ -615,8 +617,8 @@ impl AppModel {
         // WB Gains
         section = section.add(
             insight_item(fl!("insights-meta-colour-gains")).control(diagnostic_text(
-                self.insights
-                    .meta_colour_gains
+                metadata
+                    .colour_gains
                     .map_or_else(|| na.clone(), |g| format!("{:.2}, {:.2}", g[0], g[1])),
             )),
         );
@@ -624,8 +626,8 @@ impl AppModel {
         // Black Level
         section = section.add(
             insight_item(fl!("insights-meta-black-level")).control(diagnostic_text(
-                self.insights
-                    .meta_black_level
+                metadata
+                    .black_level
                     .map_or_else(|| na.clone(), |bl| format!("{:.4}", bl)),
             )),
         );
@@ -633,8 +635,8 @@ impl AppModel {
         // Illuminance (Lux)
         section = section.add(
             insight_item(fl!("insights-meta-lux")).control(diagnostic_text(
-                self.insights
-                    .meta_lux
+                metadata
+                    .lux
                     .map_or_else(|| na.clone(), |l| format!("{:.0} lux", l)),
             )),
         );
@@ -642,8 +644,8 @@ impl AppModel {
         // Lens Position
         section = section.add(
             insight_item(fl!("insights-meta-lens-position")).control(diagnostic_text(
-                self.insights
-                    .meta_lens_position
+                metadata
+                    .lens_position
                     .map_or_else(|| na.clone(), |p| format!("{:.2} dioptres", p)),
             )),
         );
@@ -651,8 +653,8 @@ impl AppModel {
         // Focus FoM
         section = section.add(
             insight_item(fl!("insights-meta-focus-fom")).control(diagnostic_text(
-                self.insights
-                    .meta_focus_fom
+                metadata
+                    .focus_fom
                     .map_or_else(|| na.clone(), |f| format!("{}", f)),
             )),
         );
@@ -660,8 +662,8 @@ impl AppModel {
         // Sequence
         section = section.add(
             insight_item(fl!("insights-meta-sequence")).control(diagnostic_text(
-                self.insights
-                    .meta_sequence
+                metadata
+                    .sequence
                     .map_or_else(|| na.clone(), |s| format!("{}", s)),
             )),
         );

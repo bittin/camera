@@ -910,17 +910,6 @@ impl AppModel {
             if self.insights.backend_type == "libcamera"
                 && let Some(meta) = &frame.libcamera_metadata
             {
-                self.insights.has_libcamera_metadata = true;
-                self.insights.meta_exposure_us = meta.exposure_time;
-                self.insights.meta_analogue_gain = meta.analogue_gain;
-                self.insights.meta_digital_gain = meta.digital_gain;
-                self.insights.meta_colour_temperature = meta.colour_temperature;
-                self.insights.meta_sequence = meta.sequence;
-                self.insights.meta_colour_gains = meta.colour_gains;
-                self.insights.meta_black_level = meta.black_level;
-                self.insights.meta_lens_position = meta.lens_position;
-                self.insights.meta_lux = meta.lux;
-                self.insights.meta_focus_fom = meta.focus_fom;
                 self.insights.frame_metadata = Some(meta.clone());
             }
         }
@@ -1175,20 +1164,21 @@ impl AppModel {
         }
 
         // Frame metadata
+        let metadata = ins.frame_metadata.as_ref();
         map.insert(
             "frame_metadata".into(),
             serde_json::json!({
-                "has_libcamera_metadata": ins.has_libcamera_metadata,
-                "exposure_us": ins.meta_exposure_us,
-                "analogue_gain": ins.meta_analogue_gain,
-                "digital_gain": ins.meta_digital_gain,
-                "colour_temperature": ins.meta_colour_temperature,
-                "sequence": ins.meta_sequence,
-                "colour_gains": ins.meta_colour_gains,
-                "black_level": ins.meta_black_level,
-                "lens_position": ins.meta_lens_position,
-                "lux": ins.meta_lux,
-                "focus_fom": ins.meta_focus_fom,
+                "has_libcamera_metadata": metadata.is_some(),
+                "exposure_us": metadata.and_then(|m| m.exposure_time),
+                "analogue_gain": metadata.and_then(|m| m.analogue_gain),
+                "digital_gain": metadata.and_then(|m| m.digital_gain),
+                "colour_temperature": metadata.and_then(|m| m.colour_temperature),
+                "sequence": metadata.and_then(|m| m.sequence),
+                "colour_gains": metadata.and_then(|m| m.colour_gains),
+                "black_level": metadata.and_then(|m| m.black_level),
+                "lens_position": metadata.and_then(|m| m.lens_position),
+                "lux": metadata.and_then(|m| m.lux),
+                "focus_fom": metadata.and_then(|m| m.focus_fom),
             }),
         );
 
@@ -1283,6 +1273,58 @@ mod tests {
         drop(model.handle_gallery_thumbnail_loaded(None));
         assert!(model.gallery_thumbnail.is_none());
         assert_eq!(model.last_media_path.as_deref(), Some("synthetic.jpg"));
+    }
+
+    #[test]
+    fn insights_metadata_export_preserves_presence_values_and_null_fields() {
+        use crate::app::state::AppModel;
+        use crate::backends::camera::types::{CameraFrame, FrameData, FrameMetadata, PixelFormat};
+        let mut model = AppModel::default();
+        model.insights.backend_type = "libcamera";
+        let metadata = FrameMetadata {
+            exposure_time: Some(1000),
+            analogue_gain: Some(2.0),
+            colour_temperature: Some(6000),
+            sequence: Some(17),
+            colour_gains: Some([1.5, 1.25]),
+            ..Default::default()
+        };
+        model.current_frame = Some(std::sync::Arc::new(CameraFrame {
+            width: 1,
+            height: 1,
+            stride: 4,
+            format: PixelFormat::RGBA,
+            data: FrameData::from_owned_vec(vec![0, 0, 0, 255]),
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            yuv_planes: None,
+            libcamera_metadata: Some(metadata),
+        }));
+        model.update_insights_frame_metadata();
+        let export = |model: &AppModel| {
+            serde_json::from_str::<serde_json::Value>(&model.build_insights_json()).unwrap()["frame_metadata"].clone()
+        };
+        assert_eq!(
+            export(&model),
+            serde_json::json!({
+                "has_libcamera_metadata": true, "exposure_us": 1000, "analogue_gain": 2.0,
+                "digital_gain": null, "colour_temperature": 6000, "sequence": 17,
+                "colour_gains": [1.5, 1.25], "black_level": null, "lens_position": null,
+                "lux": null, "focus_fom": null,
+            })
+        );
+        model.insights.backend_type = "PipeWire (V4L2)";
+        model.update_insights_frame_metadata();
+        assert!(model.insights.frame_metadata.is_none());
+        assert_eq!(
+            export(&model),
+            serde_json::json!({
+                "has_libcamera_metadata": false, "exposure_us": null, "analogue_gain": null,
+                "digital_gain": null, "colour_temperature": null, "sequence": null,
+                "colour_gains": null, "black_level": null, "lens_position": null,
+                "lux": null, "focus_fom": null,
+            })
+        );
     }
 
     #[test]

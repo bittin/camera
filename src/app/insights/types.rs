@@ -57,29 +57,6 @@ pub struct InsightsState {
     /// MJPEG decoder name when native libcamera decodes MJPEG (e.g., "turbojpeg (libjpeg-turbo)")
     pub mjpeg_decoder: Option<String>,
 
-    // Per-frame libcamera metadata (updated every frame)
-    /// Actual exposure time applied (microseconds)
-    pub meta_exposure_us: Option<u64>,
-    /// Actual analogue gain applied
-    pub meta_analogue_gain: Option<f32>,
-    /// Actual digital gain applied
-    pub meta_digital_gain: Option<f32>,
-    /// Color temperature (Kelvin)
-    pub meta_colour_temperature: Option<u32>,
-    /// Frame sequence number
-    pub meta_sequence: Option<u32>,
-    /// ISP white balance gains [R, B]
-    pub meta_colour_gains: Option<[f32; 2]>,
-    /// Sensor black level (normalized 0..1)
-    pub meta_black_level: Option<f32>,
-    /// Lens position (dioptres)
-    pub meta_lens_position: Option<f32>,
-    /// Scene illuminance (lux)
-    pub meta_lux: Option<f32>,
-    /// Focus figure of merit
-    pub meta_focus_fom: Option<i32>,
-    /// Whether libcamera metadata is present at all
-    pub has_libcamera_metadata: bool,
     /// Full libcamera FrameMetadata snapshot (includes fields not shown in UI:
     /// sensor_timestamp, colour_correction_matrix, af/ae/awb state)
     pub frame_metadata: Option<crate::backends::camera::types::FrameMetadata>,
@@ -336,17 +313,6 @@ impl InsightsState {
     }
 
     pub(crate) fn clear_frame_metadata(&mut self) {
-        self.has_libcamera_metadata = false;
-        self.meta_exposure_us = None;
-        self.meta_analogue_gain = None;
-        self.meta_digital_gain = None;
-        self.meta_colour_temperature = None;
-        self.meta_sequence = None;
-        self.meta_colour_gains = None;
-        self.meta_black_level = None;
-        self.meta_lens_position = None;
-        self.meta_lux = None;
-        self.meta_focus_fom = None;
         self.frame_metadata = None;
     }
 }
@@ -361,9 +327,11 @@ mod tests {
     fn stopped_preview_clears_pipeline_metadata_and_performance() {
         let mut state = InsightsState {
             backend_type: "libcamera",
-            has_libcamera_metadata: true,
-            meta_exposure_us: Some(1000),
-            meta_analogue_gain: Some(2.0),
+            frame_metadata: Some(crate::backends::camera::types::FrameMetadata {
+                exposure_time: Some(1000),
+                analogue_gain: Some(2.0),
+                ..Default::default()
+            }),
             full_pipeline_string: Some("old camera".into()),
             copy_time_us: Some(42),
             dropped_frames: Some(5),
@@ -373,9 +341,7 @@ mod tests {
         state.refresh_preview("pipewire:123", None, std::time::Instant::now());
         assert!(state.backend_type.is_empty());
         assert!(state.full_pipeline_string.is_none());
-        assert!(!state.has_libcamera_metadata);
-        assert!(state.meta_exposure_us.is_none());
-        assert!(state.meta_analogue_gain.is_none());
+        assert!(state.frame_metadata.is_none());
         assert!(state.copy_time_us.is_none());
         assert!(state.dropped_frames.is_none());
         assert_eq!(state.measured_fps, 0.0);
@@ -419,9 +385,11 @@ mod tests {
     fn same_session_pipewire_frames_cannot_retain_native_sensor_metadata() {
         let mut state = InsightsState {
             preview_generation: Some(1),
-            has_libcamera_metadata: true,
-            meta_exposure_us: Some(1000),
-            meta_lens_position: Some(4.0),
+            frame_metadata: Some(crate::backends::camera::types::FrameMetadata {
+                exposure_time: Some(1000),
+                lens_position: Some(4.0),
+                ..Default::default()
+            }),
             libcamera_version: Some("old".into()),
             pipeline_handler: Some("simple".into()),
             ..Default::default()
@@ -434,9 +402,7 @@ mod tests {
             }),
             std::time::Instant::now(),
         );
-        assert!(!state.has_libcamera_metadata);
-        assert!(state.meta_exposure_us.is_none());
-        assert!(state.meta_lens_position.is_none());
+        assert!(state.frame_metadata.is_none());
         assert!(state.libcamera_version.is_none());
         assert!(state.pipeline_handler.is_none());
     }

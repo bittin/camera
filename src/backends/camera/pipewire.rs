@@ -1249,7 +1249,7 @@ mod tests {
                 .unwrap()
                 .contains("pipewiresrc")
         );
-        assert!(!insights.has_libcamera_metadata);
+        assert!(insights.frame_metadata.is_none());
         println!(
             "Live Insights: backend={}, frame_count={}, source_format={}, bytes={}, copy_us={:?}",
             insights.backend_type,
