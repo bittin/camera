@@ -29,10 +29,9 @@ fn frame(format: PixelFormat) -> CameraFrame {
 
 #[test]
 fn startup_warmup_compiles_photo_without_retaining_frame_allocations() {
-    let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu(
-            "startup_warmup_compiles_photo_without_retaining_frame_allocations",
-        );
+    let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+        "startup_warmup_compiles_photo_without_retaining_frame_allocations",
+    ) else {
         return;
     };
     pollster::block_on(async {
@@ -71,10 +70,9 @@ fn startup_warmup_compiles_photo_without_retaining_frame_allocations() {
 
 #[test]
 fn photo_programs_compile_lazily_and_survive_workspace_retirement() {
-    let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu(
-            "photo_programs_compile_lazily_and_survive_workspace_retirement",
-        );
+    let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+        "photo_programs_compile_lazily_and_survive_workspace_retirement",
+    ) else {
         return;
     };
     pollster::block_on(async {
@@ -133,8 +131,9 @@ fn photo_programs_compile_lazily_and_survive_workspace_retirement() {
 
 #[test]
 fn photo_bilinear_avoids_full_resolution_float_workspace() {
-    let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu("photo_bilinear_avoids_full_resolution_float_workspace");
+    let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+        "photo_bilinear_avoids_full_resolution_float_workspace",
+    ) else {
         return;
     };
     pollster::block_on(async {
@@ -158,10 +157,9 @@ fn photo_bilinear_avoids_full_resolution_float_workspace() {
 
 #[test]
 fn photo_bilinear_matches_unfused_output_and_releases_old_surfaces() {
-    let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-        crate::test_gpu::skip_no_gpu(
-            "photo_bilinear_matches_unfused_output_and_releases_old_surfaces",
-        );
+    let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+        "photo_bilinear_matches_unfused_output_and_releases_old_surfaces",
+    ) else {
         return;
     };
     pollster::block_on(async {

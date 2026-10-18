@@ -20,9 +20,17 @@ use std::sync::Arc;
 use tracing::{debug, info};
 
 const TILE_SIZE: u32 = 16;
-const FFT_MERGE_SHADER: &str = include_str!("../../../shaders/burst_mode/fft_merge.wgsl");
-const SPATIAL_DENOISE_SHADER: &str =
-    include_str!("../../../shaders/burst_mode/spatial_denoise.wgsl");
+// Compose only the identical inverse helpers; module-specific forward/window math stays local.
+const FFT_MERGE_SHADER: &str = concat!(
+    include_str!("../../../shaders/burst_mode/fft_inverse.wgsl"),
+    "\n",
+    include_str!("../../../shaders/burst_mode/fft_merge.wgsl"),
+);
+const SPATIAL_DENOISE_SHADER: &str = concat!(
+    include_str!("../../../shaders/burst_mode/fft_inverse.wgsl"),
+    "\n",
+    include_str!("../../../shaders/burst_mode/spatial_denoise.wgsl"),
+);
 const CHROMA_DENOISE_SHADER: &str = include_str!("../../../shaders/burst_mode/chroma_denoise.wgsl");
 
 // GPU parameter structs imported from params module
@@ -43,7 +51,6 @@ struct FftPipelineSet {
     add_reference: wgpu::ComputePipeline,
     merge: wgpu::ComputePipeline,
     normalize: wgpu::ComputePipeline,
-    reduce_artifacts: wgpu::ComputePipeline,
 }
 
 /// GPU pipeline for FFT-based frame merging
@@ -105,7 +112,7 @@ impl FftMergePipeline {
         );
 
         // Create bind group layout using helper
-        // Bindings: reference(r), aligned(r), output(rw), params(u), rms(rw), mismatch(rw), highlights_norm(rw), weight(rw)
+        // Bindings: reference(r), aligned(r), output(rw), params(u), rms(rw), mismatch(rw), highlights_norm(rw)
         use BindingKind::*;
         let bind_group_layout = gpu_helpers::create_layout(
             &device,
@@ -115,7 +122,6 @@ impl FftMergePipeline {
                 StorageRead,
                 StorageReadWrite,
                 Uniform,
-                StorageReadWrite,
                 StorageReadWrite,
                 StorageReadWrite,
                 StorageReadWrite,
@@ -186,13 +192,6 @@ impl FftMergePipeline {
                 &shader_module,
                 "normalize_output",
             ),
-            reduce_artifacts: gpu_helpers::create_pipeline(
-                &device,
-                "reduce_tile_artifacts_pipeline",
-                &pipeline_layout,
-                &shader_module,
-                "reduce_tile_artifacts",
-            ),
         };
 
         // Create spatial denoising shader and pipeline (HDR+ Section 5)
@@ -206,11 +205,11 @@ impl FftMergePipeline {
             "Spatial denoise shader compiled"
         );
 
-        // Bindings: input(r), output(rw), params(u), weight(rw)
+        // Bindings: input(r), output(rw), params(u)
         let spatial_denoise_bind_group_layout = gpu_helpers::create_layout(
             &device,
             "spatial_denoise_bind_group_layout",
-            &[StorageRead, StorageReadWrite, Uniform, StorageReadWrite],
+            &[StorageRead, StorageReadWrite, Uniform],
         );
 
         let spatial_denoise_pipeline_layout =
@@ -512,19 +511,10 @@ impl FftMergePipeline {
         frame_count: u32,
         preserve_linear: bool,
     ) {
-        let pixel_count = (width * height) as usize;
-
         let spatial_output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("spatial_denoise_output_buffer"),
             size: buffer_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let spatial_weight_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("spatial_denoise_weight_buffer"),
-            size: (pixel_count * std::mem::size_of::<f32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
@@ -553,10 +543,6 @@ impl FftMergePipeline {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: spatial_params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: spatial_weight_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -925,9 +911,6 @@ impl FftMergePipeline {
             wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         );
 
-        let weight_buffer =
-            self.create_tile_buffer("weight_buffer", pixel_count, wgpu::BufferUsages::STORAGE);
-
         debug!(
             elapsed_ms = buffer_create_start.elapsed().as_millis(),
             "Created GPU buffers"
@@ -974,10 +957,6 @@ impl FftMergePipeline {
                 wgpu::BindGroupEntry {
                     binding: 6,
                     resource: highlights_norm_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: weight_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1148,30 +1127,23 @@ impl FftMergePipeline {
             );
         }
 
-        // Step 4 & 5: Normalize output and reduce artifacts
+        // Normalize once, including the encoded-output clamp; retain the batch fence.
         let normalize_start = std::time::Instant::now();
         self.queue
             .write_buffer(&params_buffer, 0, bytemuck::cast_slice(&[base_params]));
 
         self.run_batched_compute_passes(
             "normalize_clamp",
-            &[
-                (
-                    &pipelines.normalize,
-                    &bind_group,
-                    (width.div_ceil(16), height.div_ceil(16), 1),
-                ),
-                (
-                    &pipelines.reduce_artifacts,
-                    &bind_group,
-                    (width.div_ceil(16), height.div_ceil(16), 1),
-                ),
-            ],
+            &[(
+                &pipelines.normalize,
+                &bind_group,
+                (width.div_ceil(16), height.div_ceil(16), 1),
+            )],
         )
         .await;
         debug!(
             elapsed_ms = normalize_start.elapsed().as_millis(),
-            "Step 4-5: normalize + clamp"
+            "Step 4: normalize + clamp"
         );
 
         // Step 5.5: Spatial denoising (HDR+ Section 5 post-processing)
@@ -1212,31 +1184,105 @@ impl FftMergePipeline {
 
 #[cfg(test)]
 mod tests {
-    use super::super::CA_ESTIMATE_SHADER;
+    use super::super::{
+        ALIGN_TILE_SHADER, CA_ESTIMATE_SHADER, NOISE_ESTIMATE_SHADER, PYRAMID_SHADER,
+        SHARPNESS_SHADER, TONEMAP_SHADER, WARP_SHADER,
+    };
     use super::*;
 
-    use crate::test_gpu::validate_shader;
-
     #[test]
-    fn test_fft_merge_shader_validates() {
-        validate_shader("fft_merge", FFT_MERGE_SHADER);
+    fn burst_shader_modules_validate() {
+        for (name, source) in [
+            ("fft_merge", FFT_MERGE_SHADER),
+            ("spatial_denoise", SPATIAL_DENOISE_SHADER),
+            ("chroma_denoise", CHROMA_DENOISE_SHADER),
+            ("ca_estimate", CA_ESTIMATE_SHADER),
+            ("pyramid", PYRAMID_SHADER),
+            ("sharpness", SHARPNESS_SHADER),
+            ("align_tile", ALIGN_TILE_SHADER),
+            ("warp", WARP_SHADER),
+            ("tonemap", TONEMAP_SHADER),
+            ("noise_estimate", NOISE_ESTIMATE_SHADER),
+        ] {
+            crate::test_gpu::validate_shader(name, source);
+        }
     }
 
     #[test]
-    fn test_spatial_denoise_shader_validates() {
-        validate_shader("spatial_denoise", SPATIAL_DENOISE_SHADER);
-    }
-
-    #[test]
-    fn test_chroma_denoise_shader_validates() {
-        validate_shader("chroma_denoise", CHROMA_DENOISE_SHADER);
-    }
-
-    #[test]
-    fn test_ca_estimate_shader_validates() {
-        validate_shader("ca_estimate", CA_ESTIMATE_SHADER);
+    fn composed_fft_bindings_uniforms_and_entry_points_match_host() {
+        for (name, source, uniform_binding, uniform_size, bindings, entries) in [
+            (
+                "fft_merge",
+                FFT_MERGE_SHADER,
+                3,
+                std::mem::size_of::<MergeParams>(),
+                7,
+                &[
+                    "init_output",
+                    "calculate_rms",
+                    "calculate_mismatch",
+                    "calculate_highlights_norm",
+                    "normalize_mismatch",
+                    "add_reference_to_output",
+                    "merge_tile",
+                    "normalize_output",
+                ][..],
+            ),
+            (
+                "spatial_denoise",
+                SPATIAL_DENOISE_SHADER,
+                2,
+                std::mem::size_of::<SpatialDenoiseParams>(),
+                3,
+                &[
+                    "spatial_denoise_init",
+                    "spatial_denoise",
+                    "spatial_denoise_normalize",
+                ][..],
+            ),
+        ] {
+            let module = crate::test_gpu::validate_shader(name, source);
+            let mut actual_bindings: Vec<_> = module
+                .global_variables
+                .iter()
+                .filter_map(|(_, v)| v.binding.as_ref().map(|b| (b.group, b.binding)))
+                .collect();
+            actual_bindings.sort_unstable();
+            assert_eq!(
+                actual_bindings,
+                (0..bindings).map(|b| (0, b)).collect::<Vec<_>>(),
+                "{name}"
+            );
+            let params = module
+                .global_variables
+                .iter()
+                .find_map(|(_, v)| {
+                    v.binding
+                        .as_ref()
+                        .filter(|b| b.group == 0 && b.binding == uniform_binding)
+                        .map(|_| v.ty)
+                })
+                .unwrap();
+            let naga::TypeInner::Struct { span, .. } = module.types[params].inner else {
+                panic!("{name}: params must be a struct");
+            };
+            assert_eq!(span as usize, uniform_size, "{name}: uniform ABI");
+            let mut actual: Vec<_> = module
+                .entry_points
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect();
+            actual.sort_unstable();
+            let mut expected = entries.to_vec();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{name}: entry-point coverage");
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "fft_characterization_tests.rs"]
+mod fft_characterization_tests;
 
 #[cfg(test)]
 mod resident_bayer_contract_tests {
@@ -1265,10 +1311,9 @@ mod resident_bayer_contract_tests {
 mod resident_bayer_gpu_tests {
     #[test]
     fn normalized_signed_overwhite_fft_output_reaches_production_hdr_engines() {
-        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
-            crate::test_gpu::skip_no_gpu(
-                "normalized_signed_overwhite_fft_output_reaches_production_hdr_engines",
-            );
+        let Some((_guard, _, _)) = crate::test_gpu::compute_device_or_skip(
+            "normalized_signed_overwhite_fft_output_reaches_production_hdr_engines",
+        ) else {
             return;
         };
         pollster::block_on(async {

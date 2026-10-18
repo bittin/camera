@@ -185,6 +185,19 @@ pub(crate) fn headless_device_with_compute()
     Some(fixture)
 }
 
+/// Keep the shared-device lock and mandatory-GPU skip policy together. Callers
+/// must retain the returned guard through resource teardown, just as for
+/// `headless_device_with_compute`; conversion failures remain test assertions.
+pub(crate) fn compute_device_or_skip(
+    what: &str,
+) -> Option<(MutexGuard<'static, ()>, wgpu::Device, wgpu::Queue)> {
+    let fixture = headless_device_with_compute();
+    if fixture.is_none() {
+        skip_no_gpu(what);
+    }
+    fixture
+}
+
 /// Called wherever a GPU test degrades to a skip because there is no adapter.
 ///
 /// A `println!` and a `return` is a PASS, so without this every GPU test in the
