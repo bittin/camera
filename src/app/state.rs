@@ -854,8 +854,7 @@ pub struct AppModel {
     pub overlay_effect_dropdown_options: Vec<String>,
     /// Capture-controls position dropdown options (Bottom, Left, Right).
     pub controls_position_dropdown_options: Vec<String>,
-    /// Burst mode merge mode dropdown options (Quality FFT, Fast Spatial)
-    pub burst_mode_merge_dropdown_options: Vec<String>,
+
     /// Burst mode frame count dropdown options (Auto, 4, 6, 8 frames)
     pub burst_mode_frame_count_dropdown_options: Vec<String>,
     /// Photo output format dropdown options (JPEG, PNG, DNG)
@@ -1294,22 +1293,6 @@ impl PhotoAspectRatio {
             let offset = (1.0 - scale) / 2.0;
             Some((0.0, offset, 1.0, 1.0 - offset))
         }
-    }
-
-    /// Get the default aspect ratio accounting for sensor rotation
-    /// For 90°/270° rotations, the frame dimensions are swapped after GStreamer applies rotation
-    pub fn default_for_frame_with_rotation(
-        width: u32,
-        height: u32,
-        rotation: crate::backends::camera::types::SensorRotation,
-    ) -> Self {
-        // For 90°/270° rotations, swap dimensions to match the rotated frame
-        let (effective_width, effective_height) = if rotation.swaps_dimensions() {
-            (height, width)
-        } else {
-            (width, height)
-        };
-        Self::default_for_frame(effective_width, effective_height)
     }
 }
 

@@ -152,20 +152,7 @@ const CONTEXT_DRAWER_INSET: u16 = 8;
 const BURST_MODE_PROGRESS_BAR_WIDTH: f32 = 200.0;
 const BURST_MODE_PROGRESS_BAR_HEIGHT: f32 = 8.0;
 
-/// Fallback aspect ratio used before the first window-resize event arrives.
-const FALLBACK_ASPECT_RATIO: f32 = 16.0 / 9.0;
-
 impl AppModel {
-    /// Current window aspect ratio, populated from `on_window_resize`. Returns
-    /// 16:9 as a fallback before the first resize event.
-    pub fn screen_aspect_ratio(&self) -> f32 {
-        if self.screen_width > 0.0 && self.screen_height > 0.0 {
-            self.screen_width / self.screen_height
-        } else {
-            FALLBACK_ASPECT_RATIO
-        }
-    }
-
     /// `true` when the window is taller than wide. Drives the orientation
     /// flip applied to the aspect-ratio crop, the canvas overlay bars, the
     /// composition guide and the aspect-icon selection so all four agree

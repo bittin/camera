@@ -109,12 +109,6 @@ impl AppModel {
         v4l2_controls::get_control(&path, v4l2_controls::V4L2_CID_TILT_ABSOLUTE)
     }
 
-    /// Get current V4L2 zoom value
-    pub fn get_v4l2_zoom_value(&self) -> Option<i32> {
-        let path = self.get_v4l2_device_path()?;
-        v4l2_controls::get_control(&path, v4l2_controls::V4L2_CID_ZOOM_ABSOLUTE)
-    }
-
     /// Set V4L2 pan absolute position
     pub fn set_v4l2_pan(&self, value: i32) {
         if let Some(path) = self.get_v4l2_device_path()

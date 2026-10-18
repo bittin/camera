@@ -583,10 +583,7 @@ impl cosmic::Application for AppModel {
                 fl!("controls-position-left"),
                 fl!("controls-position-right"),
             ],
-            burst_mode_merge_dropdown_options: vec![
-                fl!("burst-mode-quality"),
-                fl!("burst-mode-fast"),
-            ],
+
             burst_mode_frame_count_dropdown_options: vec![
                 fl!("hdr-plus-off"),
                 fl!("hdr-plus-auto"),

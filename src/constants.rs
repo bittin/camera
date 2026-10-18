@@ -86,38 +86,6 @@ pub enum ResolutionTier {
     FourK,
 }
 
-impl ResolutionTier {
-    /// Get all tiers for UI iteration (HD = 1080p, excludes 720p)
-    pub const ALL: [ResolutionTier; 4] = [
-        ResolutionTier::SD,
-        ResolutionTier::FullHD,
-        ResolutionTier::TwoK,
-        ResolutionTier::FourK,
-    ];
-
-    /// Get display name for the tier
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            ResolutionTier::SD => "SD",
-            ResolutionTier::HD => "720p",
-            ResolutionTier::FullHD => "HD",
-            ResolutionTier::TwoK => "2K",
-            ResolutionTier::FourK => "4K",
-        }
-    }
-
-    /// Get typical resolution for this tier
-    pub fn typical_resolution(&self) -> &'static str {
-        match self {
-            ResolutionTier::SD => "640×480",
-            ResolutionTier::HD => "1280×720",
-            ResolutionTier::FullHD => "1920×1080",
-            ResolutionTier::TwoK => "2560×1440",
-            ResolutionTier::FourK => "3840×2160",
-        }
-    }
-}
-
 /// Get the resolution tier for a given width
 pub fn get_resolution_tier(width: u32) -> ResolutionTier {
     match width {
@@ -126,16 +94,6 @@ pub fn get_resolution_tier(width: u32) -> ResolutionTier {
         w if w >= 1920 => ResolutionTier::FullHD,
         w if w >= 1280 => ResolutionTier::HD,
         _ => ResolutionTier::SD,
-    }
-}
-
-/// Format bitrate for display (e.g., "8 Mbps" or "2.5 Mbps")
-pub fn format_bitrate(kbps: u32) -> String {
-    let mbps = kbps as f64 / 1000.0;
-    if mbps == mbps.floor() {
-        format!("{} Mbps", mbps as u32)
-    } else {
-        format!("{:.1} Mbps", mbps)
     }
 }
 
@@ -191,9 +149,6 @@ pub mod ui {
 
     /// Default framerate display string
     pub const DEFAULT_FPS_DISPLAY: &str = "30";
-
-    /// Default resolution label
-    pub const DEFAULT_RES_LABEL: &str = "HD";
 }
 
 /// Resolution thresholds for label detection
@@ -210,44 +165,9 @@ pub mod resolution_thresholds {
 
 /// Video format constants
 pub mod formats {
-    /// Common frame rates to try when exact enumeration fails
-    pub const COMMON_FRAMERATES: &[u32] = &[30, 60, 15, 24];
 
     /// Default resolution for picker selection
     pub const DEFAULT_PICKER_RESOLUTION: u32 = 1920;
-}
-
-/// GStreamer pipeline constants
-pub mod pipeline {
-    /// Maximum buffer queue size (keep small for low latency)
-    pub const MAX_BUFFERS: u32 = 2;
-
-    /// Get number of threads for videoconvert based on available CPU threads
-    pub fn videoconvert_threads() -> u32 {
-        std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
-            .unwrap_or(4) // Fallback to 4 if detection fails
-    }
-
-    /// Output pixel format for appsink
-    /// RGBA uses 4 bytes/pixel - native RGB for simplified GPU processing
-    pub const OUTPUT_FORMAT: &str = "RGBA";
-}
-
-/// Timing constants
-pub mod timing {
-    /// Frame counter modulo for periodic logging
-    pub const FRAME_LOG_INTERVAL: u64 = 30;
-
-    /// GStreamer state change timeout for validation
-    /// Reduced to minimize startup delay - we accept async state changes
-    pub const STATE_CHANGE_TIMEOUT_MS: u64 = 50;
-
-    /// Pipeline state change timeout on stop
-    pub const STOP_TIMEOUT_SECS: u64 = 2;
-
-    /// Pipeline playing state timeout on start
-    pub const START_TIMEOUT_SECS: u64 = 5;
 }
 
 /// Frame latency optimization constants

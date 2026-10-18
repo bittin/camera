@@ -90,11 +90,6 @@ impl QrDetector {
         }
     }
 
-    /// Create a QR detector with custom max dimension
-    pub fn with_max_dimension(max_dimension: u32) -> Self {
-        Self { max_dimension }
-    }
-
     /// Detect QR codes in a camera frame
     ///
     /// This is an async-friendly method that performs CPU-intensive work.
