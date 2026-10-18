@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Media processing utilities for encoding, decoding, and format handling
+//! Media processing utilities for encoding and format handling
 //!
 //! This module provides low-level media processing capabilities used by
 //! the camera pipelines:
@@ -13,19 +13,16 @@
 //!
 //! # Format Detection
 //!
-//! The [`formats`] module provides codec metadata and format conversion utilities
+//! The [`formats`] module provides codec metadata
 //! for working with various pixel formats (RGBA, MJPEG, YUYV, etc.).
 //!
 //! # Modules
 //!
-//! - [`decoders`]: Hardware decoder detection and pipeline creation
 //! - [`encoders`]: Video/audio encoder selection and configuration
-//! - [`formats`]: Codec metadata and format conversion utilities
+//! - [`formats`]: Codec metadata
 
-pub mod decoders;
 pub mod encoders;
 pub mod formats;
 
 // Re-export commonly used types
-pub use decoders::detect_hw_decoders;
 pub use formats::Codec;

@@ -271,15 +271,15 @@ mod tests {
 
     #[tokio::test]
     async fn latest_avif_thumbnail_applies_capture_orientation() {
-        use crate::pipelines::capture_metadata::CaptureOrientation;
+        use crate::pipelines::capture_metadata::{CaptureMetadata, CaptureOrientation};
         use crate::pipelines::photo::processing::ProcessedImage;
-        use crate::pipelines::photo::{CameraMetadata, EncodingFormat, PhotoEncoder};
+        use crate::pipelines::photo::{EncodingFormat, PhotoEncoder};
 
         let root = std::env::temp_dir().join(format!("camera-avif-test-{}", uuid::Uuid::new_v4()));
         let photos = root.join("photos");
         let mut encoder = PhotoEncoder::new();
         encoder.set_format(EncodingFormat::Avif);
-        encoder.set_camera_metadata(CameraMetadata {
+        encoder.set_camera_metadata(CaptureMetadata {
             orientation: CaptureOrientation::Rotate270,
             ..Default::default()
         });

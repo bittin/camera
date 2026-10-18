@@ -201,7 +201,6 @@ impl AppModel {
     /// This consolidates the logic shared by SwitchCamera, SetMode, and SelectCamera messages
     /// Select format from cached available_formats without querying hardware.
     /// Used during pipeline restart to avoid blocking the UI thread.
-    /// Select format from cached available_formats and update UI dropdowns.
     /// Does NOT save to disk — call save_settings() separately (or defer it)
     /// to avoid blocking the UI thread on eMMC writes.
     pub fn select_format_from_cache(&mut self, mode: CameraMode) {
@@ -217,8 +216,6 @@ impl AppModel {
             }
             CameraMode::Video => self.select_video_format(&camera_path),
         };
-
-        self.update_all_dropdowns();
 
         if !camera_path.is_empty() {
             self.mark_camera_pending(camera_path);
@@ -246,9 +243,6 @@ impl AppModel {
             }
             CameraMode::Video => self.select_video_format(&camera_path),
         };
-
-        // Update all dropdown options
-        self.update_all_dropdowns();
 
         // Mark this camera as pending — `last_camera_path` is only promoted
         // once the first frame from the new camera arrives. This prevents a
@@ -300,140 +294,6 @@ impl AppModel {
                 )
             {
                 error!(?err, "Failed to persist pending_camera_path");
-            }
-        }
-    }
-
-    /// Change to a specific format (used by consolidated mode dropdown)
-    pub fn change_format(&mut self, format: crate::backends::camera::types::CameraFormat) {
-        info!(format = %format, "Switched to format");
-        // Set new format - subscription will detect change and call manager.recreate()
-        // No need to manually clear pipeline - manager handles stop→create atomically
-        self.active_format = Some(format);
-        self.current_frame = None;
-        self.update_all_dropdowns();
-        self.save_settings();
-    }
-
-    /// Change pixel format while preserving resolution and framerate
-    pub fn change_pixel_format(&mut self, pixel_format: String) {
-        if let Some(current) = &self.active_format {
-            let width = current.width;
-            let height = current.height;
-            let framerate = current.framerate;
-
-            if let Some(fmt) =
-                format_selection::find_format_with_criteria(&self.available_formats, |f| {
-                    f.width == width
-                        && f.height == height
-                        && f.framerate == framerate
-                        && f.pixel_format == pixel_format
-                })
-            {
-                info!(format = %fmt, "Switched to format");
-                // Set new format - subscription will detect change and call manager.recreate()
-                // No need to manually clear pipeline - manager handles stop→create atomically
-                self.active_format = Some(fmt);
-                self.current_frame = None;
-                self.update_codec_options();
-                self.save_settings();
-            }
-        }
-    }
-
-    /// Change resolution while trying to preserve pixel format and framerate
-    pub fn change_resolution(&mut self, width: u32, height: u32) {
-        let current_pixel_format = self.active_format.as_ref().map(|f| f.pixel_format.clone());
-        let current_framerate = self.active_format.as_ref().and_then(|f| f.framerate);
-
-        // Try to preserve both pixel format and framerate
-        let new_format =
-            format_selection::find_format_with_criteria(&self.available_formats, |f| {
-                f.width == width
-                    && f.height == height
-                    && current_pixel_format
-                        .as_ref()
-                        .is_none_or(|pf| &f.pixel_format == pf)
-                    && current_framerate.is_none_or(|fps| f.framerate == Some(fps))
-            })
-            .or_else(|| {
-                // Fall back to best format for this resolution
-                let formats_for_res: Vec<_> = self
-                    .available_formats
-                    .iter()
-                    .filter(|f| f.width == width && f.height == height)
-                    .cloned()
-                    .collect();
-                format_selection::select_best_codec(&formats_for_res)
-            });
-
-        if let Some(fmt) = new_format {
-            info!(format = %fmt, "Switched to format");
-            // Set new format - subscription will detect change and call manager.recreate()
-            // Manager handles stop→create atomically, preventing race conditions
-            self.active_format = Some(fmt);
-            self.current_frame = None;
-            self.update_framerate_options();
-            self.update_pixel_format_options();
-            self.update_codec_options();
-            self.save_settings();
-        }
-    }
-
-    /// Change framerate while trying to preserve resolution and pixel format
-    pub fn change_framerate(&mut self, fps: u32) {
-        self.change_framerate_optional(Some(fps));
-    }
-
-    /// Change framerate while trying to preserve resolution and pixel format
-    /// Accepts Option<u32> to support VFR (None = libcamera-managed dynamic framerate)
-    pub fn change_framerate_optional(&mut self, fps: Option<u32>) {
-        if let Some(current) = &self.active_format {
-            let width = current.width;
-            let height = current.height;
-            let pixel_format = current.pixel_format.clone();
-
-            // Helper to check if framerate matches target
-            let framerate_matches = |f: &CameraFormat| -> bool {
-                match fps {
-                    Some(target_fps) => f
-                        .framerate
-                        .map(|fr| fr.matches_int(target_fps))
-                        .unwrap_or(false),
-                    None => f.framerate.is_none(), // VFR - looking for framerate=None
-                }
-            };
-
-            let new_format =
-                format_selection::find_format_with_criteria(&self.available_formats, |f| {
-                    f.width == width
-                        && f.height == height
-                        && f.pixel_format == pixel_format
-                        && framerate_matches(f)
-                })
-                .or_else(|| {
-                    // Fall back to best format for this resolution and framerate
-                    let formats_for_fps: Vec<_> = self
-                        .available_formats
-                        .iter()
-                        .filter(|f| f.width == width && f.height == height && framerate_matches(f))
-                        .cloned()
-                        .collect();
-                    format_selection::select_best_codec(&formats_for_fps)
-                });
-
-            if let Some(fmt) = new_format {
-                let fps_str = fps
-                    .map(|f| f.to_string())
-                    .unwrap_or_else(|| "Auto".to_string());
-                info!(format = %fmt, fps = %fps_str, "Switched to format");
-                // Set new format - subscription will detect change and call manager.recreate()
-                // Manager handles stop→create atomically, preventing race conditions
-                self.active_format = Some(fmt);
-                self.current_frame = None;
-                self.update_pixel_format_options();
-                self.update_codec_options();
-                self.save_settings();
             }
         }
     }

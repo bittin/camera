@@ -389,7 +389,6 @@ mod tests {
 
     #[tokio::test]
     async fn external_edit_after_coalesced_return_to_default_is_applied() {
-        use futures::StreamExt;
         let fixture = Fixture::new();
         let writer = Writer::start(fixture.store.clone()).unwrap();
         let release = stall(&writer);
@@ -408,13 +407,7 @@ mod tests {
         fixture.store.set("motion_photo", true).unwrap();
         let external = Config::get_entry(&fixture.store).unwrap();
         let task = app.update(Message::UpdateConfig(external));
-        if let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) {
-            while let Some(cosmic::iced::runtime::Action::Output(cosmic::Action::App(message))) =
-                stream.next().await
-            {
-                drop(app.update(message));
-            }
-        }
+        dispatch_reload(&mut app, task).await;
         assert!(
             app.config.motion_photo,
             "a coalesced no-op has no watcher echo and must not permanently hide external edits"

@@ -25,14 +25,14 @@
 //! - **Configurable**: Support for multiple output formats and quality settings
 
 pub mod burst_mode;
-pub mod capture;
 pub mod encoding;
 pub mod processing;
 
-pub use encoding::{CameraMetadata, EncodingFormat, EncodingQuality, PhotoEncoder, RawBayerData};
+pub use encoding::{EncodingFormat, EncodingQuality, PhotoEncoder, RawBayerData};
 pub use processing::{PostProcessingConfig, PostProcessor};
 
 use crate::backends::camera::types::CameraFrame;
+use crate::pipelines::capture_metadata::CaptureMetadata;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::info;
@@ -130,76 +130,8 @@ impl PhotoPipeline {
         Ok(output_path)
     }
 
-    /// Capture and save with progress callback
-    ///
-    /// Same as `capture_and_save` but calls the provided callback at each stage.
-    ///
-    /// # Arguments
-    /// * `frame` - Raw camera frame
-    /// * `output_dir` - Directory to save the photo
-    /// * `progress` - Callback for progress updates (0.0 - 1.0)
-    pub async fn capture_and_save_with_progress<F>(
-        &self,
-        frame: Arc<CameraFrame>,
-        output_dir: PathBuf,
-        mut progress: F,
-    ) -> Result<PathBuf, String>
-    where
-        F: FnMut(f32) + Send,
-    {
-        progress(0.0);
-
-        // DNG + Bayer: bypass post-processing
-        if self.encoder.format() == EncodingFormat::Dng && frame.format.is_bayer() {
-            let raw = RawBayerData {
-                data: frame.data.to_vec(),
-                width: frame.width,
-                height: frame.height,
-                stride: frame.stride,
-                format: frame.format,
-            };
-            progress(0.33);
-
-            let encoded = self.encoder.encode_raw(raw).await?;
-            progress(0.66);
-
-            let output_path = self.encoder.save(encoded, output_dir).await?;
-            progress(1.0);
-            return Ok(output_path);
-        }
-
-        // Post-process
-        let processed = self.post_processor.process(frame).await?;
-        progress(0.33);
-
-        // Encode
-        let encoded = self.encoder.encode(processed).await?;
-        progress(0.66);
-
-        // Save
-        let output_path = self.encoder.save(encoded, output_dir).await?;
-        progress(1.0);
-
-        Ok(output_path)
-    }
-
-    /// Update post-processing configuration
-    pub fn set_processing_config(&mut self, config: PostProcessingConfig) {
-        self.post_processor = PostProcessor::new(config);
-    }
-
-    /// Update encoding format
-    pub fn set_encoding_format(&mut self, format: EncodingFormat) {
-        self.encoder.set_format(format);
-    }
-
-    /// Update encoding quality
-    pub fn set_encoding_quality(&mut self, quality: EncodingQuality) {
-        self.encoder.set_quality(quality);
-    }
-
     /// Set camera metadata for DNG encoding
-    pub fn set_camera_metadata(&mut self, metadata: CameraMetadata) {
+    pub fn set_camera_metadata(&mut self, metadata: CaptureMetadata) {
         self.encoder.set_camera_metadata(metadata);
     }
 }

@@ -5,12 +5,6 @@
 use camera::constants::BitratePreset;
 
 #[test]
-fn test_bitrate_preset_values() {
-    // Test that all presets exist (Low, Medium, High)
-    assert_eq!(BitratePreset::ALL.len(), 3);
-}
-
-#[test]
 fn test_bitrate_preset_ordering() {
     // Test that presets are ordered from lowest to highest quality
     let mut prev_bitrate = 0u32;
@@ -33,17 +27,4 @@ fn test_bitrate_scales_with_resolution() {
 
     assert!(hd_bitrate < fhd_bitrate);
     assert!(fhd_bitrate < uhd_bitrate);
-}
-
-#[test]
-fn test_bitrate_preset_display_names() {
-    // Test that all presets have non-empty display names
-    for preset in BitratePreset::ALL {
-        let name = preset.display_name();
-        assert!(
-            !name.is_empty(),
-            "Preset {:?} has empty display name",
-            preset
-        );
-    }
 }

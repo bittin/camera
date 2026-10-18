@@ -792,9 +792,9 @@ mod orientation_tests {
 
     #[tokio::test]
     async fn avif_file_source_applies_all_capture_orientations() {
-        use crate::pipelines::capture_metadata::CaptureOrientation;
+        use crate::pipelines::capture_metadata::{CaptureMetadata, CaptureOrientation};
         use crate::pipelines::photo::processing::ProcessedImage;
-        use crate::pipelines::photo::{CameraMetadata, EncodingFormat, PhotoEncoder};
+        use crate::pipelines::photo::{EncodingFormat, PhotoEncoder};
 
         let source = image::RgbImage::from_fn(65, 33, |x, y| {
             image::Rgb([(x * 3) as u8, (y * 7) as u8, 40])
@@ -811,7 +811,7 @@ mod orientation_tests {
         ] {
             let mut encoder = PhotoEncoder::new();
             encoder.set_format(EncodingFormat::Avif);
-            encoder.set_camera_metadata(CameraMetadata {
+            encoder.set_camera_metadata(CaptureMetadata {
                 orientation,
                 ..Default::default()
             });

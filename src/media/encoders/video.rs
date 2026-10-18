@@ -236,13 +236,6 @@ pub fn enumerate_video_encoders() -> Vec<EncoderInfo> {
         ("svtav1enc", "SVT-AV1 (SW)", VideoCodec::AV1, false, 10),
         ("av1enc", "AOM AV1 (SW)", VideoCodec::AV1, false, 11),
         // Hardware HEVC/H.265
-        (
-            "vaapih265enc",
-            "VA-API H.265 (HW)",
-            VideoCodec::HEVC,
-            true,
-            20,
-        ),
         ("vah265enc", "VA-API H.265 (HW)", VideoCodec::HEVC, true, 21),
         ("nvh265enc", "NVIDIA H.265 (HW)", VideoCodec::HEVC, true, 22),
         (
@@ -263,13 +256,6 @@ pub fn enumerate_video_encoders() -> Vec<EncoderInfo> {
         // Software HEVC/H.265
         ("x265enc", "x265 H.265 (SW)", VideoCodec::HEVC, false, 31),
         // Hardware H.264
-        (
-            "vaapih264enc",
-            "VA-API H.264 (HW)",
-            VideoCodec::H264,
-            true,
-            40,
-        ),
         ("vah264enc", "VA-API H.264 (HW)", VideoCodec::H264, true, 41),
         ("nvh264enc", "NVIDIA H.264 (HW)", VideoCodec::H264, true, 42),
         (
@@ -323,16 +309,6 @@ pub fn enumerate_video_encoders() -> Vec<EncoderInfo> {
     available_encoders
 }
 
-/// Create encoder from encoder info
-pub fn create_encoder_from_info(
-    info: &EncoderInfo,
-    quality: VideoQuality,
-    width: u32,
-    height: u32,
-) -> Result<SelectedVideoEncoder, String> {
-    create_encoder_from_info_with_bitrate(info, quality, width, height, None)
-}
-
 /// Create encoder from encoder info with optional bitrate override
 pub fn create_encoder_from_info_with_bitrate(
     info: &EncoderInfo,
@@ -345,7 +321,6 @@ pub fn create_encoder_from_info_with_bitrate(
         .build()
         .map_err(|e| format!("Failed to create encoder {}: {}", info.element_name, e))?;
 
-    // Configure encoder
     configure_video_encoder(
         &encoder,
         &info.element_name,
@@ -355,8 +330,15 @@ pub fn create_encoder_from_info_with_bitrate(
         bitrate_override_kbps,
     );
 
+    assemble_video_encoder(encoder, info.codec)
+}
+
+fn assemble_video_encoder(
+    encoder: gst::Element,
+    codec: VideoCodec,
+) -> Result<SelectedVideoEncoder, String> {
     // Create parser if needed
-    let parser = if let Some(parser_name) = info.codec.parser_name() {
+    let parser = if let Some(parser_name) = codec.parser_name() {
         match gst::ElementFactory::make(parser_name).build() {
             Ok(p) => {
                 debug!("Created parser: {}", parser_name);
@@ -372,7 +354,7 @@ pub fn create_encoder_from_info_with_bitrate(
     };
 
     // Create muxer
-    let container = info.codec.container_format();
+    let container = codec.container_format();
     let muxer = gst::ElementFactory::make(container.muxer_name())
         .build()
         .map_err(|e| format!("Failed to create muxer {}: {}", container.muxer_name(), e))?;
@@ -381,36 +363,10 @@ pub fn create_encoder_from_info_with_bitrate(
         encoder,
         parser,
         muxer,
-        codec: info.codec,
+        codec,
         container,
-        extension: info.codec.file_extension(),
+        extension: codec.file_extension(),
     })
-}
-
-/// Select the best available video encoder
-///
-/// Priority order:
-/// 1. Hardware AV1 (vaapiavcenc, nvav1enc)
-/// 2. Hardware HEVC/H.265 (vaapih265enc, nvh265enc)
-/// 3. Hardware H.264 (vaapih264enc, nvh264enc)
-/// 4. Software H.264 (x264enc)
-/// 5. Software HEVC/H.265 (x265enc)
-/// 6. Software H.264 (openh264enc)
-///
-/// # Arguments
-/// * `quality` - Quality preset for encoding
-/// * `width` - Video width (for bitrate calculation)
-/// * `height` - Video height (for bitrate calculation)
-///
-/// # Returns
-/// * `Ok(SelectedVideoEncoder)` - Selected encoder with configuration
-/// * `Err(String)` - Error message if no encoder available
-pub fn select_video_encoder(
-    quality: VideoQuality,
-    width: u32,
-    height: u32,
-) -> Result<SelectedVideoEncoder, String> {
-    select_video_encoder_with_bitrate(quality, width, height, None)
 }
 
 /// Select the best available video encoder with optional bitrate override
@@ -425,14 +381,14 @@ pub fn select_video_encoder_with_bitrate(
     // Try encoders in priority order
     let encoders = [
         // Hardware AV1
-        ("vaapiavcenc", VideoCodec::AV1, true),
+        ("vaav1enc", VideoCodec::AV1, true),
         ("nvav1enc", VideoCodec::AV1, true),
         // Hardware HEVC
-        ("vaapih265enc", VideoCodec::HEVC, true),
+        ("vah265enc", VideoCodec::HEVC, true),
         ("nvh265enc", VideoCodec::HEVC, true),
         ("v4l2h265enc", VideoCodec::HEVC, true),
         // Hardware H.264
-        ("vaapih264enc", VideoCodec::H264, true),
+        ("vah264enc", VideoCodec::H264, true),
         ("nvh264enc", VideoCodec::H264, true),
         ("v4l2h264enc", VideoCodec::H264, true),
         // Software H.264 (preferred — fast, widely compatible)
@@ -462,36 +418,7 @@ pub fn select_video_encoder_with_bitrate(
                 bitrate_override_kbps,
             );
 
-            // Create parser if needed
-            let parser = if let Some(parser_name) = codec.parser_name() {
-                match gst::ElementFactory::make(parser_name).build() {
-                    Ok(p) => {
-                        debug!("Created parser: {}", parser_name);
-                        Some(p)
-                    }
-                    Err(e) => {
-                        warn!("Failed to create parser {}: {}", parser_name, e);
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Create muxer
-            let container = codec.container_format();
-            let muxer = gst::ElementFactory::make(container.muxer_name())
-                .build()
-                .map_err(|e| format!("Failed to create muxer {}: {}", container.muxer_name(), e))?;
-
-            return Ok(SelectedVideoEncoder {
-                encoder,
-                parser,
-                muxer,
-                codec: *codec,
-                container,
-                extension: codec.file_extension(),
-            });
+            return assemble_video_encoder(encoder, *codec);
         }
     }
 
@@ -531,13 +458,6 @@ pub fn configure_video_encoder(
                 quality.x264_preset(),
                 bitrate
             );
-        }
-
-        // VA-API encoders (old plugin style - uses integer)
-        "vaapih264enc" | "vaapih265enc" => {
-            encoder.set_property("rate-control", 2); // CBR
-            encoder.set_property("bitrate", bitrate);
-            debug!("Configured VA-API encoder: bitrate={} kbps", bitrate);
         }
 
         // NVIDIA encoders (NVENC)
@@ -606,15 +526,8 @@ pub fn configure_video_encoder(
             );
         }
 
-        // VA-API AV1 encoder
-        "vaav1enc" | "vaapiavcenc" => {
-            encoder.set_property_from_str("rate-control", "cbr");
-            encoder.set_property("bitrate", bitrate);
-            debug!("Configured VA-API AV1 encoder: bitrate={} kbps", bitrate);
-        }
-
-        // VA-API H.264/H.265 encoders (new plugin style - uses string)
-        "vah264enc" | "vah265enc" => {
+        // VA-API encoders
+        "vaav1enc" | "vah264enc" | "vah265enc" => {
             encoder.set_property_from_str("rate-control", "cbr");
             encoder.set_property("bitrate", bitrate);
             debug!("Configured VA-API encoder: bitrate={} kbps", bitrate);

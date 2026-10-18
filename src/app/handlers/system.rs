@@ -554,7 +554,6 @@ impl AppModel {
         let color_task = self.handle_reset_color_settings();
         let fit_anim_task = self.start_fit_animation(from_fit);
 
-        self.update_all_dropdowns();
         Task::batch([
             exposure_task,
             color_task,

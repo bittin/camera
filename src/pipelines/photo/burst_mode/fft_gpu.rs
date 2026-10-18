@@ -24,8 +24,6 @@ const FFT_MERGE_SHADER: &str = include_str!("../../../shaders/burst_mode/fft_mer
 const SPATIAL_DENOISE_SHADER: &str =
     include_str!("../../../shaders/burst_mode/spatial_denoise.wgsl");
 const CHROMA_DENOISE_SHADER: &str = include_str!("../../../shaders/burst_mode/chroma_denoise.wgsl");
-#[cfg(test)]
-const GUIDED_FILTER_SHADER: &str = include_str!("../../../shaders/burst_mode/guided_filter.wgsl");
 
 // GPU parameter structs imported from params module
 use super::params::{ChromaDenoiseParams, MergeParams, SpatialDenoiseParams};
@@ -266,11 +264,11 @@ impl FftMergePipeline {
             "Chroma denoise shader compiled"
         );
 
-        // Bindings: input(r), output(rw), temp(rw), params(u)
+        // Bindings: input(r), output(rw), params(u)
         let chroma_denoise_bind_group_layout = gpu_helpers::create_layout(
             &device,
             "chroma_denoise_bind_group_layout",
-            &[StorageRead, StorageReadWrite, StorageReadWrite, Uniform],
+            &[StorageRead, StorageReadWrite, Uniform],
         );
 
         let chroma_denoise_pipeline_layout =
@@ -672,13 +670,6 @@ impl FftMergePipeline {
             mapped_at_creation: false,
         });
 
-        let chroma_temp_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("chroma_temp_buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
         // Chroma denoise: very light to preserve color saturation
         let chroma_params = ChromaDenoiseParams {
             width,
@@ -715,10 +706,6 @@ impl FftMergePipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: chroma_temp_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
                     resource: chroma_params_buffer.as_entire_binding(),
                 },
             ],
@@ -1294,11 +1281,6 @@ mod tests {
     #[test]
     fn test_ca_estimate_shader_validates() {
         validate_shader("ca_estimate", CA_ESTIMATE_SHADER);
-    }
-
-    #[test]
-    fn test_guided_filter_shader_validates() {
-        validate_shader("guided_filter", GUIDED_FILTER_SHADER);
     }
 }
 

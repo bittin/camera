@@ -95,7 +95,7 @@ fn get_local_luminance(x: u32, y: u32) -> f32 {
 }
 
 // COMMON UTILITY: BT.601 RGB to luminance conversion
-// See common.wgsl for reference. Keep in sync across all shaders that use this.
+// Keep in sync across all shaders that use this.
 // Formula: Y = 0.299*R + 0.587*G + 0.114*B
 fn rgb_to_luminance(rgb: vec3<f32>) -> f32 {
     return 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
@@ -399,30 +399,4 @@ fn compute_local_luminance(@builtin(global_invocation_id) gid: vec3<u32>) {
     let fixed_avg = u32(avg * 256.0);
     atomicAdd(&global_brightness_accum[0], fixed_avg);
     atomicAdd(&global_brightness_accum[1], 1u);
-}
-
-//=============================================================================
-// Simple gamma-only correction (fast path)
-//=============================================================================
-
-@compute @workgroup_size(16, 16)
-fn gamma_correct(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = gid.x;
-    let y = gid.y;
-
-    if (x >= params.width || y >= params.height) {
-        return;
-    }
-
-    let pixel = load_pixel(x, y);
-
-    // Apply sRGB gamma
-    let out = vec4<f32>(
-        linear_to_srgb(clamp(pixel.x, 0.0, 1.0)),
-        linear_to_srgb(clamp(pixel.y, 0.0, 1.0)),
-        linear_to_srgb(clamp(pixel.z, 0.0, 1.0)),
-        pixel.w
-    );
-
-    store_pixel(x, y, out);
 }

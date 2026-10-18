@@ -2,14 +2,7 @@
 
 //! Types for the Insights drawer diagnostic information.
 
-use crate::media::decoders::{DecoderDef, H264_DECODERS, H265_DECODERS, MJPEG_DECODERS};
 use crate::pipelines::video::AudioLevels;
-use std::sync::OnceLock;
-
-/// Cached decoder availability (checked once at startup, per codec)
-static MJPEG_AVAILABILITY: OnceLock<Vec<bool>> = OnceLock::new();
-static H264_AVAILABILITY: OnceLock<Vec<bool>> = OnceLock::new();
-static H265_AVAILABILITY: OnceLock<Vec<bool>> = OnceLock::new();
 
 /// State for Insights drawer diagnostic information
 #[derive(Debug, Clone, Default)]
@@ -143,7 +136,7 @@ pub struct StreamInfo {
 /// Status of a decoder in the fallback chain
 #[derive(Debug, Clone)]
 pub struct DecoderStatus {
-    /// Decoder element name (e.g., "vaapijpegdec")
+    /// Decoder element name (e.g., "vajpegdec")
     pub name: &'static str,
     /// Human-readable description
     pub description: &'static str,
@@ -185,62 +178,6 @@ pub(crate) fn frame_copy_time_text(time_us: Option<u64>) -> String {
         Some(us) if us < 10 => "< 0.01 ms (measured copy)".into(),
         Some(us) => format!("{:.2} ms", us as f64 / 1000.0),
     }
-}
-
-/// Get cached decoder availability for a decoder list
-fn get_cached_availability(
-    decoders: &[DecoderDef],
-    cache: &'static OnceLock<Vec<bool>>,
-) -> &'static Vec<bool> {
-    cache.get_or_init(|| {
-        decoders
-            .iter()
-            .map(|d| gstreamer::ElementFactory::find(d.name).is_some())
-            .collect()
-    })
-}
-
-/// Build a decoder status chain from decoder definitions
-///
-/// This is the generic builder that replaces the three format-specific methods.
-fn build_chain_from_defs(
-    decoders: &'static [DecoderDef],
-    availability: &[bool],
-    full_pipeline: Option<&str>,
-) -> Vec<DecoderStatus> {
-    // Find which decoder is actually used in the pipeline
-    let active_decoder = full_pipeline.and_then(|pipeline| {
-        decoders.iter().find_map(|d| {
-            // Check for decoder name followed by space, '!', or end of string
-            if pipeline.contains(&format!("{} ", d.name))
-                || pipeline.contains(&format!("{}!", d.name))
-                || pipeline.ends_with(d.name)
-            {
-                Some(d.name)
-            } else {
-                None
-            }
-        })
-    });
-
-    decoders
-        .iter()
-        .enumerate()
-        .map(|(i, decoder)| {
-            let state = if active_decoder == Some(decoder.name) {
-                FallbackState::Selected
-            } else if availability.get(i).copied().unwrap_or(false) {
-                FallbackState::Available
-            } else {
-                FallbackState::Unavailable
-            };
-            DecoderStatus {
-                name: decoder.name,
-                description: decoder.description,
-                state,
-            }
-        })
-        .collect()
 }
 
 impl InsightsState {
@@ -411,33 +348,6 @@ impl InsightsState {
         self.meta_lux = None;
         self.meta_focus_fom = None;
         self.frame_metadata = None;
-    }
-
-    /// Build the decoder fallback chain based on pixel format
-    ///
-    /// `pixel_format` is the camera's native format (e.g., "MJPG", "H264", "YUYV")
-    /// `full_pipeline` is the actual GStreamer pipeline string to parse for the active decoder.
-    /// Decoder availability is cached on first call since it doesn't change at runtime.
-    pub fn build_decoder_chain(
-        pixel_format: Option<&str>,
-        full_pipeline: Option<&str>,
-    ) -> Vec<DecoderStatus> {
-        match pixel_format {
-            Some("MJPG") | Some("MJPEG") => {
-                let availability = get_cached_availability(MJPEG_DECODERS, &MJPEG_AVAILABILITY);
-                build_chain_from_defs(MJPEG_DECODERS, availability, full_pipeline)
-            }
-            Some("H264") => {
-                let availability = get_cached_availability(H264_DECODERS, &H264_AVAILABILITY);
-                build_chain_from_defs(H264_DECODERS, availability, full_pipeline)
-            }
-            Some("H265") | Some("HEVC") => {
-                let availability = get_cached_availability(H265_DECODERS, &H265_AVAILABILITY);
-                build_chain_from_defs(H265_DECODERS, availability, full_pipeline)
-            }
-            // Raw formats don't need decoders
-            _ => Vec::new(),
-        }
     }
 }
 

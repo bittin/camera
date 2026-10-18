@@ -28,7 +28,6 @@ pub mod backends;
 pub mod bug_report;
 pub mod config;
 pub mod constants;
-pub mod errors;
 pub mod flash;
 pub mod gpu;
 pub mod i18n;

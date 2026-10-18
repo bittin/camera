@@ -215,96 +215,6 @@ fn subpixel_refine_2d(costs: array<f32, 9>) -> vec2<f32> {
 }
 
 //=============================================================================
-// Main alignment kernel - one thread per tile
-// Performs exhaustive search over 5x5 grid with optional sub-pixel refinement
-//=============================================================================
-
-@compute @workgroup_size(1, 1, 1)
-fn align_tiles_simple(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let tile_x = gid.x;
-    let tile_y = gid.y;
-
-    if (tile_x >= params.n_tiles_x || tile_y >= params.n_tiles_y) {
-        return;
-    }
-
-    let tile_idx = get_tile_idx(tile_x, tile_y);
-
-    // Get initial offset from previous level (sub-pixel, so multiply by 2.0)
-    var initial_dx = 0.0;
-    var initial_dy = 0.0;
-
-    if (prev_n_tiles_x > 0u && params.prev_tile_step > 0u) {
-        // Current tile's center pixel position
-        let tile_center_x = tile_x * params.tile_step + params.tile_size / 2u;
-        let tile_center_y = tile_y * params.tile_step + params.tile_size / 2u;
-
-        // Scale to previous level coordinates (image is 2x smaller)
-        let prev_pixel_x = tile_center_x / 2u;
-        let prev_pixel_y = tile_center_y / 2u;
-
-        // Find tile index in previous level that contains this pixel
-        let prev_tx = min(prev_pixel_x / params.prev_tile_step, prev_n_tiles_x - 1u);
-        let prev_ty = min(prev_pixel_y / params.prev_tile_step, params.prev_n_tiles_y - 1u);
-
-        let prev_idx = prev_ty * prev_n_tiles_x + prev_tx;
-        let prev_vec = prev_alignment[prev_idx];
-        // Scale up by 2 for pyramid upsampling, round to nearest integer for search
-        initial_dx = prev_vec.x * 2.0;
-        initial_dy = prev_vec.y * 2.0;
-    }
-
-    // Round initial offset to integer for search grid
-    let initial_dx_i = i32(round(initial_dx));
-    let initial_dy_i = i32(round(initial_dy));
-
-    // Search for best integer alignment
-    var best_cost = 1e10;
-    var best_dx = initial_dx_i;
-    var best_dy = initial_dy_i;
-
-    let search_dist_i = i32(params.search_dist);
-
-    for (var dy = -search_dist_i; dy <= search_dist_i; dy++) {
-        for (var dx = -search_dist_i; dx <= search_dist_i; dx++) {
-            let test_dx = initial_dx_i + dx;
-            let test_dy = initial_dy_i + dy;
-
-            let cost = compute_tile_cost(tile_x, tile_y, test_dx, test_dy);
-
-            if (cost < best_cost) {
-                best_cost = cost;
-                best_dx = test_dx;
-                best_dy = test_dy;
-            }
-        }
-    }
-
-    // For L2 (coarse levels), apply sub-pixel refinement
-    var final_dx = f32(best_dx);
-    var final_dy = f32(best_dy);
-
-    if (params.use_l2 == 1u) {
-        // Compute 3x3 cost surface around best integer location
-        var costs: array<f32, 9>;
-        var idx = 0u;
-        for (var dy = -1; dy <= 1; dy++) {
-            for (var dx = -1; dx <= 1; dx++) {
-                costs[idx] = compute_tile_cost(tile_x, tile_y, best_dx + dx, best_dy + dy);
-                idx++;
-            }
-        }
-
-        // Sub-pixel refinement using 2D quadratic fit
-        let subpixel = subpixel_refine_2d(costs);
-        final_dx = f32(best_dx) + subpixel.x;
-        final_dy = f32(best_dy) + subpixel.y;
-    }
-
-    alignment[tile_idx] = vec2<f32>(final_dx, final_dy);
-}
-
-//=============================================================================
 // Upsampling error correction
 // At motion boundaries, upsampled alignment vectors may be inaccurate.
 // Based on HDR+ paper Section 4:
@@ -459,34 +369,6 @@ fn rgb_to_luminance(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let lum_idx = y * lum_params.width + x;
     luminance_output[lum_idx] = lum;
-}
-
-/// Extract single channel or compute luminance based on channel parameter
-/// channel: 0=R, 1=G, 2=B, 3=luminance
-@compute @workgroup_size(16, 16)
-fn rgb_to_channel(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let x = gid.x;
-    let y = gid.y;
-
-    if (x >= lum_params.width || y >= lum_params.height) {
-        return;
-    }
-
-    let rgb_idx = (y * lum_params.width + x) * 4u;
-    let r = rgb_input[rgb_idx];
-    let g = rgb_input[rgb_idx + 1u];
-    let b = rgb_input[rgb_idx + 2u];
-
-    var value: f32;
-    switch (lum_params.channel) {
-        case 0u: { value = r; }                               // Red
-        case 1u: { value = g; }                               // Green
-        case 2u: { value = b; }                               // Blue
-        default: { value = 0.299 * r + 0.587 * g + 0.114 * b; } // Luminance
-    }
-
-    let out_idx = y * lum_params.width + x;
-    luminance_output[out_idx] = value;
 }
 
 //=============================================================================

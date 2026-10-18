@@ -226,19 +226,6 @@ fn build_pulse_volume_guard(
     audio_device.and_then(crate::backends::audio::PulseSourceVolumeGuard::normalize_for_recording)
 }
 
-/// Select encoder set: use a specific encoder if provided, otherwise auto-select.
-fn select_encoder_set(
-    encoder_info: Option<&crate::media::encoders::video::EncoderInfo>,
-    encoder_config: &EncoderConfig,
-    enable_audio: bool,
-) -> Result<super::encoder_selection::SelectedEncoders, String> {
-    if let Some(enc_info) = encoder_info {
-        super::encoder_selection::select_encoders_with_video(encoder_config, enc_info, enable_audio)
-    } else {
-        select_encoders(encoder_config, enable_audio)
-    }
-}
-
 /// Shared state from the common recorder preparation phase.
 ///
 /// Both `new_from_appsrc` and `new_from_appsrc_jpeg` begin with the same
@@ -271,7 +258,7 @@ fn prepare_recorder(
     output_path: PathBuf,
     framerate: u32,
 ) -> Result<RecorderSetup, String> {
-    let encoders = select_encoder_set(encoder_info, encoder_config, enable_audio)?;
+    let encoders = select_encoders(encoder_config, encoder_info, enable_audio)?;
 
     let audio_elements = if let Some(audio_encoder_config) = encoders.audio {
         VideoRecorder::create_audio_branch(
@@ -1707,11 +1694,6 @@ struct AudioBranch {
     /// is gone (source rate flows through unchanged).
     level: gst::Element,
     encoder: gst::Element,
-}
-
-/// Check which video encoders are available (backward compatibility)
-pub fn check_available_encoders() {
-    crate::media::encoders::log_available_encoders();
 }
 
 #[cfg(test)]

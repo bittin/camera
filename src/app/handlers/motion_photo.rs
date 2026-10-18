@@ -7,6 +7,7 @@
 use crate::app::state::AppModel;
 use crate::backends::camera::types::{CameraFrame, SensorRotation};
 use crate::media::encoders::video::EncoderInfo;
+use crate::pipelines::capture_metadata::CaptureMetadata;
 use crate::pipelines::motion_photo_ring::{MemoryEncoder, POST_ROLL_NS};
 use crate::pipelines::photo::processing::{PostProcessingConfig, PostProcessor};
 use std::path::PathBuf;
@@ -30,7 +31,7 @@ impl Drop for TemporaryClip {
 #[derive(Clone)]
 pub struct MotionPhotoSnapshot {
     pub photo_output_format: crate::config::PhotoOutputFormat,
-    pub camera_metadata: crate::pipelines::photo::CameraMetadata,
+    pub camera_metadata: CaptureMetadata,
     pub filter: crate::app::FilterType,
     pub zoom: f32,
     pub media_rotation: SensorRotation,

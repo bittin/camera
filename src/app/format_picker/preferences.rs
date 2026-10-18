@@ -185,14 +185,6 @@ pub fn select_first_time_video_format(formats: &[CameraFormat]) -> Option<Camera
     best_format.or_else(|| formats.first().cloned())
 }
 
-/// Find a format matching specific criteria
-pub fn find_format_with_criteria<F>(formats: &[CameraFormat], filter: F) -> Option<CameraFormat>
-where
-    F: Fn(&CameraFormat) -> bool,
-{
-    formats.iter().find(|f| filter(f)).cloned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,23 +278,6 @@ mod tests {
         assert_eq!(max_res.width, 3840);
         assert_eq!(max_res.height, 2160);
         assert_eq!(max_res.pixel_format, "MJPG");
-    }
-
-    #[test]
-    fn test_find_format_with_criteria() {
-        let formats = vec![
-            create_test_format(1920, 1080, "YUYV", false),
-            create_test_format(1920, 1080, "MJPG", true),
-            create_test_format(1280, 720, "YUYV", false),
-        ];
-
-        let found =
-            find_format_with_criteria(&formats, |f| f.width == 1920 && f.pixel_format == "MJPG");
-
-        assert!(found.is_some());
-        let fmt = found.unwrap();
-        assert_eq!(fmt.width, 1920);
-        assert_eq!(fmt.pixel_format, "MJPG");
     }
 
     #[test]

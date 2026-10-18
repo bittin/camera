@@ -234,11 +234,6 @@ impl AppModel {
 
             // ===== Format Selection =====
             Message::SetMode(mode) => self.handle_set_mode(mode),
-            Message::SelectMode(index) => self.handle_select_mode(index),
-            Message::SelectPixelFormat(format) => self.handle_select_pixel_format(format),
-            Message::SelectResolution(resolution) => self.handle_select_resolution(resolution),
-            Message::SelectFramerate(framerate) => self.handle_select_framerate(framerate),
-            Message::SelectCodec(codec) => self.handle_select_codec(codec),
             Message::PickerSelectResolution(width) => self.handle_picker_select_resolution(width),
             Message::PickerSelectFormat(index) => self.handle_picker_select_format(index),
             Message::SelectBitratePreset(index) => self.handle_select_bitrate_preset(index),

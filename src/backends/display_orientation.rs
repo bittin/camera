@@ -37,21 +37,15 @@ pub enum DisplayOrientation {
     Rotate90,
     Rotate180,
     Rotate270,
-    // Kept for compatibility with layout code, but the Wayland backend never
-    // emits these until the full rendering/capture pipeline supports reflection.
-    Flipped0,
-    Flipped90,
-    Flipped180,
-    Flipped270,
 }
 
 impl DisplayOrientation {
     pub fn degrees(self) -> u32 {
         match self {
-            Self::Rotate0 | Self::Flipped0 => 0,
-            Self::Rotate90 | Self::Flipped90 => 90,
-            Self::Rotate180 | Self::Flipped180 => 180,
-            Self::Rotate270 | Self::Flipped270 => 270,
+            Self::Rotate0 => 0,
+            Self::Rotate90 => 90,
+            Self::Rotate180 => 180,
+            Self::Rotate270 => 270,
         }
     }
 
