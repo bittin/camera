@@ -418,15 +418,13 @@ impl GpuDemosaic {
                     ]),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
-                if method != DemosaicMethod::Bilinear {
-                    for (stage, ai, bi, oi) in [
-                        (1, 1, 2, 0),
-                        (2, 0, 2, 1),
-                        (3, 0, 1, 2),
-                        (4, 2, if method == DemosaicMethod::Rcd { 1 } else { 2 }, 3),
-                    ] {
-                        dispatch(stage, ai, bi, &views[oi], &params, w + 32, h + 32)?;
-                    }
+                for (stage, ai, bi, oi) in [
+                    (1, 1, 2, 0),
+                    (2, 0, 2, 1),
+                    (3, 0, 1, 2),
+                    (4, 2, if method == DemosaicMethod::Rcd { 1 } else { 2 }, 3),
+                ] {
+                    dispatch(stage, ai, bi, &views[oi], &params, w + 32, h + 32)?;
                 }
                 dispatch(5, 2, 3, &output, &params, w, h)?;
             }
@@ -492,7 +490,7 @@ impl GpuDemosaic {
     }
 
     /// Submit first; validate only a compact GPU reduction before colour dispatch.
-    pub fn validate(&self, _device: &wgpu::Device) -> Result<f64, String> {
+    pub fn validate(&self) -> Result<f64, String> {
         let data = self.staging.read()?;
         let s: &[u32] = bytemuck::cast_slice(&data);
         let result = if s[3] != 0 {

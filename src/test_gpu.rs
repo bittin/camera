@@ -96,6 +96,23 @@ impl PhotoTrace {
     }
 }
 
+/// Parse and validate composed WGSL, retaining the module for entry-point checks.
+pub(crate) fn validate_shader(name: &str, source: &str) -> naga::Module {
+    let module = naga::front::wgsl::parse_str(source).unwrap_or_else(|error| {
+        panic!(
+            "Shader '{name}' parse failed: {}",
+            error.emit_to_string(source)
+        )
+    });
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .unwrap_or_else(|error| panic!("Shader '{name}' validation failed: {error:?}"));
+    module
+}
+
 /// The ONE headless wgpu device the GPU tests share, or `None` when the
 /// machine has no usable adapter.
 ///

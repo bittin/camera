@@ -2,14 +2,7 @@
 use super::{PHOTO_WORKGROUP_SIZE, TILE_WORKGROUP_SIZE, bayer_workgroups};
 
 fn shader_workgroup(source: &str) -> [u32; 2] {
-    let module = naga::front::wgsl::parse_str(source)
-        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
-    naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::all(),
-    )
-    .validate(&module)
-    .unwrap();
+    let module = crate::test_gpu::validate_shader("Bayer workgroup", source);
     assert_eq!(module.entry_points.len(), 1);
     let entry = &module.entry_points[0];
     assert_eq!(entry.stage, naga::ShaderStage::Compute);

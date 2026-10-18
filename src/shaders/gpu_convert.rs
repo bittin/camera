@@ -243,7 +243,7 @@ impl<'a> GpuFrameInput<'a> {
         };
 
         match frame.format {
-            PixelFormat::NV12 | PixelFormat::NV21 => {
+            PixelFormat::NV12 | PixelFormat::NV21 | PixelFormat::I420 => {
                 let planes = frame
                     .yuv_planes
                     .as_ref()
@@ -270,35 +270,7 @@ impl<'a> GpuFrameInput<'a> {
                     planes.uv_height as usize,
                 )?);
                 input.uv_stride = planes.uv_stride;
-            }
-            PixelFormat::I420 => {
-                let planes = frame
-                    .yuv_planes
-                    .as_ref()
-                    .ok_or(crate::backends::camera::types::FrameLayoutError::MissingPlanes)?;
-                input.y_data = crate::backends::camera::types::checked_plane(
-                    buffer_data,
-                    planes.y_offset,
-                    planes.y_size,
-                    frame.stride as usize,
-                    frame.width as usize,
-                    frame.height as usize,
-                )?;
-                input.uv_data = Some(crate::backends::camera::types::checked_plane(
-                    buffer_data,
-                    planes.uv_offset,
-                    planes.uv_size,
-                    planes.uv_stride as usize,
-                    planes.uv_width as usize
-                        * if frame.format == PixelFormat::I420 {
-                            1
-                        } else {
-                            2
-                        },
-                    planes.uv_height as usize,
-                )?);
-                input.uv_stride = planes.uv_stride;
-                if planes.v_size > 0 {
+                if frame.format == PixelFormat::I420 && planes.v_size > 0 {
                     input.v_data = Some(crate::backends::camera::types::checked_plane(
                         buffer_data,
                         planes.v_offset,
@@ -308,7 +280,9 @@ impl<'a> GpuFrameInput<'a> {
                         planes.uv_height as usize,
                     )?);
                 }
-                input.v_stride = planes.v_stride;
+                if frame.format == PixelFormat::I420 {
+                    input.v_stride = planes.v_stride;
+                }
             }
             PixelFormat::BayerRGGB
             | PixelFormat::BayerBGGR
@@ -1820,10 +1794,7 @@ impl GpuConvertPipeline {
             black_level: blacks[0],
             _pad0: match raw_layout {
                 RawLayout::U8 => (65535.0f32 / 65280.0).to_bits(),
-                RawLayout::Unpacked16 { bits } => {
-                    (65535.0f32 / (((1u32 << bits) - 1) << (16 - bits)) as f32).to_bits()
-                }
-                RawLayout::Csi2 { bits } => {
+                RawLayout::Unpacked16 { bits } | RawLayout::Csi2 { bits } => {
                     (65535.0f32 / (((1u32 << bits) - 1) << (16 - bits)) as f32).to_bits()
                 }
             },
@@ -2347,7 +2318,7 @@ impl GpuConvertPipeline {
                 );
                 self.queue.submit([encoder.take().unwrap().finish()]);
             }
-            let bound = engine.validate(&self.device)?;
+            let bound = engine.validate()?;
             super::validate_bayer_colour(
                 Some(
                     input
@@ -2871,94 +2842,47 @@ impl GpuConvertPipeline {
         tex_uv: &wgpu::Texture,
         tex_v: &wgpu::Texture,
     ) -> Result<(), String> {
-        match input.format {
-            // Packed 4:2:2 formats
+        // Texture upload widths differ from image widths for packed 4:2:2
+        // (two pixels per RGBA texel) and RGB24 (three R8 texels per pixel).
+        let y_width = match input.format {
             PixelFormat::YUYV | PixelFormat::UYVY | PixelFormat::YVYU | PixelFormat::VYUY => {
-                self.write_plane(
-                    tex_y,
-                    input.y_data,
-                    input.y_stride,
-                    input.width.div_ceil(2),
-                    input.height,
-                );
+                input.width.div_ceil(2)
             }
-
-            // NV12/NV21: Y plane + UV plane
-            PixelFormat::NV12 | PixelFormat::NV21 => {
-                self.write_plane(
-                    tex_y,
-                    input.y_data,
-                    input.y_stride,
-                    input.width,
-                    input.height,
-                );
-                if let Some(uv_data) = input.uv_data {
-                    let (w, h) = input
-                        .uv_dimensions
-                        .ok_or("Missing active chroma geometry")?;
-                    self.write_plane(tex_uv, uv_data, input.uv_stride, w, h);
-                }
-            }
-
-            // I420: Y + U + V planes
-            // UV dimensions derived from actual data (supports I422/I444 tagged as I420)
-            PixelFormat::I420 => {
-                self.write_plane(
-                    tex_y,
-                    input.y_data,
-                    input.y_stride,
-                    input.width,
-                    input.height,
-                );
-                if let Some(uv_data) = input.uv_data {
-                    let (uv_w, uv_h) = input
-                        .uv_dimensions
-                        .ok_or("Missing active chroma geometry")?;
-                    self.write_plane(tex_uv, uv_data, input.uv_stride, uv_w, uv_h);
-                }
-                if let Some(v_data) = input.v_data {
-                    let (v_w, v_h) = input
-                        .uv_dimensions
-                        .ok_or("Missing active chroma geometry")?;
-                    self.write_plane(tex_v, v_data, input.v_stride, v_w, v_h);
-                }
-            }
-
-            // Gray8: single channel
-            PixelFormat::Gray8 => {
-                self.write_plane(
-                    tex_y,
-                    input.y_data,
-                    input.y_stride,
-                    input.width,
-                    input.height,
-                );
-            }
-
-            // RGBA-family: 4 bytes per pixel, uploaded as Rgba8Unorm
-            PixelFormat::RGB24 => self.write_plane(
-                tex_y,
-                input.y_data,
-                input.y_stride,
-                input.width * 3,
-                input.height,
-            ),
-            PixelFormat::RGBA | PixelFormat::ABGR | PixelFormat::BGRA => {
-                self.write_plane(
-                    tex_y,
-                    input.y_data,
-                    input.y_stride,
-                    input.width,
-                    input.height,
-                );
-            }
-
-            // Bayer uploads belong exclusively to the validated float path.
+            PixelFormat::RGB24 => input.width * 3,
             PixelFormat::BayerRGGB
             | PixelFormat::BayerBGGR
             | PixelFormat::BayerGRBG
             | PixelFormat::BayerGBRG => {
                 return Err("Bayer upload requires the canonical Bayer conversion path".into());
+            }
+            PixelFormat::NV12
+            | PixelFormat::NV21
+            | PixelFormat::I420
+            | PixelFormat::Gray8
+            | PixelFormat::RGBA
+            | PixelFormat::ABGR
+            | PixelFormat::BGRA => input.width,
+        };
+        self.write_plane(tex_y, input.y_data, input.y_stride, y_width, input.height);
+
+        if matches!(
+            input.format,
+            PixelFormat::NV12 | PixelFormat::NV21 | PixelFormat::I420
+        ) {
+            if let Some(uv_data) = input.uv_data {
+                let (w, h) = input
+                    .uv_dimensions
+                    .ok_or("Missing active chroma geometry")?;
+                self.write_plane(tex_uv, uv_data, input.uv_stride, w, h);
+            }
+            // Planar I420 also carries the active I422/I444 geometry from MJPEG.
+            if input.format == PixelFormat::I420
+                && let Some(v_data) = input.v_data
+            {
+                let (w, h) = input
+                    .uv_dimensions
+                    .ok_or("Missing active chroma geometry")?;
+                self.write_plane(tex_v, v_data, input.v_stride, w, h);
             }
         }
 
