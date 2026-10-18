@@ -1491,26 +1491,11 @@ impl AppModel {
             );
         }
 
-        // Window control buttons
-        cells.push(axis_gap(5.0));
-        cells.push(
-            widget::button::icon(icon::from_name("window-minimize-symbolic").symbolic(true))
-                .extra_small()
-                .on_press(Message::WindowMinimize)
-                .into(),
-        );
-        cells.push(
-            widget::button::icon(icon::from_name("window-maximize-symbolic").symbolic(true))
-                .extra_small()
-                .on_press(Message::WindowToggleMaximize)
-                .into(),
-        );
-        cells.push(
-            widget::button::icon(icon::from_name("window-close-symbolic").symbolic(true))
-                .extra_small()
-                .on_press(Message::WindowClose)
-                .into(),
-        );
+        let window_controls = self.build_window_control_buttons();
+        if !window_controls.is_empty() {
+            cells.push(axis_gap(5.0));
+            cells.extend(window_controls);
+        }
 
         // Portrait keeps the historical `Row`; sideways folds the same cells
         // into a `Column`. The top bar's window controls belong at the strip's
@@ -1559,6 +1544,36 @@ impl AppModel {
             .on_drag(Message::WindowDrag)
             .on_double_press(Message::WindowToggleMaximize)
             .into()
+    }
+
+    /// Keep desktop button placement while respecting the requested visibility.
+    fn build_window_control_buttons(&self) -> Vec<Element<'_, Message>> {
+        [
+            (
+                self.window_controls.minimize,
+                "window-minimize-symbolic",
+                Message::WindowMinimize,
+            ),
+            (
+                self.window_controls.maximize,
+                "window-maximize-symbolic",
+                Message::WindowToggleMaximize,
+            ),
+            (
+                self.window_controls.close,
+                "window-close-symbolic",
+                Message::WindowClose,
+            ),
+        ]
+        .into_iter()
+        .filter(|(visible, _, _)| *visible)
+        .map(|(_, name, message)| {
+            widget::button::icon(icon::from_name(name).symbolic(true))
+                .extra_small()
+                .on_press(message)
+                .into()
+        })
+        .collect()
     }
 
     /// Build the format button (resolution/FPS display)
@@ -2570,6 +2585,39 @@ mod bar_insets_tests {
         assert_eq!(layout.top_bar, crate::app::bar_layout::Edge::Right);
         assert_eq!(insets.left, m.bottom_ui_height());
         assert_eq!(insets.right, m.top_ui_height());
+    }
+}
+
+#[cfg(test)]
+mod window_controls_tests {
+    use super::*;
+    use crate::app::window_controls::WindowControls;
+    use crate::backends::display_orientation::DisplayOrientation;
+
+    #[test]
+    fn window_controls_follow_live_mobile_and_desktop_requests_in_every_rotation() {
+        for orientation in [
+            DisplayOrientation::Rotate0,
+            DisplayOrientation::Rotate90,
+            DisplayOrientation::Rotate180,
+            DisplayOrientation::Rotate270,
+        ] {
+            let mut model = AppModel {
+                display_orientation: orientation,
+                ..Default::default()
+            };
+            assert_eq!(model.build_window_control_buttons().len(), 3);
+            for (layout, count) in [
+                ("appmenu:", 0),
+                (":close", 1),
+                (":minimize,maximize,close", 3),
+            ] {
+                let controls = WindowControls::from_button_layout(layout);
+                let _ = model.update(Message::WindowControlsChanged(controls));
+                assert_eq!(model.window_controls, controls);
+                assert_eq!(model.build_window_control_buttons().len(), count);
+            }
+        }
     }
 }
 
