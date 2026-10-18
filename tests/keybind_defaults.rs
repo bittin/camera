@@ -97,8 +97,9 @@ fn every_default_keybind_round_trips_through_serde() {
         };
         let ser = SerializedKeyBind::from(&kb);
         let round_tripped = ser.to_keybind();
-        assert!(
-            round_tripped.is_some(),
+        assert_eq!(
+            round_tripped.as_ref(),
+            Some(&kb),
             "default for {a:?} failed serde round-trip (key={:?})",
             kb.key,
         );

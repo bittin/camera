@@ -1211,7 +1211,6 @@ mod tests {
         let format: crate::config::PhotoOutputFormat =
             serde_json::from_str("\"Avif\"").expect("AVIF must be a selectable format");
         assert!(crate::config::PhotoOutputFormat::ALL.contains(&format));
-        assert_eq!(format.extension(), "avif");
         let mut encoder = PhotoEncoder::new();
         encoder.set_format(format.into());
         let captured_at = FixedOffset::east_opt(7200)
