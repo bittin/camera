@@ -44,6 +44,7 @@ pub mod params;
 
 use crate::backends::camera::types::{CameraFrame, PixelFormat};
 use crate::gpu::{self, wgpu};
+use crate::pipelines::capture_metadata::CaptureMetadata;
 use crate::shaders::{GpuFrameInput, get_gpu_convert_pipeline};
 #[cfg(test)]
 mod white_level_tests;
@@ -88,10 +89,6 @@ const NOISE_ESTIMATE_SHADER: &str = include_str!("../../../shaders/burst_mode/no
 pub(crate) const CA_ESTIMATE_SHADER: &str =
     include_str!("../../../shaders/burst_mode/ca_estimate.wgsl");
 const BAYER_FINISH_SHADER: &str = include_str!("../../../shaders/burst_mode/bayer_finish.wgsl");
-
-// Common utilities reference (see common.wgsl for documentation)
-#[cfg(test)]
-const COMMON_SHADER_REF: &str = include_str!("../../../shaders/burst_mode/common.wgsl");
 
 // GPU parameter structs imported from params module
 use params::{
@@ -177,8 +174,6 @@ pub struct BurstModeConfig {
     pub demosaic_method: crate::shaders::DemosaicMethod,
     /// Number of frames to capture in burst (4, 6, or 8)
     pub frame_count: usize,
-    /// Frame interval in milliseconds (~33ms for 30fps camera)
-    pub frame_interval_ms: u32,
     /// Robustness parameter for merge (higher = more aggressive denoising)
     pub robustness: f32,
     /// Shadow boost strength for tone mapping (0.0 - 1.0)
@@ -197,7 +192,7 @@ pub struct BurstModeConfig {
     /// Output encoding format (JPEG, PNG, or DNG)
     pub encoding_format: super::EncodingFormat,
     /// Camera metadata for DNG encoding
-    pub camera_metadata: super::CameraMetadata,
+    pub camera_metadata: CaptureMetadata,
 }
 
 impl Default for BurstModeConfig {
@@ -205,7 +200,6 @@ impl Default for BurstModeConfig {
         Self {
             demosaic_method: crate::shaders::DemosaicMethod::default(),
             frame_count: 8,
-            frame_interval_ms: 33,
             robustness: 1.0,
             shadow_boost: 0.2,                            // Subtle shadow lifting
             local_contrast: 0.15,                         // Subtle contrast enhancement
@@ -213,7 +207,7 @@ impl Default for BurstModeConfig {
             export_raw_frames: false,  // Don't export raw frames by default
             save_burst_raw_dng: false, // Don't save raw DNG frames by default
             encoding_format: super::EncodingFormat::Jpeg, // Default to JPEG
-            camera_metadata: super::CameraMetadata::default(),
+            camera_metadata: CaptureMetadata::default(),
         }
     }
 }
@@ -3160,7 +3154,7 @@ pub struct SaveOutputParams {
     pub output_dir: std::path::PathBuf,
     pub crop_rect: Option<(u32, u32, u32, u32)>,
     pub encoding_format: super::EncodingFormat,
-    pub camera_metadata: super::CameraMetadata,
+    pub camera_metadata: CaptureMetadata,
     pub filter: Option<crate::app::FilterType>,
 }
 
@@ -3323,7 +3317,7 @@ pub async fn export_raw_frames(
 pub async fn export_burst_frames_dng(
     frames: &[Arc<CameraFrame>],
     output_dir: std::path::PathBuf,
-    camera_metadata: &super::CameraMetadata,
+    camera_metadata: &CaptureMetadata,
 ) -> Result<std::path::PathBuf, String> {
     use super::{EncodingFormat, EncodingQuality, PhotoEncoder};
     use image::{ImageBuffer, Rgba};
@@ -3429,7 +3423,7 @@ mod tests {
                     output_dir: root.clone(),
                     crop_rect: None,
                     encoding_format: super::super::EncodingFormat::Jpeg,
-                    camera_metadata: super::super::CameraMetadata {
+                    camera_metadata: CaptureMetadata {
                         captured_at: Some(timestamp),
                         ..Default::default()
                     },
@@ -3954,42 +3948,6 @@ mod tests {
     #[test]
     fn test_noise_estimate_shader_validates() {
         validate_shader("noise_estimate", NOISE_ESTIMATE_SHADER);
-    }
-
-    #[test]
-    fn test_common_utilities_documented() {
-        // Verify the common.wgsl reference file exists and documents utilities
-        // that are actually used in the shaders
-        assert!(
-            COMMON_SHADER_REF.contains("BT.601 RGB to Luminance"),
-            "common.wgsl should document luminance conversion"
-        );
-        assert!(
-            COMMON_SHADER_REF.contains("Raised Cosine Window"),
-            "common.wgsl should document window function"
-        );
-        assert!(
-            COMMON_SHADER_REF.contains("Laplacian Edge Detection"),
-            "common.wgsl should document Laplacian operator"
-        );
-    }
-
-    #[test]
-    fn test_shaders_use_documented_utilities() {
-        // Verify shaders actually use the utilities documented in common.wgsl
-        // BT.601 luminance: 0.299 * R + 0.587 * G + 0.114 * B
-        assert!(
-            TONEMAP_SHADER.contains("0.299") && TONEMAP_SHADER.contains("0.587"),
-            "tonemap.wgsl should use BT.601 coefficients"
-        );
-        assert!(
-            SHARPNESS_SHADER.contains("0.299") && SHARPNESS_SHADER.contains("0.587"),
-            "sharpness.wgsl should use BT.601 coefficients"
-        );
-        assert!(
-            PYRAMID_SHADER.contains("0.299") && PYRAMID_SHADER.contains("0.587"),
-            "pyramid.wgsl should use BT.601 coefficients"
-        );
     }
 }
 

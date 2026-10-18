@@ -117,14 +117,11 @@ pub struct RawBayerData {
     pub format: PixelFormat,
 }
 
-/// Backwards-compatible name used by the photo pipeline API.
-pub type CameraMetadata = CaptureMetadata;
-
 /// Photo encoder
 pub struct PhotoEncoder {
     format: EncodingFormat,
     quality: EncodingQuality,
-    camera_metadata: CameraMetadata,
+    camera_metadata: CaptureMetadata,
 }
 
 struct MetadataFallback<'a> {
@@ -134,7 +131,7 @@ struct MetadataFallback<'a> {
 }
 
 impl PhotoEncoder {
-    fn complete_host_metadata(metadata: &mut CameraMetadata) {
+    fn complete_host_metadata(metadata: &mut CaptureMetadata) {
         let host = crate::pipelines::capture_metadata::host_device_metadata();
         if metadata.device_make.is_none() {
             metadata.device_make.clone_from(&host.make);
@@ -149,7 +146,7 @@ impl PhotoEncoder {
         Self {
             format: EncodingFormat::Jpeg,
             quality: EncodingQuality::High,
-            camera_metadata: CameraMetadata::default(),
+            camera_metadata: CaptureMetadata::default(),
         }
     }
 
@@ -169,7 +166,7 @@ impl PhotoEncoder {
     }
 
     /// Set camera metadata for DNG encoding
-    pub fn set_camera_metadata(&mut self, metadata: CameraMetadata) {
+    pub fn set_camera_metadata(&mut self, metadata: CaptureMetadata) {
         self.camera_metadata = metadata;
     }
 
@@ -547,7 +544,7 @@ impl PhotoEncoder {
         file_type: FileExtension,
         width: u32,
         height: u32,
-        camera_metadata: &CameraMetadata,
+        camera_metadata: &CaptureMetadata,
         fallback: MetadataFallback<'_>,
     ) -> Vec<u8> {
         let metadata = build_standard_exif(width, height, camera_metadata);
@@ -650,7 +647,7 @@ impl PhotoEncoder {
         image: &RgbImage,
         width: u32,
         height: u32,
-        camera_metadata: &CameraMetadata,
+        camera_metadata: &CaptureMetadata,
     ) -> Result<Vec<u8>, String> {
         use dng::ifd::{IfdValue, Offsets};
         use dng::tags::ifd as tiff_tags;
@@ -698,7 +695,7 @@ impl PhotoEncoder {
     /// for later raw processing in tools like RawTherapee or darktable.
     fn encode_dng_raw(
         raw: &RawBayerData,
-        camera_metadata: &CameraMetadata,
+        camera_metadata: &CaptureMetadata,
     ) -> Result<Vec<u8>, String> {
         use dng::ifd::{IfdValue, Offsets};
         use dng::tags::ifd as tiff_tags;
@@ -847,7 +844,7 @@ fn avif_thread_count(available: usize) -> usize {
     available.saturating_sub(2).max(1)
 }
 
-fn build_standard_exif(width: u32, height: u32, camera_metadata: &CameraMetadata) -> Metadata {
+fn build_standard_exif(width: u32, height: u32, camera_metadata: &CaptureMetadata) -> Metadata {
     let mut metadata = Metadata::new();
 
     metadata.set_tag(ExifTag::ExifImageWidth(vec![width]));
@@ -920,7 +917,7 @@ impl dng::ifd::Offsets for DngOffsets {
 fn set_common_dng_tags(
     width: u32,
     height: u32,
-    camera_metadata: &CameraMetadata,
+    camera_metadata: &CaptureMetadata,
     _version: &str,
 ) -> dng::ifd::Ifd {
     use dng::ifd::{Ifd, IfdValue};
@@ -1221,7 +1218,7 @@ mod tests {
             .unwrap()
             .with_ymd_and_hms(2026, 9, 28, 14, 5, 6)
             .unwrap();
-        encoder.set_camera_metadata(CameraMetadata {
+        encoder.set_camera_metadata(CaptureMetadata {
             captured_at: Some(captured_at),
             device_make: Some("Google".into()),
             device_model: Some("Pixel 3a".into()),
@@ -1373,7 +1370,7 @@ mod tests {
             .unwrap()
             .with_nanosecond(123_000_000)
             .unwrap();
-        let camera_metadata = CameraMetadata {
+        let camera_metadata = CaptureMetadata {
             camera_name: Some("Back Camera".into()),
             camera_driver: Some("libcamera".into()),
             sensor_model: Some("sony,imx363".into()),
@@ -1467,7 +1464,7 @@ mod tests {
     #[test]
     fn png_metadata_uses_standard_exif_chunk() {
         let source = test_image(65, 33);
-        let camera_metadata = CameraMetadata {
+        let camera_metadata = CaptureMetadata {
             orientation: crate::pipelines::capture_metadata::CaptureOrientation::Rotate270,
             ..Default::default()
         };

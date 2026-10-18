@@ -6,6 +6,7 @@
 
 use crate::app::state::{AppModel, CameraMode, Message, RecordingState, TimelapseState};
 use crate::backends::camera::types::RecordingFrame;
+use crate::pipelines::capture_metadata::CaptureMetadata;
 use crate::pipelines::photo::burst_mode::BurstModeConfig;
 use crate::pipelines::photo::burst_mode::burst::{
     calculate_adaptive_params, estimate_scene_brightness,
@@ -216,12 +217,12 @@ impl AppModel {
     }
 
     /// Build camera metadata (name, driver, exposure info) for photo encoding.
-    pub(super) fn build_camera_metadata(&self) -> crate::pipelines::photo::CameraMetadata {
+    pub(super) fn build_camera_metadata(&self) -> CaptureMetadata {
         let host = crate::pipelines::capture_metadata::cached_host_device_metadata();
         let mut metadata = self
             .available_cameras
             .get(self.current_camera_index)
-            .map(|cam| crate::pipelines::photo::CameraMetadata {
+            .map(|cam| CaptureMetadata {
                 camera_name: Some(cam.name.clone()),
                 camera_driver: cam.device_info.as_ref().map(|info| info.driver.clone()),
                 sensor_model: cam.sensor_model.clone(),
@@ -233,7 +234,7 @@ impl AppModel {
                 captured_at: Some(chrono::Local::now().fixed_offset()),
                 ..Default::default()
             })
-            .unwrap_or_else(|| crate::pipelines::photo::CameraMetadata {
+            .unwrap_or_else(|| CaptureMetadata {
                 device_make: host.and_then(|h| h.make.clone()),
                 device_model: host.and_then(|h| h.model.clone()),
                 captured_at: Some(chrono::Local::now().fixed_offset()),
@@ -2152,16 +2153,16 @@ impl AppModel {
                     }
                 });
                 // frame_tx moved into the task; create a dummy sender for the
-                // backend manager so the rest of the code doesn't panic.
+                // recording bridge so the rest of the code doesn't panic.
                 let (dummy_tx, _dummy_rx) = tokio::sync::mpsc::channel(1);
-                if let Some(ref manager) = self.backend_manager {
+                if let Some(ref manager) = self.recording_bridge {
                     manager.set_recording_sender(Some(dummy_tx));
                     manager.set_jpeg_recording_mode(false);
                 }
             }
         } else {
             // Direct path: capture thread → appsrc (bypasses UI thread entirely)
-            if let Some(ref manager) = self.backend_manager {
+            if let Some(ref manager) = self.recording_bridge {
                 manager.set_recording_sender(Some(frame_tx));
                 manager.set_jpeg_recording_mode(use_jpeg_pipeline);
             }
@@ -2180,7 +2181,7 @@ impl AppModel {
             Some(audio_levels.clone()),
         );
 
-        let backend_manager = self.backend_manager.clone();
+        let recording_bridge = self.recording_bridge.clone();
         let va_jpeg_dec_name = va_jpeg_dec.map(|s| s.to_string());
         let live_filter = self.recording_filter_code.clone();
         let record_audio = self.config.record_audio;
@@ -2192,7 +2193,7 @@ impl AppModel {
                 let rt_handle = tokio::runtime::Handle::current();
 
                 // Clone for use inside spawn_blocking's fallback path
-                let backend_manager_inner = backend_manager.clone();
+                let recording_bridge_inner = recording_bridge.clone();
 
                 let recorder = tokio::task::spawn_blocking(move || {
                     // Enter the runtime context so tokio::spawn works inside
@@ -2255,14 +2256,14 @@ impl AppModel {
                                     "VA-API JPEG pipeline failed, falling back to legacy"
                                 );
                                 // Clear jpeg mode so capture thread sends decoded frames
-                                if let Some(ref manager) = backend_manager_inner {
+                                if let Some(ref manager) = recording_bridge_inner {
                                     manager.set_jpeg_recording_mode(false);
                                 }
                                 // Need a new channel since the old rx was consumed
                                 // This is a rare error path — the recording will start
                                 // without any buffered frames, which is acceptable.
                                 let (fallback_tx, fallback_rx) = tokio::sync::mpsc::channel(15);
-                                if let Some(ref manager) = backend_manager_inner {
+                                if let Some(ref manager) = recording_bridge_inner {
                                     manager.set_recording_sender(Some(fallback_tx));
                                 }
                                 VideoRecorder::new_from_appsrc(
@@ -2289,7 +2290,7 @@ impl AppModel {
 
                 // Clear the direct recording sender — drops the Sender, closing
                 // the channel so the appsrc pusher sees None and sends EOS.
-                if let Some(ref manager) = backend_manager {
+                if let Some(ref manager) = recording_bridge {
                     manager.set_recording_sender(None);
                     manager.set_jpeg_recording_mode(false);
                 }
@@ -2750,7 +2751,7 @@ async fn save_first_burst_frame(
     save_dir: &std::path::Path,
     crop_rect: Option<(u32, u32, u32, u32)>,
     encoding_format: crate::pipelines::photo::EncodingFormat,
-    camera_metadata: &crate::pipelines::photo::CameraMetadata,
+    camera_metadata: &CaptureMetadata,
     filter: crate::app::FilterType,
 ) -> Result<PathBuf, String> {
     use crate::pipelines::photo::burst_mode::{MergedFrame, SaveOutputParams, save_output};

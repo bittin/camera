@@ -7,7 +7,7 @@ use crate::app::exposure_picker::{
 };
 use crate::app::frame_processor::{QrDetection, tasks::QrDetectionScheduler};
 use crate::backends::audio::AudioDevice;
-use crate::backends::camera::CameraBackendManager;
+use crate::backends::camera::RecordingBridge;
 use crate::backends::camera::types::{CameraDevice, CameraFormat, CameraFrame};
 use crate::config::Config;
 use crate::media::encoders::video::EncoderInfo;
@@ -807,8 +807,8 @@ pub struct AppModel {
     /// V4L2 device path the user is trying to switch to (set when switching
     /// to a hotplugged camera that needs full re-enumeration).
     pub pending_hotplug_switch: Option<String>,
-    /// Camera backend manager
-    pub backend_manager: Option<CameraBackendManager>,
+    /// Recording channel and mode shared across capture-pipeline restarts.
+    pub recording_bridge: Option<RecordingBridge>,
     /// Flag to cancel camera subscription (used when switching backends/cameras)
     pub camera_cancel_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Counter to force camera stream restart (incremented to change subscription ID)

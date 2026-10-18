@@ -396,9 +396,8 @@ impl cosmic::Application for AppModel {
             })
             .collect();
 
-        // Create backend manager
-        info!("Creating libcamera backend");
-        let backend_manager = crate::backends::camera::CameraBackendManager::new();
+        // Recording state survives capture-pipeline restarts.
+        let recording_bridge = crate::backends::camera::RecordingBridge::default();
 
         // Read the Copy flags before `flags.preview_source` is moved below.
         let preview_spoof_recording = flags.preview_spoof_recording;
@@ -546,7 +545,7 @@ impl cosmic::Application for AppModel {
             gallery_thumbnail_rgba: None,
             picker_selected_resolution: None,
             pending_hotplug_switch: None,
-            backend_manager: Some(backend_manager),
+            recording_bridge: Some(recording_bridge),
             camera_cancel_flag: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             camera_stream_restart_counter: 0,
             still_capture: Default::default(),
@@ -1027,9 +1026,9 @@ impl cosmic::Application for AppModel {
 
         // Get the shared recording sender Arc so the capture thread can forward
         // frames directly to the appsrc recording pipeline (libcamera only).
-        let recording_sender = self.backend_manager.as_ref().map(|m| m.recording_sender());
+        let recording_sender = self.recording_bridge.as_ref().map(|s| s.recording_sender());
         let jpeg_recording_mode = self
-            .backend_manager
+            .recording_bridge
             .as_ref()
             .map(|m| m.jpeg_recording_mode())
             .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));

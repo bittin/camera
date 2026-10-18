@@ -6,34 +6,14 @@
 //! Native libcamera is preferred. Processed V4L2 cameras it does not enumerate
 //! are discovered and streamed through the user's PipeWire session.
 //!
-//! # Architecture
-//!
-//! ```text
-//! ┌─────────────────────┐
-//! │   UI Layer (App)    │
-//! └──────────┬──────────┘
-//!            │
-//!            ▼
-//! ┌─────────────────────┐
-//! │ CameraBackendManager│  ← Lifecycle management, crash recovery
-//! └──────────┬──────────┘
-//!            │
-//!            ▼
-//! ┌─────────────────────┐
-//! │  CameraBackend Trait│  ← Common interface
-//! └──────────┬──────────┘
-//!            │
-//!            ▼
-//!       ┌──────────┐
-//!       │libcamera │  ← Native libcamera-rs bindings
-//!       └──────────┘
-//! ```
+//! Capture pipelines own camera lifecycle and acquisition. [`RecordingBridge`]
+//! keeps the recording channel and JPEG mode shared across pipeline restarts.
 
 pub mod libcamera;
-pub mod manager;
 pub(crate) mod pipeline;
 pub(crate) mod pipewire;
 pub(crate) mod preview_metrics;
+pub mod recording;
 pub(crate) mod still_capture;
 pub mod synthetic;
 pub mod types;
@@ -41,7 +21,7 @@ mod usb_name;
 pub mod v4l2_controls;
 pub mod v4l2_utils;
 
-pub use manager::CameraBackendManager;
+pub use recording::RecordingBridge;
 pub use types::*;
 
 /// Complete camera backend trait

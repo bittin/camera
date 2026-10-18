@@ -481,10 +481,10 @@ pub fn process_burst_mode(
     input: Vec<PathBuf>,
     output: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use camera::pipelines::photo::EncodingFormat;
     use camera::pipelines::photo::burst_mode::{
         BurstModeConfig, SaveOutputParams, process_burst_mode as run_burst_mode, save_output,
     };
-    use camera::pipelines::photo::{CameraMetadata, EncodingFormat};
 
     // Collect all image paths from input (can be files or directories)
     let image_paths = collect_image_paths(&input)?;
@@ -546,7 +546,7 @@ pub fn process_burst_mode(
     })?;
 
     // Save output
-    let camera_metadata = CameraMetadata {
+    let camera_metadata = CaptureMetadata {
         camera_name: Some("Burst Mode CLI".to_string()),
         camera_driver: None,
         exposure_time: None,
