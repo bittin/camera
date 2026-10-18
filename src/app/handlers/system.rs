@@ -977,9 +977,7 @@ impl AppModel {
 
         // For the raw/capture stream we use the same still-capture mechanism as burst mode
         let is_multistream = self.is_current_camera_multistream();
-        let still_requested = std::sync::Arc::clone(&self.still_capture_requested);
-        let still_frame = std::sync::Arc::clone(&self.latest_still_frame);
-        let still_frame_notify = std::sync::Arc::clone(&self.still_frame_notify);
+        let still_capture = std::sync::Arc::clone(&self.still_capture);
 
         let save_dir =
             crate::app::get_photo_directory(&self.config.save_folder_name).join("insights");
@@ -1034,15 +1032,11 @@ impl AppModel {
 
                     // --- Raw/capture stream frame ---
                     if is_multistream {
-                        still_requested.store(true, std::sync::atomic::Ordering::Release);
+                        let still_request = still_capture.request();
 
                         let timeout = std::time::Duration::from_secs(2);
-                        let raw_frame = super::capture::wait_for_still_frame(
-                            &still_frame,
-                            &still_frame_notify,
-                            timeout,
-                        )
-                        .await;
+                        let raw_frame =
+                            super::capture::wait_for_still_frame(still_request, timeout).await;
                         if raw_frame.is_none() {
                             info!(frame = i + 1, "Timeout waiting for raw frame, skipping");
                         }

@@ -323,7 +323,7 @@ impl AppModel {
             recorder.postroll_requests.load(Ordering::Acquire) != 0
         });
         if !needs_postroll
-            && !self.still_capture_requested.load(Ordering::Acquire)
+            && !self.still_capture.has_request()
             && !self.burst_mode.is_collecting_frames()
         {
             self.camera_cancel_flag.store(true, Ordering::Release);

@@ -43,6 +43,7 @@ fn build_ringed_circle(
     ring_color: Color,
     button_size: f32,
     anim_scale: f32,
+    loading: bool,
 ) -> Element<'static, Message> {
     let base_inner = ui::CAPTURE_BUTTON_INNER * button_size;
     let border_w = RING_WIDTH * button_size;
@@ -81,6 +82,23 @@ fn build_ringed_circle(
         ..Default::default()
     });
 
+    let circle: Element<'static, Message> = if loading {
+        let spinner = widget::container(
+            widget::progress_bar::indeterminate_circular()
+                .size(base_inner * 0.55)
+                .bar_color(Color::from_rgb(0.55, 0.55, 0.55))
+                .track_color(Color::TRANSPARENT)
+                .border_color(Color::TRANSPARENT),
+        )
+        .width(Length::Fixed(fill_size))
+        .height(Length::Fixed(fill_size))
+        .center_x(fill_size)
+        .center_y(fill_size);
+        cosmic::iced::widget::stack![circle, spinner].into()
+    } else {
+        circle.into()
+    };
+
     // Ring with fill centered inside
     let ringed = widget::container(
         widget::container(circle)
@@ -114,6 +132,14 @@ fn build_ringed_circle(
 }
 
 impl AppModel {
+    /// Count accepted photos, including the frame currently being acquired.
+    fn photo_queue_at_capacity(&self) -> bool {
+        self.photo_jobs
+            .len()
+            .saturating_add(usize::from(self.hardware_photo_id.is_some()))
+            >= 8
+    }
+
     /// Animate capture button scale toward a new target.
     /// Call this whenever the button's target scale changes.
     pub fn animate_capture_scale(&mut self, target: f32) {
@@ -169,7 +195,19 @@ impl AppModel {
     /// Build the interactive capture circle (Shrink width, no outer Fill container).
     /// Used by both the centered layout and the recording row layout.
     pub(crate) fn build_capture_circle(&self) -> Element<'_, Message> {
-        let is_disabled = self.transition_state.ui_disabled || self.burst_mode.is_active();
+        // Acquisition alone does not grey the shutter. Handlers still silently
+        // reject overlapping requests; only a full queue shows the spinner.
+        let photo_action = self.mode == CameraMode::Photo
+            && !self.quick_record.is_recording()
+            && self.photo_timer_countdown.is_none();
+        let loading = photo_action && self.photo_queue_at_capacity();
+        let is_disabled = loading
+            || ((self.pending_close
+                || self.transition_state.ui_disabled
+                || self.burst_mode.is_active())
+                && !self.quick_record.is_recording()
+                && !(self.mode == CameraMode::Video && self.recording.is_recording())
+                && self.photo_timer_countdown.is_none());
 
         let theme = cosmic::theme::active();
         let cosmic_theme = theme.cosmic();
@@ -203,10 +241,11 @@ impl AppModel {
         };
 
         let scale = self.current_capture_scale();
-        let base_circle = build_ringed_circle(color, color, 1.0, scale);
+        let base_circle = build_ringed_circle(color, color, 1.0, scale, loading);
 
         // Overlay timer seconds on the capture button when timer is set in Photo mode
-        let circle: Element<'_, Message> = if self.mode == CameraMode::Photo
+        let circle: Element<'_, Message> = if !loading
+            && self.mode == CameraMode::Photo
             && self.photo_timer_setting != PhotoTimerSetting::Off
             && self.photo_timer_countdown.is_none()
         {
@@ -270,11 +309,347 @@ impl AppModel {
         let theme = cosmic::theme::active();
         let cosmic_theme = theme.cosmic();
         let accent: Color = cosmic_theme.accent_color().into();
-        let circle = build_ringed_circle(accent, accent, PHOTO_BTN_SIZE_RATIO, scale);
+        let loading = self.photo_queue_at_capacity();
+        let is_disabled = loading
+            || self.pending_close
+            || self.transition_state.ui_disabled
+            || self.burst_mode.is_active();
+        let color = if is_disabled {
+            Color::from_rgba(0.5, 0.5, 0.5, 0.3)
+        } else {
+            accent
+        };
+        let circle = build_ringed_circle(color, color, PHOTO_BTN_SIZE_RATIO, scale, loading);
+        if is_disabled {
+            return circle;
+        }
 
         widget::mouse_area(circle)
             .on_press(Message::Capture)
             .interaction(cosmic::iced::mouse::Interaction::Pointer)
             .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::advanced::{
+        Layout, Shell, clipboard, layout, renderer::Headless, widget::Tree,
+    };
+    use cosmic::iced::{Event, Font, Pixels, Point, Rectangle, Size, mouse, window};
+
+    fn renderer() -> cosmic::Renderer {
+        pollster::block_on(cosmic::Renderer::new(
+            Font::DEFAULT,
+            Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .expect("headless software renderer")
+    }
+
+    fn exercise(
+        mut element: Element<'_, Message>,
+        renderer: &cosmic::Renderer,
+    ) -> (Vec<Message>, bool, Size) {
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(200.0, 200.0)),
+        );
+        let viewport = Rectangle::with_size(Size::new(200.0, 200.0));
+        let mut messages = Vec::new();
+        let mut animates = false;
+        for event in [
+            Event::Window(window::Event::RedrawRequested(std::time::Instant::now())),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        ] {
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(Point::new(
+                    node.size().width / 2.0,
+                    node.size().height / 2.0,
+                )),
+                renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+            animates |= shell.redraw_request() != window::RedrawRequest::Wait;
+        }
+        (messages, animates, node.size())
+    }
+
+    #[test]
+    fn photo_readiness_tracks_acquisition_capacity_and_recovers_after_failure() {
+        let renderer = renderer();
+        for motion in [false, true] {
+            let mut model = AppModel::default();
+            model.config.motion_photo = motion;
+            model.mode = CameraMode::Photo;
+            model.capture_scale_to = 1.0;
+            model.photo_btn_scale_to = 1.0;
+            for blocked in 0..6 {
+                match blocked {
+                    0 => model.is_capturing = true,
+                    1 => model.hardware_photo_id = Some(7),
+                    2 => model.burst_mode.stage = crate::app::state::BurstModeStage::Processing,
+                    3 => {
+                        for id in 1..=8 {
+                            model.photo_jobs.insert(
+                                id,
+                                crate::app::handlers::motion_photo::PhotoJob {
+                                    live: None,
+                                    still_path: None,
+                                },
+                            );
+                        }
+                    }
+                    4 => model.pending_close = true,
+                    5 => model.transition_state.ui_disabled = true,
+                    _ => unreachable!(),
+                }
+                assert!(!model.can_accept_photo(), "blocker {blocked}");
+                for element in [
+                    model.build_capture_circle(),
+                    model.build_photo_during_recording_button(),
+                ] {
+                    let (messages, animates, _) = exercise(element, &renderer);
+                    assert_eq!(messages.is_empty(), blocked >= 2, "blocker {blocked}");
+                    assert_eq!(animates, blocked == 3, "spinner only for queue capacity");
+                }
+                let next_id = model.next_photo_id;
+                for task in [
+                    model.capture_photo(),
+                    model.handle_capture_button_pressed(),
+                    model.handle_capture(),
+                ] {
+                    assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+                }
+                assert_eq!(model.next_photo_id, next_id);
+                assert!(!model.still_capture.has_request());
+                assert!(model.motion_photo_error.is_none());
+                assert!(!model.quick_record.is_pressed());
+                model.is_capturing = false;
+                model.hardware_photo_id = None;
+                model.burst_mode.stage = crate::app::state::BurstModeStage::Idle;
+                model.photo_jobs.clear();
+                model.pending_close = false;
+                model.transition_state.ui_disabled = false;
+                assert!(model.can_accept_photo());
+            }
+            // Hardware acquisition releases while earlier encoding remains busy.
+            for id in 1..=6 {
+                model.photo_jobs.insert(
+                    id,
+                    crate::app::handlers::motion_photo::PhotoJob {
+                        live: None,
+                        still_path: None,
+                    },
+                );
+            }
+            model.is_capturing = true;
+            model.hardware_photo_id = Some(7);
+            let _ = model.update(Message::PhotoCaptureAcquired(7));
+            assert_eq!(model.photo_jobs.len(), 7);
+            assert!(model.can_accept_photo());
+            assert!(
+                !exercise(model.build_capture_circle(), &renderer)
+                    .0
+                    .is_empty()
+            );
+            assert!(
+                !exercise(model.build_photo_during_recording_button(), &renderer)
+                    .0
+                    .is_empty()
+            );
+            model.hardware_photo_id = Some(8);
+            model.is_capturing = true;
+            let _ = model.update(Message::PhotoCaptureAcquired(8));
+            assert!(!model.can_accept_photo());
+            let _ = model.update(Message::PhotoCaptureFinished(
+                1,
+                Err("real encoding failure".into()),
+            ));
+            assert_eq!(model.photo_jobs.len(), 7);
+            assert_eq!(
+                model.motion_photo_error.as_deref(),
+                Some("real encoding failure")
+            );
+            assert!(
+                model.can_accept_photo(),
+                "diagnostics must not permanently lock the shutter"
+            );
+            let (messages, animates, _) =
+                exercise(model.build_photo_during_recording_button(), &renderer);
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| matches!(message, Message::Capture))
+            );
+            assert!(!animates);
+        }
+    }
+
+    #[test]
+    fn photo_backpressure_never_disables_recording_stop_or_timer_cancel() {
+        use crate::app::state::{QuickRecordState, RecordingState};
+        let renderer = renderer();
+        let mut model = AppModel {
+            capture_scale_to: 1.0,
+            mode: CameraMode::Video,
+            ..Default::default()
+        };
+        model.burst_mode.stage = crate::app::state::BurstModeStage::Processing;
+        model.transition_state.ui_disabled = true;
+        model.recording = RecordingState::Recording {
+            session: 1,
+            start_time: std::time::Instant::now(),
+            file_path: String::new(),
+            stop_sender: None,
+            audio_levels: None,
+        };
+        assert!(
+            exercise(model.build_capture_circle(), &renderer)
+                .0
+                .iter()
+                .any(|message| matches!(message, Message::ToggleRecording))
+        );
+        model.mode = CameraMode::Photo;
+        model.quick_record = QuickRecordState::Recording;
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        if let RecordingState::Recording { stop_sender, .. } = &mut model.recording {
+            *stop_sender = Some(sender);
+        }
+        for message in exercise(model.build_capture_circle(), &renderer).0 {
+            let _ = model.update(message);
+        }
+        assert!(receiver.try_recv().is_ok());
+        assert!(!model.quick_record.is_recording());
+        assert!(!model.recording.is_recording());
+        model.photo_timer_countdown = Some(3);
+        for message in exercise(model.build_capture_circle(), &renderer).0 {
+            let _ = model.update(message);
+        }
+        assert!(model.photo_timer_countdown.is_none());
+    }
+
+    #[test]
+    fn capture_diagnostics_never_add_a_modal_to_the_view() {
+        fn shape(tree: &Tree) -> Vec<Vec<usize>> {
+            fn visit(tree: &Tree, path: &mut Vec<usize>, result: &mut Vec<Vec<usize>>) {
+                result.push(path.clone());
+                for (index, child) in tree.children.iter().enumerate() {
+                    path.push(index);
+                    visit(child, path, result);
+                    path.pop();
+                }
+            }
+            let mut result = Vec::new();
+            visit(tree, &mut Vec::new(), &mut result);
+            result
+        }
+        for motion in [false, true] {
+            let mut model = AppModel::default();
+            model.config.motion_photo = motion;
+            let baseline = shape(&Tree::new(model.view().as_widget()));
+            model.motion_photo_error = Some("real capture failure retained in diagnostics".into());
+            assert_eq!(shape(&Tree::new(model.view().as_widget())), baseline);
+            assert!(model.motion_photo_error.is_some());
+        }
+    }
+
+    #[test]
+    fn raw_acquisition_keeps_shutters_normal_until_queue_limit() {
+        let renderer = renderer();
+        let mut model = AppModel {
+            mode: CameraMode::Photo,
+            capture_scale_to: 1.0,
+            photo_btn_scale_to: 1.0,
+            is_capturing: true,
+            hardware_photo_id: Some(8),
+            ..Default::default()
+        };
+        for count in 0..=7 {
+            if count > 0 {
+                model.photo_jobs.insert(
+                    count,
+                    crate::app::handlers::motion_photo::PhotoJob {
+                        live: None,
+                        still_path: None,
+                    },
+                );
+            }
+            for element in [
+                model.build_capture_circle(),
+                model.build_photo_during_recording_button(),
+            ] {
+                let (messages, animates, _) = exercise(element, &renderer);
+                assert_eq!(
+                    animates,
+                    count == 7,
+                    "spinner only at eight accepted photos"
+                );
+                assert_eq!(
+                    messages.is_empty(),
+                    count == 7,
+                    "normal shutter below limit"
+                );
+            }
+        }
+        model.photo_jobs.remove(&1);
+        for element in [
+            model.build_capture_circle(),
+            model.build_photo_during_recording_button(),
+        ] {
+            let (messages, animates, _) = exercise(element, &renderer);
+            assert!(!messages.is_empty());
+            assert!(!animates);
+        }
+    }
+
+    #[test]
+    fn busy_photo_shutters_ignore_clicks_and_animate_without_resizing() {
+        let renderer = renderer();
+        let mut model = AppModel {
+            mode: CameraMode::Photo,
+            capture_scale_to: 1.0,
+            photo_btn_scale_to: 1.0,
+            ..Default::default()
+        };
+        let normal_main = exercise(model.build_capture_circle(), &renderer).2;
+        let normal_secondary = exercise(model.build_photo_during_recording_button(), &renderer).2;
+        model.is_capturing = true;
+        model.hardware_photo_id = Some(8);
+        for id in 1..=7 {
+            model.photo_jobs.insert(
+                id,
+                crate::app::handlers::motion_photo::PhotoJob {
+                    live: None,
+                    still_path: None,
+                },
+            );
+        }
+        model.photo_timer_setting = PhotoTimerSetting::Sec3;
+        for (element, expected_size) in [
+            (model.build_capture_circle(), normal_main),
+            (
+                model.build_photo_during_recording_button(),
+                normal_secondary,
+            ),
+        ] {
+            let (messages, animates, size) = exercise(element, &renderer);
+            assert!(messages.is_empty(), "busy shutter emitted {messages:?}");
+            assert!(
+                animates,
+                "busy shutter must request spinner animation redraws"
+            );
+            assert_eq!(size, expected_size);
+        }
     }
 }

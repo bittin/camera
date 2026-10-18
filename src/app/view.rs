@@ -1139,20 +1139,6 @@ impl AppModel {
             main_stack = main_stack.push(self.build_tools_menu());
         }
 
-        if let Some(error) = self.motion_photo_error.as_deref() {
-            main_stack = main_stack.push(build_overlay_popup(
-                self,
-                icon::from_name("dialog-warning-symbolic").size(32).into(),
-                &fl!("motion-photo-error-title"),
-                error,
-                Some(
-                    widget::button::suggested(fl!("motion-photo-error-dismiss"))
-                        .on_press(Message::DismissMotionPhotoError)
-                        .into(),
-                ),
-            ));
-        }
-
         // Context drawer (Settings, Filters, Insights, Shortcuts) last, so it
         // sits above every other overlay.
         if self.core.window.show_context {

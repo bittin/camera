@@ -3,6 +3,7 @@
 //! `pw-dump` is a runtime prerequisite; streaming is exclusively `pipewiresrc`.
 use super::libcamera::PipelineSharedState;
 use super::preview_metrics::{PreviewMetrics, StreamDiagnostics};
+use super::still_capture::{StillCapture, StillRequest};
 use super::types::*;
 
 use gstreamer as gst;
@@ -23,8 +24,8 @@ pub(crate) struct PipeWirePipeline {
     stop_flag: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     latest_preview: Arc<Mutex<Option<CameraFrame>>>,
-    still_requested: Arc<AtomicBool>,
-    still_frame: Arc<Mutex<Option<CameraFrame>>>,
+    still_capture: Arc<StillCapture>,
+    still_request: Mutex<Option<StillRequest>>,
 }
 
 fn build_stream(
@@ -180,8 +181,7 @@ impl PipeWirePipeline {
         gst::init().map_err(|e| BackendError::InitializationFailed(e.to_string()))?;
         // Shared GUI storage outlives pipelines; never carry a still from the
         // previous camera/format across a restart.
-        *shared.still_frame.lock().unwrap() = None;
-        shared.still_requested.store(false, Ordering::Release);
+        shared.still_capture.reset();
         let device = CameraDevice {
             path: format!("pipewire:{serial}"),
             ..Default::default()
@@ -214,8 +214,8 @@ impl PipeWirePipeline {
             stop_flag: Arc::clone(&stop_flag),
             thread: None,
             latest_preview: Arc::clone(&latest_preview),
-            still_requested: Arc::clone(&shared.still_requested),
-            still_frame: Arc::clone(&shared.still_frame),
+            still_capture: Arc::clone(&shared.still_capture),
+            still_request: Mutex::new(None),
         };
         let serial = serial.to_owned();
         let (init_tx, init_rx) = std::sync::mpsc::sync_channel(1);
@@ -270,6 +270,7 @@ impl PipeWirePipeline {
                                     .record_drops(dropped.saturating_sub(appsink_dropped));
                                 appsink_dropped = dropped;
                             }
+                            let still_ticket = shared.still_capture.pending();
                             match sample_to_frame(&sample, Some(&preview_metrics)) {
                                 Ok(mut frame) => {
                                     // Translate stream PTS to CLOCK_BOOTTIME, the recorder's
@@ -308,9 +309,8 @@ impl PipeWirePipeline {
                                     }
                                     preview_metrics.record_frame(&frame);
                                     *latest_preview.lock().unwrap() = Some(frame.clone());
-                                    if shared.still_requested.swap(false, Ordering::AcqRel) {
-                                        *shared.still_frame.lock().unwrap() = Some(frame.clone());
-                                        shared.still_frame_notify.notify_one();
+                                    if let Some(ticket) = still_ticket {
+                                        shared.still_capture.publish(ticket, frame.clone());
                                     }
                                     if let Some(tx) =
                                         shared.recording_sender.lock().unwrap().as_ref()
@@ -354,10 +354,14 @@ impl PipeWirePipeline {
         Ok(result)
     }
     pub(crate) fn request_still_capture(&self) {
-        self.still_requested.store(true, Ordering::Release);
+        let mut request = self.still_request.lock().unwrap();
+        *request = Some(self.begin_still_capture());
     }
     pub(crate) fn get_still_frame(&self) -> Option<CameraFrame> {
-        self.still_frame.lock().ok()?.take()
+        self.still_request.lock().unwrap().as_ref()?.take()
+    }
+    pub(crate) fn begin_still_capture(&self) -> StillRequest {
+        self.still_capture.request()
     }
     pub(crate) fn get_preview_frame(&self) -> Option<CameraFrame> {
         self.latest_preview.lock().ok()?.clone()
@@ -954,9 +958,7 @@ mod tests {
         (
             PipelineSharedState {
                 frame_sender,
-                still_requested: Arc::new(AtomicBool::new(false)),
-                still_frame: Arc::new(Mutex::new(None)),
-                still_frame_notify: Arc::new(tokio::sync::Notify::new()),
+                still_capture: Default::default(),
                 recording_sender: Arc::new(Mutex::new(None)),
                 jpeg_recording_mode: Arc::new(AtomicBool::new(false)),
                 cancel_flag: Arc::new(AtomicBool::new(false)),
@@ -1248,18 +1250,22 @@ mod tests {
             .find(|f| f.width == 640 && f.height == 480)
             .unwrap_or(&node.formats[0]);
         let (shared, mut receiver) = shared_state();
-        *shared.still_frame.lock().unwrap() = Some(CameraFrame {
-            width: 1,
-            height: 1,
-            data: FrameData::from_owned_vec(vec![0; 4]),
-            format: PixelFormat::RGBA,
-            stride: 4,
-            yuv_planes: None,
-            captured_at: Instant::now(),
-            sensor_timestamp_ns: None,
-            libcamera_metadata: None,
-        });
-        let notify = Arc::clone(&shared.still_frame_notify);
+        let old_request = shared.still_capture.request();
+        assert!(shared.still_capture.publish(
+            shared.still_capture.pending().unwrap(),
+            CameraFrame {
+                width: 1,
+                height: 1,
+                data: FrameData::from_owned_vec(vec![0; 4]),
+                format: PixelFormat::RGBA,
+                stride: 4,
+                yuv_planes: None,
+                captured_at: Instant::now(),
+                sensor_timestamp_ns: None,
+                libcamera_metadata: None,
+            }
+        ));
+        let still_capture = Arc::clone(&shared.still_capture);
         let cancel = Arc::clone(&shared.cancel_flag);
         let (tx, mut recording) = tokio::sync::mpsc::channel(1);
         *shared.recording_sender.lock().unwrap() = Some(tx);
@@ -1283,7 +1289,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!((still.width, still.height), (format.width, format.height));
-        assert!(notify.notified().now_or_never().is_some());
+        assert!(old_request.take().is_none());
+        assert!(!still_capture.has_request());
         assert!(matches!(
             recording.try_recv().unwrap(),
             RecordingFrame::Decoded(_)

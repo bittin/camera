@@ -12,6 +12,7 @@ use super::diagnostics::{
 };
 use super::pixel_formats::{map_pixel_format, pixel_format_name};
 use crate::backends::camera::preview_metrics::PreviewMetrics;
+use crate::backends::camera::still_capture::{StillCapture, StillTicket};
 use crate::backends::camera::types::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -32,11 +33,7 @@ pub(crate) struct CaptureThreadParams {
     pub(crate) limit_preview: bool,
     pub(crate) stop_flag: Arc<AtomicBool>,
     pub(crate) latest_preview: Arc<Mutex<Option<CameraFrame>>>,
-    pub(crate) latest_still: Arc<Mutex<Option<CameraFrame>>>,
-    pub(crate) still_requested: Arc<AtomicBool>,
-    /// Notified when a new still frame has been stored. Lets consumers await
-    /// the next still instead of polling the mutex.
-    pub(crate) still_frame_notify: Arc<tokio::sync::Notify>,
+    pub(crate) still_capture: Arc<StillCapture>,
     pub(crate) preview_frame_count: Arc<AtomicU64>,
     pub(crate) still_frame_count: Arc<AtomicU64>,
     pub(crate) frame_sender: FrameSender,
@@ -189,17 +186,21 @@ impl QueueWorker<MjpegDecodeJob, CaptureEvent> for MjpegDecodeWorker {
 type MjpegDecodeQueue = BoundedWorkerQueue<MjpegDecodeJob>;
 
 struct FrameDispatchContext<T> {
-    capture_still: bool,
+    capture_still: Option<StillTicket>,
     recording_sender: Option<tokio::sync::mpsc::Sender<T>>,
 }
 
 fn snapshot_frame_dispatch_context<T>(
     is_multistream: bool,
-    still_requested: &AtomicBool,
+    still_capture: &StillCapture,
     recording_sender: &Mutex<Option<tokio::sync::mpsc::Sender<T>>>,
 ) -> FrameDispatchContext<T> {
     FrameDispatchContext {
-        capture_still: !is_multistream && still_requested.load(Ordering::Acquire),
+        capture_still: if is_multistream {
+            None
+        } else {
+            still_capture.pending()
+        },
         recording_sender: recording_sender
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1161,6 +1162,13 @@ fn run_capture_loop(
                     continue;
                 }
 
+                // Bind the still generation before copying or scheduling decode;
+                // delayed viewfinder work must not claim a later shutter request.
+                let dispatch_context = snapshot_frame_dispatch_context(
+                    is_multistream,
+                    &params.still_capture,
+                    &params.recording_sender,
+                );
                 // Copy mmap data once into recyclable owned storage before the
                 // request is requeued. Multi-plane formats are concatenated in
                 // plane order for the existing FrameData/YuvPlanes contract.
@@ -1172,11 +1180,6 @@ fn run_capture_loop(
                 );
                 if let Some(queue) = jpeg_decode_queue.as_ref() {
                     let jpeg_data = captured_data;
-                    let dispatch_context = snapshot_frame_dispatch_context(
-                        is_multistream,
-                        &params.still_requested,
-                        &params.recording_sender,
-                    );
                     let jpeg_sent_to_recorder = if params
                         .jpeg_recording_mode
                         .load(Ordering::Relaxed)
@@ -1258,11 +1261,6 @@ fn run_capture_loop(
                         sensor_timestamp_ns,
                         metadata.clone(),
                     );
-                    let dispatch_context = snapshot_frame_dispatch_context(
-                        is_multistream,
-                        &params.still_requested,
-                        &params.recording_sender,
-                    );
                     dispatch_viewfinder_frame(
                         frame,
                         frame_num,
@@ -1283,9 +1281,8 @@ fn run_capture_loop(
         }
 
         // Process raw buffer only when still capture is requested (multistream only).
-        // Acquire pairs with the Release store in `request_still_capture`.
         if is_multistream
-            && params.still_requested.load(Ordering::Acquire)
+            && let Some(ticket) = params.still_capture.pending()
             && let Some(sr) = stream_raw
         {
             let raw_pf = formats.raw_pixel_format.unwrap_or(PixelFormat::BayerRGGB);
@@ -1309,16 +1306,7 @@ fn run_capture_loop(
                     "Raw still frame captured"
                 );
 
-                let stored = if let Ok(mut still) = params.latest_still.lock() {
-                    *still = Some(still_frame);
-                    params.still_requested.store(false, Ordering::Release);
-                    true
-                } else {
-                    false
-                };
-                if stored {
-                    params.still_frame_notify.notify_waiters();
-                }
+                params.still_capture.publish(ticket, still_frame);
             }
         }
 
@@ -1365,29 +1353,14 @@ fn dispatch_viewfinder_frame(
     }
 
     // In single-stream mode, also handle still capture from preview.
-    // Acquire pairs with the Release store in `request_still_capture`.
-    if !is_multistream
-        && dispatch_context.capture_still
-        && params
-            .still_requested
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    {
+    if !is_multistream && let Some(ticket) = dispatch_context.capture_still {
         info!(
             frame = frame_num,
             width = frame.width,
             height = frame.height,
             "Still frame captured from preview stream"
         );
-        let stored = if let Ok(mut still) = params.latest_still.lock() {
-            *still = Some(frame.clone());
-            true
-        } else {
-            false
-        };
-        if stored {
-            params.still_frame_notify.notify_waiters();
-        }
+        params.still_capture.publish(ticket, frame.clone());
     }
 
     // Send ViewFinder frames to recording (via appsrc encoder pipeline).
@@ -1721,6 +1694,7 @@ mod tests {
         BoundedWorkerQueue, QueueWorker, advance_mjpeg_dispatch_watermark, drain_pending_events,
         pooled_copy_frame_planes, snapshot_frame_dispatch_context,
     };
+    use crate::backends::camera::still_capture::StillCapture;
     use crate::backends::camera::types::FrameDataPool;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
@@ -2054,9 +2028,7 @@ mod tests {
             limit_preview: false,
             stop_flag: Arc::new(AtomicBool::new(false)),
             latest_preview: Arc::new(Mutex::new(None)),
-            latest_still: Arc::new(Mutex::new(None)),
-            still_requested: Arc::new(AtomicBool::new(false)),
-            still_frame_notify: Arc::new(tokio::sync::Notify::new()),
+            still_capture: Default::default(),
             preview_frame_count: Arc::new(super::AtomicU64::new(0)),
             still_frame_count: Arc::new(super::AtomicU64::new(0)),
             frame_sender,
@@ -2082,6 +2054,40 @@ mod tests {
     }
 
     #[test]
+    fn delayed_viewfinder_publication_cannot_satisfy_new_still_request() {
+        let metrics = super::PreviewMetrics::start("delayed-still-ticket-test");
+        let (sender, _receiver) = cosmic::iced::futures::channel::mpsc::channel(4);
+        let mut params = dispatch_test_params(sender, metrics);
+        let a = params.still_capture.request();
+        let context_a =
+            snapshot_frame_dispatch_context(false, &params.still_capture, &params.recording_sender);
+        drop(a);
+        let b = params.still_capture.request();
+        let ticket_b = params.still_capture.pending().unwrap();
+        super::dispatch_viewfinder_frame(
+            dispatch_test_frame(),
+            1,
+            &mut params,
+            false,
+            context_a,
+            false,
+        );
+        assert!(b.take().is_none());
+        assert_eq!(params.still_capture.pending(), Some(ticket_b));
+        let context_b =
+            snapshot_frame_dispatch_context(false, &params.still_capture, &params.recording_sender);
+        super::dispatch_viewfinder_frame(
+            dispatch_test_frame(),
+            2,
+            &mut params,
+            false,
+            context_b,
+            false,
+        );
+        assert!(b.take().is_some());
+    }
+
+    #[test]
     fn native_dispatch_counts_every_full_channel_drop_and_produced_frame() {
         let metrics = crate::backends::camera::preview_metrics::PreviewMetrics::start(
             "native-dispatch-metrics-test",
@@ -2096,7 +2102,7 @@ mod tests {
                 &mut params,
                 false,
                 super::FrameDispatchContext {
-                    capture_still: false,
+                    capture_still: None,
                     recording_sender: None,
                 },
                 false,
@@ -2125,7 +2131,7 @@ mod tests {
                     frame_num,
                     frame,
                     dispatch_context: super::FrameDispatchContext {
-                        capture_still: false,
+                        capture_still: None,
                         recording_sender: None,
                     },
                     skip_recording: false,
@@ -2348,16 +2354,16 @@ mod tests {
 
     #[test]
     fn async_dispatch_uses_capture_time_still_and_recording_state() {
-        let still_requested = AtomicBool::new(false);
+        let still_capture = Arc::new(StillCapture::default());
         let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
         let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(1);
         let recording_sender = Mutex::new(Some(old_tx));
 
-        let context = snapshot_frame_dispatch_context(false, &still_requested, &recording_sender);
-        still_requested.store(true, Ordering::Release);
+        let context = snapshot_frame_dispatch_context(false, &still_capture, &recording_sender);
+        let _request = still_capture.request();
         *recording_sender.lock().unwrap() = Some(new_tx);
 
-        assert!(!context.capture_still);
+        assert!(context.capture_still.is_none());
         context.recording_sender.unwrap().try_send(7_u8).unwrap();
         assert_eq!(old_rx.try_recv(), Ok(7));
         assert!(new_rx.try_recv().is_err());
