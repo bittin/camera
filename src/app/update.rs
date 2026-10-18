@@ -38,6 +38,7 @@ impl AppModel {
                 | Message::VideoPreviewPlaybackStopped
                 | Message::VideoFileProgress(..)
                 | Message::DisplayOrientationChanged(_)
+                | Message::WindowControlsChanged(_)
                 | Message::PortalColorSchemeChanged(_)
                 | Message::CosmicThemeChanged
                 | Message::CamerasInitialized(..)
@@ -304,6 +305,10 @@ impl AppModel {
                 Task::none()
             }
             Message::WindowClose => self.handle_window_close(),
+            Message::WindowControlsChanged(controls) => {
+                self.window_controls = controls;
+                Task::none()
+            }
             Message::WindowMinimize => self.core.minimize(None),
             Message::WindowToggleMaximize => self.core.toggle_maximize(None),
             Message::WindowDrag => self.core.drag(None),

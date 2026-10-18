@@ -678,6 +678,8 @@ pub struct AppModel {
     /// mounting rotation at render time so the preview stays upright
     /// when the phone is rotated between portrait and landscape.
     pub display_orientation: crate::backends::display_orientation::DisplayOrientation,
+    /// Window buttons requested by the desktop settings portal.
+    pub window_controls: super::window_controls::WindowControls,
     /// Rotation of the camera that produced the blur frame
     /// (captured at start of blur transition to maintain correct rotation during transition)
     pub blur_frame_rotation: crate::backends::camera::types::SensorRotation,
@@ -1623,6 +1625,8 @@ pub enum Message {
     /// composed with the sensor mounting rotation at preview time so
     /// the preview reorients with the screen.
     DisplayOrientationChanged(crate::backends::display_orientation::DisplayOrientation),
+    /// Desktop requested a new set of visible title-bar buttons.
+    WindowControlsChanged(super::window_controls::WindowControls),
     /// Window control: close
     WindowClose,
     /// Window control: minimize

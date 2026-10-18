@@ -56,6 +56,7 @@ mod video_primitive;
 pub(crate) use video_primitive::tests::review_decoded_preview;
 mod video_widget;
 mod view;
+mod window_controls;
 
 // Re-export public API
 use crate::config::Config;
@@ -464,6 +465,7 @@ impl cosmic::Application for AppModel {
             current_frame_rotation: crate::backends::camera::types::SensorRotation::None,
             display_orientation: crate::backends::display_orientation::DisplayOrientation::default(
             ),
+            window_controls: window_controls::WindowControls::default(),
             blur_frame_rotation: crate::backends::camera::types::SensorRotation::None,
             blur_frame_mirror: false,
             blur_frame_zoom: 1.0,
@@ -1800,6 +1802,7 @@ impl cosmic::Application for AppModel {
             Subscription::none()
         };
         Subscription::batch([
+            window_controls::subscription(),
             motion_photo_lifecycle,
             config_sub,
             camera_sub,
