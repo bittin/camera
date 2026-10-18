@@ -21,10 +21,6 @@ impl AppModel {
         let opening = !self.exposure_picker_visible;
         self.close_all_pickers();
         self.exposure_picker_visible = opening;
-        if opening {
-            // Clear base exposure time when opening (will be captured on first slider move)
-            self.base_exposure_time = None;
-        }
         info!(
             visible = self.exposure_picker_visible,
             "Exposure picker toggled"

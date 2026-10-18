@@ -94,7 +94,6 @@ fn bilinear_roi_matches_full_sensor_production() {
                         contrast: 1.1,
                         saturation: 0.9,
                         sharpening: true,
-                        ..Default::default()
                     };
                     // Compare the production legacy paths. Ordinary SDR ROI
                     // coverage lives in still_sdr_tests for all methods.

@@ -700,14 +700,6 @@ impl VideoDecoder {
             .map(|dur| dur.seconds_f64())
     }
 
-    /// Get playback progress as a fraction (0.0 to 1.0)
-    pub fn progress(&self) -> Option<f64> {
-        match (self.position(), self.duration()) {
-            (Some(pos), Some(dur)) if dur > 0.0 => Some((pos / dur).clamp(0.0, 1.0)),
-            _ => None,
-        }
-    }
-
     /// Seek to a specific position in seconds.
     ///
     /// Uses `ACCURATE` so the slider lands on the requested frame instead of

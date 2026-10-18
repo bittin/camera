@@ -35,8 +35,6 @@ use tracing::{debug, info, warn};
 pub struct PostProcessingConfig {
     /// Photo-only demosaic selection, independent of video.
     pub demosaic_method: crate::shaders::DemosaicMethod,
-    /// Enable color correction
-    pub color_correction: bool,
     /// Enable sharpening
     pub sharpening: bool,
     /// Brightness adjustment (-1.0 to 1.0, 0.0 = no change)
@@ -57,7 +55,6 @@ impl Default for PostProcessingConfig {
     fn default() -> Self {
         Self {
             demosaic_method: crate::shaders::DemosaicMethod::default(),
-            color_correction: true,
             sharpening: false,
             brightness: 0.0,
             contrast: 1.0,
@@ -785,7 +782,6 @@ mod tests {
                             contrast: 1.1,
                             saturation: 0.9,
                             sharpening: true,
-                            ..Default::default()
                         };
                         let processor = PostProcessor::new(config);
                         let reference = processor
@@ -1650,7 +1646,6 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = PostProcessingConfig::default();
-        assert!(config.color_correction);
         assert!(!config.sharpening);
         assert_eq!(config.brightness, 0.0);
         assert_eq!(config.contrast, 1.0);
