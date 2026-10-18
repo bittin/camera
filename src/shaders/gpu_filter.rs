@@ -356,9 +356,35 @@ impl GpuFilterPipeline {
         height: u32,
         filter: FilterType,
     ) -> Result<Vec<u8>, String> {
+        self.apply_filter_rgba_with_stride(rgba_data, width, height, width * 4, filter)
+            .await
+    }
+
+    /// Apply a filter to RGBA rows with optional trailing padding.
+    ///
+    /// Filtered output is tightly packed. Standard copies tight input verbatim
+    /// and strips padding from strided input without allocating GPU resources.
+    /// Unlike photo texture filtering, uploads retain their workspace between
+    /// frames and never participate in photo GPU pacing or retirement.
+    pub async fn apply_filter_rgba_with_stride(
+        &mut self,
+        rgba_data: &[u8],
+        width: u32,
+        height: u32,
+        stride: u32,
+        filter: FilterType,
+    ) -> Result<Vec<u8>, String> {
         if filter == FilterType::Standard {
-            // No filter needed, return as-is
-            return Ok(rgba_data.to_vec());
+            let row_bytes = (width * 4) as usize;
+            if stride as usize == row_bytes {
+                return Ok(rgba_data.to_vec());
+            }
+            let mut output = Vec::with_capacity(row_bytes * height as usize);
+            for row in 0..height as usize {
+                let start = row * stride as usize;
+                output.extend_from_slice(&rgba_data[start..start + row_bytes]);
+            }
+            return Ok(output);
         }
 
         self.ensure_resources(width, height, true);
@@ -378,7 +404,7 @@ impl GpuFilterPipeline {
             rgba_data,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(width * 4),
+                bytes_per_row: Some(stride),
                 rows_per_image: Some(height),
             },
             wgpu::Extent3d {
@@ -731,6 +757,140 @@ mod texture_region_tests {
 }
 
 #[cfg(test)]
+mod continuous_upload_tests {
+    use super::*;
+    use crate::test_gpu::{PhotoEvents, PhotoTrace};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn padded_uploads_match_tight_pixels_and_reuse_unpaced_workspace_for_every_filter() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu(
+                "padded_uploads_match_tight_pixels_and_reuse_unpaced_workspace_for_every_filter",
+            );
+            return;
+        };
+        let events = PhotoEvents::default();
+        let subscriber = tracing_subscriber::registry().with(PhotoTrace(events.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            pollster::block_on(async {
+                let mut pipeline = GpuFilterPipeline::new().await.unwrap();
+                let mut reference = GpuFilterPipeline::new().await.unwrap();
+                for (width, height) in [(17, 19), (3, 2)] {
+                    let stride = width * 4 + 12;
+                    let pixels: Vec<u8> = (0..width * height)
+                        .flat_map(|i| {
+                            [
+                                (i * 37 % 256) as u8,
+                                (i * 53 % 256) as u8,
+                                (i * 97 % 256) as u8,
+                                (i * 11 % 256) as u8,
+                            ]
+                        })
+                        .collect();
+                    let mut padded = vec![0xa5; (stride * height) as usize];
+                    for (source, destination) in pixels
+                        .chunks_exact((width * 4) as usize)
+                        .zip(padded.chunks_exact_mut(stride as usize))
+                    {
+                        destination[..source.len()].copy_from_slice(source);
+                    }
+                    // Start with preblur so its allocation must survive every later mode.
+                    pipeline
+                        .apply_filter_rgba_with_stride(
+                            &padded,
+                            width,
+                            height,
+                            stride,
+                            FilterType::Pencil,
+                        )
+                        .await
+                        .unwrap();
+                    let input = pipeline.input_texture.clone();
+                    let preblur = pipeline.preblur_texture.clone();
+                    let output = pipeline.output_buffer.clone();
+                    let staging = pipeline.staging_buffer.as_ref().unwrap().buffer();
+                    for code in (0..=14).rev() {
+                        let mode = FilterType::from_gpu_filter_code(code);
+                        for offset in 0..3u8 {
+                            let changed: Vec<u8> = pixels
+                                .iter()
+                                .map(|byte| byte.wrapping_add(offset * 31))
+                                .collect();
+                            for (source, destination) in changed
+                                .chunks_exact((width * 4) as usize)
+                                .zip(padded.chunks_exact_mut(stride as usize))
+                            {
+                                destination[..source.len()].copy_from_slice(source);
+                            }
+                            let expected = reference
+                                .apply_filter_rgba(&changed, width, height, mode)
+                                .await
+                                .unwrap();
+                            let actual = pipeline
+                                .apply_filter_rgba_with_stride(&padded, width, height, stride, mode)
+                                .await
+                                .unwrap();
+                            assert_eq!(actual, expected, "{mode:?}, {width}x{height}");
+                            assert_eq!(pipeline.input_texture, input);
+                            assert_eq!(pipeline.preblur_texture, preblur);
+                            assert_eq!(pipeline.output_buffer, output);
+                            assert_eq!(pipeline.staging_buffer.as_ref().unwrap().buffer(), staging);
+                            assert_eq!(
+                                (pipeline.cached_width, pipeline.cached_height),
+                                (width, height)
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    events.lock().unwrap().is_empty(),
+                    "continuous filters were photo-paced"
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn standard_upload_does_not_allocate_or_dispatch() {
+        let Some((_guard, _, _)) = crate::test_gpu::headless_device_with_compute() else {
+            crate::test_gpu::skip_no_gpu("standard_upload_does_not_allocate_or_dispatch");
+            return;
+        };
+        pollster::block_on(async {
+            let mut pipeline = GpuFilterPipeline::new().await.unwrap();
+            let pixels = vec![10, 20, 30, 40, 50, 60, 70, 80];
+            // Tight passthrough preserves all supplied bytes, as before.
+            assert_eq!(
+                pipeline
+                    .apply_filter_rgba(&pixels, 1, 1, FilterType::Standard)
+                    .await
+                    .unwrap(),
+                pixels
+            );
+            assert_eq!(
+                pipeline
+                    .apply_filter_rgba_with_stride(
+                        &[10, 20, 30, 40, 0xa5, 0xa5, 0xa5, 0xa5, 50, 60, 70, 80],
+                        1,
+                        2,
+                        8,
+                        FilterType::Standard,
+                    )
+                    .await
+                    .unwrap(),
+                pixels
+            );
+            assert!(pipeline.input_texture.is_none());
+            assert!(pipeline.preblur_texture.is_none());
+            assert!(pipeline.output_buffer.is_none());
+            assert!(pipeline.staging_buffer.is_none());
+            assert_eq!((pipeline.cached_width, pipeline.cached_height), (0, 0));
+        });
+    }
+}
+
+#[cfg(test)]
 mod readback_owner_tests {
     use super::*;
     #[test]
@@ -743,22 +903,52 @@ mod readback_owner_tests {
         };
         pollster::block_on(async {
             let mut pipeline = GpuFilterPipeline::new().await.unwrap();
-            let pixels = [96, 96, 96, 255].repeat(16);
-            let expected = pipeline
-                .apply_filter_rgba(&pixels, 4, 4, FilterType::Mono)
-                .await
-                .unwrap();
-            let cache = pipeline.staging_buffer.as_ref().unwrap();
-            cache.buffer().destroy();
-            let error = cache.read_async().await.err().unwrap();
-            assert!(error.contains("destroyed"), "{error}");
-            assert_eq!(
-                pipeline
-                    .apply_filter_rgba(&pixels, 4, 4, FilterType::Mono)
+            let pixels: Vec<u8> = (0..16).flat_map(|i| [i * 7, i * 11, i * 13, 255]).collect();
+            let padded: Vec<u8> = pixels
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .flat_map(|row| row.iter().copied().chain([0xa5; 12]))
+                .collect();
+            for mode in [FilterType::Mono, FilterType::Pencil] {
+                let expected = pipeline
+                    .apply_filter_rgba(&pixels, 4, 4, mode)
                     .await
-                    .unwrap(),
-                expected
-            );
+                    .unwrap();
+                let input = pipeline.input_texture.clone();
+                let output = pipeline.output_buffer.clone();
+                let preblur = pipeline.preblur_texture.clone();
+                let cache = pipeline.staging_buffer.as_ref().unwrap();
+                let failed_buffer = cache.buffer();
+                failed_buffer.destroy();
+                let error = cache.read_async().await.err().unwrap();
+                assert!(error.contains("destroyed"), "{error}");
+                // A failed map must never manufacture an empty successful read.
+                assert!(
+                    cache
+                        .read_async()
+                        .await
+                        .err()
+                        .unwrap()
+                        .contains("unavailable")
+                );
+                for _ in 0..3 {
+                    assert_eq!(
+                        pipeline
+                            .apply_filter_rgba_with_stride(&padded, 4, 4, 28, mode)
+                            .await
+                            .unwrap(),
+                        expected
+                    );
+                    assert_eq!(pipeline.input_texture, input);
+                    assert_eq!(pipeline.output_buffer, output);
+                    assert_eq!(pipeline.preblur_texture, preblur);
+                    assert_ne!(
+                        pipeline.staging_buffer.as_ref().unwrap().buffer(),
+                        failed_buffer
+                    );
+                }
+            }
         });
     }
 }
