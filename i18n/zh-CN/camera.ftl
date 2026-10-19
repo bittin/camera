@@ -25,7 +25,7 @@ settings-video = 视频
 settings-device = 设备
 settings-microphone = 麦克风
 settings-record-audio = 录制音频
-settings-audio-encoder = 音频编码器
+settings-audio-encoder = 视频音频编码器
 settings-encoder = 编码器
 settings-quality = 质量
 settings-mirror-preview = 镜像预览
@@ -327,3 +327,10 @@ controls-position-left = 左边
 controls-position-right = 右边
 settings-controls-position = 控制位置
 settings-controls-position-description = 将捕获控制放置于底部、左边或右边。左右控制也将标题栏移动到相对面边缘，并不会旋转相机预览。
+shutdown-pending-saves =
+    { $count ->
+        [0] 正在退出
+        [one] 1 项照片/视频代保存
+       *[other] { $count } 项照片/视频代保存
+    }
+no-camera-available = 无可用的摄像头
