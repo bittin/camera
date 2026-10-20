@@ -354,19 +354,19 @@ impl TimelapseState {
 /// (COSMIC, tracked upstream in pop-os/xdg-desktop-portal-cosmic#342) simply
 /// don't inhibit; we intentionally keep no direct-D-Bus fallback for them.
 pub struct InhibitGuard {
-    pub connection: zbus::blocking::Connection,
-    pub handle: zbus::zvariant::OwnedObjectPath,
+    pub connection: zbus::Connection,
+    pub handle: zbus::OwnedObjectPath,
 }
 
 impl Drop for InhibitGuard {
     fn drop(&mut self) {
-        let _ = self.connection.call_method(
+        let _ = zbus::block_on(self.connection.call_method(
             Some("org.freedesktop.portal.Desktop"),
             &self.handle,
             Some("org.freedesktop.portal.Request"),
             "Close",
             &(),
-        );
+        ));
     }
 }
 
