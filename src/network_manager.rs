@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use tracing::{error, info};
-use zbus::zvariant::{ObjectPath, Value};
+use zbus::{ObjectPath, OwnedObjectPath, Variant};
 
 /// Connect to a WiFi network using NetworkManager's D-Bus API
 ///
@@ -52,13 +52,7 @@ pub async fn connect_wifi(
     // Call AddAndActivateConnection(settings, device_path, specific_object)
     // specific_object is "/" for no specific access point
     let no_specific_object = ObjectPath::try_from("/").unwrap();
-    let result: Result<
-        (
-            zbus::zvariant::OwnedObjectPath,
-            zbus::zvariant::OwnedObjectPath,
-        ),
-        _,
-    > = nm_proxy
+    let result: Result<(OwnedObjectPath, OwnedObjectPath), _> = nm_proxy
         .call(
             "AddAndActivateConnection",
             &(settings, &device_path, &no_specific_object),
@@ -88,25 +82,25 @@ fn build_connection_settings<'a>(
     password: Option<&'a str>,
     security: &str,
     hidden: bool,
-) -> HashMap<&'a str, HashMap<&'a str, Value<'a>>> {
-    let mut settings: HashMap<&str, HashMap<&str, Value>> = HashMap::new();
+) -> HashMap<&'a str, HashMap<&'a str, Variant<'a>>> {
+    let mut settings: HashMap<&str, HashMap<&str, Variant>> = HashMap::new();
 
     // Connection settings
-    let mut connection: HashMap<&str, Value> = HashMap::new();
-    connection.insert("type", Value::new("802-11-wireless"));
-    connection.insert("id", Value::new(ssid));
+    let mut connection: HashMap<&str, Variant> = HashMap::new();
+    connection.insert("type", Variant::new("802-11-wireless"));
+    connection.insert("id", Variant::new(ssid));
     // Generate a UUID for the connection
     let uuid_str = uuid::Uuid::new_v4().to_string();
-    connection.insert("uuid", Value::new(uuid_str));
+    connection.insert("uuid", Variant::new(uuid_str));
     settings.insert("connection", connection);
 
     // Wireless settings
-    let mut wireless: HashMap<&str, Value> = HashMap::new();
+    let mut wireless: HashMap<&str, Variant> = HashMap::new();
     // SSID must be sent as bytes
-    wireless.insert("ssid", Value::new(ssid.as_bytes().to_vec()));
-    wireless.insert("mode", Value::new("infrastructure"));
+    wireless.insert("ssid", Variant::new(ssid.as_bytes().to_vec()));
+    wireless.insert("mode", Variant::new("infrastructure"));
     if hidden {
-        wireless.insert("hidden", Value::new(true));
+        wireless.insert("hidden", Variant::new(true));
     }
     settings.insert("802-11-wireless", wireless);
 
@@ -121,18 +115,18 @@ fn build_connection_settings<'a>(
     };
 
     if let Some(km) = key_mgmt {
-        let mut wireless_security: HashMap<&str, Value> = HashMap::new();
-        wireless_security.insert("key-mgmt", Value::new(km));
-        wireless_security.insert("auth-alg", Value::new("open"));
+        let mut wireless_security: HashMap<&str, Variant> = HashMap::new();
+        wireless_security.insert("key-mgmt", Variant::new(km));
+        wireless_security.insert("auth-alg", Variant::new("open"));
 
         if let Some(pwd) = password {
             if km == "none" {
                 // WEP key
-                wireless_security.insert("wep-key0", Value::new(pwd));
-                wireless_security.insert("wep-key-type", Value::new(1u32)); // 1 = passphrase
+                wireless_security.insert("wep-key0", Variant::new(pwd));
+                wireless_security.insert("wep-key-type", Variant::new(1u32)); // 1 = passphrase
             } else {
                 // WPA/WPA2/WPA3 PSK
-                wireless_security.insert("psk", Value::new(pwd));
+                wireless_security.insert("psk", Variant::new(pwd));
             }
         }
 
@@ -140,27 +134,25 @@ fn build_connection_settings<'a>(
 
         // Tell wireless settings about security
         if let Some(w) = settings.get_mut("802-11-wireless") {
-            w.insert("security", Value::new("802-11-wireless-security"));
+            w.insert("security", Variant::new("802-11-wireless-security"));
         }
     }
 
     // IPv4 settings - auto
-    let mut ipv4: HashMap<&str, Value> = HashMap::new();
-    ipv4.insert("method", Value::new("auto"));
+    let mut ipv4: HashMap<&str, Variant> = HashMap::new();
+    ipv4.insert("method", Variant::new("auto"));
     settings.insert("ipv4", ipv4);
 
     // IPv6 settings - auto
-    let mut ipv6: HashMap<&str, Value> = HashMap::new();
-    ipv6.insert("method", Value::new("auto"));
+    let mut ipv6: HashMap<&str, Variant> = HashMap::new();
+    ipv6.insert("method", Variant::new("auto"));
     settings.insert("ipv6", ipv6);
 
     settings
 }
 
 /// Find the first available WiFi device
-async fn find_wifi_device(
-    connection: &zbus::Connection,
-) -> Result<zbus::zvariant::OwnedObjectPath, String> {
+async fn find_wifi_device(connection: &zbus::Connection) -> Result<OwnedObjectPath, String> {
     let nm_proxy = zbus::Proxy::new(
         connection,
         "org.freedesktop.NetworkManager",
@@ -171,7 +163,7 @@ async fn find_wifi_device(
     .map_err(|e| format!("Failed to create NetworkManager proxy: {}", e))?;
 
     // Get all devices
-    let devices: Vec<zbus::zvariant::OwnedObjectPath> = nm_proxy
+    let devices: Vec<OwnedObjectPath> = nm_proxy
         .call("GetDevices", &())
         .await
         .map_err(|e| format!("Failed to get devices: {}", e))?;
@@ -197,4 +189,69 @@ async fn find_wifi_device(
     }
 
     Err("No WiFi device found".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_settings_keep_network_manager_wire_types() {
+        for (security, key_mgmt, password_key) in [
+            ("OPEN", None, None),
+            ("WPA2", Some("wpa-psk"), Some("psk")),
+            ("WPA3", Some("sae"), Some("psk")),
+            ("WEP", Some("none"), Some("wep-key0")),
+        ] {
+            for hidden in [false, true] {
+                let settings =
+                    build_connection_settings("Test WiFi", Some("test-key"), security, hidden);
+                let device =
+                    ObjectPath::try_from("/org/freedesktop/NetworkManager/Devices/1").unwrap();
+                let specific_object = ObjectPath::try_from("/").unwrap();
+                let message = zbus::Message::method_call(
+                    "/org/freedesktop/NetworkManager",
+                    "AddAndActivateConnection",
+                )
+                .build(&(settings, &device, &specific_object))
+                .unwrap();
+                let body = message.body();
+                assert_eq!(body.signature().to_string(), "(a{sa{sv}}oo)");
+                let (settings, decoded_device, decoded_specific): (
+                    HashMap<String, HashMap<String, zbus::OwnedVariant>>,
+                    OwnedObjectPath,
+                    OwnedObjectPath,
+                ) = body.deserialize().unwrap();
+                assert_eq!(decoded_device.as_str(), device.as_str());
+                assert_eq!(decoded_specific.as_str(), "/");
+                assert_eq!(
+                    <&str>::try_from(&settings["connection"]["id"]).unwrap(),
+                    "Test WiFi"
+                );
+                assert_eq!(
+                    Vec::<u8>::try_from(settings["802-11-wireless"]["ssid"].try_clone().unwrap())
+                        .unwrap(),
+                    b"Test WiFi"
+                );
+                assert_eq!(settings["802-11-wireless"].contains_key("hidden"), hidden);
+                if hidden {
+                    assert!(bool::try_from(&settings["802-11-wireless"]["hidden"]).unwrap());
+                }
+                if let Some(key_mgmt) = key_mgmt {
+                    let security = &settings["802-11-wireless-security"];
+                    assert_eq!(<&str>::try_from(&security["key-mgmt"]).unwrap(), key_mgmt);
+                    assert_eq!(
+                        <&str>::try_from(&security[password_key.unwrap()]).unwrap(),
+                        "test-key"
+                    );
+                    if key_mgmt == "none" {
+                        assert_eq!(u32::try_from(&security["wep-key-type"]).unwrap(), 1);
+                    }
+                } else {
+                    assert!(!settings.contains_key("802-11-wireless-security"));
+                    assert!(!settings["802-11-wireless"].contains_key("security"));
+                }
+            }
+        }
+    }
 }

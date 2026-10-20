@@ -2425,18 +2425,24 @@ impl AppModel {
 /// pop-os/xdg-desktop-portal-cosmic#342) return an error here and the caller
 /// leaves the session un-inhibited; there is no direct-D-Bus fallback.
 fn portal_inhibit() -> Result<crate::app::state::InhibitGuard, String> {
+    zbus::block_on(portal_inhibit_async())
+}
+
+async fn portal_inhibit_async() -> Result<crate::app::state::InhibitGuard, String> {
     use std::collections::HashMap;
-    use zbus::zvariant::Value;
+    use zbus::Variant;
 
     // Inhibit flags bitmask: 4 = Suspend, 8 = Idle. Together these match the
     // previous logind "idle:sleep" request.
     const INHIBIT_SUSPEND: u32 = 4;
     const INHIBIT_IDLE: u32 = 8;
 
-    let conn = zbus::blocking::Connection::session()
+    let conn = zbus::Connection::session()
+        .await
         .map_err(|e| format!("D-Bus session connection: {e}"))?;
-    let options: HashMap<&str, Value> = HashMap::from([("reason", Value::from("Camera active"))]);
-    let handle: zbus::zvariant::OwnedObjectPath = conn
+    let options: HashMap<&str, Variant> =
+        HashMap::from([("reason", Variant::from("Camera active"))]);
+    let handle: zbus::OwnedObjectPath = conn
         .call_method(
             Some("org.freedesktop.portal.Desktop"),
             "/org/freedesktop/portal/desktop",
@@ -2445,6 +2451,7 @@ fn portal_inhibit() -> Result<crate::app::state::InhibitGuard, String> {
             // (window, flags, options): empty window means no parent surface.
             &("", INHIBIT_SUSPEND | INHIBIT_IDLE, options),
         )
+        .await
         .map_err(|e| format!("portal Inhibit: {e}"))?
         .body()
         .deserialize()
@@ -2453,6 +2460,83 @@ fn portal_inhibit() -> Result<crate::app::state::InhibitGuard, String> {
         connection: conn,
         handle,
     })
+}
+
+#[cfg(test)]
+mod portal_inhibit_tests {
+    use std::{collections::HashMap, sync::mpsc, time::Duration};
+
+    const REQUEST_PATH: &str = "/org/freedesktop/portal/desktop/request/camera/test";
+
+    struct Inhibit;
+
+    #[zbus::interface(name = "org.freedesktop.portal.Inhibit")]
+    impl Inhibit {
+        fn inhibit(
+            &self,
+            window: &str,
+            flags: u32,
+            options: HashMap<String, zbus::OwnedVariant>,
+        ) -> zbus::OwnedObjectPath {
+            assert_eq!(window, "");
+            assert_eq!(flags, 12);
+            assert_eq!(
+                <&str>::try_from(&options["reason"]).unwrap(),
+                "Camera active"
+            );
+            zbus::OwnedObjectPath::try_from(REQUEST_PATH).unwrap()
+        }
+    }
+
+    struct Request(mpsc::Sender<()>);
+
+    #[zbus::interface(name = "org.freedesktop.portal.Request")]
+    impl Request {
+        fn close(&self) {
+            self.0.send(()).unwrap();
+        }
+    }
+
+    #[test]
+    fn portal_inhibit_keeps_connection_alive_and_closes_request_on_drop() {
+        // Never claim the real desktop portal's name or inhibit the user's session.
+        const CHILD: &str = "CAMERA_TEST_PRIVATE_PORTAL_BUS";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("timeout")
+                .args(["30s", "dbus-run-session", "--"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::handlers::capture::portal_inhibit_tests::portal_inhibit_keeps_connection_alive_and_closes_request_on_drop",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("portal test requires timeout and dbus-run-session");
+            assert!(status.success(), "isolated portal test failed: {status}");
+            return;
+        }
+
+        let (closed, receive_close) = mpsc::channel();
+        let service = zbus::block_on(async {
+            zbus::connection::Builder::session()
+                .name("org.freedesktop.portal.Desktop")
+                .serve_at("/org/freedesktop/portal/desktop", Inhibit)
+                .serve_at(REQUEST_PATH, Request(closed))
+                .build()
+                .await
+                .unwrap()
+        });
+
+        let guard = super::portal_inhibit().unwrap();
+        assert_eq!(guard.handle.as_str(), REQUEST_PATH);
+        assert!(receive_close.try_recv().is_err());
+        // This separate call proves connection work continues between block_on calls.
+        zbus::block_on(guard.connection.peer_creds()).unwrap();
+        drop(guard);
+        receive_close.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(service);
+    }
 }
 
 /// Async function to process collected burst mode frames (GPU-only)
