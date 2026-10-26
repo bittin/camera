@@ -1071,7 +1071,7 @@ impl AppModel {
             has_hardware = self.flash.hardware.has_devices(),
             "Flash toggled"
         );
-        Task::none()
+        self.show_toggle_feedback(crate::app::toggle_feedback::ToggleKind::Flash)
     }
 
     pub(crate) fn handle_toggle_burst_mode(&mut self) -> Task<cosmic::Action<Message>> {
@@ -1125,7 +1125,7 @@ impl AppModel {
         if config_changed {
             self.persist_config_async();
         }
-        Task::none()
+        self.show_toggle_feedback(crate::app::toggle_feedback::ToggleKind::Hdr)
     }
 
     pub(crate) fn handle_set_burst_mode_frame_count(
@@ -4644,6 +4644,17 @@ mod tests {
         assert!(!model.is_capturing);
         assert!(model.photo_jobs[&1].live.is_none());
         assert!(model.motion_photo_error.is_none());
+    }
+
+    #[test]
+    fn flash_toggle_schedules_transient_confirmation() {
+        let mut model = crate::app::state::AppModel::default();
+        let task = model.handle_toggle_flash();
+        assert!(model.flash.enabled);
+        assert!(
+            cosmic::iced::runtime::task::into_stream(task).is_some(),
+            "successful toggle must schedule confirmation dismissal"
+        );
     }
 
     #[tokio::test]

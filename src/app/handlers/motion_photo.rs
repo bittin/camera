@@ -186,7 +186,11 @@ impl AppModel {
         &mut self,
     ) -> cosmic::Task<cosmic::Action<crate::app::Message>> {
         if self.should_show_motion_photo_button() {
-            return self.handle_toggle_motion_photo(!self.config.motion_photo);
+            let setting = self.handle_toggle_motion_photo(!self.config.motion_photo);
+            return cosmic::Task::batch([
+                setting,
+                self.show_toggle_feedback(crate::app::toggle_feedback::ToggleKind::MotionPhoto),
+            ]);
         }
         cosmic::Task::none()
     }

@@ -716,6 +716,8 @@ pub struct AppModel {
     pub motion_photo_capture: Option<crate::app::handlers::motion_photo::MotionPhotoCapture>,
     /// Last explicit Motion Photo error, available to the UI without hiding failure.
     pub motion_photo_error: Option<String>,
+    /// Transient title-bar toggle confirmation, independent of capture state.
+    pub(crate) toggle_feedback: Option<crate::app::toggle_feedback::ToggleFeedback>,
     /// Whether the format picker is visible (iOS-style popup)
     pub format_picker_visible: bool,
     /// Whether the exposure picker is visible (iOS-style popup)
@@ -1565,6 +1567,8 @@ pub enum Message {
     ToggleBurstMode,
     /// Toggle Motion Photo for subsequent captures without hiding its button.
     ToggleMotionPhotoCapture,
+    /// Dismiss only the confirmation that scheduled this timeout.
+    DismissToggleFeedback(Instant),
     /// Set burst mode frame count (0 = Auto, 1 = 4 frames, 2 = 6 frames, 3 = 8 frames)
     SetBurstModeFrameCount(usize),
     /// Burst mode frames collected, ready to process

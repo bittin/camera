@@ -49,6 +49,7 @@ mod preview_geometry;
 pub mod qr_overlay;
 pub mod settings;
 mod state;
+mod toggle_feedback;
 mod ui;
 mod update;
 mod video_primitive;
@@ -512,6 +513,7 @@ impl cosmic::Application for AppModel {
             motion_photo_retiring: None,
             motion_photo_capture: None,
             motion_photo_error: None,
+            toggle_feedback: None,
             format_picker_visible: false,
             exposure_picker_visible: false,
             color_picker_visible: false,

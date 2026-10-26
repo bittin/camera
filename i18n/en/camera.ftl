@@ -19,6 +19,16 @@ about = About
 # Link label in the About page pointing at the project source repository.
 repository = Repository
 
+## Brief confirmations after changing a title-bar capture toggle.
+# Keep these short. The label sizes to the translation and wraps when needed.
+# Translate each complete phrase rather than joining a feature name and ON/OFF.
+toggle-flash-on = FLASH ON
+toggle-flash-off = FLASH OFF
+toggle-motion-on = MOTION ON
+toggle-motion-off = MOTION OFF
+toggle-hdr-on = HDR ON
+toggle-hdr-off = HDR OFF
+
 ## Capture modes, shown in the mode carousel at the bottom of the screen.
 
 # Video recording mode. Carousel labels must be very short: the pill is sized

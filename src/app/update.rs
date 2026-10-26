@@ -231,6 +231,10 @@ impl AppModel {
             // ===== Capture Operations =====
             Message::Capture => self.handle_capture(),
             Message::ToggleFlash => self.handle_toggle_flash(),
+            Message::DismissToggleFeedback(shown_at) => {
+                self.dismiss_toggle_feedback(shown_at);
+                Task::none()
+            }
             Message::DismissFlashError => self.handle_dismiss_flash_error(),
             Message::ToggleBurstMode => self.handle_toggle_burst_mode(),
             Message::ToggleMotionPhotoCapture => self.handle_toggle_motion_photo_capture(),

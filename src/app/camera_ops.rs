@@ -19,6 +19,13 @@ fn framerate_matches_config(framerate: Option<&Framerate>, config_fps: Option<u3
 }
 
 impl AppModel {
+    /// Flash is available for photos, or as a hardware torch in video/timelapse.
+    pub(crate) fn should_show_flash_button(&self) -> bool {
+        self.mode == CameraMode::Photo
+            || (matches!(self.mode, CameraMode::Video | CameraMode::Timelapse)
+                && self.use_hardware_flash())
+    }
+
     /// Whether the format picker should be hidden for the current mode.
     /// Libcamera handles resolution automatically in Photo / Video /
     /// Timelapse modes; View doesn't expose any resolution controls
