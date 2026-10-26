@@ -1225,7 +1225,7 @@ impl AppModel {
                     motion_photo_icon,
                     Message::ToggleMotionPhotoCapture,
                     motion_photo_active,
-                    is_disabled || !self.motion_photo_format_compatible(),
+                    is_disabled,
                 ));
                 cells.push(axis_gap(5.0));
             }

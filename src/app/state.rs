@@ -716,8 +716,6 @@ pub struct AppModel {
     pub motion_photo_capture: Option<crate::app::handlers::motion_photo::MotionPhotoCapture>,
     /// Last explicit Motion Photo error, available to the UI without hiding failure.
     pub motion_photo_error: Option<String>,
-    /// Session-only top-bar override; leaves the settings preference enabled.
-    pub motion_photo_override_disabled: bool,
     /// Whether the format picker is visible (iOS-style popup)
     pub format_picker_visible: bool,
     /// Whether the exposure picker is visible (iOS-style popup)
