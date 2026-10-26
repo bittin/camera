@@ -1897,9 +1897,9 @@ impl AppModel {
             self.top_ui_height(),
             self.bottom_ui_height(),
         );
-        // Sideways controls occupy the full strip even when the preview's
-        // scrim is narrower (Video/Timelapse/Virtual). Keep popups clear of
-        // the actual capture lane, not just the shaded preview reservation.
+        // Video/Timelapse/Virtual scrims reserve less than the capture controls.
+        // Keep the popup clear of the full capture lane in every orientation,
+        // without changing the preview's shaded reservation.
         match self.controls_bar_layout().bottom_bar {
             Edge::Left => {
                 insets.left = insets
@@ -1910,6 +1910,11 @@ impl AppModel {
                 insets.right = insets
                     .right
                     .max(crate::app::bar_layout::SIDEWAYS_STRIP_WIDTH)
+            }
+            Edge::Bottom => {
+                insets.bottom = insets
+                    .bottom
+                    .max(crate::app::bottom_bar::BOTTOM_BAR_HEIGHT + self.capture_area_height())
             }
             _ => {}
         }
@@ -2914,6 +2919,70 @@ mod toolbox_placement_tests {
                         assert!((panel.x - (reserved + gap)).abs() < 0.01)
                     }
                     _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn upright_toolbox_clears_capture_controls_in_every_mode() {
+        use crate::backends::display_orientation::DisplayOrientation;
+        let renderer = pollster::block_on(cosmic::Renderer::new(
+            Font::DEFAULT,
+            Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        for mode in [
+            CameraMode::Video,
+            CameraMode::Timelapse,
+            CameraMode::Virtual,
+            CameraMode::Photo,
+        ] {
+            for orientation in [DisplayOrientation::Rotate0, DisplayOrientation::Rotate180] {
+                for size in [Size::new(360.0, 780.0), Size::new(780.0, 360.0)] {
+                    let model = AppModel {
+                        mode,
+                        display_orientation: orientation,
+                        screen_width: size.width,
+                        screen_height: size.height,
+                        tools_menu_visible: true,
+                        ..Default::default()
+                    };
+                    let capture_area = widget::container(model.build_capture_button())
+                        .width(Length::Fill)
+                        .height(Length::Fixed(model.capture_area_height()));
+                    let controls = model.build_capture_controls(
+                        capture_area.into(),
+                        model.build_bottom_bar(),
+                        model.build_video_progress_bar(),
+                    );
+                    let mut controls = model.pin_to_edge(controls, Edge::Bottom);
+                    let mut controls_tree = Tree::new(controls.as_widget());
+                    let controls_node = controls.as_widget_mut().layout(
+                        &mut controls_tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, size),
+                    );
+                    let controls_bounds = controls_node.children()[0].bounds();
+                    let mut menu = model.build_tools_menu();
+                    let mut tree = Tree::new(menu.as_widget());
+                    let node = menu.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, size),
+                    );
+                    let panel = node.children()[0].bounds();
+                    let gap = f32::from(cosmic::theme::spacing().space_xs);
+                    assert!(
+                        (panel.y + panel.height - (controls_bounds.y - gap)).abs() < 0.01,
+                        "{mode:?}, {orientation:?}, {size:?}: toolbox {panel:?} overlaps capture controls {controls_bounds:?}"
+                    );
+                    assert!((panel.center_x() - size.width / 2.0).abs() < 0.01);
+                    if mode != CameraMode::Photo {
+                        // Popup clearance must not enlarge the preview scrim.
+                        assert!(model.bottom_ui_height() < controls_bounds.height);
+                    }
                 }
             }
         }
