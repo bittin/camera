@@ -36,6 +36,7 @@ makedepends="
 	wayland-dev
 "
 checkdepends="
+	dbus
 	ffmpeg
 	gst-plugins-ugly
 "
