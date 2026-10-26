@@ -525,6 +525,13 @@ impl AppModel {
         // its already-queued tick cannot trigger a capture after resetting.
         let _ = self.handle_abort_photo_timer();
         self.photo_timer_setting = Default::default();
+        // Flash is session state rather than a Config field. Turn off the LEDs
+        // before clearing its UI state, retaining hardware discovery/permissions.
+        self.turn_off_flash_hardware();
+        self.flash.enabled = false;
+        self.flash.active = false;
+        self.flash.error_popup = None;
+        self.toggle_feedback = None;
         self.current_video_encoder_index = 0;
         self.selected_filter = FilterType::default();
         self.recording_filter_code.store(

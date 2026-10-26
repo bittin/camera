@@ -26,6 +26,70 @@ use cosmic::widget::{self, icon};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::info;
 
+/// Center upright capture controls independently of the side groups. Sideways,
+/// keep Settings/window controls first and pack capture/format controls at the end.
+fn top_bar_groups<'a>(
+    mut leading: Vec<Element<'a, Message>>,
+    mut capture: Vec<Element<'a, Message>>,
+    mut trailing: Vec<Element<'a, Message>>,
+    sideways: bool,
+) -> Element<'a, Message> {
+    if sideways {
+        leading.reverse();
+        capture.reverse();
+        trailing.reverse();
+        widget::Column::new()
+            .push(
+                widget::container(
+                    widget::Column::with_children(trailing).align_x(Alignment::Center),
+                )
+                .height(Length::Fill)
+                .align_y(Alignment::Start)
+                .clip(true),
+            )
+            .push(
+                widget::container(
+                    widget::Column::with_children(capture).align_x(Alignment::Center),
+                )
+                .id(crate::app::toggle_feedback::CAPTURE_GROUP_ID),
+            )
+            .push(
+                widget::container(
+                    widget::Column::with_children(leading).align_x(Alignment::Center),
+                )
+                .height(Length::Shrink)
+                .align_y(Alignment::End)
+                .clip(true),
+            )
+            .padding(7)
+            .align_x(Alignment::Center)
+            .height(Length::Fill)
+            .into()
+    } else {
+        widget::Row::new()
+            .push(
+                widget::container(widget::Row::with_children(leading).align_y(Alignment::Center))
+                    .width(Length::Fill)
+                    .align_x(Alignment::Start)
+                    .clip(true),
+            )
+            .push(
+                widget::container(widget::Row::with_children(capture).align_y(Alignment::Center))
+                    .id(crate::app::toggle_feedback::CAPTURE_GROUP_ID),
+            )
+            .push(
+                widget::container(widget::Row::with_children(trailing).align_y(Alignment::Center))
+                    .width(Length::Fill)
+                    .align_x(Alignment::End)
+                    .clip(true),
+            )
+            .padding([7, 7, 8, 7])
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
+    }
+}
+
 pub(crate) fn picker_panel_height(sideways: bool, screen_height: f32) -> Length {
     const COMPACT_SIDE_HEIGHT_MAX: f32 = 480.0;
     if sideways && screen_height > 0.0 && screen_height <= COMPACT_SIDE_HEIGHT_MAX {
@@ -253,7 +317,7 @@ impl AppModel {
     /// them on. Single source of truth shared by [`Self::bar_insets`] and
     /// [`Self::settled_bar_insets`] so the edge mapping cannot drift between
     /// the animated and settled variants.
-    fn map_bar_insets(
+    pub(super) fn map_bar_insets(
         layout: crate::app::bar_layout::BarLayout,
         top: f32,
         bottom: f32,
@@ -447,20 +511,30 @@ fn disabled_top_bar_icon_style(theme: &cosmic::Theme) -> widget::container::Styl
     }
 }
 
-/// Top-bar toggles keep the same footprint and disabled foreground during transitions.
+/// Top-bar toggles keep native styling and disabled foreground during transitions.
 fn top_bar_toggle_button<'a>(
-    handle: widget::icon::Handle,
+    handle: impl Into<widget::icon::Handle>,
     message: Message,
     active: bool,
     disabled: bool,
 ) -> Element<'a, Message> {
+    let capture_toggle = matches!(
+        message,
+        Message::ToggleFlash | Message::ToggleMotionPhotoCapture
+    );
+    let mut button = widget::button::icon(handle).extra_small();
+    if capture_toggle {
+        button = button.icon_size(20);
+    }
+    let button = button
+        .selected(active)
+        .on_press_maybe((!disabled).then_some(message));
     if disabled {
-        widget::container(widget::icon(handle).size(20))
+        widget::container(button)
             .style(disabled_top_bar_icon_style)
-            .padding([4, 8])
             .into()
     } else {
-        overlay_icon_button(handle, Some(message), active)
+        button.into()
     }
 }
 
@@ -853,6 +927,10 @@ impl AppModel {
                 main_stack = main_stack.push(chip_layer);
             }
 
+            if let Some(feedback) = self.build_toggle_feedback() {
+                main_stack = main_stack.push(feedback);
+            }
+
             if self.flash.error_popup.is_some() {
                 main_stack = main_stack.push(self.build_flash_error_popup());
             }
@@ -1129,14 +1207,6 @@ impl AppModel {
                 s.width(Length::Fixed(px)).into()
             }
         };
-        let fill_gap = move || -> Element<'static, Message> {
-            let s = widget::Space::new();
-            if sideways {
-                s.height(Length::Fill).into()
-            } else {
-                s.width(Length::Fill).into()
-            }
-        };
 
         // Children in portrait order (leading -> trailing). Sideways, this same
         // sequence is folded into a `Column`; a rotate-left (270deg / Ccw90)
@@ -1186,16 +1256,14 @@ impl AppModel {
             cells.push(self.build_file_source_resolution_label());
         }
 
-        // Right side buttons
-        cells.push(fill_gap());
+        let leading = cells;
+        let mut capture_cells = Vec::new();
+        let mut cells = Vec::new();
 
         // Top-bar toggle buttons (flash, HDR, file, tools) are always
         // shown. Picker overlays appear on top of them but never replace them.
         // Flash toggle button (Photo mode, or Video/Timelapse mode with hardware flash for torch)
-        if self.mode == CameraMode::Photo
-            || ((self.mode == CameraMode::Video || self.mode == CameraMode::Timelapse)
-                && self.use_hardware_flash())
-        {
+        if self.should_show_flash_button() {
             let flash_icon_bytes = if self.flash.enabled {
                 FLASH_ICON
             } else {
@@ -1203,17 +1271,15 @@ impl AppModel {
             };
             let flash_icon = widget::icon::from_svg_bytes(flash_icon_bytes).symbolic(true);
 
-            cells.push(top_bar_toggle_button(
+            capture_cells.push(top_bar_toggle_button(
                 flash_icon,
                 Message::ToggleFlash,
                 self.flash.enabled,
                 is_disabled,
             ));
 
-            // 5px spacing
-            cells.push(axis_gap(5.0));
-
             if self.should_show_motion_photo_button() {
+                capture_cells.push(axis_gap(5.0));
                 let motion_photo_active = self.motion_photo_enabled();
                 let motion_photo_icon = widget::icon::from_svg_bytes(if motion_photo_active {
                     MOTION_PHOTO_ICON
@@ -1221,13 +1287,12 @@ impl AppModel {
                     MOTION_PHOTO_OFF_ICON
                 })
                 .symbolic(true);
-                cells.push(top_bar_toggle_button(
+                capture_cells.push(top_bar_toggle_button(
                     motion_photo_icon,
                     Message::ToggleMotionPhotoCapture,
                     motion_photo_active,
                     is_disabled,
                 ));
-                cells.push(axis_gap(5.0));
             }
 
             if self.should_show_burst_button() {
@@ -1283,27 +1348,12 @@ impl AppModel {
         }
 
         // Settings button (normally in header_end)
-        if is_disabled {
-            cells.push(
-                widget::container(
-                    widget::button::icon(
-                        icon::from_name("preferences-system-symbolic").symbolic(true),
-                    )
-                    .extra_small(),
-                )
-                .style(disabled_top_bar_icon_style)
-                .into(),
-            );
-        } else {
-            cells.push(
-                widget::button::icon(icon::from_name("preferences-system-symbolic").symbolic(true))
-                    .extra_small()
-                    .on_press(Message::ToggleContextPage(
-                        crate::app::state::ContextPage::Settings,
-                    ))
-                    .into(),
-            );
-        }
+        cells.push(top_bar_toggle_button(
+            icon::from_name("preferences-system-symbolic").symbolic(true),
+            Message::ToggleContextPage(crate::app::state::ContextPage::Settings),
+            false,
+            is_disabled,
+        ));
 
         let window_controls = self.build_window_control_buttons();
         if !window_controls.is_empty() {
@@ -1311,25 +1361,9 @@ impl AppModel {
             cells.extend(window_controls);
         }
 
-        // Portrait keeps the historical `Row`; sideways folds the same cells
-        // into a `Column`. The top bar's window controls belong at the strip's
-        // TOP in BOTH rotations - a horizontal mirror preserves vertical order,
-        // so unlike the bottom bar (which mirrors via `sideways_column_reverses`)
-        // the portrait cells, whose window controls are trailing, are reversed
-        // whenever sideways. Not doing this at 90° left them at the bottom and
-        // pushed the cluster partly off-screen.
-        let content: Element<'_, Message> = if sideways {
-            cells.reverse();
-            widget::Column::with_children(cells)
-                .padding([7, 7, 8, 7])
-                .align_x(Alignment::Center)
-                .into()
-        } else {
-            widget::Row::with_children(cells)
-                .padding([7, 7, 8, 7])
-                .align_y(Alignment::Center)
-                .into()
-        };
+        // Upright: equal flexible side slots keep Flash/Motion centered.
+        // Sideways: keep them at the opposite end from Settings/window controls.
+        let content = top_bar_groups(leading, capture_cells, cells, sideways);
 
         // This bar *is* the window's title bar, so it adopts the native COSMIC
         // header bar's colours: accent icons while the window holds focus,
@@ -2915,6 +2949,69 @@ mod toolbox_placement_tests {
 #[cfg(test)]
 mod motion_photo_disabled_icon_tests {
     use super::*;
+
+    #[test]
+    fn hdr_button_keeps_settings_footprint_in_every_state() {
+        use crate::app::settings::widget_test_support::{layout, renderer};
+        let renderer = renderer();
+        let size = cosmic::iced::Size::new(320.0, 180.0);
+        let mut settings: Element<'_, Message> =
+            widget::button::icon(icon::from_name("preferences-system-symbolic").symbolic(true))
+                .extra_small()
+                .into();
+        let (_, settings_node) = layout(&mut settings, &renderer, size);
+        for active in [false, true] {
+            for disabled in [false, true] {
+                let mut toggle = top_bar_toggle_button(
+                    widget::icon::from_svg_bytes(MOON_ICON).symbolic(true),
+                    Message::ToggleBurstMode,
+                    active,
+                    disabled,
+                );
+                let (_, node) = layout(&mut toggle, &renderer, size);
+                assert_eq!(node.size(), settings_node.size());
+            }
+        }
+    }
+
+    #[test]
+    fn flash_motion_icons_are_larger_with_original_padding() {
+        use crate::app::settings::widget_test_support::{layout, renderer};
+        use cosmic::iced::advanced::layout::Node;
+        fn icon_node(node: &Node) -> &Node {
+            match node.children().first() {
+                Some(child) => icon_node(child),
+                None => node,
+            }
+        }
+        let renderer = renderer();
+        let size = cosmic::iced::Size::new(320.0, 180.0);
+        for (bytes, message) in [
+            (FLASH_ICON, Message::ToggleFlash),
+            (FLASH_OFF_ICON, Message::ToggleFlash),
+            (MOTION_PHOTO_ICON, Message::ToggleMotionPhotoCapture),
+            (MOTION_PHOTO_OFF_ICON, Message::ToggleMotionPhotoCapture),
+        ] {
+            for active in [false, true] {
+                for disabled in [false, true] {
+                    let mut button = top_bar_toggle_button(
+                        widget::icon::from_svg_bytes(bytes).symbolic(true),
+                        message.clone(),
+                        active,
+                        disabled,
+                    );
+                    let (_, node) = layout(&mut button, &renderer, size);
+                    assert_eq!(icon_node(&node).size(), cosmic::iced::Size::new(20.0, 20.0));
+                    let original_padding = f32::from(cosmic::theme::spacing().space_xxs);
+                    let expected_extent = 20.0 + 2.0 * original_padding;
+                    assert_eq!(
+                        node.size(),
+                        cosmic::iced::Size::new(expected_extent, expected_extent)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn disabled_motion_photo_icon_uses_theme_disabled_foreground_not_white() {

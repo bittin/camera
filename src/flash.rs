@@ -213,3 +213,54 @@ pub fn all_off(devices: &[FlashDevice]) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{AppModel, CameraMode, Message};
+
+    #[test]
+    fn reset_all_settings_disables_flash_and_turns_off_detected_leds() {
+        let root =
+            std::env::temp_dir().join(format!("camera-flash-reset-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        for mode in [CameraMode::Photo, CameraMode::Video, CameraMode::Timelapse] {
+            std::fs::write(root.join("brightness"), "255").unwrap();
+            let mut app = AppModel::default();
+            let _ = app.update(Message::ToggleFlash);
+            assert!(app.flash.enabled);
+            app.mode = mode;
+            app.flash.active = true;
+            app.flash.error_popup = Some("stale permission popup".into());
+            app.flash.hardware = FlashHardware {
+                devices: vec![FlashDevice {
+                    path: root.clone(),
+                    max_brightness: 255,
+                    name: "fixture:flash".into(),
+                }],
+                permission_error: Some("another LED is not writable".into()),
+            };
+
+            let _ = app.update(Message::ResetAllSettings);
+
+            assert!(!app.flash.enabled, "flash stayed enabled in {mode:?}");
+            assert!(!app.flash.active, "screen flash stayed active in {mode:?}");
+            assert!(app.flash.error_popup.is_none());
+            assert!(app.build_toggle_feedback().is_none());
+            assert_eq!(
+                std::fs::read_to_string(root.join("brightness")).unwrap(),
+                "0"
+            );
+            assert_eq!(
+                app.flash.hardware.devices.len(),
+                1,
+                "reset must retain discovered hardware"
+            );
+            assert_eq!(
+                app.flash.hardware.permission_error.as_deref(),
+                Some("another LED is not writable")
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
