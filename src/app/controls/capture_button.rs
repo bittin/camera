@@ -290,17 +290,21 @@ impl AppModel {
         }
     }
 
-    /// Build the main capture button (shown in all modes).
-    /// Wraps the circle in a Fill container for centering when used standalone.
+    /// Build the capture lane. Toolbox shares the still-during-video slot,
+    /// yielding that slot to photo capture while recording/streaming.
     pub fn build_capture_button(&self) -> Element<'_, Message> {
-        let spacing = cosmic::theme::spacing();
-        let circle = self.build_capture_circle();
-
-        widget::container(circle)
-            .width(Length::Fill)
-            .center_x(Length::Fill)
-            .padding([spacing.space_xs, 0])
-            .into()
+        let recording_layout = (self.recording.is_recording() && !self.quick_record.is_recording())
+            || self.virtual_camera.is_streaming();
+        let right = if recording_layout {
+            self.build_photo_during_recording_button()
+        } else {
+            self.build_capture_tools_button()
+        };
+        self.build_capture_row(
+            self.build_video_play_pause_button(),
+            self.build_capture_circle(),
+            right,
+        )
     }
 
     /// Build the photo capture button shown during video recording (right side).
@@ -346,6 +350,165 @@ mod tests {
             Some("tiny-skia"),
         ))
         .expect("headless software renderer")
+    }
+
+    fn find_tools_button(
+        element: Element<'_, Message>,
+        renderer: &cosmic::Renderer,
+        size: Size,
+    ) -> Option<Point> {
+        find_action_button(element, renderer, size, |message| {
+            matches!(message, Message::ToggleToolsMenu)
+        })
+    }
+
+    fn find_action_button(
+        mut element: Element<'_, Message>,
+        renderer: &cosmic::Renderer,
+        size: Size,
+        matches_action: impl Fn(&Message) -> bool,
+    ) -> Option<Point> {
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let viewport = Rectangle::with_size(size);
+        for y in (4..size.height as usize).step_by(8) {
+            for x in (4..size.width as usize).step_by(8) {
+                let point = Point::new(x as f32, y as f32);
+                let mut messages = Vec::new();
+                for event in [
+                    Event::Window(window::Event::RedrawRequested(std::time::Instant::now())),
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+                    Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+                ] {
+                    let mut shell = Shell::new(&mut messages);
+                    element.as_widget_mut().update(
+                        &mut tree,
+                        &event,
+                        Layout::new(&node),
+                        mouse::Cursor::Available(point),
+                        renderer,
+                        &mut clipboard::Null,
+                        &mut shell,
+                        &viewport,
+                    );
+                }
+                if messages.iter().any(&matches_action) {
+                    return Some(point);
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn toolbox_moves_from_title_bar_to_beside_the_shutter() {
+        let renderer = renderer();
+        let size = Size::new(640.0, 180.0);
+        for mode in [
+            CameraMode::Photo,
+            CameraMode::Video,
+            CameraMode::Timelapse,
+            CameraMode::Virtual,
+        ] {
+            let mut model = AppModel {
+                mode,
+                ..Default::default()
+            };
+            let tools = find_tools_button(model.build_capture_button(), &renderer, size)
+                .expect("toolbox must be available beside the shutter");
+            assert!(tools.x > size.width / 2.0);
+            assert!(
+                find_tools_button(model.build_top_bar(), &renderer, size).is_none(),
+                "toolbox must not remain duplicated in the title bar"
+            );
+            model.transition_state.ui_disabled = true;
+            assert!(find_tools_button(model.build_capture_button(), &renderer, size).is_none());
+        }
+    }
+
+    #[test]
+    fn toolbox_uses_the_camera_switch_button_footprint() {
+        let renderer = renderer();
+        let model = AppModel::default();
+        let (messages, _, size) = exercise(model.build_capture_tools_button(), &renderer);
+        assert_eq!(
+            size,
+            Size::new(ui::PLACEHOLDER_BUTTON_WIDTH, ui::PLACEHOLDER_BUTTON_WIDTH)
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::ToggleToolsMenu))
+        );
+    }
+
+    #[test]
+    fn toolbox_and_recording_photo_share_the_same_slot_in_each_rotation() {
+        use crate::app::state::RecordingState;
+        use crate::backends::display_orientation::DisplayOrientation;
+        let renderer = renderer();
+        for (orientation, size) in [
+            (DisplayOrientation::Rotate0, Size::new(320.0, 100.0)),
+            (DisplayOrientation::Rotate0, Size::new(640.0, 100.0)),
+            (DisplayOrientation::Rotate90, Size::new(100.0, 360.0)),
+            (DisplayOrientation::Rotate270, Size::new(100.0, 360.0)),
+            (DisplayOrientation::Rotate90, Size::new(100.0, 180.0)),
+            (DisplayOrientation::Rotate270, Size::new(100.0, 180.0)),
+        ] {
+            let mut model = AppModel {
+                mode: CameraMode::Video,
+                display_orientation: orientation,
+                ..Default::default()
+            };
+            let layout = |mut element: Element<'_, Message>| {
+                let mut tree = Tree::new(element.as_widget());
+                element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                )
+            };
+            let idle = layout(model.build_capture_button());
+            let tools = find_tools_button(model.build_capture_button(), &renderer, size)
+                .expect("toolbox clipped out of capture lane");
+            model.recording = RecordingState::Recording {
+                session: 1,
+                start_time: std::time::Instant::now(),
+                file_path: String::new(),
+                stop_sender: None,
+                audio_levels: None,
+            };
+            let recording = layout(model.build_capture_button());
+            assert_eq!(
+                idle.size(),
+                recording.size(),
+                "changing slot action must not move the shutter"
+            );
+            assert_eq!(idle.children().len(), recording.children().len());
+            for (idle, recording) in idle.children().iter().zip(recording.children()) {
+                assert_eq!(idle.bounds().center(), recording.bounds().center());
+            }
+            assert!(find_tools_button(model.build_capture_button(), &renderer, size).is_none());
+            let photo =
+                find_action_button(model.build_capture_button(), &renderer, size, |message| {
+                    matches!(message, Message::Capture)
+                })
+                .expect("photo capture during recording must remain reachable");
+            assert!((photo.x - tools.x).abs() < 32.0 && (photo.y - tools.y).abs() < 32.0);
+            assert!(
+                find_action_button(
+                    model.build_capture_button(),
+                    &renderer,
+                    size,
+                    |message| matches!(message, Message::ToggleRecording)
+                )
+                .is_some()
+            );
+        }
     }
 
     fn exercise(

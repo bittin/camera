@@ -12,6 +12,31 @@ use cosmic::widget;
 const CAMERA_SWITCH_ICON: &[u8] =
     include_bytes!("../../../resources/button_icons/camera-switch.svg");
 
+/// Shared native styling for the camera switcher and capture-lane Toolbox.
+pub(crate) fn capture_side_button(
+    handle: widget::icon::Handle,
+    message: Option<Message>,
+    selected: bool,
+) -> Element<'static, Message> {
+    let icon = widget::icon(handle)
+        .size(24)
+        .class(cosmic::theme::Svg::custom(|theme| {
+            cosmic::iced::widget::svg::Style {
+                color: Some(cosmic::iced::Color::from(theme.cosmic().accent_color())),
+            }
+        }));
+    let mut button = widget::button::custom(icon)
+        .padding(10)
+        .width(Length::Fixed(ui::PLACEHOLDER_BUTTON_WIDTH))
+        .height(Length::Fixed(ui::PLACEHOLDER_BUTTON_WIDTH))
+        .class(cosmic::theme::Button::Standard)
+        .selected(selected);
+    if let Some(message) = message {
+        button = button.on_press(message);
+    }
+    button.into()
+}
+
 impl AppModel {
     /// Build the camera switcher button widget
     ///
@@ -34,29 +59,11 @@ impl AppModel {
         }
 
         if self.available_cameras.len() > 1 {
-            let switch_handle = widget::icon::from_svg_bytes(CAMERA_SWITCH_ICON).symbolic(true);
-
-            // Create icon widget with accent color
-            let icon_widget =
-                widget::icon(switch_handle)
-                    .size(24)
-                    .class(cosmic::theme::Svg::custom(|theme| {
-                        cosmic::iced::widget::svg::Style {
-                            color: Some(cosmic::iced::Color::from(theme.cosmic().accent_color())),
-                        }
-                    }));
-
-            let mut btn = widget::button::custom(icon_widget)
-                .padding(10)
-                .width(Length::Fixed(44.0))
-                .height(Length::Fixed(44.0))
-                .class(cosmic::theme::Button::Standard);
-
-            if !is_disabled {
-                btn = btn.on_press(Message::SwitchCamera);
-            }
-
-            btn.into()
+            capture_side_button(
+                widget::icon::from_svg_bytes(CAMERA_SWITCH_ICON).symbolic(true),
+                (!is_disabled).then_some(Message::SwitchCamera),
+                false,
+            )
         } else {
             widget::Space::new()
                 .width(Length::Fixed(ui::PLACEHOLDER_BUTTON_WIDTH))

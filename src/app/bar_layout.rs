@@ -222,13 +222,12 @@ pub fn bar_anchored_popup_padding(
 ///
 /// Portrait always pins the capture area to `capture_area_height()` so the
 /// View↔Photo transition can animate the slot's collapse. When the device is
-/// held sideways *and* the recording/streaming three-slot layout is showing, the
+/// held sideways, the capture lane always uses three slots (Toolbox while idle,
+/// photo capture while recording/streaming). The
 /// three controls stack into a `Column` that is taller than the ~100px portrait
 /// lane, so the area must size to its content instead of clipping the stack.
-/// Every other sideways case (idle capture button, video-file controls) still
-/// wants the fixed lane height.
-pub fn capture_area_height_is_fixed(sideways: bool, recording_layout: bool) -> bool {
-    !(sideways && recording_layout)
+pub fn capture_area_height_is_fixed(sideways: bool) -> bool {
+    !sideways
 }
 
 #[cfg(test)]
@@ -444,15 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn capture_area_fixed_height_except_sideways_recording() {
+    fn capture_area_fixed_height_only_in_portrait() {
         // Portrait always keeps the fixed lane height (drives the View↔Photo
         // animation), in every layout state.
-        assert!(capture_area_height_is_fixed(false, false));
-        assert!(capture_area_height_is_fixed(false, true));
-        // Sideways idle capture button still uses the fixed lane.
-        assert!(capture_area_height_is_fixed(true, false));
-        // Only the sideways recording/streaming stack sizes to its content.
-        assert!(!capture_area_height_is_fixed(true, true));
+        assert!(capture_area_height_is_fixed(false));
+        // Toolbox and recording-photo controls both need the whole side lane.
+        assert!(!capture_area_height_is_fixed(true));
     }
 
     #[test]

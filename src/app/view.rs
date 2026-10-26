@@ -686,140 +686,12 @@ impl AppModel {
         // hidden.
         let show_zoom_label = self.mode.supports_fit_and_zoom() && !self.ui_hidden;
 
-        // Capture button area - changes based on recording/streaming state and video file selection
-        // Check if we have video file controls (play/pause button for video file sources)
-        let play_pause_button = self.build_video_play_pause_button();
-        let has_video_controls = play_pause_button.is_some();
-
         // Held sideways the bars move to the side edges; the capture area is a
         // narrow (~100px) vertical lane, so the recording three-slot layout
         // stacks into a Column instead of the portrait Row.
         let sideways = self.controls_are_sideways();
-        // The recording/streaming state that replaces the single capture button
-        // with the [play·stop·photo] three-slot layout.
-        let recording_layout = (self.recording.is_recording() && !self.quick_record.is_recording())
-            || self.virtual_camera.is_streaming();
 
-        let capture_button_only = if recording_layout {
-            // Mirror the bottom bar's three-column layout so the stop circle
-            // sits where the carousel does and the photo button lines up with
-            // the camera-switch position. Portrait uses `three_col_row` (the
-            // shared shape); sideways stacks the same three slots into a Column
-            // that fits the narrow strip. The side spacer width and center
-            // container width match the bottom bar's gallery/switch buttons and
-            // carousel width.
-            let stop_circle = self.build_capture_circle();
-            let photo_button = self.build_photo_during_recording_button();
-            let slide = std::sync::Arc::clone(&self.carousel_button_slide);
-
-            let spacing = cosmic::theme::spacing();
-            let side_width = ui::PLACEHOLDER_BUTTON_WIDTH;
-            let center_width = crate::app::bottom_bar::mode_carousel::carousel_width_for_modes(
-                &self.available_modes(),
-            );
-
-            // While the virtual camera is streaming a video file source, keep
-            // the play/pause control reachable in the left slot (it's hidden
-            // by the streaming layout otherwise). For the camera-source
-            // streaming case `play_pause_button` is `None` and we fall back
-            // to the original spacer.
-            let left_slot: Element<'_, Message> = if let Some(pp_button) = play_pause_button {
-                widget::container(pp_button)
-                    .width(Length::Fixed(side_width))
-                    .center_x(side_width)
-                    .into()
-            } else {
-                widget::Space::new()
-                    .width(Length::Fixed(side_width))
-                    .height(Length::Shrink)
-                    .into()
-            };
-            let center_slot: Element<'_, Message> = widget::container(stop_circle)
-                .width(Length::Fixed(center_width))
-                .center_x(center_width)
-                .into();
-
-            if sideways {
-                // Same three slots as portrait, stacked to fit the vertical
-                // strip. Mirror-aware: a rotate-left (270°/Ccw90) turn reverses
-                // the column so the stop circle keeps mirroring the carousel
-                // (whose labels already flip bottom↔top there); rotate-right
-                // (90°) keeps portrait order. See `sideways_column_reverses`.
-                let photo_slot: Element<'_, Message> = widget::container(photo_button)
-                    .width(Length::Fixed(side_width))
-                    .center_x(side_width)
-                    .into();
-                let mut slots: Vec<Element<'_, Message>> = vec![left_slot, center_slot, photo_slot];
-                if sideways_column_reverses(self.controls_bar_layout().quarter) {
-                    slots.reverse();
-                }
-                widget::Column::with_children(slots)
-                    .align_x(cosmic::iced::alignment::Horizontal::Center)
-                    .spacing(spacing.space_m)
-                    .width(Length::Fill)
-                    .into()
-            } else {
-                // Vertical padding matches build_capture_button so the circle
-                // doesn't shift when the layout flips between idle and recording.
-                crate::app::bottom_bar::three_col_row(
-                    left_slot,
-                    // Wrap the center container in a SlidePrimer so it publishes the
-                    // resting carousel slide (from its own bounds) into the shared
-                    // atomic. During recording the carousel isn't in the tree, so
-                    // without this the photo button's SlideH would read a stale/zero
-                    // offset - the misplacement seen in spoofed preview screenshots.
-                    crate::app::bottom_bar::slide_h::SlidePrimer::new(
-                        center_slot,
-                        std::sync::Arc::clone(&self.carousel_button_slide),
-                    )
-                    .into(),
-                    SlideH::new(photo_button, slide, -1.0).into(),
-                    [spacing.space_xs, spacing.space_m],
-                )
-            }
-        } else if has_video_controls {
-            // Video file selected but not streaming: show play button + capture button
-            let capture_button = self.build_capture_button();
-            let icon_button_width = crate::constants::ui::ICON_BUTTON_WIDTH;
-
-            // Layout: [Fill] [Play container] [Capture] [Spacer matching Play] [Fill]
-            // Use fixed-width container for play button to ensure centering
-            let mut row = widget::Row::new().push(
-                widget::Space::new()
-                    .width(Length::Fill)
-                    .height(Length::Shrink),
-            );
-
-            if let Some(pp_button) = play_pause_button {
-                // Wrap play/pause button in fixed-width container for consistent centering
-                row = row.push(
-                    widget::container(pp_button)
-                        .width(Length::Fixed(icon_button_width))
-                        .align_x(cosmic::iced::alignment::Horizontal::Center),
-                );
-            }
-
-            row = row
-                .push(capture_button)
-                // Spacer matches play/pause button width for centering
-                .push(
-                    widget::Space::new()
-                        .width(Length::Fixed(icon_button_width))
-                        .height(Length::Shrink),
-                )
-                .push(
-                    widget::Space::new()
-                        .width(Length::Fill)
-                        .height(Length::Shrink),
-                )
-                .align_y(Alignment::Center)
-                .width(Length::Fill);
-
-            row.into()
-        } else {
-            // Normal single capture button
-            self.build_capture_button()
-        };
+        let capture_button_only = self.build_capture_button();
 
         // Capture button area (filter name label is now an overlay on the
         // preview). Wrap in a fixed-height container driven by the animated
@@ -840,11 +712,11 @@ impl AppModel {
             capture_button_only
         };
         // Portrait always pins the lane to `capture_h` (drives the View↔Photo
-        // collapse animation). Sideways, the taller stacked recording Column
+        // collapse animation). Sideways, the taller stacked capture Column
         // needs to size to its own content instead of being clipped to the
         // ~100px lane - see `capture_area_height_is_fixed`.
         let mut capture_area = widget::container(inner).width(Length::Fill).clip(true);
-        if crate::app::bar_layout::capture_area_height_is_fixed(sideways, recording_layout) {
+        if crate::app::bar_layout::capture_area_height_is_fixed(sideways) {
             capture_area = capture_area.height(Length::Fixed(capture_h.max(0.0)));
         }
         let capture_button_area: Element<'_, Message> = capture_area.into();
@@ -1126,8 +998,99 @@ impl AppModel {
         .into()
     }
 
+    /// Reuse the recording lane's slots for idle capture controls, keeping
+    /// Toolbox/photo capture aligned with the camera switcher in every rotation.
+    pub(super) fn build_capture_row<'a>(
+        &self,
+        left: Option<Element<'a, Message>>,
+        center: Element<'a, Message>,
+        right: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let spacing = cosmic::theme::spacing();
+        let side_width = ui::PLACEHOLDER_BUTTON_WIDTH;
+        let center_width = crate::app::bottom_bar::mode_carousel::carousel_width_for_modes(
+            &self.available_modes(),
+        );
+        // Keep the shutter and both actions reachable even before the first
+        // resize event or at the minimum supported window height.
+        let available_height = if self.screen_height > 0.0 {
+            self.screen_height
+        } else {
+            180.0
+        };
+        let shutter_size = crate::app::controls::capture_button::CAPTURE_BUTTON_OUTER_SIZE;
+        let side_spacing =
+            crate::app::bottom_bar::mode_carousel::sideways_sibling_spacing_for_modes(
+                &self.available_modes(),
+                self.screen_height,
+            )
+            .min(((available_height - 2.0 * side_width - shutter_size) / 2.0).max(0.0));
+        let center_height = center_width
+            .min((available_height - 2.0 * side_width - 2.0 * side_spacing).max(shutter_size));
+        let left = left.unwrap_or_else(|| widget::Space::new().into());
+        let left: Element<'a, Message> = widget::container(left)
+            .width(side_width)
+            .height(side_width)
+            .center_x(side_width)
+            .center_y(side_width)
+            .into();
+        let center: Element<'a, Message> = if self.controls_are_sideways() {
+            widget::container(center)
+                .width(Length::Fill)
+                .height(center_height)
+                .center_x(Length::Fill)
+                .center_y(center_height)
+                .into()
+        } else {
+            widget::container(center)
+                .width(center_width)
+                .center_x(center_width)
+                .into()
+        };
+        let right: Element<'a, Message> = widget::container(right)
+            .width(side_width)
+            .height(side_width)
+            .center_x(side_width)
+            .center_y(side_width)
+            .into();
+
+        if self.controls_are_sideways() {
+            let mut slots = vec![left, center, right];
+            if sideways_column_reverses(self.controls_bar_layout().quarter) {
+                slots.reverse();
+            }
+            widget::Column::with_children(slots)
+                .align_x(Alignment::Center)
+                .spacing(side_spacing)
+                .width(Length::Fill)
+                .into()
+        } else {
+            // Prime the slide even while recording hides the carousel. Both
+            // side controls follow the same geometry as their bottom-bar peers.
+            let slide = std::sync::Arc::clone(&self.carousel_button_slide);
+            crate::app::bottom_bar::three_col_row(
+                SlideH::new(left, std::sync::Arc::clone(&slide), 1.0).into(),
+                crate::app::bottom_bar::slide_h::SlidePrimer::new(
+                    center,
+                    std::sync::Arc::clone(&slide),
+                )
+                .into(),
+                SlideH::new(right, slide, -1.0).into(),
+                [spacing.space_xs, spacing.space_m],
+            )
+        }
+    }
+
+    pub(super) fn build_capture_tools_button(&self) -> Element<'_, Message> {
+        crate::app::bottom_bar::camera_switcher::capture_side_button(
+            widget::icon::from_svg_bytes(TOOLS_GRID_ICON).symbolic(true),
+            (!self.transition_state.ui_disabled).then_some(Message::ToggleToolsMenu),
+            self.tools_menu_visible || self.has_non_default_tool_settings(),
+        )
+    }
+
     /// Build the top bar with recording indicator and format button
-    fn build_top_bar(&self) -> Element<'_, Message> {
+    pub(super) fn build_top_bar(&self) -> Element<'_, Message> {
         // View mode and hidden chrome strip every top-bar button (and the
         // title-bar window controls) but keep the draggable row so the user
         // can still move / double-click-to-maximize the window. Without it a
@@ -1318,18 +1281,6 @@ impl AppModel {
             // 5px spacing
             cells.push(axis_gap(5.0));
         }
-
-        // Tools menu button (opens overlay with timer, aspect ratio, exposure, filter, motor)
-        // Highlight when tools menu is open or any tool setting is non-default
-        let tools_active = self.tools_menu_visible || self.has_non_default_tool_settings();
-        let tools_icon = widget::icon::from_svg_bytes(TOOLS_GRID_ICON).symbolic(true);
-
-        cells.push(top_bar_toggle_button(
-            tools_icon,
-            Message::ToggleToolsMenu,
-            tools_active,
-            is_disabled,
-        ));
 
         // Settings button (normally in header_end)
         if is_disabled {
@@ -1779,7 +1730,7 @@ impl AppModel {
     /// Build the tools menu overlay
     ///
     /// Shows timer, aspect ratio, exposure, filter buttons
-    /// in a floating panel aligned to the top-right with large icon buttons in a 2-row grid.
+    /// in a floating panel centered above the capture lane.
     fn build_tools_menu(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
         let is_photo_mode = self.mode == CameraMode::Photo;
@@ -1907,12 +1858,66 @@ impl AppModel {
         // Build panel with semi-transparent themed background
         let panel = self.frosted_panel(column.into(), PICKER_PANEL);
 
-        // Anchor to the top bar's inner edge (below it in portrait, off the side
-        // bar in landscape), tapping outside to close.
-        self.anchor_bar_popup(panel, Message::CloseToolsMenu)
+        let mut insets = Self::map_bar_insets(
+            self.controls_bar_layout(),
+            self.top_ui_height(),
+            self.bottom_ui_height(),
+        );
+        // Sideways controls occupy the full strip even when the preview's
+        // scrim is narrower (Video/Timelapse/Virtual). Keep popups clear of
+        // the actual capture lane, not just the shaded preview reservation.
+        match self.controls_bar_layout().bottom_bar {
+            Edge::Left => {
+                insets.left = insets
+                    .left
+                    .max(crate::app::bar_layout::SIDEWAYS_STRIP_WIDTH)
+            }
+            Edge::Right => {
+                insets.right = insets
+                    .right
+                    .max(crate::app::bar_layout::SIDEWAYS_STRIP_WIDTH)
+            }
+            _ => {}
+        }
+        let gap = f32::from(spacing.space_xs);
+        if !self.controls_are_sideways() && self.screen_height > 0.0 {
+            // A minimum-height window has no free preview above the capture
+            // lane. Relax the bottom reservation rather than hiding the menu;
+            // the bounded scroll viewport keeps at least one tool row usable.
+            const MIN_TOOLBOX_VIEWPORT_HEIGHT: f32 = 96.0;
+            let max_bottom =
+                (self.screen_height - insets.top - 2.0 * gap - MIN_TOOLBOX_VIEWPORT_HEIGHT)
+                    .max(0.0);
+            insets.bottom = insets.bottom.min(max_bottom);
+        }
+        let (horizontal, vertical) = match self.controls_bar_layout().bottom_bar {
+            Edge::Left => (Alignment::Start, Alignment::Center),
+            Edge::Right => (Alignment::End, Alignment::Center),
+            _ => (Alignment::Center, Alignment::End),
+        };
+        // The scroll viewport is only the panel, not the surrounding dismiss
+        // area. Keep the shared overlay theme/frosting and upright text.
+        let panel = widget::scrollable(panel)
+            .width(Length::Shrink)
+            .height(Length::Shrink);
+        widget::mouse_area(
+            widget::container(panel)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(horizontal)
+                .align_y(vertical)
+                .padding([
+                    insets.top + gap,
+                    insets.right + gap,
+                    insets.bottom + gap,
+                    insets.left + gap,
+                ]),
+        )
+        .on_press(Message::CloseToolsMenu)
+        .into()
     }
 
-    /// Anchor a top popup (tools menu, exposure/color pickers) `space_xs` off the
+    /// Anchor a top popup (exposure/color pickers) `space_xs` off the
     /// top bar's inner edge at the bar's trailing (top) end, in every
     /// orientation, and close it when the surrounding area is tapped.
     ///
@@ -1927,7 +1932,7 @@ impl AppModel {
         panel: Element<'a, Message>,
         close_msg: Message,
     ) -> Element<'a, Message> {
-        // Trailing (right-end) popups: tools menu, exposure/color/motor pickers.
+        // Trailing (right-end) popups: exposure/color/motor pickers.
         self.anchor_bar_popup_at(panel, close_msg, false)
     }
 
@@ -2387,6 +2392,64 @@ mod bar_insets_tests {
     }
 
     #[test]
+    fn sideways_toolbox_aligns_with_camera_switcher() {
+        use crate::backends::camera::types::CameraDevice;
+        let renderer = renderer();
+        for orientation in [DisplayOrientation::Rotate90, DisplayOrientation::Rotate270] {
+            for height in [312.0, 360.0, 733.0] {
+                let model = AppModel {
+                    display_orientation: orientation,
+                    screen_width: 780.0,
+                    screen_height: height,
+                    available_cameras: vec![CameraDevice::default(), CameraDevice::default()],
+                    ..Default::default()
+                };
+                let mut element = model.build_capture_controls(
+                    model.build_capture_button(),
+                    model.build_bottom_bar(),
+                    None,
+                );
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(
+                        Size::ZERO,
+                        Size::new(crate::app::bar_layout::SIDEWAYS_STRIP_WIDTH, height),
+                    ),
+                );
+                fn button_centers(node: &layout::Node, offset: f32, centers: &mut Vec<f32>) {
+                    let bounds = node.bounds();
+                    let y = offset + bounds.y;
+                    if bounds.size()
+                        == Size::new(ui::PLACEHOLDER_BUTTON_WIDTH, ui::PLACEHOLDER_BUTTON_WIDTH)
+                    {
+                        centers.push(y + bounds.height / 2.0);
+                        return;
+                    }
+                    for child in node.children() {
+                        button_centers(child, y, centers);
+                    }
+                }
+                let lanes = node.children()[0].children();
+                assert!(node.size().width <= crate::app::bar_layout::SIDEWAYS_STRIP_WIDTH);
+                let mut first = Vec::new();
+                let mut second = Vec::new();
+                button_centers(&lanes[0], 0.0, &mut first);
+                button_centers(&lanes[1], 0.0, &mut second);
+                assert_eq!(first.len(), 2);
+                assert_eq!(second.len(), 2);
+                for (first, second) in first.into_iter().zip(second) {
+                    assert!(
+                        (first - second).abs() < 0.01,
+                        "{orientation:?}, height {height}: toolbox/switcher {first} != {second}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sideways_video_progress_is_kept_with_the_side_controls() {
         let renderer = renderer();
         for mut model in layout_models() {
@@ -2714,6 +2777,138 @@ mod window_controls_tests {
                 assert_eq!(model.build_window_control_buttons().len(), count);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod toolbox_placement_tests {
+    use super::*;
+    use cosmic::iced::advanced::{layout, renderer::Headless, widget::Tree};
+    use cosmic::iced::{Font, Pixels, Size};
+
+    #[test]
+    fn sideways_toolbox_panel_clears_the_full_capture_strip_in_every_mode() {
+        use crate::backends::display_orientation::DisplayOrientation;
+        let renderer = pollster::block_on(cosmic::Renderer::new(
+            Font::DEFAULT,
+            Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        for orientation in [DisplayOrientation::Rotate90, DisplayOrientation::Rotate270] {
+            for mode in [
+                CameraMode::Photo,
+                CameraMode::Video,
+                CameraMode::Timelapse,
+                CameraMode::Virtual,
+            ] {
+                let size = Size::new(780.0, 312.0);
+                let model = AppModel {
+                    mode,
+                    display_orientation: orientation,
+                    screen_width: size.width,
+                    screen_height: size.height,
+                    ..Default::default()
+                };
+                let mut menu = model.build_tools_menu();
+                let mut tree = Tree::new(menu.as_widget());
+                let node = menu.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, size),
+                );
+                let panel = node.children()[0].bounds();
+                let reserved = crate::app::bar_layout::SIDEWAYS_STRIP_WIDTH
+                    + f32::from(cosmic::theme::spacing().space_xs);
+                match model.controls_bar_layout().bottom_bar {
+                    Edge::Right => assert!(
+                        panel.x + panel.width <= size.width - reserved + 0.01,
+                        "{mode:?}: {panel:?}"
+                    ),
+                    Edge::Left => assert!(panel.x >= reserved - 0.01, "{mode:?}: {panel:?}"),
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toolbox_remains_visible_in_compact_and_rotated_windows() {
+        use crate::backends::display_orientation::DisplayOrientation;
+        let renderer = pollster::block_on(cosmic::Renderer::new(
+            Font::DEFAULT,
+            Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        for (orientation, size) in [
+            (DisplayOrientation::Rotate0, Size::new(320.0, 180.0)),
+            (DisplayOrientation::Rotate90, Size::new(720.0, 360.0)),
+            (DisplayOrientation::Rotate270, Size::new(720.0, 360.0)),
+        ] {
+            let model = AppModel {
+                display_orientation: orientation,
+                screen_width: size.width,
+                screen_height: size.height,
+                ..Default::default()
+            };
+            let mut menu = model.build_tools_menu();
+            let mut tree = Tree::new(menu.as_widget());
+            let node = menu.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let panel = node.children()[0].bounds();
+            assert!(
+                panel.width > 0.0 && panel.height >= 96.0,
+                "toolbox squeezed out: {panel:?}"
+            );
+            assert!(panel.x >= 0.0 && panel.y >= 0.0);
+            assert!(panel.x + panel.width <= size.width && panel.y + panel.height <= size.height);
+            if model.controls_are_sideways() {
+                assert!((panel.center_y() - size.height / 2.0).abs() < 0.01);
+                let gap = f32::from(cosmic::theme::spacing().space_xs);
+                let reserved = model
+                    .bottom_ui_height()
+                    .max(crate::app::bar_layout::SIDEWAYS_STRIP_WIDTH);
+                match model.controls_bar_layout().bottom_bar {
+                    Edge::Right => assert!(
+                        (panel.x + panel.width - (size.width - reserved - gap)).abs() < 0.01
+                    ),
+                    Edge::Left => {
+                        assert!((panel.x - (reserved + gap)).abs() < 0.01)
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn toolbox_opens_centered_above_the_capture_lane() {
+        let renderer = pollster::block_on(cosmic::Renderer::new(
+            Font::DEFAULT,
+            Pixels(14.0),
+            Some("tiny-skia"),
+        ))
+        .unwrap();
+        let model = AppModel::default();
+        let size = Size::new(640.0, 720.0);
+        let mut menu = model.build_tools_menu();
+        let mut tree = Tree::new(menu.as_widget());
+        let node = menu.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let panel = node.children()[0].bounds();
+        let gap = f32::from(cosmic::theme::spacing().space_xs);
+        assert!((panel.center_x() - size.width / 2.0).abs() < 0.01);
+        assert!(
+            (panel.y + panel.height - (size.height - model.bottom_ui_height() - gap)).abs() < 0.01,
+            "toolbox must sit above the capture lane, got {panel:?}"
+        );
     }
 }
 
