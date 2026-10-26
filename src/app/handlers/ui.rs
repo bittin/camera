@@ -163,7 +163,7 @@ impl AppModel {
     // =========================================================================
 
     pub(crate) fn handle_toggle_tools_menu(&mut self) -> Task<cosmic::Action<Message>> {
-        // The top bar hides the tools button entirely in View mode and disables
+        // The capture lane hides the tools button in View mode and disables
         // it mid-transition, so before the keyboard shortcut existed these
         // states were simply unreachable. Opening the menu here anyway gives a
         // panel with no buttons in it, since every tool is gated on a mode or a
