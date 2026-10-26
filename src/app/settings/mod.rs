@@ -25,7 +25,6 @@ impl crate::app::state::AppModel {
         }
         tracing::info!(enabled, previous = self.config.motion_photo, format = ?self.config.photo_output_format, "Accepted Motion Photo setting toggle");
         self.config.motion_photo = enabled;
-        self.motion_photo_override_disabled = false;
         self.persist_config_async();
         cosmic::Task::none()
     }
@@ -136,7 +135,6 @@ mod tests {
             for saved in [true, false] {
                 app.config.photo_output_format = format;
                 app.config.motion_photo = saved;
-                app.motion_photo_override_disabled = true;
                 app.config
                     .write_entry(app.config_handler.as_ref().unwrap())
                     .unwrap();
@@ -146,7 +144,6 @@ mod tests {
                     let _ = app.update(Message::ToggleMotionPhotoCapture);
                     app.config_persistence.flush();
                     assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
-                    assert!(app.motion_photo_override_disabled);
                     let persisted =
                         Config::get_entry(app.config_handler.as_ref().unwrap()).unwrap();
                     assert_eq!(serde_json::to_value(persisted).unwrap(), before);

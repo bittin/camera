@@ -175,20 +175,18 @@ impl Drop for MotionPhotoCapture {
 
 impl AppModel {
     pub(crate) fn should_show_motion_photo_button(&self) -> bool {
-        self.mode == crate::app::CameraMode::Photo
-            && self.config.motion_photo
-            && self.motion_photo_format_compatible()
+        self.mode == crate::app::CameraMode::Photo && self.motion_photo_format_compatible()
     }
 
     pub(crate) fn motion_photo_enabled(&self) -> bool {
-        self.config.motion_photo && !self.motion_photo_override_disabled
+        self.config.motion_photo
     }
 
     pub(crate) fn handle_toggle_motion_photo_capture(
         &mut self,
     ) -> cosmic::Task<cosmic::Action<crate::app::Message>> {
-        if self.should_show_motion_photo_button() && self.motion_photo_format_compatible() {
-            self.motion_photo_override_disabled = !self.motion_photo_override_disabled;
+        if self.should_show_motion_photo_button() {
+            return self.handle_toggle_motion_photo(!self.config.motion_photo);
         }
         cosmic::Task::none()
     }
@@ -840,7 +838,7 @@ mod tests {
             model.motion_photo_recorder.is_none(),
             "off must release without needing another camera frame"
         );
-        assert!(model.config.motion_photo);
+        assert!(!model.config.motion_photo);
     }
 
     #[test]
@@ -854,7 +852,7 @@ mod tests {
             assert!(!model.motion_photo_format_compatible());
             let _ = model.update(crate::app::Message::ToggleMotionPhotoCapture);
             assert!(
-                !model.motion_photo_override_disabled,
+                model.config.motion_photo,
                 "queued unsupported top-bar toggle must be ignored"
             );
             let _ = model.update(crate::app::Message::ToggleMotionPhoto(true));
@@ -877,24 +875,71 @@ mod tests {
     }
 
     #[test]
-    fn top_bar_toggle_preserves_master_preference_and_can_be_reenabled() {
+    fn top_bar_toggle_updates_preference_and_can_be_reenabled() {
         let mut model = AppModel::default();
-        assert!(!model.should_show_motion_photo_button());
+        assert!(model.should_show_motion_photo_button());
         let _ = model.update(crate::app::Message::ToggleMotionPhoto(true));
         assert!(model.should_show_motion_photo_button());
         assert!(model.motion_photo_enabled());
         let _ = model.update(crate::app::Message::ToggleMotionPhotoCapture);
-        assert!(model.config.motion_photo);
+        assert!(!model.config.motion_photo);
         assert!(model.should_show_motion_photo_button());
         assert!(!model.motion_photo_enabled());
         let _ = model.update(crate::app::Message::ToggleMotionPhotoCapture);
         assert!(model.motion_photo_enabled());
         model.mode = crate::app::CameraMode::Video;
         assert!(!model.should_show_motion_photo_button());
+        let _ = model.update(crate::app::Message::ToggleMotionPhotoCapture);
+        assert!(model.config.motion_photo);
         model.mode = crate::app::CameraMode::Photo;
         let _ = model.update(crate::app::Message::ToggleMotionPhoto(false));
-        assert!(!model.should_show_motion_photo_button());
+        assert!(model.should_show_motion_photo_button());
         assert!(!model.motion_photo_enabled());
+    }
+
+    #[test]
+    fn top_bar_and_settings_toggle_share_persisted_motion_photo_preference() {
+        use cosmic::cosmic_config::{Config as Store, CosmicConfigEntry};
+
+        let root = std::env::temp_dir().join(format!(
+            "camera-motion-photo-header-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store =
+            Store::with_custom_path("camera-test", crate::config::Config::VERSION, root.clone())
+                .unwrap();
+        let mut model = AppModel {
+            config_handler: Some(store),
+            ..Default::default()
+        };
+
+        for format in [
+            crate::config::PhotoOutputFormat::Jpeg,
+            crate::config::PhotoOutputFormat::Avif,
+        ] {
+            model.config.photo_output_format = format;
+            for (message, enabled) in [
+                (crate::app::Message::ToggleMotionPhoto(true), true),
+                (crate::app::Message::ToggleMotionPhotoCapture, false),
+                (crate::app::Message::ToggleMotionPhotoCapture, true),
+                (crate::app::Message::ToggleMotionPhoto(false), false),
+                (crate::app::Message::ToggleMotionPhotoCapture, true),
+                (crate::app::Message::ToggleMotionPhotoCapture, false),
+            ] {
+                let _ = model.update(message);
+                assert_eq!(model.config.motion_photo, enabled);
+                assert_eq!(model.motion_photo_enabled(), enabled);
+                assert!(model.should_show_motion_photo_button());
+                model.config_persistence.flush();
+                assert_eq!(
+                    crate::config::Config::get_entry(model.config_handler.as_ref().unwrap())
+                        .unwrap()
+                        .motion_photo,
+                    enabled
+                );
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

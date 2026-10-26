@@ -512,7 +512,6 @@ impl cosmic::Application for AppModel {
             motion_photo_retiring: None,
             motion_photo_capture: None,
             motion_photo_error: None,
-            motion_photo_override_disabled: false,
             format_picker_visible: false,
             exposure_picker_visible: false,
             color_picker_visible: false,

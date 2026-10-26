@@ -4635,11 +4635,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn motion_photo_top_bar_override_saves_an_ordinary_still() {
+    async fn motion_photo_top_bar_disable_saves_an_ordinary_still() {
         let mut model = live_model();
         let _ = model.update(crate::app::Message::ToggleMotionPhotoCapture);
         let _ = model.capture_photo();
-        assert!(model.config.motion_photo);
+        assert!(!model.config.motion_photo);
         assert_eq!(model.photo_jobs.len(), 1);
         assert!(!model.is_capturing);
         assert!(model.photo_jobs[&1].live.is_none());
