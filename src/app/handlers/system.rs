@@ -521,6 +521,10 @@ impl AppModel {
         self.persist_config_async();
 
         // Reset UI state that shadows config values
+        // The photo timer is session state too. Cancel any running countdown so
+        // its already-queued tick cannot trigger a capture after resetting.
+        let _ = self.handle_abort_photo_timer();
+        self.photo_timer_setting = Default::default();
         self.current_video_encoder_index = 0;
         self.selected_filter = FilterType::default();
         self.recording_filter_code.store(
@@ -1368,6 +1372,40 @@ mod tests {
         model.core.window.show_context = false;
         model.sync_audio_probe();
         assert!(model.audio_probe.is_none());
+    }
+
+    #[test]
+    fn reset_all_settings_turns_off_photo_timer_and_cancels_countdown() {
+        use crate::app::state::{AppModel, Message, PhotoTimerSetting};
+
+        for setting in [
+            PhotoTimerSetting::Sec3,
+            PhotoTimerSetting::Sec5,
+            PhotoTimerSetting::Sec10,
+        ] {
+            for remaining in [None, Some(3), Some(1)] {
+                let mut app = AppModel {
+                    photo_timer_setting: setting,
+                    photo_timer_countdown: remaining,
+                    photo_timer_tick_start: remaining.map(|_| std::time::Instant::now()),
+                    capture_scale_to: if remaining.is_some() { 0.9 } else { 1.0 },
+                    ..AppModel::default()
+                };
+                let _ = app.update(Message::ResetAllSettings);
+
+                assert_eq!(app.photo_timer_setting, PhotoTimerSetting::Off);
+                assert!(app.photo_timer_countdown.is_none());
+                assert!(app.photo_timer_tick_start.is_none());
+                assert_eq!(app.capture_scale_to, 1.0);
+                // A timeout already queued before Reset must not take a photo.
+                assert!(
+                    cosmic::iced::runtime::task::into_stream(app.handle_photo_timer_tick())
+                        .is_none()
+                );
+                assert!(!app.is_capturing);
+                assert!(app.photo_jobs.is_empty());
+            }
+        }
     }
 
     #[test]
