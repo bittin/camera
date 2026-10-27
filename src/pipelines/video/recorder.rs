@@ -605,9 +605,11 @@ fn compute_pts(
         return PtsResult::Pts(fallback_pts(capture_index, frame_duration_ns));
     };
 
-    // Skip frames until pipeline is PLAYING.
+    // A clock can be assigned before PLAYING, while base_time is still zero.
+    // Its running time is then system uptime, not the recording timeline.
     if !*pipeline_playing {
-        if appsrc.current_running_time().is_none() {
+        if appsrc.current_state() != gst::State::Playing || appsrc.current_running_time().is_none()
+        {
             RECORDING_STATS
                 .pusher_skipped
                 .fetch_add(1, Ordering::Relaxed);
@@ -1487,6 +1489,83 @@ struct AudioBranch {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sensor_pts_waits_for_playing_even_when_a_clock_is_available() {
+        gst::init().unwrap();
+        let appsrc = gst_app::AppSrc::builder().is_live(true).build();
+        appsrc.set_clock(Some(&gst::SystemClock::obtain())).unwrap();
+        appsrc.set_state(gst::State::Ready).unwrap();
+        assert_eq!(appsrc.base_time(), Some(gst::ClockTime::ZERO));
+        assert!(appsrc.current_running_time().is_some());
+        let mut pipeline_playing = false;
+        let mut ts_offset = None;
+        let result = compute_pts(
+            &appsrc,
+            Some(read_clock_boottime_ns()),
+            0,
+            1_000_000_000 / 30,
+            &mut pipeline_playing,
+            &mut ts_offset,
+        );
+        appsrc.set_state(gst::State::Null).unwrap();
+
+        assert!(
+            matches!(result, PtsResult::Skip),
+            "a clock assigned before PLAYING must not seed video PTS with system uptime"
+        );
+        assert!(!pipeline_playing);
+        assert!(ts_offset.is_none());
+    }
+
+    #[test]
+    fn sensor_pts_uses_recording_running_time_after_playing() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "appsrc name=input is-live=true format=time ! fakesink sync=false async=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let appsrc = pipeline
+            .by_name("input")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        assert_eq!(appsrc.current_state(), gst::State::Playing);
+        let sensor_ts = read_clock_boottime_ns();
+        let mut pipeline_playing = false;
+        let mut ts_offset = None;
+        let first = compute_pts(
+            &appsrc,
+            Some(sensor_ts),
+            0,
+            33_333_333,
+            &mut pipeline_playing,
+            &mut ts_offset,
+        );
+        let next = compute_pts(
+            &appsrc,
+            Some(sensor_ts + 33_333_333),
+            1,
+            33_333_333,
+            &mut pipeline_playing,
+            &mut ts_offset,
+        );
+        let running_time = appsrc.current_running_time().unwrap().nseconds();
+        pipeline.set_state(gst::State::Null).unwrap();
+
+        let PtsResult::Pts(first) = first else {
+            panic!("a PLAYING source must accept sensor-timestamped frames");
+        };
+        let PtsResult::Pts(next) = next else {
+            panic!("the next sensor frame must remain on the recording timeline");
+        };
+        assert!(first <= running_time);
+        assert_eq!(next - first, 33_333_333);
+        assert!(pipeline_playing);
+    }
+
     fn construction_config<'a>(
         encoder: &'a crate::media::encoders::video::EncoderInfo,
         output_path: PathBuf,
@@ -1814,8 +1893,10 @@ mod tests {
         let appsrc = gst_app::AppSrc::builder().build();
         let monitor = RecordingMonitor::new("identity".into());
         let (destroyed_tx, destroyed_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let _notify = appsrc.add_weak_ref_notify(move || {
             let _ = destroyed_tx.send(());
+            let _ = release_rx.recv();
         });
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let pusher = VideoRecorder::spawn_filtered_pusher(
@@ -1837,7 +1918,20 @@ mod tests {
             "pusher completion alone must not complete the recorder owner"
         );
         monitor.finish();
-        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+        let mut completion = monitor.subscribe();
+        assert_eq!(
+            completion.borrow().phase,
+            RecordingPhase::Starting,
+            "final native unref must finish before the pusher lease is released"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while completion.borrow_and_update().phase != RecordingPhase::Finished {
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("pusher cleanup must publish completion after final native unref");
     }
 
     #[test]
