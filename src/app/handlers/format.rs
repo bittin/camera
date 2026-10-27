@@ -138,9 +138,7 @@ impl AppModel {
         }
 
         if self.recording.is_recording() {
-            if let Some(sender) = self.recording.take_stop_sender() {
-                let _ = sender.send(());
-            }
+            self.request_recording_stop();
             self.recording = RecordingState::Idle;
         }
 

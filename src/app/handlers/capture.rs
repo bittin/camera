@@ -1476,9 +1476,7 @@ impl AppModel {
         self.turn_off_flash_hardware();
         // Keep camera/encoded memory worker alive until all accepted post-roll
         // windows and still encoders finish. Closing never cancels accepted media.
-        if let Some(sender) = self.recording.take_stop_sender() {
-            let _ = sender.send(());
-        }
+        self.request_recording_stop();
         let timelapse_stop = if self.timelapse.is_running() {
             self.stop_timelapse()
         } else {
@@ -1584,7 +1582,28 @@ impl AppModel {
         Task::none()
     }
 
+    /// Arm the deadline before handing Stop to a worker that may already be stuck.
+    /// Retain job ownership until native cleanup really completes.
+    pub(crate) fn request_recording_stop(&mut self) {
+        if let Some(session) = self.recording.session()
+            && let Some(monitor) =
+                self.encoder_operations
+                    .get(&crate::app::recording_error::EncoderOperation::Video(
+                        session,
+                    ))
+        {
+            monitor.set_phase(crate::pipelines::video::RecordingPhase::Finalizing);
+        }
+        if let Some(sender) = self.recording.take_stop_sender() {
+            let _ = sender.send(());
+        }
+    }
+
     pub(crate) fn handle_toggle_recording(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.encoder_restart_required() {
+            self.show_encoder_restart_warning();
+            return Task::none();
+        }
         if self.pending_close || (!self.recording.is_recording() && !self.recording_jobs.is_empty())
         {
             self.motion_photo_error =
@@ -1599,10 +1618,7 @@ impl AppModel {
             if self.flash.enabled {
                 self.turn_off_flash_hardware();
             }
-            if let Some(sender) = self.recording.take_stop_sender() {
-                info!("Sending stop signal to recorder");
-                let _ = sender.send(());
-            }
+            self.request_recording_stop();
             self.recording = RecordingState::Idle;
             self.update_idle_inhibit();
         } else {
@@ -1630,6 +1646,9 @@ impl AppModel {
         &mut self,
         path: String,
     ) -> Task<cosmic::Action<Message>> {
+        if self.encoder_restart_required() {
+            return Task::none();
+        }
         info!(path = %path, "Recording started successfully");
         self.update_idle_inhibit();
         self.sync_audio_probe();
@@ -1648,8 +1667,25 @@ impl AppModel {
         // wake from `stop_rx.await` with an error and self-terminate via
         // `recorder.stop()`. We still log the result and update
         // `last_media_path` / the gallery for the just-finalized file.
-        self.recording_jobs.remove(&session);
         let is_current = self.recording.session() == Some(session);
+        let known_session = self.recording_jobs.contains(&session) || is_current;
+        let operation = crate::app::recording_error::EncoderOperation::Video(session);
+        if known_session && result.is_err() && !self.encoder_operations.contains_key(&operation) {
+            let encoder = self
+                .available_video_encoders
+                .get(self.current_video_encoder_index)
+                .map(|encoder| encoder.element_name.clone())
+                .unwrap_or_else(|| crate::fl!("recording-error-automatic"));
+            // Legacy/synthetic completions have no native owner to publish Finished.
+            let monitor = crate::pipelines::video::RecordingMonitor::new(encoder);
+            monitor.finish();
+            self.register_encoder_operation(operation, monitor);
+        }
+        if self.encoder_operations.contains_key(&operation) {
+            self.finish_encoder_operation(operation, result.as_ref().err().cloned());
+        } else {
+            self.recording_jobs.remove(&session);
+        }
 
         if is_current {
             self.recording = RecordingState::Idle;
@@ -1788,10 +1824,8 @@ impl AppModel {
                 // Long press ended: stop recording
                 self.quick_record = QuickRecordState::Idle;
 
-                // Stop recording (same as toggle off)
-                if let Some(sender) = self.recording.take_stop_sender() {
-                    let _ = sender.send(());
-                }
+                // Stop recording (same as toggle off).
+                self.request_recording_stop();
                 self.recording = RecordingState::Idle;
                 self.update_idle_inhibit();
                 Task::none()
@@ -1805,6 +1839,11 @@ impl AppModel {
 
     /// 300ms elapsed — if still pressed, start recording.
     pub(crate) fn handle_quick_record_threshold(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.encoder_restart_required() {
+            self.quick_record = crate::app::state::QuickRecordState::Idle;
+            self.show_encoder_restart_warning();
+            return Task::none();
+        }
         use crate::app::state::QuickRecordState;
         // Only act if still in Pressed state (finger hasn't lifted)
         if self.pending_close
@@ -1862,6 +1901,10 @@ impl AppModel {
     }
 
     pub(crate) fn handle_start_recording_after_delay(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.encoder_restart_required() {
+            self.show_encoder_restart_warning();
+            return Task::none();
+        }
         if self.pending_close || !self.recording_jobs.is_empty() {
             self.motion_photo_error =
                 Some("Video capture cannot start during finalization or shutdown".into());
@@ -1949,6 +1992,11 @@ impl AppModel {
         &mut self,
         config: AppsrcRecordingConfig,
     ) -> Task<cosmic::Action<Message>> {
+        if self.encoder_restart_required() {
+            self.quick_record = crate::app::state::QuickRecordState::Idle;
+            self.show_encoder_restart_warning();
+            return Task::none();
+        }
         use crate::backends::camera::types::PixelFormat;
 
         if self.motion_photo_capture.is_some() {
@@ -2030,6 +2078,16 @@ impl AppModel {
         let audio_levels: crate::pipelines::video::SharedAudioLevels = Default::default();
         self.recording_session_counter += 1;
         let session = self.recording_session_counter;
+        let monitor = crate::pipelines::video::RecordingMonitor::new(
+            selected_encoder
+                .as_ref()
+                .map(|encoder| encoder.element_name.clone())
+                .unwrap_or_else(|| crate::fl!("recording-error-automatic")),
+        );
+        self.register_encoder_operation(
+            crate::app::recording_error::EncoderOperation::Video(session),
+            monitor.clone(),
+        );
         self.recording_jobs.insert(session);
         self.recording = RecordingState::start(
             session,
@@ -2095,10 +2153,11 @@ impl AppModel {
                             }
                         };
 
-                    let recorder =
-                        VideoRecorder::new_from_appsrc(make_appsrc_config(audio_levels), frame_rx)?;
-
-                    recorder.start()?;
+                    let recorder = VideoRecorder::new_from_appsrc_monitored(
+                        make_appsrc_config(audio_levels),
+                        frame_rx,
+                        monitor,
+                    )?;
                     let path = output_path.display().to_string();
                     Ok::<_, String>((recorder, path))
                 })
@@ -2251,6 +2310,10 @@ impl AppModel {
     // =========================================================================
 
     pub(crate) fn handle_toggle_timelapse(&mut self) -> Task<cosmic::Action<Message>> {
+        if self.encoder_restart_required() {
+            self.show_encoder_restart_warning();
+            return Task::none();
+        }
         if self.pending_close {
             return Task::none();
         }
@@ -2298,6 +2361,17 @@ impl AppModel {
             .unwrap_or((1920, 1080));
         let bitrate_kbps = Some(self.config.bitrate_preset.bitrate_kbps(w, h));
         let live_filter_code = Arc::clone(&self.recording_filter_code);
+        self.recording_session_counter += 1;
+        let operation = crate::app::recording_error::EncoderOperation::Timelapse(
+            self.recording_session_counter,
+        );
+        let monitor = crate::pipelines::video::RecordingMonitor::new_waiting(
+            encoder_info
+                .as_ref()
+                .map(|encoder| encoder.element_name.clone())
+                .unwrap_or_else(|| crate::fl!("recording-error-automatic")),
+        );
+        self.register_encoder_operation(operation, monitor.clone());
         let mut capture_metadata = self.build_camera_metadata();
         capture_metadata.orientation =
             crate::pipelines::capture_metadata::CaptureOrientation::from_capture(
@@ -2310,19 +2384,24 @@ impl AppModel {
             async move {
                 let video_dir = crate::app::get_video_directory(&folder_name);
                 if let Err(e) = std::fs::create_dir_all(&video_dir) {
-                    return Err(format!("Failed to create video directory: {e}"));
+                    let error = format!("Failed to create video directory: {e}");
+                    monitor.report_error(error.clone());
+                    // No encoder worker was created, so no native resources remain.
+                    monitor.finish();
+                    return Err(error);
                 }
 
                 let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S_%3f");
                 let output_path = video_dir.join(format!("timelapse_{timestamp}.mp4"));
 
-                crate::pipelines::video::timelapse::run_timelapse_encoder(
+                crate::pipelines::video::timelapse::run_timelapse_encoder_monitored(
                     frame_rx,
                     output_path,
                     encoder_info,
                     bitrate_kbps,
                     live_filter_code,
                     capture_metadata,
+                    monitor,
                 )
                 .await
             },
@@ -2352,6 +2431,14 @@ impl AppModel {
     /// which causes the encoder task to finalise the video and send
     /// `TimelapseAssemblyComplete`.
     fn stop_timelapse(&mut self) -> Task<cosmic::Action<Message>> {
+        for (operation, monitor) in &self.encoder_operations {
+            if matches!(
+                operation,
+                crate::app::recording_error::EncoderOperation::Timelapse(_)
+            ) {
+                monitor.set_phase(crate::pipelines::video::RecordingPhase::Finalizing);
+            }
+        }
         let shots = self.timelapse.shots_taken();
         let start_time = match &self.timelapse {
             TimelapseState::Running { start_time, .. } => *start_time,
@@ -2371,6 +2458,14 @@ impl AppModel {
         &mut self,
         result: Result<String, String>,
     ) -> Task<cosmic::Action<Message>> {
+        if let Some(operation) = self.encoder_operations.keys().copied().find(|operation| {
+            matches!(
+                operation,
+                crate::app::recording_error::EncoderOperation::Timelapse(_)
+            )
+        }) {
+            self.finish_encoder_operation(operation, result.as_ref().err().cloned());
+        }
         self.timelapse = TimelapseState::Idle;
         self.update_idle_inhibit();
 
@@ -2807,6 +2902,67 @@ mod tests {
         })
         .await
         .expect("capture task must make progress")
+    }
+
+    #[tokio::test]
+    async fn timelapse_directory_failure_retires_encoder_operation() {
+        use crate::app::recording_error::EncoderOperation;
+        use crate::pipelines::video::RecordingPhase;
+        use futures::StreamExt;
+
+        let blocked_dir =
+            std::env::temp_dir().join(format!("camera-timelapse-blocked-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&blocked_dir, b"not a directory").unwrap();
+        let mut model = live_model();
+        model.config.motion_photo = false;
+        model.config.save_folder_name = blocked_dir.to_string_lossy().into_owned();
+        let task = model.handle_toggle_timelapse();
+        let operation = EncoderOperation::Timelapse(model.recording_session_counter);
+        let monitor = model.encoder_operations[&operation].clone();
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            RecordingPhase::WaitingForFrames
+        );
+        let mut recipes =
+            iced_futures::subscription::into_recipes(model.encoder_failure_subscriptions());
+        let mut observer = recipes
+            .pop()
+            .unwrap()
+            .stream(Box::pin(futures::stream::pending()));
+        let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+        let message = next_capture_message(&mut stream).await;
+        std::fs::remove_file(&blocked_dir).unwrap();
+        let super::Message::TimelapseAssemblyComplete(Err(ref detail)) = message else {
+            panic!("expected directory failure, got {message:?}");
+        };
+        assert!(detail.starts_with("Failed to create video directory: "));
+        let detail = detail.clone();
+        drop(model.update(message));
+
+        assert!(
+            model.encoder_operations.is_empty(),
+            "no encoder worker owns this operation"
+        );
+        assert!(!model.timelapse.is_active());
+        assert!(!model.shutdown_has_pending_media());
+        assert_eq!(model.recording_failure.as_ref().unwrap().detail, detail);
+        let status = monitor.subscribe().borrow().clone();
+        assert_eq!(status.phase, RecordingPhase::Finished);
+        assert_eq!(status.error.as_deref(), Some(detail.as_str()));
+        let failure = tokio::time::timeout(std::time::Duration::from_secs(1), observer.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(failure, super::Message::EncoderFailed { operation: actual, .. } if actual == operation)
+        );
+        let finished = tokio::time::timeout(std::time::Duration::from_secs(1), observer.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(finished, super::Message::EncoderOperationFinished(actual) if actual == operation)
+        );
     }
 
     #[tokio::test]
@@ -4241,6 +4397,50 @@ mod tests {
             assert!(!model.shutdown_has_pending_media());
             assert!(model.shutdown_waiting_for_recorder);
             assert_recorder_drain_scheduled(task).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_video_stop_starts_deadline_before_worker_acknowledges() {
+        use crate::app::recording_error::EncoderOperation;
+        use crate::pipelines::video::{RecordingMonitor, RecordingPhase};
+
+        for message in [
+            super::Message::ToggleRecording,
+            super::Message::CaptureButtonReleased,
+            super::Message::WindowClose,
+            super::Message::SetMode(super::CameraMode::Photo),
+        ] {
+            let mut model = shutdown_model();
+            model.mode = super::CameraMode::Video;
+            if matches!(message, super::Message::CaptureButtonReleased) {
+                model.mode = super::CameraMode::Photo;
+                model.quick_record = crate::app::state::QuickRecordState::Recording;
+            }
+            let (stop, mut stopped) = tokio::sync::oneshot::channel();
+            model.recording = super::RecordingState::start(7, "video.mp4".into(), stop, None);
+            model.recording_jobs.insert(7);
+            let monitor = RecordingMonitor::new("synthetic".into());
+            monitor.set_phase(RecordingPhase::Recording);
+            model.register_encoder_operation(EncoderOperation::Video(7), monitor.clone());
+
+            let _ = model.update(message);
+
+            assert_eq!(stopped.try_recv(), Ok(()));
+            assert_eq!(
+                monitor.subscribe().borrow().phase,
+                RecordingPhase::Finalizing,
+                "Stop must arm a deadline without depending on the worker or new input"
+            );
+            assert!(
+                model.recording_jobs.contains(&7),
+                "Stop does not complete cleanup"
+            );
+            assert!(
+                model
+                    .encoder_operations
+                    .contains_key(&EncoderOperation::Video(7))
+            );
         }
     }
 

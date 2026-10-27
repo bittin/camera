@@ -65,6 +65,9 @@ impl AppModel {
                 | Message::ResetBurstModeState
                 | Message::RecordingStarted(_)
                 | Message::RecordingStopped { .. }
+                | Message::EncoderFailed { .. }
+                | Message::EncoderOperationFinished(_)
+                | Message::DismissEncoderFailure
                 | Message::TimelapseAssemblyComplete(_)
                 | Message::VirtualCameraStarted
                 | Message::VirtualCameraStopped(_)
@@ -321,6 +324,14 @@ impl AppModel {
             Message::ClearCaptureAnimation => self.handle_clear_capture_animation(),
             Message::ToggleRecording => self.handle_toggle_recording(),
             Message::RecordingStarted(path) => self.handle_recording_started(path),
+            Message::EncoderFailed { operation, failure } => {
+                self.handle_encoder_failure(operation, failure)
+            }
+            Message::EncoderOperationFinished(operation) => {
+                self.finish_encoder_operation(operation, None);
+                Task::none()
+            }
+            Message::DismissEncoderFailure => self.dismiss_encoder_failure(),
             Message::RecordingStopped { session, result } => {
                 self.handle_recording_stopped(session, result)
             }

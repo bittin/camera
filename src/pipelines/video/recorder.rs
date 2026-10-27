@@ -12,6 +12,7 @@ use super::encoder_selection::{
     EncoderConfig, VideoEncoderInput, prepare_video_encoder_input, select_encoders,
 };
 use super::muxer::link_audio_to_muxer;
+use super::recording_monitor::{FinishRecording, RecordingMonitor, RecordingPhase};
 use super::stats::{
     RECORDING_STATS, RecordingDiagnostics, clear_recording_diagnostics,
     publish_recording_diagnostics,
@@ -97,10 +98,95 @@ pub struct VideoRecorder {
     /// drops) restores the user's prior PA volume. `None` for default-device
     /// recordings or when the PulseAudio socket is unreachable.
     _pulse_volume_guard: Option<crate::backends::audio::PulseSourceVolumeGuard>,
-    /// Handle to the appsrc pusher task. Stored so `stop()` / `Drop` can abort
-    /// it before transitioning the pipeline to NULL, avoiding races where the
-    /// detached task pushes into a finalising pipeline.
-    pusher_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation is cooperative: a stuck native call cannot be interrupted.
+    /// Dropping this handle never joins the native worker.
+    pusher_handle: Option<PusherTask>,
+    monitor: RecordingMonitor,
+    cleanup_complete: bool,
+    _finish: FinishRecording,
+}
+
+/// A blocking task's abort handle cannot cancel it once started. Own an explicit
+/// cancellation channel instead, including cancellation when the owner is dropped.
+#[derive(Debug)]
+struct PusherTask {
+    worker: tokio::task::JoinHandle<()>,
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for PusherTask {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+impl std::future::Future for PusherTask {
+    type Output = Result<(), tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().worker).poll(cx)
+    }
+}
+
+/// Field order guarantees the lease outlives the appsrc's final native unref,
+/// including unwinding and cancellation of asynchronous frame processing.
+struct PusherResources {
+    appsrc: gst_app::AppSrc,
+    _lease: super::recording_monitor::RecordingResourceLease,
+}
+
+/// Observe errors synchronously before starting any recording-like pipeline.
+/// Audio levels still update; errors and EOS remain available on the bus.
+/// Callers own phase updates and must publish Cleanup before NULL.
+pub fn install_recording_observer(
+    pipeline: &gst::Pipeline,
+    audio_levels: &SharedAudioLevels,
+    monitor: &RecordingMonitor,
+) {
+    if let Some(pad) = pipeline
+        .by_name("recording-encoder")
+        .and_then(|encoder| encoder.static_pad("src"))
+    {
+        let activity = monitor.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            activity.note_output();
+            gst::PadProbeReturn::Ok
+        });
+    }
+    let monitor = monitor.clone();
+    let weak_pipeline = pipeline.downgrade();
+    crate::pipelines::audio_level::install_level_sync_handler_with_observer(
+        pipeline,
+        audio_levels,
+        move |message| {
+            if let gst::MessageView::Error(err) = message.view() {
+                let source = err
+                    .src()
+                    .map(|s| s.name().to_string())
+                    .unwrap_or_else(|| "pipeline".into());
+                monitor.report_error(format!(
+                    "{source}: {} ({})",
+                    err.error(),
+                    err.debug().as_deref().unwrap_or("no debug details")
+                ));
+            } else if let gst::MessageView::StateChanged(state) = message.view()
+                && state.current() == gst::State::Playing
+                && weak_pipeline
+                    .upgrade()
+                    .is_some_and(|pipeline| message.src() == Some(pipeline.upcast_ref()))
+            {
+                let starting = monitor.subscribe().borrow().phase == RecordingPhase::Starting;
+                if starting {
+                    monitor.set_phase(RecordingPhase::Recording);
+                }
+            }
+        },
+    );
 }
 
 fn encoder_input_caps_filter(input: &VideoEncoderInput) -> String {
@@ -680,12 +766,40 @@ impl VideoRecorder {
     /// continues uninterrupted because the same frames are displayed in the UI
     /// and forwarded here.
     ///
-    /// The returned recorder must be started with `.start()`. When the `frame_rx`
+    /// The returned recorder is already started. When the `frame_rx`
     /// channel closes (sender dropped), the pusher task sends EOS and the
     /// pipeline finalizes gracefully.
     pub fn new_from_appsrc(
         config: AppsrcRecorderConfig<'_>,
         frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
+    ) -> Result<Self, String> {
+        Self::new_from_appsrc_monitored(config, frame_rx, RecordingMonitor::new("automatic".into()))
+    }
+
+    /// Construct and eagerly start, publishing failures before blocking cleanup.
+    pub fn new_from_appsrc_monitored(
+        config: AppsrcRecorderConfig<'_>,
+        frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
+        monitor: RecordingMonitor,
+    ) -> Result<Self, String> {
+        monitor.enable_activity_watchdog();
+        monitor.set_phase(RecordingPhase::Starting);
+        let result = Self::new_from_appsrc_inner(config, frame_rx, monitor.clone());
+        if let Err(detail) = &result {
+            monitor.report_error(detail.clone());
+            // The inner call has released all constructor-owned resources,
+            // even if it failed before constructing the recorder's drop guard.
+            // finish() still waits for any independently owned pusher leases.
+            monitor.set_phase(RecordingPhase::Cleanup);
+            monitor.finish();
+        }
+        result
+    }
+
+    fn new_from_appsrc_inner(
+        config: AppsrcRecorderConfig<'_>,
+        frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
+        monitor: RecordingMonitor,
     ) -> Result<Self, String> {
         let AppsrcRecorderConfig {
             base:
@@ -741,6 +855,7 @@ impl VideoRecorder {
         )?;
 
         let (base_width, base_height) = (width, height);
+        monitor.set_encoder(setup.encoder_name.clone());
         let (final_width, final_height) = (setup.encoder_input.width, setup.encoder_input.height);
 
         // Only insert videoscale/capsfilter when downscaling is needed.
@@ -791,13 +906,19 @@ impl VideoRecorder {
             &audio_levels,
         )?;
         apply_video_tags(&pipeline, &capture_metadata);
+        install_recording_observer(&pipeline, &audio_levels, &monitor);
 
         info!(
             initial_filter = initial_filter_code,
             "Pusher will apply live GPU filter (RGBA output)"
         );
-        let pusher_handle =
-            Self::spawn_filtered_pusher(appsrc, frame_rx, framerate, live_filter_code);
+        let pusher_handle = Self::spawn_filtered_pusher(
+            appsrc,
+            frame_rx,
+            framerate,
+            live_filter_code,
+            monitor.clone(),
+        );
 
         // Publish diagnostics for the insights drawer
         let mode = if needs_scaling {
@@ -818,10 +939,12 @@ impl VideoRecorder {
             file_path: setup.output_path,
             _pulse_volume_guard: pulse_volume_guard,
             pusher_handle: Some(pusher_handle),
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
         };
 
-        // Eagerly start: if a hardware encoder fails (e.g. VA-API backed by
-        // NVENC in a flatpak sandbox), return Err so the caller can retry.
+        // Eagerly start so synchronous encoder failures reach the caller.
         recorder.start()?;
 
         Ok(recorder)
@@ -836,140 +959,175 @@ impl VideoRecorder {
     /// running the filter shader.
     fn spawn_filtered_pusher(
         appsrc: gst_app::AppSrc,
+        frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
+        framerate: u32,
+        live_filter_code: Arc<std::sync::atomic::AtomicU32>,
+        monitor: RecordingMonitor,
+    ) -> PusherTask {
+        let resources = PusherResources {
+            appsrc,
+            _lease: monitor.resource_lease(),
+        };
+        let runtime = tokio::runtime::Handle::current();
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            // Native push, EOS, queries and final unref stay off libcosmic's
+            // sole async worker. GPU conversion still awaits without busy-waiting.
+            runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = cancelled => {}
+                    _ = Self::run_filtered_pusher(
+                        &resources.appsrc, frame_rx, framerate, live_filter_code, monitor,
+                    ) => {}
+                }
+            });
+            drop(resources);
+        });
+        PusherTask {
+            worker,
+            cancel: Some(cancel),
+        }
+    }
+
+    async fn run_filtered_pusher(
+        appsrc: &gst_app::AppSrc,
         mut frame_rx: tokio::sync::mpsc::Receiver<RecordingFrame>,
         framerate: u32,
         live_filter_code: Arc<std::sync::atomic::AtomicU32>,
-    ) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let initial = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
-            info!(
-                initial_filter_code = initial,
-                "Filtered appsrc pusher task started"
-            );
+        monitor: RecordingMonitor,
+    ) {
+        let initial = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
+        info!(
+            initial_filter_code = initial,
+            "Filtered appsrc pusher task started"
+        );
 
-            let start_epoch_ns = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            RECORDING_STATS
-                .pusher_start_epoch_ns
-                .store(start_epoch_ns, Ordering::Relaxed);
+        let start_epoch_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        RECORDING_STATS
+            .pusher_start_epoch_ns
+            .store(start_epoch_ns, Ordering::Relaxed);
 
-            let mut frame_count: u64 = 0;
-            let mut capture_frame_count: u64 = 0;
-            let start_time = std::time::Instant::now();
-            let frame_duration_ns = 1_000_000_000u64 / framerate as u64;
-            let mut pipeline_playing = false;
-            let mut ts_offset: Option<(u64, u64)> = None;
+        let mut frame_count: u64 = 0;
+        let mut capture_frame_count: u64 = 0;
+        let start_time = std::time::Instant::now();
+        let frame_duration_ns = 1_000_000_000u64 / framerate as u64;
+        let mut pipeline_playing = false;
+        let mut ts_offset: Option<(u64, u64)> = None;
 
-            while let Some(rec_frame) = frame_rx.recv().await {
-                let frame = rec_frame;
+        while let Some(rec_frame) = frame_rx.recv().await {
+            // Offer is activity even if downstream backpressure drops it.
+            monitor.note_input();
+            let frame = rec_frame;
 
-                let capture_index = capture_frame_count;
-                capture_frame_count += 1;
-                if appsrc_queue_is_full(&appsrc) {
-                    RECORDING_STATS
-                        .pusher_skipped
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                let sensor_ts = frame.sensor_timestamp_ns;
-                let sequence = frame.libcamera_metadata.as_ref().and_then(|m| m.sequence);
-
-                // Read the live filter for every frame so Standard ↔ filtered
-                // switching remains seamless within one fixed-caps pipeline.
-                let filter_code = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
-                let filter_type = crate::app::FilterType::from_gpu_filter_code(filter_code);
-
-                let t0 = std::time::Instant::now();
-                let mut buffer = if let Some(buffer) = try_shared_rgba_buffer(&frame, filter_type) {
-                    buffer
-                } else {
-                    let rgba = match convert_frame_to_rgba(&frame).await {
-                        Ok(data) => data,
-                        Err(e) => {
-                            warn!(error = %e, "Failed to convert frame to RGBA, skipping");
-                            continue;
-                        }
-                    };
-
-                    let output = if filter_type == crate::app::FilterType::Standard {
-                        rgba
-                    } else {
-                        match crate::shaders::apply_filter_gpu_rgba(
-                            &rgba,
-                            frame.width,
-                            frame.height,
-                            filter_type,
-                        )
-                        .await
-                        {
-                            Ok(data) => data,
-                            Err(e) => {
-                                warn!(error = %e, "Failed to apply filter, using unfiltered RGBA");
-                                rgba
-                            }
-                        }
-                    };
-
-                    gst::Buffer::from_mut_slice(output)
-                };
-
+            let capture_index = capture_frame_count;
+            capture_frame_count += 1;
+            if appsrc_queue_is_full(appsrc) {
                 RECORDING_STATS
-                    .last_convert_time_us
-                    .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-                let pts_ns = match compute_pts(
-                    &appsrc,
-                    sensor_ts,
-                    capture_index,
-                    frame_duration_ns,
-                    &mut pipeline_playing,
-                    &mut ts_offset,
-                ) {
-                    PtsResult::Pts(pts) => pts,
-                    PtsResult::Skip => continue,
-                };
-
-                {
-                    let buf_ref = buffer.get_mut().unwrap();
-                    buf_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
-                    buf_ref.set_duration(gst::ClockTime::from_nseconds(frame_duration_ns));
-                }
-
-                RECORDING_STATS.last_pts_ns.store(pts_ns, Ordering::Relaxed);
-
-                if appsrc.push_buffer(buffer).is_err() {
-                    warn!("Filtered pusher: failed to push buffer, stopping");
-                    break;
-                }
-
-                RECORDING_STATS
-                    .pusher_pushed
+                    .pusher_skipped
                     .fetch_add(1, Ordering::Relaxed);
-                frame_count += 1;
-                if frame_count.is_multiple_of(LOG_EVERY_N_FRAMES) {
-                    let elapsed = start_time.elapsed().as_secs_f64();
-                    debug!(
-                        frames = frame_count,
-                        seq = ?sequence,
-                        sensor_ts_ms = ?sensor_ts.map(|t| t / 1_000_000),
-                        pts_ms = pts_ns / 1_000_000,
-                        elapsed_secs = format!("{:.1}", elapsed),
-                        effective_fps = format!("{:.1}", frame_count as f64 / elapsed),
-                        filter_time_us = t0.elapsed().as_micros(),
-                        "Filtered pusher progress"
-                    );
-                }
+                continue;
             }
 
-            info!(
-                total_frames = frame_count,
-                "Frame channel closed, sending EOS to filtered appsrc"
-            );
-            let _ = appsrc.end_of_stream();
-        })
+            let sensor_ts = frame.sensor_timestamp_ns;
+            let sequence = frame.libcamera_metadata.as_ref().and_then(|m| m.sequence);
+
+            // Read the live filter for every frame so Standard ↔ filtered
+            // switching remains seamless within one fixed-caps pipeline.
+            let filter_code = live_filter_code.load(std::sync::atomic::Ordering::Relaxed);
+            let filter_type = crate::app::FilterType::from_gpu_filter_code(filter_code);
+
+            let t0 = std::time::Instant::now();
+            let mut buffer = if let Some(buffer) = try_shared_rgba_buffer(&frame, filter_type) {
+                buffer
+            } else {
+                let rgba = match convert_frame_to_rgba(&frame).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(error = %e, "Failed to convert frame to RGBA, skipping");
+                        continue;
+                    }
+                };
+
+                let output = if filter_type == crate::app::FilterType::Standard {
+                    rgba
+                } else {
+                    match crate::shaders::apply_filter_gpu_rgba(
+                        &rgba,
+                        frame.width,
+                        frame.height,
+                        filter_type,
+                    )
+                    .await
+                    {
+                        Ok(data) => data,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to apply filter, using unfiltered RGBA");
+                            rgba
+                        }
+                    }
+                };
+
+                gst::Buffer::from_mut_slice(output)
+            };
+
+            RECORDING_STATS
+                .last_convert_time_us
+                .store(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+
+            let pts_ns = match compute_pts(
+                appsrc,
+                sensor_ts,
+                capture_index,
+                frame_duration_ns,
+                &mut pipeline_playing,
+                &mut ts_offset,
+            ) {
+                PtsResult::Pts(pts) => pts,
+                PtsResult::Skip => continue,
+            };
+
+            {
+                let buf_ref = buffer.get_mut().unwrap();
+                buf_ref.set_pts(gst::ClockTime::from_nseconds(pts_ns));
+                buf_ref.set_duration(gst::ClockTime::from_nseconds(frame_duration_ns));
+            }
+
+            RECORDING_STATS.last_pts_ns.store(pts_ns, Ordering::Relaxed);
+
+            if appsrc.push_buffer(buffer).is_err() {
+                warn!("Filtered pusher: failed to push buffer, stopping");
+                break;
+            }
+
+            RECORDING_STATS
+                .pusher_pushed
+                .fetch_add(1, Ordering::Relaxed);
+            frame_count += 1;
+            if frame_count.is_multiple_of(LOG_EVERY_N_FRAMES) {
+                let elapsed = start_time.elapsed().as_secs_f64();
+                debug!(
+                    frames = frame_count,
+                    seq = ?sequence,
+                    sensor_ts_ms = ?sensor_ts.map(|t| t / 1_000_000),
+                    pts_ms = pts_ns / 1_000_000,
+                    elapsed_secs = format!("{:.1}", elapsed),
+                    effective_fps = format!("{:.1}", frame_count as f64 / elapsed),
+                    filter_time_us = t0.elapsed().as_micros(),
+                    "Filtered pusher progress"
+                );
+            }
+        }
+
+        info!(
+            total_frames = frame_count,
+            "Frame channel closed, sending EOS to filtered appsrc"
+        );
+        monitor.set_phase(RecordingPhase::Finalizing);
+        let _ = appsrc.end_of_stream();
     }
 
     /// Create audio branch elements
@@ -1151,17 +1309,29 @@ impl VideoRecorder {
         }
         info!(elements = ?element_names, "Pipeline elements");
 
-        let result = self
-            .pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| format!("Failed to start recording: {}", e))?;
+        let result = self.pipeline.set_state(gst::State::Playing).map_err(|e| {
+            let detail = format!("Failed to start recording: {e}");
+            self.monitor.report_error(detail.clone());
+            detail
+        })?;
         info!(state_change = ?result, "Pipeline set to Playing");
+        if result != gst::StateChangeSuccess::Async {
+            self.monitor.set_phase(RecordingPhase::Recording);
+        }
         Ok(())
     }
 
     /// Stop recording and finalize the file
-    pub fn stop(mut self) -> Result<PathBuf, String> {
+    pub fn stop(self) -> Result<PathBuf, String> {
+        self.stop_with_timeout(gst::ClockTime::from_seconds(60))
+    }
+
+    fn stop_with_timeout(mut self, eos_wait: gst::ClockTime) -> Result<PathBuf, String> {
+        self.monitor.set_phase(RecordingPhase::Finalizing);
         info!("Stopping video recording");
+        // Stop accepting frames before any native EOS/finalization call can
+        // block. Cancellation is a signal, never a join on the native worker.
+        drop(self.pusher_handle.take());
         clear_recording_diagnostics();
 
         // Send EOS directly to every source element's src pad.
@@ -1200,10 +1370,9 @@ impl VideoRecorder {
         // duration for WebM, etc.) and the filesink has flushed.
         if let Some(bus) = self.pipeline.bus() {
             info!("Waiting for pipeline EOS on bus...");
-            match bus.timed_pop_filtered(
-                gst::ClockTime::from_seconds(60),
-                &[gst::MessageType::Eos, gst::MessageType::Error],
-            ) {
+            match bus
+                .timed_pop_filtered(eos_wait, &[gst::MessageType::Eos, gst::MessageType::Error])
+            {
                 Some(msg) => match msg.view() {
                     gst::MessageView::Eos(_) => {
                         info!("Pipeline EOS received — file finalized");
@@ -1215,36 +1384,34 @@ impl VideoRecorder {
                             source = ?err.src().map(|s| s.name()),
                             "GStreamer error while waiting for EOS"
                         );
+                        self.monitor
+                            .report_error(format!("Error finalizing recording: {}", err.error()));
                         eos_timeout = true;
                     }
                     _ => {}
                 },
                 None => {
                     warn!("Timeout (60s) waiting for pipeline EOS, forcing shutdown");
+                    self.monitor
+                        .report_error("Timeout waiting for recording EOS".into());
                     eos_timeout = true;
                 }
             }
         } else {
             // Fallback: no bus available, use fixed sleep
             warn!("No pipeline bus available, using fixed sleep fallback");
+            self.monitor
+                .report_error("Recording pipeline has no bus for EOS finalization".into());
             std::thread::sleep(std::time::Duration::from_millis(1000));
             eos_timeout = true;
         }
 
-        // Abort the pusher task before tearing down the pipeline so it can't
-        // race with the NULL transition by pushing into a finalising appsrc.
-        if let Some(handle) = self.pusher_handle.take() {
-            handle.abort();
-        }
-
         // Set pipeline to NULL state - this will trigger final cleanup
         info!("Setting pipeline to NULL state");
-        self.pipeline
-            .set_state(gst::State::Null)
-            .map_err(|e| format!("Failed to stop pipeline: {}", e))?;
+        self.cleanup()?;
 
         let file_path = std::mem::take(&mut self.file_path);
-        if eos_timeout {
+        if eos_timeout || self.monitor.subscribe().borrow().error.is_some() {
             warn!(path = %file_path.display(), "Recording may be incomplete (EOS timeout)");
             Err(format!(
                 "Recording saved but may be incomplete: {}",
@@ -1257,20 +1424,35 @@ impl VideoRecorder {
     }
 }
 
-impl Drop for VideoRecorder {
-    fn drop(&mut self) {
-        // Abort the pusher first so it cannot keep pushing buffers into the
-        // pipeline while we transition it to NULL.
-        if let Some(handle) = self.pusher_handle.take() {
-            handle.abort();
+impl VideoRecorder {
+    fn cleanup(&mut self) -> Result<(), String> {
+        if self.cleanup_complete {
+            return Ok(());
         }
-        // Remove the bus sync handler to release its captured references
+        self.monitor.set_phase(RecordingPhase::Cleanup);
+        let result = self.pipeline.set_state(gst::State::Null).map_err(|e| {
+            let detail = format!("Failed to stop pipeline: {e}");
+            self.monitor.report_error(detail.clone());
+            detail
+        });
+        // Never finish until NULL returned, nor retry a failed transition in Drop.
+        self.cleanup_complete = true;
         if let Some(bus) = self.pipeline.bus() {
             bus.unset_sync_handler();
         }
+        result.map(|_| ())
+    }
+}
+
+impl Drop for VideoRecorder {
+    fn drop(&mut self) {
+        // Request cancellation; the resource lease keeps Cleanup observable
+        // until the independent worker actually releases its appsrc.
+        drop(self.pusher_handle.take());
+
         // Ensure pipeline is properly stopped — this disconnects pulsesrc from
         // PulseAudio and releases all GStreamer resources.
-        let _ = self.pipeline.set_state(gst::State::Null);
+        let _ = self.cleanup();
     }
 }
 
@@ -1304,6 +1486,725 @@ struct AudioBranch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn construction_config<'a>(
+        encoder: &'a crate::media::encoders::video::EncoderInfo,
+        output_path: PathBuf,
+    ) -> AppsrcRecorderConfig<'a> {
+        AppsrcRecorderConfig {
+            base: RecorderConfig {
+                width: 16,
+                height: 16,
+                framerate: 30,
+                output_path,
+                encoder_config: EncoderConfig {
+                    width: 16,
+                    height: 16,
+                    ..Default::default()
+                },
+                enable_audio: false,
+                audio_device: None,
+                audio_source_rate_hz: 0,
+                encoder_info: Some(encoder),
+                capture_metadata: Default::default(),
+                audio_levels: SharedAudioLevels::default(),
+            },
+            pixel_format: PixelFormat::RGBA,
+            live_filter_code: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        }
+    }
+
+    #[tokio::test]
+    async fn monitored_constructor_encoder_selection_failure_finishes_after_releasing_input() {
+        gst::init().unwrap();
+        let encoder = crate::media::encoders::video::EncoderInfo {
+            element_name: "camera-nonexistent-encoder".into(),
+            display_name: "Missing test encoder".into(),
+            codec: crate::media::encoders::video::VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        };
+        let monitor = RecordingMonitor::new(encoder.element_name.clone());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.try_send(test_rgba_frame(2, 2, 8).into()).unwrap();
+        let error = VideoRecorder::new_from_appsrc_monitored(
+            construction_config(&encoder, PathBuf::from("unused.mp4")),
+            rx,
+            monitor.clone(),
+        )
+        .unwrap_err();
+        assert!(error.contains(&encoder.element_name), "{error}");
+        assert!(tx.is_closed(), "constructor retained its input receiver");
+        let failure =
+            super::super::recording_monitor::wait_for_recording_failure(monitor.subscribe())
+                .await
+                .unwrap();
+        assert_eq!(failure.detail, error);
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    // Post-GREEN characterizations of the other construction/lifetime branches.
+    #[tokio::test]
+    async fn monitored_constructor_pipeline_parse_failure_finishes() {
+        gst::init().unwrap();
+        let encoder = construction_software_encoder();
+        let monitor = RecordingMonitor::new("requested encoder".into());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        // An unavailable element deterministically fails real parsing after
+        // encoder selection, without opening a file or touching devices.
+        let error = VideoRecorder::new_from_appsrc_monitored(
+            construction_config(
+                &encoder,
+                PathBuf::from("unused ! camera-nonexistent-element"),
+            ),
+            rx,
+            monitor.clone(),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Failed to parse pipeline:"), "{error}");
+        assert!(tx.is_closed());
+        let failure =
+            super::super::recording_monitor::wait_for_recording_failure(monitor.subscribe())
+                .await
+                .unwrap();
+        assert_eq!(failure.detail, error);
+        assert_eq!(monitor.subscribe().borrow().encoder, "x264enc");
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    fn construction_software_encoder() -> crate::media::encoders::video::EncoderInfo {
+        crate::media::encoders::video::EncoderInfo {
+            element_name: "x264enc".into(),
+            display_name: "Synthetic software H264".into(),
+            codec: crate::media::encoders::video::VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn monitored_constructor_failure_does_not_bypass_outstanding_resource_lease() {
+        gst::init().unwrap();
+        let mut encoder = construction_software_encoder();
+        encoder.element_name = "camera-nonexistent-encoder".into();
+        let monitor = RecordingMonitor::new(encoder.element_name.clone());
+        let lease = monitor.resource_lease();
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        assert!(
+            VideoRecorder::new_from_appsrc_monitored(
+                construction_config(&encoder, PathBuf::from("unused.mp4")),
+                rx,
+                monitor.clone(),
+            )
+            .is_err()
+        );
+        assert!(monitor.subscribe().borrow().error.is_some());
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Cleanup);
+        drop(lease);
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[tokio::test]
+    async fn monitored_constructor_success_stays_live_until_recorder_and_pusher_release() {
+        gst::init().unwrap();
+        let encoder = construction_software_encoder();
+        let output = std::env::temp_dir().join(format!(
+            "camera-construction-success-{}.mp4",
+            uuid::Uuid::new_v4()
+        ));
+        let monitor = RecordingMonitor::new("requested encoder".into());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let recorder = VideoRecorder::new_from_appsrc_monitored(
+            construction_config(&encoder, output.clone()),
+            rx,
+            monitor.clone(),
+        )
+        .unwrap();
+        let status = monitor.subscribe().borrow().clone();
+        assert!(status.error.is_none());
+        assert!(matches!(
+            status.phase,
+            RecordingPhase::Starting | RecordingPhase::Recording
+        ));
+        assert!(!tx.is_closed());
+        // Successful construction must not even request deferred completion:
+        // registering a resource after finish_requested would panic.
+        let lease = monitor.resource_lease();
+        drop(recorder);
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Cleanup);
+        drop(lease);
+        let mut completion = monitor.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while completion.borrow_and_update().phase != RecordingPhase::Finished {
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert!(tx.is_closed());
+        std::fs::remove_file(output).unwrap();
+    }
+
+    #[test]
+    fn native_pusher_stall_and_destruction_do_not_starve_monitor_or_finish_early() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        gst::init().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let pipeline =
+            gst::parse::launch("appsrc name=input ! identity ! fakesink sync=false async=false")
+                .unwrap()
+                .downcast::<gst::Pipeline>()
+                .unwrap();
+        let appsrc = pipeline
+            .by_name("input")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        // A full byte queue emits enough-data synchronously inside push_buffer.
+        // Keep the pipeline in NULL: no streaming thread or device is involved.
+        appsrc.set_max_buffers(0);
+        appsrc.set_max_bytes(1);
+        appsrc.set_block(false);
+        appsrc
+            .push_buffer(gst::Buffer::with_size(16).unwrap())
+            .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        appsrc.set_callbacks(
+            gst_app::AppSrcCallbacks::builder()
+                .enough_data(move |_| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5));
+                })
+                .build(),
+        );
+        let monitor = RecordingMonitor::new("identity".into());
+        let (destroy_tx, destroy_rx) = mpsc::channel();
+        let (destroy_release_tx, destroy_release_rx) = mpsc::channel();
+        let destruction_monitor = monitor.clone();
+        let _notify = appsrc.add_weak_ref_notify(move || {
+            let _ = destroy_tx.send(destruction_monitor.subscribe().borrow().phase);
+            let _ = destroy_release_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let pusher = {
+            let _entered = runtime.enter();
+            VideoRecorder::spawn_filtered_pusher(
+                appsrc,
+                rx,
+                30,
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                monitor.clone(),
+            )
+        };
+        tx.try_send(test_rgba_frame(2, 2, 8).into()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let recorder = VideoRecorder {
+            pipeline,
+            file_path: PathBuf::from("synthetic"),
+            _pulse_volume_guard: None,
+            pusher_handle: Some(pusher),
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
+        };
+        // This is an external OS deadline, not a timer on the blocked executor.
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let status = monitor.subscribe();
+        runtime.spawn(async move {
+            let failure = super::super::recording_monitor::wait_for_recording_failure(status).await;
+            observed_tx.send(failure.unwrap().detail).unwrap();
+        });
+        let watchdog_monitor = monitor.clone();
+        runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            watchdog_monitor.report_error("native call blocked".into());
+        });
+        let observed = observed_rx.recv_timeout(Duration::from_millis(500));
+        drop(recorder); // Must signal cancellation, not wait for native completion.
+        let phase_while_native_blocked = monitor.subscribe().borrow().phase;
+        release_tx.send(()).unwrap();
+        let destruction_phase = destroy_rx.recv_timeout(Duration::from_secs(3));
+        let phase_while_destructor_blocked = monitor.subscribe().borrow().phase;
+        // A gated GObject final-unref must also be isolated from the executor.
+        let (tick_tx, tick_rx) = mpsc::channel();
+        runtime.spawn(async move {
+            tick_tx.send(()).unwrap();
+        });
+        let destructor_tick = tick_rx.recv_timeout(Duration::from_millis(500));
+        destroy_release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while monitor.subscribe().borrow().phase != RecordingPhase::Finished
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(tx);
+        runtime.shutdown_timeout(Duration::from_secs(3));
+        assert_eq!(
+            (
+                observed.ok(),
+                phase_while_native_blocked,
+                destruction_phase.ok(),
+                phase_while_destructor_blocked,
+                destructor_tick.is_ok(),
+            ),
+            (
+                Some("native call blocked".into()),
+                RecordingPhase::Cleanup,
+                Some(RecordingPhase::Cleanup),
+                RecordingPhase::Cleanup,
+                true,
+            ),
+            "native pusher must preserve timer/subscription liveness and resource lifetime",
+        );
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stop_cancels_pusher_before_waiting_for_pipeline_eos() {
+        use std::time::Duration;
+        gst::init().unwrap();
+        let monitor = RecordingMonitor::new("identity".into());
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let pusher = VideoRecorder::spawn_filtered_pusher(
+            gst_app::AppSrc::builder().build(),
+            rx,
+            30,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            monitor.clone(),
+        );
+        // This empty pipeline never publishes EOS. Pusher cancellation must
+        // precede the blocking bus wait, not depend on its timeout returning.
+        let recorder = VideoRecorder {
+            pipeline: gst::Pipeline::new(),
+            file_path: PathBuf::from("synthetic"),
+            _pulse_volume_guard: None,
+            pusher_handle: Some(pusher),
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
+        };
+        let stop = tokio::task::spawn_blocking(move || {
+            recorder.stop_with_timeout(gst::ClockTime::from_seconds(1))
+        });
+        let cancelled = tokio::time::timeout(Duration::from_millis(250), tx.closed()).await;
+        assert!(stop.await.unwrap().is_err());
+        assert!(
+            cancelled.is_ok(),
+            "pusher cancellation waited for native EOS finalization"
+        );
+    }
+
+    // Post-GREEN characterization: cancelling an idle blocking worker must not
+    // depend on the producer closing its bounded channel or on JoinHandle::abort.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_pusher_cancels_idle_receiver_and_releases_appsrc() {
+        use std::time::Duration;
+        gst::init().unwrap();
+        let appsrc = gst_app::AppSrc::builder().build();
+        let monitor = RecordingMonitor::new("identity".into());
+        let (destroyed_tx, destroyed_rx) = tokio::sync::oneshot::channel();
+        let _notify = appsrc.add_weak_ref_notify(move || {
+            let _ = destroyed_tx.send(());
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let pusher = VideoRecorder::spawn_filtered_pusher(
+            appsrc,
+            rx,
+            30,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            monitor.clone(),
+        );
+        drop(pusher);
+        tokio::time::timeout(Duration::from_secs(3), destroyed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(tx.is_closed());
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            RecordingPhase::Starting,
+            "pusher completion alone must not complete the recorder owner"
+        );
+        monitor.finish();
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[test]
+    fn monitored_encoder_output_probe_records_progress_without_replacing_existing_probes() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "appsrc name=input is-live=true ! identity name=recording-encoder ! fakesink name=sink sync=false async=false"
+        ).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let monitor = RecordingMonitor::new("identity".into());
+        monitor.enable_activity_watchdog();
+        let original_count = Arc::new(AtomicU64::new(0));
+        let count = original_count.clone();
+        pipeline
+            .by_name("recording-encoder")
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                count.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        install_recording_observer(&pipeline, &SharedAudioLevels::default(), &monitor);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let m = monitor.clone();
+        pipeline
+            .by_name("sink")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                let _ = tx.send(m.has_pending_input());
+                gst::PadProbeReturn::Ok
+            });
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let appsrc = pipeline
+            .by_name("input")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        monitor.note_input();
+        assert!(monitor.has_pending_input());
+        appsrc
+            .push_buffer(gst::Buffer::with_size(16).unwrap())
+            .unwrap();
+        let pending_at_sink = rx.recv_timeout(std::time::Duration::from_secs(3));
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(
+            !pending_at_sink.unwrap(),
+            "encoder output was not recorded as progress"
+        );
+        assert_eq!(original_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn monitored_pusher_notes_offered_input_even_when_appsrc_queue_is_full() {
+        gst::init().unwrap();
+        let appsrc = gst_app::AppSrc::builder().build();
+        configure_live_appsrc(&appsrc);
+        for _ in 0..APPSRC_MAX_BUFFERS {
+            appsrc
+                .push_buffer(gst::Buffer::with_size(16).unwrap())
+                .unwrap();
+        }
+        assert!(appsrc_queue_is_full(&appsrc));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let monitor = RecordingMonitor::new("blocked".into());
+        monitor.enable_activity_watchdog();
+        let handle = VideoRecorder::spawn_filtered_pusher(
+            appsrc.clone(),
+            rx,
+            30,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            monitor.clone(),
+        );
+        tx.send(test_rgba_frame(2, 2, 8).into()).await.unwrap();
+        drop(tx);
+        handle.await.unwrap();
+        assert!(
+            monitor.has_pending_input(),
+            "queue-full skip hid offered input"
+        );
+        assert_eq!(appsrc.current_level_buffers(), APPSRC_MAX_BUFFERS);
+    }
+
+    // Post-GREEN public-route characterization: explicit software encoder only;
+    // never run automatic hardware discovery, audio capture or GPU conversion.
+    #[tokio::test]
+    async fn monitored_constructor_reports_resolved_software_encoder_on_start_failure() {
+        gst::init().unwrap();
+        let info = crate::media::encoders::video::EncoderInfo {
+            element_name: "x264enc".into(),
+            display_name: "Synthetic software H264".into(),
+            codec: crate::media::encoders::video::VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let monitor = RecordingMonitor::new("requested encoder".into());
+        let missing = std::env::temp_dir()
+            .join(format!("camera-absent-{}", uuid::Uuid::new_v4()))
+            .join("video.mp4");
+        let result = VideoRecorder::new_from_appsrc_monitored(
+            AppsrcRecorderConfig {
+                base: RecorderConfig {
+                    width: 16,
+                    height: 16,
+                    framerate: 30,
+                    output_path: missing,
+                    encoder_config: EncoderConfig {
+                        width: 16,
+                        height: 16,
+                        ..Default::default()
+                    },
+                    enable_audio: false,
+                    audio_device: None,
+                    audio_source_rate_hz: 0,
+                    encoder_info: Some(&info),
+                    capture_metadata: Default::default(),
+                    audio_levels: SharedAudioLevels::default(),
+                },
+                pixel_format: PixelFormat::RGBA,
+                live_filter_code: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            },
+            rx,
+            monitor.clone(),
+        );
+        assert!(result.is_err());
+        let status = monitor.subscribe().borrow().clone();
+        assert_eq!(status.encoder, "x264enc");
+        monitor.note_input();
+        assert!(
+            monitor.has_pending_input(),
+            "normal constructor did not enable activity monitoring"
+        );
+        assert!(status.error.is_some());
+        // Constructor failure cancels the pusher, but its native unref runs
+        // independently. Observe completion rather than assuming immediate drop.
+        let mut completion = monitor.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while completion.borrow_and_update().phase != RecordingPhase::Finished {
+                completion.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        drop(tx);
+    }
+
+    #[test]
+    fn monitored_async_start_keeps_startup_deadline_until_playing() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("appsrc name=input is-live=true ! fakesink sync=false")
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let monitor = RecordingMonitor::new("synthetic".into());
+        install_recording_observer(&pipeline, &SharedAudioLevels::default(), &monitor);
+        let recorder = VideoRecorder {
+            pipeline: pipeline.clone(),
+            file_path: PathBuf::from("synthetic"),
+            _pulse_volume_guard: None,
+            pusher_handle: None,
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
+        };
+        recorder.start().unwrap();
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Starting);
+        let appsrc = pipeline
+            .by_name("input")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        appsrc
+            .push_buffer(gst::Buffer::with_size(16).unwrap())
+            .unwrap();
+        pipeline.state(gst::ClockTime::from_seconds(3)).0.unwrap();
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            RecordingPhase::Recording
+        );
+        drop(recorder);
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[test]
+    fn cleanup_remains_monitored_through_pipeline_destruction() {
+        gst::init().unwrap();
+        let monitor = RecordingMonitor::new("synthetic".into());
+        let recorder = VideoRecorder {
+            pipeline: gst::Pipeline::new(),
+            file_path: PathBuf::from("synthetic"),
+            _pulse_volume_guard: None,
+            pusher_handle: None,
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
+        };
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let at_destruction = observed.clone();
+        let status = monitor.clone();
+        let _notify = recorder.pipeline.add_weak_ref_notify(move || {
+            *at_destruction.lock().unwrap() = Some(status.subscribe().borrow().phase);
+        });
+        drop(recorder);
+        assert_eq!(*observed.lock().unwrap(), Some(RecordingPhase::Cleanup));
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[tokio::test]
+    async fn monitored_pusher_channel_close_marks_finalizing_before_eos() {
+        gst::init().unwrap();
+        let appsrc = gst_app::AppSrc::builder().build();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let monitor = RecordingMonitor::new("synthetic".into());
+        monitor.set_phase(RecordingPhase::Recording);
+        let handle = VideoRecorder::spawn_filtered_pusher(
+            appsrc,
+            rx,
+            30,
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            monitor.clone(),
+        );
+        drop(tx);
+        handle.await.unwrap();
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            RecordingPhase::Finalizing
+        );
+    }
+
+    #[test]
+    fn monitored_eos_timeout_is_visible_before_null_cleanup() {
+        gst::init().unwrap();
+        // A source that cannot produce EOS on its own, with an injected zero wait.
+        let pipeline = gst::parse::launch("appsrc is-live=true ! fakesink sync=false")
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let monitor = RecordingMonitor::new("synthetic".into());
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = observed.clone();
+        let m = monitor.clone();
+        pipeline.bus().unwrap().set_sync_handler(move |_, message| {
+            if let gst::MessageView::StateChanged(state) = message.view()
+                && state.current() == gst::State::Ready
+            {
+                let status = m.subscribe().borrow().clone();
+                if status.phase == RecordingPhase::Cleanup {
+                    seen.store(
+                        status.error.as_ref().is_some_and(|e| e.contains("EOS")),
+                        Ordering::Relaxed,
+                    );
+                }
+            }
+            gst::BusSyncReply::Pass
+        });
+        let recorder = VideoRecorder {
+            pipeline,
+            file_path: PathBuf::from("synthetic"),
+            _pulse_volume_guard: None,
+            pusher_handle: None,
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
+        };
+        recorder.start().unwrap();
+        assert!(recorder.stop_with_timeout(gst::ClockTime::ZERO).is_err());
+        assert!(observed.load(Ordering::Relaxed));
+        assert!(monitor.subscribe().borrow().error.is_some());
+    }
+
+    #[test]
+    fn monitored_synthetic_recorder_reports_error_before_cleanup_and_keeps_bus_error() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true ! identity name=recording-encoder ! fakesink sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let monitor = super::super::RecordingMonitor::new("identity".into());
+        install_recording_observer(&pipeline, &SharedAudioLevels::default(), &monitor);
+        let recorder = VideoRecorder {
+            pipeline: pipeline.clone(),
+            file_path: PathBuf::from("synthetic"),
+            _pulse_volume_guard: None,
+            pusher_handle: None,
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
+        };
+        recorder.start().unwrap();
+        pipeline.state(gst::ClockTime::from_seconds(3)).0.unwrap();
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            super::super::RecordingPhase::Recording
+        );
+        let encoder = pipeline.by_name("recording-encoder").unwrap();
+        encoder
+            .post_message(
+                gst::message::Error::builder(gst::CoreError::Failed, "synthetic encode failure")
+                    .src(&encoder)
+                    .build(),
+            )
+            .unwrap();
+        let error = monitor.subscribe().borrow().error.clone().unwrap();
+        assert!(error.contains("recording-encoder"));
+        assert!(error.contains("synthetic encode failure"));
+        assert!(recorder.stop().is_err());
+        assert_eq!(monitor.subscribe().borrow().error.as_ref(), Some(&error));
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            super::super::RecordingPhase::Finished
+        );
+    }
+
+    #[test]
+    fn monitored_stop_publishes_finalizing_before_eos_and_finishes_after_null() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("videotestsrc is-live=true ! fakesink sync=false")
+            .unwrap()
+            .downcast::<gst::Pipeline>()
+            .unwrap();
+        let monitor = super::super::RecordingMonitor::new("synthetic".into());
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = observed.clone();
+        let m = monitor.clone();
+        pipeline
+            .iterate_sources()
+            .into_iter()
+            .next()
+            .unwrap()
+            .unwrap()
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if info
+                    .event()
+                    .is_some_and(|event| event.type_() == gst::EventType::Eos)
+                {
+                    seen.store(
+                        m.subscribe().borrow().phase == RecordingPhase::Finalizing,
+                        Ordering::Relaxed,
+                    );
+                }
+                gst::PadProbeReturn::Ok
+            });
+        let recorder = VideoRecorder {
+            pipeline: pipeline.clone(),
+            file_path: PathBuf::from("synthetic"),
+            _pulse_volume_guard: None,
+            pusher_handle: None,
+            monitor: monitor.clone(),
+            cleanup_complete: false,
+            _finish: FinishRecording(monitor.clone()),
+        };
+        recorder.start().unwrap();
+        assert_eq!(recorder.stop().unwrap(), PathBuf::from("synthetic"));
+        assert!(observed.load(Ordering::Relaxed));
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            super::super::RecordingPhase::Finished
+        );
+        assert!(monitor.subscribe().borrow().error.is_none());
+    }
 
     #[test]
     fn recording_audio_branch_adds_and_links_every_stage_in_order() {

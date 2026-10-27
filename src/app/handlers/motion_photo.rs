@@ -4,12 +4,14 @@
 //! The preview source is used even for raw and HDR stills. Their exact exposure
 //! correspondence is unknown, so the Motion Photo presentation timestamp is -1.
 
+use crate::app::recording_error::EncoderOperation;
 use crate::app::state::AppModel;
 use crate::backends::camera::types::{CameraFrame, SensorRotation};
 use crate::media::encoders::video::EncoderInfo;
 use crate::pipelines::capture_metadata::CaptureMetadata;
 use crate::pipelines::motion_photo_ring::{MemoryEncoder, POST_ROLL_NS};
 use crate::pipelines::photo::processing::{PostProcessingConfig, PostProcessor};
+use crate::pipelines::video::{RecordingMonitor, RecordingPhase};
 use std::path::PathBuf;
 use std::sync::{
     Arc,
@@ -110,6 +112,7 @@ impl Drop for PostrollLease {
 }
 
 struct ShutterRequest {
+    completion: WorkerCompletion,
     postroll: Option<PostrollLease>,
     shutter: Instant,
     path: PathBuf,
@@ -117,6 +120,7 @@ struct ShutterRequest {
     result: tokio::sync::oneshot::Sender<Result<TemporaryClip, String>>,
 }
 pub(crate) struct MotionPhotoRecorder {
+    monitor: RecordingMonitor,
     #[cfg(test)]
     pre_roll_ready: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
@@ -214,6 +218,12 @@ impl AppModel {
 
     /// Snapshot settings once, before any photo path branches.
     pub(crate) fn start_motion_photo_capture(&mut self) -> Result<(), String> {
+        if self.encoder_restart_required() {
+            return Err(
+                "Motion Photo video encoder failed; restart the device before recording again"
+                    .into(),
+            );
+        }
         if self.motion_photo_capture.is_some()
             || self.recording.is_recording()
             || (self.timelapse.is_running() || self.timelapse.is_finalising())
@@ -251,8 +261,15 @@ impl AppModel {
             .unwrap_or_else(std::env::temp_dir)
             .join("cosmic-camera/motion-photo")
             .join(format!("{}.mp4", uuid::Uuid::new_v4()));
+        self.recording_session_counter = self.recording_session_counter.wrapping_add(1);
+        let operation = EncoderOperation::MotionPhoto(self.recording_session_counter);
+        let monitor = RecordingMonitor::new(encoder.element_name.clone());
+        // Post-roll collection does not start a pipeline or finalize anything.
+        monitor.set_phase(RecordingPhase::Recording);
+        self.register_encoder_operation(operation, monitor.clone());
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         let mut request = ShutterRequest {
+            completion: WorkerCompletion(monitor.clone()),
             postroll: None,
             shutter: started,
             path: path.clone(),
@@ -282,6 +299,7 @@ impl AppModel {
             result_rx,
             watchdog_cancel,
             Duration::from_secs(10),
+            monitor,
         ));
         self.motion_photo_capture = Some(MotionPhotoCapture {
             snapshot,
@@ -345,6 +363,16 @@ impl AppModel {
         self.sync_motion_photo_recorder_dimensions(dimensions);
     }
     fn sync_motion_photo_recorder_dimensions(&mut self, dimensions: Option<(u32, u32)>) {
+        // Check sticky worker errors even before the UI consumes its subscription.
+        if self.encoder_restart_required()
+            || self
+                .motion_photo_recorder
+                .as_ref()
+                .is_some_and(|r| r.monitor.subscribe().borrow().error.is_some())
+        {
+            self.retire_motion_photo_recorder();
+            return;
+        }
         if self
             .motion_photo_retiring
             .as_ref()
@@ -456,6 +484,12 @@ impl AppModel {
         let pre_roll_ready = Arc::new(AtomicBool::new(false));
         #[cfg(test)]
         let worker_pre_roll_ready = pre_roll_ready.clone();
+        self.recording_session_counter = self.recording_session_counter.wrapping_add(1);
+        let operation = EncoderOperation::MotionPhoto(self.recording_session_counter);
+        // An enabled prebuffer waiting for its first camera frame is not startup.
+        let monitor = RecordingMonitor::new_waiting(info.element_name.clone());
+        self.register_encoder_operation(operation, monitor.clone());
+        let worker_monitor = monitor.clone();
         let job = std::thread::Builder::new()
             .name("motion-photo-memory".into())
             .spawn(move || {
@@ -472,6 +506,7 @@ impl AppModel {
                     job_cancel.clone(),
                     job_source_cancel,
                     worker_draining,
+                    worker_monitor,
                     #[cfg(test)]
                     worker_pre_roll_ready,
                 );
@@ -480,11 +515,15 @@ impl AppModel {
         let worker = match job {
             Ok(worker) => worker,
             Err(e) => {
-                self.motion_photo_error = Some(format!("Motion Photo worker could not start: {e}"));
+                let error = format!("Motion Photo worker could not start: {e}");
+                monitor.report_error(error.clone());
+                monitor.finish();
+                self.finish_encoder_operation(operation, Some(error));
                 return;
             }
         };
         self.motion_photo_recorder = Some(MotionPhotoRecorder {
+            monitor,
             #[cfg(test)]
             pre_roll_ready,
             draining,
@@ -591,6 +630,7 @@ async fn await_clip_result(
     receiver: tokio::sync::oneshot::Receiver<Result<TemporaryClip, String>>,
     cancel: Arc<AtomicBool>,
     deadline: Duration,
+    monitor: RecordingMonitor,
 ) -> Result<TemporaryClip, String> {
     match tokio::time::timeout(deadline, receiver).await {
         Ok(result) => {
@@ -598,7 +638,10 @@ async fn await_clip_result(
         }
         Err(_) => {
             cancel.store(true, Ordering::Release);
-            Err("Motion Photo worker exceeded its finalization deadline; still preserved".into())
+            let error = "Motion Photo worker exceeded its finalization deadline; still preserved"
+                .to_string();
+            monitor.report_error(error.clone());
+            Err(error)
         }
     }
 }
@@ -607,6 +650,17 @@ fn continuous_processor(processing: PostProcessingConfig) -> PostProcessor {
     PostProcessor::new(processing)
         .for_continuous_frames()
         .without_gpu_pacing()
+}
+
+struct WorkerCompletion(RecordingMonitor);
+impl Drop for WorkerCompletion {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.report_error("Motion Photo worker panicked".into());
+        }
+        self.0.set_phase(RecordingPhase::Cleanup);
+        self.0.finish();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -623,15 +677,22 @@ fn run_memory_recorder(
     cancel: Arc<AtomicBool>,
     source_cancel: Arc<AtomicBool>,
     draining: Arc<AtomicBool>,
+    monitor: RecordingMonitor,
     #[cfg(test)] pre_roll_ready: Arc<AtomicBool>,
 ) {
+    // Declared before the encoder so Finished is published only after Drop's
+    // potentially blocking driver cleanup has actually returned.
+    let _completion = WorkerCompletion(monitor.clone());
     let origin = Instant::now();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(r) => r,
-        Err(_) => return,
+        Err(error) => {
+            monitor.report_error(format!("Motion Photo runtime could not start: {error}"));
+            return;
+        }
     };
     let processor = continuous_processor(processing);
     let mut encoder: Option<MemoryEncoder> = None;
@@ -694,7 +755,8 @@ fn run_memory_recorder(
                             temporary.0.parent().ok_or("Invalid clip cache path")?,
                         )
                         .map_err(|e| e.to_string())?;
-                        let midpoint = window.write(&temporary.0)?;
+                        let midpoint =
+                            window.write_monitored(&temporary.0, p.completion.0.clone())?;
                         if p.cancel.load(Ordering::Acquire)
                             || (!writer_draining.load(Ordering::Acquire)
                                 && (writer_cancel.load(Ordering::Acquire)
@@ -719,6 +781,7 @@ fn run_memory_recorder(
         if let Some(enc) = &encoder
             && let Err(e) = enc.check_error()
         {
+            monitor.report_error(e.clone());
             failure = Some(e);
         }
         let frame = match frames.recv_timeout(Duration::from_millis(10)) {
@@ -739,6 +802,7 @@ fn run_memory_recorder(
         let image = match processed {
             Ok(Ok(p)) => orient_clip_frame(p.image, rotation, mirror),
             Ok(Err(e)) => {
+                monitor.report_error(e.clone());
                 failure = Some(e);
                 continue;
             }
@@ -748,7 +812,7 @@ fn run_memory_recorder(
             break;
         }
         if encoder.is_none() {
-            match MemoryEncoder::new(
+            match MemoryEncoder::new_monitored(
                 &info,
                 image.width(),
                 image.height(),
@@ -756,9 +820,11 @@ fn run_memory_recorder(
                 bitrate,
                 audio.as_deref(),
                 origin,
+                monitor.clone(),
             ) {
                 Ok(enc) => encoder = Some(enc),
                 Err(e) => {
+                    monitor.report_error(e.clone());
                     failure = Some(e);
                     continue;
                 }
@@ -769,6 +835,7 @@ fn run_memory_recorder(
             .unwrap()
             .push(image, elapsed.as_nanos() as u64)
         {
+            monitor.report_error(e.clone());
             failure = Some(e);
         }
         next_pts = elapsed + Duration::from_nanos(1_000_000_000 / fps as u64);
@@ -792,12 +859,132 @@ mod pacing_tests;
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn failed_motion_clip_preserves_valid_independent_still_bytes() {
+        let path =
+            std::env::temp_dir().join(format!("motion-failed-clip-{}.jpg", uuid::Uuid::new_v4()));
+        image::RgbImage::from_pixel(16, 16, image::Rgb([70, 80, 90]))
+            .save(&path)
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let job = tokio::spawn(async { Err("synthetic video failure".into()) });
+        let error = embed_completed_clip(path.clone(), job).await.unwrap_err();
+        assert!(error.contains("Still saved at"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(image::open(&path).is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn failed_encoder_rejects_new_motion_clip_before_creating_work() {
+        let mut model = AppModel::default();
+        let monitor = RecordingMonitor::new("venus-encoder".into());
+        monitor.report_error("synthetic driver failure".into());
+        model.register_encoder_operation(EncoderOperation::MotionPhoto(1), monitor);
+        let error = model.start_motion_photo_capture().unwrap_err();
+        assert!(
+            error.contains("restart"),
+            "must reject from sticky monitor before validating a new capture: {error}"
+        );
+        assert!(model.motion_photo_capture.is_none());
+        assert_eq!(model.encoder_operations.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clip_deadline_reports_to_monitor_without_finishing_a_still_running_mux() {
+        let monitor = RecordingMonitor::new("venus-encoder".into());
+        monitor.set_phase(RecordingPhase::Finalizing);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = await_clip_result(
+            receiver,
+            cancel.clone(),
+            Duration::from_millis(1),
+            monitor.clone(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(
+            monitor
+                .subscribe()
+                .borrow()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("deadline")
+        );
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            RecordingPhase::Finalizing,
+            "a watchdog must not pretend an unresponsive mux was cleaned up"
+        );
+        drop(sender);
+    }
+
+    #[tokio::test]
+    async fn memory_worker_is_monitored_while_idle_and_retirement_cannot_restart_after_error() {
+        let mut model = AppModel::default();
+        model.config.record_audio = false;
+        model.config.motion_photo = true;
+        model.available_video_encoders.push(EncoderInfo {
+            element_name: "x264enc".into(),
+            display_name: "H264".into(),
+            codec: crate::media::encoders::video::VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        });
+        model.sync_motion_photo_recorder_dimensions(Some((64, 48)));
+        assert_eq!(
+            model.encoder_operations.len(),
+            1,
+            "register before any camera input"
+        );
+        let (&operation, monitor) = model.encoder_operations.iter().next().unwrap();
+        let monitor = monitor.clone();
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            crate::pipelines::video::RecordingPhase::WaitingForFrames,
+            "no startup deadline while waiting for first preview frame"
+        );
+        monitor.report_error("synthetic stalled encoder".into());
+        model.sync_motion_photo_recorder_dimensions(Some((64, 48)));
+        assert!(
+            model.motion_photo_recorder.is_none(),
+            "failure must retire the worker synchronously"
+        );
+        assert!(
+            model.encoder_operations.contains_key(&operation),
+            "retirement must not unregister cleanup"
+        );
+        let worker = model.motion_photo_retiring.take().unwrap();
+        tokio::task::spawn_blocking(move || worker.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            crate::pipelines::video::RecordingPhase::Finished
+        );
+        model.finish_encoder_operation(operation, None);
+        model.sync_motion_photo_recorder_dimensions(Some((64, 48)));
+        assert!(
+            model.motion_photo_recorder.is_none(),
+            "completed failed worker must not auto-restart"
+        );
+        assert!(model.recording_failure.is_some());
+    }
+
+    #[tokio::test]
     async fn unresponsive_recorder_reports_deadline_without_losing_the_still_job() {
         let (_sender, receiver) = tokio::sync::oneshot::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let result = tokio::time::timeout(
             Duration::from_millis(50),
-            await_clip_result(receiver, cancel.clone(), Duration::from_millis(1)),
+            await_clip_result(
+                receiver,
+                cancel.clone(),
+                Duration::from_millis(1),
+                RecordingMonitor::new("test".into()),
+            ),
         )
         .await;
         assert!(

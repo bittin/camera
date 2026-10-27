@@ -11,6 +11,7 @@
 pub mod encoder_selection;
 pub mod muxer;
 pub mod recorder;
+pub mod recording_monitor;
 pub mod stats;
 pub mod timelapse;
 
@@ -18,6 +19,10 @@ pub mod timelapse;
 pub use encoder_selection::EncoderConfig;
 pub use recorder::{
     AppsrcRecorderConfig, AudioLevels, RecorderConfig, SharedAudioLevels, VideoRecorder,
+    install_recording_observer,
+};
+pub use recording_monitor::{
+    RecordingFailure, RecordingMonitor, RecordingPhase, RecordingStatus, wait_for_recording_failure,
 };
 pub use stats::{
     RecordingDiagnostics, RecordingStatsSnapshot, get_recording_diagnostics, get_recording_stats,

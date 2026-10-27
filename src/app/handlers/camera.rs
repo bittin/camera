@@ -570,9 +570,7 @@ impl AppModel {
             // Stop recording if the camera used for recording is disconnected
             if self.recording.is_recording() {
                 info!("Camera disconnected during recording, stopping recording gracefully");
-                if let Some(sender) = self.recording.take_stop_sender() {
-                    let _ = sender.send(());
-                }
+                self.request_recording_stop();
                 self.recording = RecordingState::Idle;
             }
 
