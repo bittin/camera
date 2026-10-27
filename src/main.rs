@@ -143,20 +143,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
 
-    let _logging_guard = if is_terminal_mode {
+    if is_terminal_mode {
         tracing_subscriber::fmt()
             .with_env_filter(env_filter)
             .with_writer(std::io::sink)
             .init();
-        None
     } else {
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let (subscriber, guard) = logging::subscriber(std::io::stdout(), env_filter);
-        subscriber.init();
-        // Retain the worker through GUI/CLI execution and drain on shutdown.
-        Some(guard)
-    };
+        // A stalled journal/stdout must never hold the UI or shutdown hostage.
+        // Logging is best-effort: bounded backlog, no synchronous drain guard.
+        logging::subscriber(std::io::stdout(), env_filter).init();
+    }
 
     tracing::info!("camera app starting");
     camera::startup::milestone("logging_ready");

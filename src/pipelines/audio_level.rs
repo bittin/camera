@@ -71,10 +71,22 @@ pub type SharedAudioLevels = Arc<Mutex<AudioLevels>>;
 /// other messages (Eos, Error, Warning, etc.) pass through normally, so
 /// the recorder's `stop()` can use `timed_pop_filtered` without races.
 pub fn install_level_sync_handler(pipeline: &gst::Pipeline, levels: &SharedAudioLevels) {
+    install_level_sync_handler_with_observer(pipeline, levels, |_| {});
+}
+
+/// Install one shared callback: observing must never consume errors/EOS or
+/// replace the audio meter callback. The observer runs in the posting thread
+/// and must not block or retain the pipeline.
+pub fn install_level_sync_handler_with_observer(
+    pipeline: &gst::Pipeline,
+    levels: &SharedAudioLevels,
+    observer: impl Fn(&gst::MessageRef) + Send + Sync + 'static,
+) {
     let Some(bus) = pipeline.bus() else { return };
     let levels = Arc::clone(levels);
 
     bus.set_sync_handler(move |_, msg| {
+        observer(msg);
         let gst::MessageView::Element(e) = msg.view() else {
             return gst::BusSyncReply::Pass;
         };
@@ -115,6 +127,41 @@ pub fn install_level_sync_handler(pipeline: &gst::Pipeline, levels: &SharedAudio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_preserves_audio_levels_and_passes_error_and_eos() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("audiotestsrc num-buffers=10 ! level name=audio-level-output interval=1000000 ! fakesink sync=false").unwrap().downcast::<gst::Pipeline>().unwrap();
+        let levels = SharedAudioLevels::default();
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = observed.clone();
+        install_level_sync_handler_with_observer(&pipeline, &levels, move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let bus = pipeline.bus().unwrap();
+        // Discard graph-construction messages before the assertions.
+        while bus.pop().is_some() {}
+        pipeline.set_state(gst::State::Playing).unwrap();
+        assert!(
+            bus.timed_pop_filtered(gst::ClockTime::from_seconds(3), &[gst::MessageType::Eos])
+                .is_some()
+        );
+        assert!(levels.lock().unwrap().output_peak_db > -100.0);
+        pipeline.set_state(gst::State::Null).unwrap();
+        bus.set_flushing(false);
+        while bus.pop().is_some() {}
+        bus.post(
+            gst::message::Error::builder(gst::CoreError::Failed, "synthetic failure")
+                .src(&pipeline)
+                .build(),
+        )
+        .unwrap();
+        bus.post(gst::message::Eos::builder().src(&pipeline).build())
+            .unwrap();
+        assert_eq!(bus.pop().unwrap().type_(), gst::MessageType::Error);
+        assert_eq!(bus.pop().unwrap().type_(), gst::MessageType::Eos);
+        assert!(observed.load(std::sync::atomic::Ordering::Relaxed) >= 3);
+    }
 
     #[test]
     fn recording_audio_resamples_to_the_pipeline_clock_without_dropping_samples() {

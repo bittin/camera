@@ -41,6 +41,22 @@ mode-timelapse = Timelapse
 # Status badge shown while the recorded timelapse video is being finalised.
 # Replaces the shot counter in a small pill, so keep it short.
 timelapse-saving = Saving video...
+
+## Shared warning for video, Motion Photo clips, and timelapse encoders.
+# $encoder is the actual GStreamer encoder name; $error is the diagnostic detail.
+recording-error-title = Video encoder failed
+recording-error-automatic = Automatic video encoder
+recording-error-body =
+    The video encoder "{ $encoder }" failed or stopped responding.
+
+    Restart your device. After restarting, choose a different video encoder in Settings > Video before recording again.
+
+    For hardware encoders, this is likely a Linux kernel or device-driver bug. Please file an issue with your device maintainers and include the encoder name and error details.
+
+    The recording may be incomplete.
+
+    Error: { $error }
+recording-error-dismiss = Dismiss
 # Non-interactive shutdown screen, below the same spinner used at startup.
 # A Motion Photo (still plus embedded clip) counts as one pending save.
 shutdown-pending-saves =

@@ -706,6 +706,11 @@ pub struct AppModel {
     pub(crate) last_published_photo_id: u64,
     pub(crate) shutdown_waiting_for_recorder: bool,
     pub(crate) recording_jobs: std::collections::BTreeSet<u64>,
+    pub(crate) encoder_operations: std::collections::BTreeMap<
+        super::recording_error::EncoderOperation,
+        crate::pipelines::video::RecordingMonitor,
+    >,
+    pub(crate) recording_failure: Option<super::recording_error::RecordingFailureNotice>,
     /// Whether hardware/raw/HDR acquisition is in progress
     pub is_capturing: bool,
     /// Continuous encoded memory recording, retired independently of frames.
@@ -1647,6 +1652,12 @@ pub enum Message {
     ToggleRecording,
     /// Video recording started successfully
     RecordingStarted(String),
+    EncoderFailed {
+        operation: super::recording_error::EncoderOperation,
+        failure: crate::pipelines::video::RecordingFailure,
+    },
+    EncoderOperationFinished(super::recording_error::EncoderOperation),
+    DismissEncoderFailure,
     /// Video recording stopped successfully. `session` matches the
     /// `RecordingState::Recording.session` assigned at start; the handler
     /// uses it to drop stale events from an already-superseded session.

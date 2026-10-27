@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 //! Encoded Motion Photo memory storage, independent of disk and UI state.
+use super::video::{RecordingMonitor, RecordingPhase};
 use gstreamer as gst;
 use std::collections::VecDeque;
 
@@ -64,13 +65,19 @@ pub(crate) struct MemoryEncoder {
     ring: Arc<Mutex<EncodedRing>>,
     fps: u32,
     audio: bool,
+    monitor: RecordingMonitor,
+    _finish: super::video::recording_monitor::FinishRecording,
 }
 fn make(name: &str) -> Result<gst::Element, String> {
     gst::ElementFactory::make(name)
         .build()
         .map_err(|e| e.to_string())
 }
-fn memory_sink(ring: Arc<Mutex<EncodedRing>>, audio: bool) -> gst_app::AppSink {
+fn memory_sink(
+    ring: Arc<Mutex<EncodedRing>>,
+    audio: bool,
+    monitor: Option<RecordingMonitor>,
+) -> gst_app::AppSink {
     // Only Gst 1.20 APIs: max-buffers/drop (not 1.24 max-bytes).
     let sink = gst_app::AppSink::builder()
         .sync(false)
@@ -105,13 +112,34 @@ fn memory_sink(ring: Arc<Mutex<EncodedRing>>, audio: bool) -> gst_app::AppSink {
                         audio,
                         key,
                     });
+                if let Some(monitor) = &monitor {
+                    monitor.note_output();
+                }
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
     );
     sink
 }
+// A sync observer must leave messages queued for the existing bus consumers.
+fn observe_errors(pipeline: &gst::Pipeline, monitor: &RecordingMonitor) {
+    let monitor = monitor.clone();
+    if let Some(bus) = pipeline.bus() {
+        bus.set_sync_handler(move |_, message| {
+            if let gst::MessageView::Error(error) = message.view() {
+                monitor.report_error(format!(
+                    "Motion Photo pipeline failed: {} ({:?})",
+                    error.error(),
+                    error.debug()
+                ));
+            }
+            gst::BusSyncReply::Pass
+        });
+    }
+}
+
 impl MemoryEncoder {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         info: &EncoderInfo,
@@ -122,9 +150,41 @@ impl MemoryEncoder {
         audio: Option<&str>,
         origin: std::time::Instant,
     ) -> Result<Self, String> {
-        super::motion_photo_encoder::validate_encoder(info)?;
-        gst::init().map_err(|e| e.to_string())?;
+        Self::new_monitored(
+            info,
+            width,
+            height,
+            fps,
+            bitrate,
+            audio,
+            origin,
+            RecordingMonitor::new(info.element_name.clone()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_monitored(
+        info: &EncoderInfo,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate: u32,
+        audio: Option<&str>,
+        origin: std::time::Instant,
+        monitor: RecordingMonitor,
+    ) -> Result<Self, String> {
+        monitor.set_encoder(info.element_name.clone());
+        monitor.set_phase(RecordingPhase::Starting);
+        monitor.enable_activity_watchdog();
+        if let Err(error) = super::motion_photo_encoder::validate_encoder(info)
+            .and_then(|()| gst::init().map_err(|e| e.to_string()))
+        {
+            monitor.report_error(error.clone());
+            monitor.finish();
+            return Err(error);
+        }
         let pipeline = gst::Pipeline::new();
+        observe_errors(&pipeline, &monitor);
         let ring = Arc::new(Mutex::new(EncodedRing::new(MEMORY_LIMIT, RETENTION_NS)));
         let source = gst_app::AppSrc::builder()
             .caps(
@@ -147,98 +207,117 @@ impl MemoryEncoder {
             ring,
             fps,
             audio: audio.is_some(),
+            _finish: super::video::recording_monitor::FinishRecording(monitor.clone()),
+            monitor,
         };
-        let encoder = make(&info.element_name)?;
-        super::motion_photo_encoder::configure_clip_video_encoder(
-            &encoder, info, width, height, bitrate,
-        )?;
-        if matches!(info.element_name.as_str(), "x264enc" | "x265enc") {
-            encoder.set_property_from_str("tune", "zerolatency");
-        }
-        // Short GOPs bound keyframe rounding. Intra-only where supported avoids
-        // B-frame dependencies and makes the 1.25s pre-roll accurate to one frame.
-        for prop in [
-            "key-int-max",
-            "keyframe-max-dist",
-            "gop-size",
-            "keyframe-period",
-        ] {
-            if encoder.find_property(prop).is_some() {
-                encoder.set_property_from_str(prop, "1");
+        let result: Result<(), String> = (|| {
+            let encoder = make(&info.element_name)?;
+            super::motion_photo_encoder::configure_clip_video_encoder(
+                &encoder, info, width, height, bitrate,
+            )?;
+            if matches!(info.element_name.as_str(), "x264enc" | "x265enc") {
+                encoder.set_property_from_str("tune", "zerolatency");
             }
-        }
-        for prop in ["bframes", "b-frames", "lag-in-frames"] {
-            if encoder.find_property(prop).is_some() {
-                encoder.set_property_from_str(prop, "0");
+            // Short GOPs bound keyframe rounding. Intra-only where supported avoids
+            // B-frame dependencies and makes the 1.25s pre-roll accurate to one frame.
+            for prop in [
+                "key-int-max",
+                "keyframe-max-dist",
+                "gop-size",
+                "keyframe-period",
+            ] {
+                if encoder.find_property(prop).is_some() {
+                    encoder.set_property_from_str(prop, "1");
+                }
             }
-        }
-        let input = super::video::encoder_selection::prepare_video_encoder_input(
-            &encoder,
-            &info.element_name,
-            width & !1,
-            height & !1,
-            fps,
-        )?;
-        let convert = make("videoconvert")?;
-        let scale = make("videoscale")?;
-        let caps = gst::ElementFactory::make("capsfilter")
-            .property("caps", input.caps(fps))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let parser = make(
-            info.codec
-                .parser_name()
-                .ok_or("No MP4 parser for selected encoder")?,
-        )?;
-        let sink = memory_sink(this.ring.clone(), false);
-        let encoded_caps = match info.codec {
-            crate::media::encoders::video::VideoCodec::H264 => gst::Caps::builder("video/x-h264")
-                .field("stream-format", "avc")
-                .field("alignment", "au")
-                .build(),
-            crate::media::encoders::video::VideoCodec::HEVC => gst::Caps::builder("video/x-h265")
-                .field("stream-format", "hvc1")
-                .field("alignment", "au")
-                .build(),
-            crate::media::encoders::video::VideoCodec::AV1 => gst::Caps::builder("video/x-av1")
-                .field("stream-format", "obu-stream")
-                .field("alignment", "tu")
-                .build(),
-        };
-        sink.set_caps(Some(&encoded_caps));
-        let chain = [
-            this.source.upcast_ref(),
-            &convert,
-            &scale,
-            &caps,
-            &encoder,
-            &parser,
-            sink.upcast_ref(),
-        ];
-        this.pipeline.add_many(chain).map_err(|e| e.to_string())?;
-        gst::Element::link_many(chain).map_err(|e| e.to_string())?;
-        if let Some(device) = audio {
-            let sink = memory_sink(this.ring.clone(), true);
-            this.pipeline.add(&sink).map_err(|e| e.to_string())?;
-            let audio = gst::ElementFactory::make("pulsesrc")
-                .property("device", device)
+            for prop in ["bframes", "b-frames", "lag-in-frames"] {
+                if encoder.find_property(prop).is_some() {
+                    encoder.set_property_from_str(prop, "0");
+                }
+            }
+            let input = super::video::encoder_selection::prepare_video_encoder_input(
+                &encoder,
+                &info.element_name,
+                width & !1,
+                height & !1,
+                fps,
+            )?;
+            let convert = make("videoconvert")?;
+            let scale = make("videoscale")?;
+            let caps = gst::ElementFactory::make("capsfilter")
+                .property("caps", input.caps(fps))
                 .build()
                 .map_err(|e| e.to_string())?;
-            super::motion_photo_encoder::add_aac_branch(&this.pipeline, sink.upcast_ref(), &audio)?;
+            let parser = make(
+                info.codec
+                    .parser_name()
+                    .ok_or("No MP4 parser for selected encoder")?,
+            )?;
+            let sink = memory_sink(this.ring.clone(), false, Some(this.monitor.clone()));
+            let encoded_caps = match info.codec {
+                crate::media::encoders::video::VideoCodec::H264 => {
+                    gst::Caps::builder("video/x-h264")
+                        .field("stream-format", "avc")
+                        .field("alignment", "au")
+                        .build()
+                }
+                crate::media::encoders::video::VideoCodec::HEVC => {
+                    gst::Caps::builder("video/x-h265")
+                        .field("stream-format", "hvc1")
+                        .field("alignment", "au")
+                        .build()
+                }
+                crate::media::encoders::video::VideoCodec::AV1 => gst::Caps::builder("video/x-av1")
+                    .field("stream-format", "obu-stream")
+                    .field("alignment", "tu")
+                    .build(),
+            };
+            sink.set_caps(Some(&encoded_caps));
+            let chain = [
+                this.source.upcast_ref(),
+                &convert,
+                &scale,
+                &caps,
+                &encoder,
+                &parser,
+                sink.upcast_ref(),
+            ];
+            this.pipeline.add_many(chain).map_err(|e| e.to_string())?;
+            gst::Element::link_many(chain).map_err(|e| e.to_string())?;
+            if let Some(device) = audio {
+                let sink = memory_sink(this.ring.clone(), true, None);
+                this.pipeline.add(&sink).map_err(|e| e.to_string())?;
+                let audio = gst::ElementFactory::make("pulsesrc")
+                    .property("device", device)
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                super::motion_photo_encoder::add_aac_branch(
+                    &this.pipeline,
+                    sink.upcast_ref(),
+                    &audio,
+                )?;
+            }
+            let clock = gst::SystemClock::obtain();
+            this.pipeline.use_clock(Some(&clock));
+            this.pipeline.set_start_time(gst::ClockTime::NONE);
+            this.pipeline.set_base_time(clock.time().saturating_sub(
+                gst::ClockTime::from_nseconds(origin.elapsed().as_nanos() as u64),
+            ));
+            this.pipeline
+                .set_state(gst::State::Playing)
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // Publish before `this` is dropped: STREAMOFF can block forever.
+            this.monitor.report_error(error.clone());
+            return Err(error);
         }
-        let clock = gst::SystemClock::obtain();
-        this.pipeline.use_clock(Some(&clock));
-        this.pipeline.set_start_time(gst::ClockTime::NONE);
-        this.pipeline
-            .set_base_time(clock.time().saturating_sub(gst::ClockTime::from_nseconds(
-                origin.elapsed().as_nanos() as u64,
-            )));
-        this.pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| e.to_string())?;
+        this.monitor.set_phase(RecordingPhase::Recording);
         Ok(this)
     }
     pub(crate) fn push(&mut self, image: image::RgbImage, pts: u64) -> Result<(), String> {
+        self.monitor.note_input();
         self.check_error()?;
         let row = image.width() as usize * 3;
         let stride = (row + 3) & !3;
@@ -334,7 +413,15 @@ impl MemoryEncoder {
 }
 impl Drop for MemoryEncoder {
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        if std::thread::panicking() {
+            self.monitor
+                .report_error("Motion Photo encoder worker panicked".into());
+        }
+        self.monitor.set_phase(RecordingPhase::Cleanup);
+        if let Err(error) = self.pipeline.set_state(gst::State::Null) {
+            self.monitor
+                .report_error(format!("Motion Photo cleanup failed: {error}"));
+        }
     }
 }
 pub(crate) struct EncodedWindow {
@@ -343,89 +430,123 @@ pub(crate) struct EncodedWindow {
     shutter: u64,
 }
 impl EncodedWindow {
+    #[cfg(test)]
     pub(crate) fn write(self, path: &std::path::Path) -> Result<u64, String> {
-        mux_packets(path, &self.packets, self.start)?;
-        Ok(self.shutter - self.start)
+        self.write_monitored(path, RecordingMonitor::new("Motion Photo clip mux".into()))
+    }
+    pub(crate) fn write_monitored(
+        self,
+        path: &std::path::Path,
+        monitor: RecordingMonitor,
+    ) -> Result<u64, String> {
+        monitor.set_phase(RecordingPhase::Finalizing);
+        let result = mux_packets(path, &self.packets, self.start, &monitor)
+            .map(|()| self.shutter - self.start);
+        if let Err(error) = &result {
+            monitor.report_error(error.clone());
+        }
+        monitor.finish();
+        result
     }
 }
-fn mux_packets(path: &std::path::Path, packets: &[Packet], start: u64) -> Result<(), String> {
+fn mux_packets(
+    path: &std::path::Path,
+    packets: &[Packet],
+    start: u64,
+    monitor: &RecordingMonitor,
+) -> Result<(), String> {
     // This function is called only on a worker, and only after a shutter.
     let pipeline = gst::Pipeline::new();
-    struct Stop(gst::Pipeline);
+    struct Stop(gst::Pipeline, RecordingMonitor);
     impl Drop for Stop {
         fn drop(&mut self) {
-            let _ = self.0.set_state(gst::State::Null);
+            if std::thread::panicking() {
+                self.1
+                    .report_error("Motion Photo mux worker panicked".into());
+            }
+            self.1.set_phase(RecordingPhase::Cleanup);
+            if let Err(error) = self.0.set_state(gst::State::Null) {
+                self.1
+                    .report_error(format!("Motion Photo mux cleanup failed: {error}"));
+            }
         }
     }
-    let _stop = Stop(pipeline.clone());
-    let muxer = make("mp4mux")?;
-    let sink = gst::ElementFactory::make("filesink")
-        .property("location", path.to_str().ok_or("Invalid clip path")?)
-        .build()
-        .map_err(|e| e.to_string())?;
-    pipeline
-        .add_many([&muxer, &sink])
-        .map_err(|e| e.to_string())?;
-    muxer.link(&sink).map_err(|e| e.to_string())?;
-    let mut sources = Vec::new();
-    for audio in [false, true] {
-        if let Some(first) = packets.iter().find(|p| p.audio == audio) {
-            let source = gst_app::AppSrc::builder()
-                .caps(&first.caps)
-                .format(gst::Format::Time)
-                .block(false)
-                .build();
-            pipeline.add(&source).map_err(|e| e.to_string())?;
-            let pad = muxer
-                .request_pad_simple(if audio { "audio_%u" } else { "video_%u" })
-                .ok_or("No muxer track")?;
-            source
-                .static_pad("src")
-                .ok_or("No appsrc pad")?
-                .link(&pad)
-                .map_err(|e| e.to_string())?;
-            sources.push((audio, source));
-        }
-    }
-    pipeline
-        .set_state(gst::State::Playing)
-        .map_err(|e| e.to_string())?;
-    for packet in packets {
-        let mut buffer = packet.buffer.clone();
-        let b = buffer.make_mut();
-        b.set_pts(gst::ClockTime::from_nseconds(packet.pts - start));
-        b.set_dts(
-            packet
-                .buffer
-                .dts()
-                .map(|d| gst::ClockTime::from_nseconds(d.nseconds().saturating_sub(start))),
-        );
-        sources
-            .iter()
-            .find(|(audio, _)| *audio == packet.audio)
-            .unwrap()
-            .1
-            .push_buffer(buffer)
+    let _stop = Stop(pipeline.clone(), monitor.clone());
+    observe_errors(&pipeline, monitor);
+    let result = (|| {
+        let muxer = make("mp4mux")?;
+        let sink = gst::ElementFactory::make("filesink")
+            .property("location", path.to_str().ok_or("Invalid clip path")?)
+            .build()
             .map_err(|e| e.to_string())?;
+        pipeline
+            .add_many([&muxer, &sink])
+            .map_err(|e| e.to_string())?;
+        muxer.link(&sink).map_err(|e| e.to_string())?;
+        let mut sources = Vec::new();
+        for audio in [false, true] {
+            if let Some(first) = packets.iter().find(|p| p.audio == audio) {
+                let source = gst_app::AppSrc::builder()
+                    .caps(&first.caps)
+                    .format(gst::Format::Time)
+                    .block(false)
+                    .build();
+                pipeline.add(&source).map_err(|e| e.to_string())?;
+                let pad = muxer
+                    .request_pad_simple(if audio { "audio_%u" } else { "video_%u" })
+                    .ok_or("No muxer track")?;
+                source
+                    .static_pad("src")
+                    .ok_or("No appsrc pad")?
+                    .link(&pad)
+                    .map_err(|e| e.to_string())?;
+                sources.push((audio, source));
+            }
+        }
+        pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| e.to_string())?;
+        for packet in packets {
+            let mut buffer = packet.buffer.clone();
+            let b = buffer.make_mut();
+            b.set_pts(gst::ClockTime::from_nseconds(packet.pts - start));
+            b.set_dts(
+                packet
+                    .buffer
+                    .dts()
+                    .map(|d| gst::ClockTime::from_nseconds(d.nseconds().saturating_sub(start))),
+            );
+            sources
+                .iter()
+                .find(|(audio, _)| *audio == packet.audio)
+                .unwrap()
+                .1
+                .push_buffer(buffer)
+                .map_err(|e| e.to_string())?;
+        }
+        for (_, source) in sources {
+            source.end_of_stream().map_err(|e| e.to_string())?;
+        }
+        match pipeline.bus().ok_or("No mux bus")?.timed_pop_filtered(
+            gst::ClockTime::from_seconds(5),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        ) {
+            Some(m) => match m.view() {
+                gst::MessageView::Eos(_) => Ok(()),
+                gst::MessageView::Error(e) => Err(format!(
+                    "Motion Photo mux failed: {} ({:?})",
+                    e.error(),
+                    e.debug()
+                )),
+                _ => unreachable!(),
+            },
+            None => Err("Motion Photo mux timed out".into()),
+        }
+    })();
+    if let Err(error) = &result {
+        monitor.report_error(error.clone());
     }
-    for (_, source) in sources {
-        source.end_of_stream().map_err(|e| e.to_string())?;
-    }
-    match pipeline.bus().ok_or("No mux bus")?.timed_pop_filtered(
-        gst::ClockTime::from_seconds(5),
-        &[gst::MessageType::Eos, gst::MessageType::Error],
-    ) {
-        Some(m) => match m.view() {
-            gst::MessageView::Eos(_) => Ok(()),
-            gst::MessageView::Error(e) => Err(format!(
-                "Motion Photo mux failed: {} ({:?})",
-                e.error(),
-                e.debug()
-            )),
-            _ => unreachable!(),
-        },
-        None => Err("Motion Photo mux timed out".into()),
-    }
+    result
 }
 
 #[cfg(test)]
@@ -464,7 +585,7 @@ pub(crate) mod test_fixture {
         // Match production: assemble both branches before starting the graph.
         // Adding an async sink during video preroll can strand it in Paused.
         encoder.pipeline.set_state(gst::State::Null).unwrap();
-        let sink = memory_sink(encoder.ring.clone(), true);
+        let sink = memory_sink(encoder.ring.clone(), true, None);
         encoder.pipeline.add(&sink).unwrap();
         let audio = gst::ElementFactory::make("audiotestsrc")
             .property("is-live", true)
@@ -537,6 +658,246 @@ pub(crate) mod test_fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_cleanup_remains_monitored_through_pipeline_destruction() {
+        let monitor = RecordingMonitor::new("x264enc".into());
+        let encoder = MemoryEncoder::new_monitored(
+            &test_fixture::software_encoder(),
+            64,
+            48,
+            10,
+            800,
+            None,
+            std::time::Instant::now(),
+            monitor.clone(),
+        )
+        .unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let at_destruction = observed.clone();
+        let status = monitor.clone();
+        let _notify = encoder.pipeline.add_weak_ref_notify(move || {
+            *at_destruction.lock().unwrap() = Some(status.subscribe().borrow().phase);
+        });
+        drop(encoder);
+        assert_eq!(*observed.lock().unwrap(), Some(RecordingPhase::Cleanup));
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[tokio::test]
+    async fn memory_activity_watchdog_tracks_real_input_and_encoded_video_progress() {
+        use std::time::{Duration, Instant};
+        let monitor = RecordingMonitor::new("x264enc".into());
+        let mut encoder = MemoryEncoder::new_monitored(
+            &test_fixture::software_encoder(),
+            64,
+            48,
+            10,
+            800,
+            None,
+            Instant::now(),
+            monitor.clone(),
+        )
+        .unwrap();
+        // A real encoded frame must acknowledge this earlier outstanding input.
+        monitor.note_input();
+        test_fixture::push_frame(&mut encoder, image::RgbImage::new(64, 48), 0);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let pad = encoder.source.static_pad("src").unwrap();
+        let probe = pad
+            .add_probe(gst::PadProbeType::BUFFER, |_, _| gst::PadProbeReturn::Drop)
+            .unwrap();
+        let blocked = Instant::now();
+        encoder
+            .push(image::RgbImage::new(64, 48), 100_000_000)
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(32),
+            super::super::video::wait_for_recording_failure(monitor.subscribe()),
+        )
+        .await;
+        pad.remove_probe(probe);
+        drop(encoder);
+        let failure = result
+            .expect(
+                "pending video must be independently observed without more input or watch updates",
+            )
+            .unwrap();
+        assert!(
+            failure.detail.contains("no encoded output"),
+            "{}",
+            failure.detail
+        );
+        assert!(
+            blocked.elapsed() >= Duration::from_secs(29),
+            "the earlier successful output must reset the progress deadline"
+        );
+    }
+
+    // Characterization of the real state-transition boundary: no camera/driver
+    // is needed to hold STREAMOFF-equivalent cleanup independently of the UI.
+    #[test]
+    fn memory_cleanup_stays_visible_until_pipeline_shutdown_returns() {
+        let monitor = RecordingMonitor::new("x264enc".into());
+        let mut encoder = MemoryEncoder::new_monitored(
+            &test_fixture::software_encoder(),
+            64,
+            48,
+            10,
+            800,
+            None,
+            std::time::Instant::now(),
+            monitor.clone(),
+        )
+        .unwrap();
+        test_fixture::push_frame(&mut encoder, image::RgbImage::new(64, 48), 0);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = Mutex::new(Some(release_rx));
+        encoder
+            .pipeline
+            .bus()
+            .unwrap()
+            .set_sync_handler(move |_, message| {
+                if let gst::MessageView::StateChanged(state) = message.view()
+                    && state.current() == gst::State::Ready
+                    && let Some(receiver) = release.lock().unwrap().take()
+                {
+                    let _ = entered_tx.send(());
+                    let _ = receiver.recv();
+                }
+                gst::BusSyncReply::Pass
+            });
+        let worker = std::thread::spawn(move || drop(encoder));
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let during = monitor.subscribe().borrow().clone();
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        assert!(
+            entered.is_ok(),
+            "cleanup must exercise a real blocking state transition"
+        );
+        assert_eq!(during.phase, RecordingPhase::Cleanup);
+        assert_eq!(monitor.subscribe().borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[test]
+    fn memory_unwind_reports_failure_before_driver_cleanup() {
+        let monitor = RecordingMonitor::new("x264enc".into());
+        let observer = monitor.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _encoder = MemoryEncoder::new_monitored(
+                &test_fixture::software_encoder(),
+                64,
+                48,
+                10,
+                800,
+                None,
+                std::time::Instant::now(),
+                monitor,
+            )
+            .unwrap();
+            panic!("synthetic worker panic");
+        }));
+        assert!(result.is_err());
+        assert!(
+            observer
+                .subscribe()
+                .borrow()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("panicked")
+        );
+        assert_eq!(
+            observer.subscribe().borrow().phase,
+            RecordingPhase::Finished
+        );
+    }
+
+    #[test]
+    fn memory_startup_failure_is_sticky_before_finished_is_published() {
+        let mut info = test_fixture::software_encoder();
+        info.element_name = "missing-camera-motion-encoder".into();
+        let monitor = RecordingMonitor::new(info.element_name.clone());
+        let result = MemoryEncoder::new_monitored(
+            &info,
+            64,
+            48,
+            10,
+            800,
+            None,
+            std::time::Instant::now(),
+            monitor.clone(),
+        );
+        assert!(result.is_err());
+        let status = monitor.subscribe().borrow().clone();
+        assert!(
+            status.error.is_some(),
+            "cleanup completion must not race ahead of startup failure"
+        );
+        assert_eq!(status.phase, RecordingPhase::Finished);
+    }
+
+    #[test]
+    fn mux_monitor_reports_failure_and_finishes_after_cleanup() {
+        gst::init().unwrap();
+        let monitor = RecordingMonitor::new("x264enc".into());
+        let window = EncodedWindow {
+            packets: vec![],
+            start: 0,
+            shutter: 1,
+        };
+        let path = std::env::temp_dir()
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("missing/clip.mp4");
+        assert!(window.write_monitored(&path, monitor.clone()).is_err());
+        let status = monitor.subscribe().borrow().clone();
+        assert_eq!(status.encoder, "x264enc");
+        assert!(status.error.is_some());
+        assert_eq!(status.phase, RecordingPhase::Finished);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn memory_monitor_observes_bus_error_without_consuming_it_and_finishes_after_drop() {
+        let monitor = super::super::video::RecordingMonitor::new("x264enc".into());
+        let encoder = MemoryEncoder::new_monitored(
+            &test_fixture::software_encoder(),
+            64,
+            48,
+            10,
+            800,
+            None,
+            std::time::Instant::now(),
+            monitor.clone(),
+        )
+        .unwrap();
+        let message =
+            gst::message::Error::builder(gst::CoreError::Failed, "synthetic encoder failure")
+                .build();
+        encoder.pipeline.bus().unwrap().post(message).unwrap();
+        assert!(
+            monitor
+                .subscribe()
+                .borrow()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("synthetic encoder failure")
+        );
+        assert!(
+            encoder
+                .check_error()
+                .unwrap_err()
+                .contains("synthetic encoder failure")
+        );
+        drop(encoder);
+        assert_eq!(
+            monitor.subscribe().borrow().phase,
+            super::super::video::RecordingPhase::Finished
+        );
+    }
 
     #[test]
     fn synthetic_audio_fixture_starts_both_streams_without_more_video_input() {

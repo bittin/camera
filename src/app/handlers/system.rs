@@ -367,9 +367,7 @@ impl AppModel {
             && self.recording.is_recording()
         {
             info!("Audio input disconnected during recording, stopping recording gracefully");
-            if let Some(sender) = self.recording.take_stop_sender() {
-                let _ = sender.send(());
-            }
+            self.request_recording_stop();
             self.recording = RecordingState::Idle;
         }
 
@@ -532,6 +530,10 @@ impl AppModel {
         self.flash.active = false;
         self.flash.error_popup = None;
         self.toggle_feedback = None;
+        // The photo timer is session state too. Cancel any running countdown so
+        // its already-queued tick cannot trigger a capture after resetting.
+        let _ = self.handle_abort_photo_timer();
+        self.photo_timer_setting = Default::default();
         self.current_video_encoder_index = 0;
         self.selected_filter = FilterType::default();
         self.recording_filter_code.store(

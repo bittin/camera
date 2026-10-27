@@ -13,6 +13,7 @@ use super::encoder_selection::{
 };
 use super::muxer::{create_muxer, link_muxer_to_sink, link_video_to_muxer};
 use super::recorder::{apply_video_tags_to_muxer, convert_frame_to_rgba};
+use super::{RecordingMonitor, RecordingPhase};
 use crate::backends::camera::types::CameraFrame;
 use crate::media::encoders::video::EncoderInfo;
 use gstreamer as gst;
@@ -34,20 +35,203 @@ const TIMELAPSE_FPS: u32 = 30;
 /// finalises the file when the channel closes.
 ///
 /// This function is intended to be spawned as an async task.
+/// Compatibility entry point for callers without a failure subscription.
 pub async fn run_timelapse_encoder(
-    mut frame_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<CameraFrame>>,
+    frame_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<CameraFrame>>,
     output_path: PathBuf,
     encoder_info: Option<EncoderInfo>,
     bitrate_kbps: Option<u32>,
     live_filter_code: Arc<AtomicU32>,
     capture_metadata: crate::pipelines::capture_metadata::CaptureMetadata,
 ) -> Result<String, String> {
+    let monitor = RecordingMonitor::new_waiting(
+        encoder_info
+            .as_ref()
+            .map(|info| info.element_name.clone())
+            .unwrap_or_else(|| "automatic".into()),
+    );
+    run_timelapse_encoder_monitored(
+        frame_rx,
+        output_path,
+        encoder_info,
+        bitrate_kbps,
+        live_filter_code,
+        capture_metadata,
+        monitor,
+    )
+    .await
+}
+
+/// Run on an owned OS thread: even a kernel-blocked state change or destructor
+/// must not block the caller's async executor. The caller subscribes to `monitor`
+/// independently (using `RecordingMonitor::new_waiting`); abandoning this future
+/// does not cancel or retry the worker.
+pub async fn run_timelapse_encoder_monitored(
+    frame_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<CameraFrame>>,
+    output_path: PathBuf,
+    encoder_info: Option<EncoderInfo>,
+    bitrate_kbps: Option<u32>,
+    live_filter_code: Arc<AtomicU32>,
+    capture_metadata: crate::pipelines::capture_metadata::CaptureMetadata,
+    monitor: RecordingMonitor,
+) -> Result<String, String> {
+    let worker_monitor = monitor.clone();
+    run_timelapse_worker(monitor, move || async move {
+        let mut guard = TimelapsePipeline::new(worker_monitor.clone());
+        let result = run_timelapse_encoder_inner(
+            frame_rx,
+            output_path,
+            encoder_info,
+            bitrate_kbps,
+            live_filter_code,
+            capture_metadata,
+            &mut guard,
+        )
+        .await;
+        // Publish errors before entering potentially uninterruptible NULL/drop.
+        if let Err(detail) = &result {
+            worker_monitor.report_error(detail.clone());
+        }
+        let cleanup = guard.cleanup();
+        result.and_then(|path| cleanup.map(|()| path))
+    })
+    .await
+}
+
+async fn run_timelapse_worker<F, Fut>(monitor: RecordingMonitor, work: F) -> Result<String, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let worker_monitor = monitor.clone();
+    let spawn = std::thread::Builder::new()
+        .name("timelapse-encoder".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| format!("Timelapse runtime: {e}"))?;
+                runtime.block_on(work())
+            }))
+            .unwrap_or_else(|_| Err("Timelapse encoder worker panicked".into()));
+            if let Err(detail) = &result {
+                worker_monitor.report_error(detail.clone());
+            }
+            worker_monitor.finish();
+            let _ = sender.send(result);
+        });
+    if let Err(error) = spawn {
+        let detail = format!("Cannot start timelapse encoder worker: {error}");
+        monitor.report_error(detail.clone());
+        monitor.finish();
+        return Err(detail);
+    }
+    // Deliberately do not join: a stuck driver cannot be forcibly cancelled.
+    receiver
+        .await
+        .unwrap_or_else(|_| Err("Timelapse encoder worker disconnected".into()))
+}
+
+/// Own the pipeline through *all* early returns and unwinding. Never finish the
+/// monitor here: Gst object destruction after NULL can itself block in a driver.
+struct TimelapsePipeline {
+    pipeline: Option<gst::Pipeline>,
+    monitor: RecordingMonitor,
+}
+
+impl TimelapsePipeline {
+    fn new(monitor: RecordingMonitor) -> Self {
+        Self {
+            pipeline: None,
+            monitor,
+        }
+    }
+
+    fn cleanup(&mut self) -> Result<(), String> {
+        // Take before entering Gst so Drop cannot retry NULL or reset its clock.
+        let Some(pipeline) = self.pipeline.take() else {
+            return Ok(());
+        };
+        self.monitor.set_phase(RecordingPhase::Cleanup);
+        let result = pipeline
+            .set_state(gst::State::Null)
+            .map(|_| ())
+            .map_err(|e| format!("set NULL: {e:?}"));
+        if let Err(detail) = &result {
+            self.monitor.report_error(detail.clone());
+        }
+        drop(pipeline);
+        result
+    }
+}
+
+impl Drop for TimelapsePipeline {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.monitor
+                .report_error("Timelapse encoder worker panicked".into());
+        }
+        let _ = self.cleanup();
+    }
+}
+
+/// Observe without removing messages needed by the final EOS/error wait.
+fn install_timelapse_observer(pipeline: &gst::Pipeline, monitor: &RecordingMonitor) {
+    if let Some(bus) = pipeline.bus() {
+        let monitor = monitor.clone();
+        bus.set_sync_handler(move |_, message| {
+            if let gst::MessageView::Error(error) = message.view() {
+                monitor.report_error(format!(
+                    "GStreamer error: {} ({})",
+                    error.error(),
+                    error.debug().unwrap_or_default(),
+                ));
+            }
+            gst::BusSyncReply::Pass
+        });
+    }
+}
+
+async fn receive_timelapse_frame(
+    frames: &mut tokio::sync::mpsc::UnboundedReceiver<Arc<CameraFrame>>,
+    status: &mut tokio::sync::watch::Receiver<super::RecordingStatus>,
+) -> Result<Option<Arc<CameraFrame>>, String> {
+    loop {
+        if let Some(detail) = status.borrow().error.clone() {
+            return Err(detail);
+        }
+        tokio::select! {
+            biased;
+            changed = status.changed() => {
+                changed.map_err(|_| "Timelapse monitor disconnected".to_string())?;
+            }
+            frame = frames.recv() => return Ok(frame),
+        }
+    }
+}
+
+async fn run_timelapse_encoder_inner(
+    mut frame_rx: tokio::sync::mpsc::UnboundedReceiver<Arc<CameraFrame>>,
+    output_path: PathBuf,
+    encoder_info: Option<EncoderInfo>,
+    bitrate_kbps: Option<u32>,
+    live_filter_code: Arc<AtomicU32>,
+    capture_metadata: crate::pipelines::capture_metadata::CaptureMetadata,
+    guard: &mut TimelapsePipeline,
+) -> Result<String, String> {
+    let monitor = guard.monitor.clone();
+    // The caller supplies new_waiting(): sparse input (even frame one) is idle,
+    // not startup. Do not opt into the continuous-recording activity watchdog.
+    monitor.set_phase(RecordingPhase::WaitingForFrames);
     // Wait for the first frame so we know the dimensions.
     let first_frame = frame_rx
         .recv()
         .await
         .ok_or_else(|| "Channel closed before first frame".to_string())?;
 
+    monitor.set_phase(RecordingPhase::Starting);
     let width = first_frame.width;
     let height = first_frame.height;
 
@@ -77,6 +261,19 @@ pub async fn run_timelapse_encoder(
         .factory()
         .map(|f| f.name().to_string())
         .unwrap_or_default();
+    monitor.set_encoder(enc_name.clone());
+    // Retain the resolved encoder in the guard before input negotiation can fail.
+    // Otherwise an early `?` could drop the device-backed element before the
+    // caller can publish the error and enter monitored cleanup.
+    guard.pipeline = Some(gst::Pipeline::new());
+    let pipeline = guard.pipeline.as_ref().unwrap();
+    install_timelapse_observer(pipeline, &monitor);
+    let mut status = monitor.subscribe();
+    pipeline.add(&video_enc.encoder).map_err(|e| {
+        let detail = format!("pipeline add encoder: {e}");
+        monitor.report_error(detail.clone());
+        detail
+    })?;
     let extension = video_enc.extension;
     let encoder_input =
         prepare_video_encoder_input(&video_enc.encoder, &enc_name, width, height, TIMELAPSE_FPS)
@@ -94,7 +291,6 @@ pub async fn run_timelapse_encoder(
           "Timelapse encoder selected");
 
     // --- build GStreamer pipeline (always RGBA input) -------------------------
-    let pipeline = gst::Pipeline::new();
 
     let appsrc = gst_app::AppSrc::builder()
         .caps(
@@ -127,7 +323,6 @@ pub async fn run_timelapse_encoder(
             &videoconvert,
             &input_chain.videoscale,
             &input_chain.capsfilter,
-            &encoder_elem,
             &muxer_cfg.muxer,
             &muxer_cfg.filesink,
         ])
@@ -154,6 +349,7 @@ pub async fn run_timelapse_encoder(
     pipeline
         .set_state(gst::State::Playing)
         .map_err(|e| format!("set PLAYING: {e:?}"))?;
+    monitor.set_phase(RecordingPhase::Recording);
 
     // --- push frames --------------------------------------------------------
     let frame_duration_ns: u64 = 1_000_000_000 / TIMELAPSE_FPS as u64;
@@ -166,7 +362,7 @@ pub async fn run_timelapse_encoder(
     frame_index += 1;
 
     // Receive remaining frames until the channel is closed (timelapse stopped)
-    while let Some(frame) = frame_rx.recv().await {
+    while let Some(frame) = receive_timelapse_frame(&mut frame_rx, &mut status).await? {
         if frame.width != width || frame.height != height {
             warn!(
                 expected_w = width,
@@ -181,7 +377,7 @@ pub async fn run_timelapse_encoder(
             Ok(rgba) => {
                 if let Err(e) = push_rgba(&appsrc, rgba, frame_index, frame_duration) {
                     error!(error = %e, frame = frame_index, "Failed to push frame, stopping");
-                    break;
+                    return Err(e);
                 }
                 frame_index += 1;
             }
@@ -202,19 +398,37 @@ pub async fn run_timelapse_encoder(
     );
 
     if frame_index == 0 {
-        pipeline.set_state(gst::State::Null).ok();
         let _ = std::fs::remove_file(&final_output);
         return Err("No frames were encoded".into());
     }
 
+    finalize_timelapse_pipeline(
+        pipeline,
+        &appsrc,
+        &monitor,
+        gst::ClockTime::from_seconds(30),
+    )?;
+
+    info!(path = %final_output.display(), frames = frame_index, "Timelapse video saved");
+    Ok(final_output.display().to_string())
+}
+
+fn finalize_timelapse_pipeline(
+    pipeline: &gst::Pipeline,
+    appsrc: &gst_app::AppSrc,
+    monitor: &RecordingMonitor,
+    timeout: gst::ClockTime,
+) -> Result<(), String> {
+    monitor.set_phase(RecordingPhase::Finalizing);
     // Signal end of stream
-    let _ = appsrc.end_of_stream();
+    appsrc
+        .end_of_stream()
+        .map_err(|e| format!("end_of_stream: {e}"))?;
 
     // Wait for EOS
     let bus = pipeline.bus().ok_or("No pipeline bus")?;
-    let timeout = gst::ClockTime::from_seconds(30);
     loop {
-        match bus.timed_pop(timeout) {
+        match bus.timed_pop_filtered(timeout, &[gst::MessageType::Eos, gst::MessageType::Error]) {
             Some(msg) => match msg.view() {
                 gst::MessageView::Eos(..) => {
                     info!("Timelapse video EOS received");
@@ -226,24 +440,17 @@ pub async fn run_timelapse_encoder(
                         e.error(),
                         e.debug().unwrap_or_default()
                     );
-                    pipeline.set_state(gst::State::Null).ok();
                     return Err(err_msg);
                 }
                 _ => {}
             },
             None => {
-                pipeline.set_state(gst::State::Null).ok();
                 return Err("Timeout waiting for pipeline EOS".into());
             }
         }
     }
 
-    pipeline
-        .set_state(gst::State::Null)
-        .map_err(|e| format!("set NULL: {e:?}"))?;
-
-    info!(path = %final_output.display(), frames = frame_index, "Timelapse video saved");
-    Ok(final_output.display().to_string())
+    Ok(())
 }
 
 struct EncoderInputChain {
@@ -322,6 +529,386 @@ fn push_rgba(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitored_timelapse_closed_input_reports_failure_and_finishes() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(tx);
+        let monitor = super::super::RecordingMonitor::new("chosen".into());
+        let status = monitor.subscribe();
+        let result = run_timelapse_encoder_monitored(
+            rx,
+            PathBuf::from("unused-timelapse-output"),
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Default::default(),
+            monitor,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "Channel closed before first frame");
+        assert_eq!(
+            status.borrow().error.as_deref(),
+            Some("Channel closed before first frame")
+        );
+        assert_eq!(
+            status.borrow().phase,
+            super::super::RecordingPhase::Finished
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitored_timelapse_sparse_input_is_idle_not_starting() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let monitor = RecordingMonitor::new_waiting("chosen".into());
+        let status = monitor.subscribe();
+        let task = tokio::spawn(run_timelapse_encoder_monitored(
+            rx,
+            PathBuf::from("unused-timelapse-output"),
+            None,
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Default::default(),
+            monitor,
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let phase = status.borrow().phase;
+        drop(tx);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(phase, RecordingPhase::WaitingForFrames);
+    }
+
+    #[test]
+    fn monitored_timelapse_drop_cleans_pipeline_without_finishing_or_resetting_deadline() {
+        gst::init().unwrap();
+        let monitor = RecordingMonitor::new("software".into());
+        let status = monitor.subscribe();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let mut guard = TimelapsePipeline::new(monitor.clone());
+        guard.pipeline = Some(pipeline.clone());
+        guard.cleanup().unwrap();
+        let cleanup_started = status.borrow().phase_started;
+        drop(guard);
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert_eq!(status.borrow().phase, RecordingPhase::Cleanup);
+        assert_eq!(status.borrow().phase_started, cleanup_started);
+
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let mut guard = TimelapsePipeline::new(monitor.clone());
+        guard.pipeline = Some(pipeline.clone());
+        drop(guard);
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert_eq!(status.borrow().phase, RecordingPhase::Cleanup);
+        assert_eq!(status.borrow().phase_started, cleanup_started);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitored_timelapse_software_resolves_encoder_and_writes_video() {
+        gst::init().unwrap();
+        let scratch = PathBuf::from(std::env::var_os("TMPDIR").expect("scratch TMPDIR"));
+        let output = scratch.join(format!("timelapse-monitor-{}.mp4", uuid::Uuid::new_v4()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let frame = Arc::new(CameraFrame {
+            width: 32,
+            height: 32,
+            data: crate::backends::camera::types::FrameData::from_owned_vec(vec![128; 32 * 32 * 4]),
+            format: crate::backends::camera::types::PixelFormat::RGBA,
+            stride: 32 * 4,
+            yuv_planes: None,
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        });
+        tx.send(frame.clone()).unwrap();
+        tx.send(frame).unwrap();
+        drop(tx);
+        let monitor = RecordingMonitor::new("unresolved".into());
+        let status = monitor.subscribe();
+        let encoder = EncoderInfo {
+            element_name: "x264enc".into(),
+            display_name: "software fixture".into(),
+            codec: crate::media::encoders::video::VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_timelapse_encoder_monitored(
+                rx,
+                output.clone(),
+                Some(encoder),
+                None,
+                Arc::new(AtomicU32::new(0)),
+                Default::default(),
+                monitor,
+            ),
+        )
+        .await;
+        let bytes = std::fs::read(&output);
+        let _ = std::fs::remove_file(&output);
+        assert_eq!(result.unwrap().unwrap(), output.display().to_string());
+        assert!(bytes.unwrap().len() > 100);
+        assert_eq!(status.borrow().encoder, "x264enc");
+        assert_eq!(status.borrow().phase, RecordingPhase::Finished);
+        assert!(status.borrow().error.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitored_timelapse_bus_error_is_visible_while_input_remains_open() {
+        gst::init().unwrap();
+        let output = PathBuf::from(std::env::var_os("TMPDIR").expect("scratch TMPDIR"))
+            .join(format!("timelapse-error-{}.mp4", uuid::Uuid::new_v4()));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(Arc::new(CameraFrame {
+            width: 33,
+            height: 33,
+            // x264 rejects odd I420 dimensions during asynchronous negotiation.
+            data: crate::backends::camera::types::FrameData::from_owned_vec(vec![0; 33 * 33 * 4]),
+            format: crate::backends::camera::types::PixelFormat::RGBA,
+            stride: 33 * 4,
+            yuv_planes: None,
+            captured_at: std::time::Instant::now(),
+            sensor_timestamp_ns: None,
+            libcamera_metadata: None,
+        }))
+        .unwrap();
+        let monitor = RecordingMonitor::new("unresolved".into());
+        let mut status = monitor.subscribe();
+        let encoder = EncoderInfo {
+            element_name: "x264enc".into(),
+            display_name: "software fixture".into(),
+            codec: crate::media::encoders::video::VideoCodec::H264,
+            is_hardware: false,
+            priority: 0,
+        };
+        let task = tokio::spawn(run_timelapse_encoder_monitored(
+            rx,
+            output.clone(),
+            Some(encoder),
+            None,
+            Arc::new(AtomicU32::new(0)),
+            Default::default(),
+            monitor,
+        ));
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if status.borrow().error.is_some() {
+                    break;
+                }
+                status.changed().await.unwrap();
+            }
+        })
+        .await;
+        drop(tx);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
+        let _ = std::fs::remove_file(&output);
+        assert!(
+            observed.is_ok(),
+            "Gst Error must be reported before the input closes"
+        );
+        assert!(result.unwrap().unwrap().is_err());
+        assert!(
+            status
+                .borrow()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("GStreamer error")
+        );
+        assert_eq!(status.borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[test]
+    fn monitored_timelapse_marks_finalizing_before_eos_is_observed() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst_app::AppSrc::builder().format(gst::Format::Time).build();
+        let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+        pipeline.add_many([appsrc.upcast_ref(), &sink]).unwrap();
+        appsrc.link(&sink).unwrap();
+        let monitor = RecordingMonitor::new("software".into());
+        let status = monitor.subscribe();
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        let callback_observed = observed.clone();
+        let callback_status = status.clone();
+        pipeline.bus().unwrap().set_sync_handler(move |_, message| {
+            if matches!(message.view(), gst::MessageView::Eos(_)) {
+                *callback_observed.lock().unwrap() = Some(callback_status.borrow().phase);
+            }
+            gst::BusSyncReply::Pass
+        });
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let result = finalize_timelapse_pipeline(
+            &pipeline,
+            &appsrc,
+            &monitor,
+            gst::ClockTime::from_seconds(1),
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(*observed.lock().unwrap(), Some(RecordingPhase::Finalizing));
+        assert_eq!(status.borrow().phase, RecordingPhase::Finalizing);
+    }
+
+    #[test]
+    fn monitored_timelapse_eos_bus_noise_does_not_extend_deadline() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let appsrc = gst_app::AppSrc::builder().build();
+        appsrc.set_state(gst::State::Paused).unwrap();
+        let bus = pipeline.bus().unwrap();
+        for _ in 0..100 {
+            bus.post(
+                gst::message::Application::builder(gst::Structure::new_empty(
+                    "timelapse-test-noise",
+                ))
+                .build(),
+            )
+            .unwrap();
+        }
+        bus.post(gst::message::Eos::builder().build()).unwrap();
+        let result = finalize_timelapse_pipeline(
+            &pipeline,
+            &appsrc,
+            &RecordingMonitor::new("software".into()),
+            gst::ClockTime::from_nseconds(1),
+        );
+        appsrc.set_state(gst::State::Null).unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert_eq!(result.unwrap_err(), "Timeout waiting for pipeline EOS");
+    }
+
+    #[test]
+    fn monitored_timelapse_rejected_eos_is_an_error_not_success() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let appsrc = gst_app::AppSrc::builder().build();
+        appsrc.set_state(gst::State::Paused).unwrap();
+        appsrc.set_state(gst::State::Null).unwrap();
+        pipeline
+            .bus()
+            .unwrap()
+            .post(gst::message::Eos::builder().build())
+            .unwrap();
+        let result = finalize_timelapse_pipeline(
+            &pipeline,
+            &appsrc,
+            &RecordingMonitor::new("software".into()),
+            gst::ClockTime::from_seconds(1),
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(result.unwrap_err().contains("end_of_stream"));
+    }
+
+    // Supplemental finite characterization of the worker boundary and observer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitored_timelapse_worker_keeps_executor_responsive_until_cleanup_returns() {
+        let monitor = RecordingMonitor::new("software".into());
+        let status = monitor.subscribe();
+        let worker_monitor = monitor.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::current().id();
+        let task = tokio::spawn(run_timelapse_worker(monitor, move || async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            worker_monitor.report_error("synthetic error before cleanup".into());
+            worker_monitor.set_phase(RecordingPhase::Cleanup);
+            entered_tx.send(std::thread::current().id()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            Err("synthetic error before cleanup".into())
+        }));
+        let worker = tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let phase_while_blocked = status.borrow().phase;
+        let error_while_blocked = status.borrow().error.clone();
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(worker, caller);
+        assert_eq!(phase_while_blocked, RecordingPhase::Cleanup);
+        assert_eq!(
+            error_while_blocked.as_deref(),
+            Some("synthetic error before cleanup")
+        );
+        assert!(result.is_err());
+        assert_eq!(status.borrow().phase, RecordingPhase::Finished);
+    }
+
+    #[test]
+    fn monitored_timelapse_observer_preserves_errors_for_finalization() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let monitor = RecordingMonitor::new("software".into());
+        let status = monitor.subscribe();
+        install_timelapse_observer(&pipeline, &monitor);
+        let bus = pipeline.bus().unwrap();
+        bus.post(
+            gst::message::Error::builder(gst::CoreError::Failed, "synthetic driver error")
+                .src(&pipeline)
+                .build(),
+        )
+        .unwrap();
+        assert!(
+            status
+                .borrow()
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("synthetic driver error")
+        );
+        let appsrc = gst_app::AppSrc::builder().build();
+        appsrc.set_state(gst::State::Paused).unwrap();
+        let result = finalize_timelapse_pipeline(
+            &pipeline,
+            &appsrc,
+            &monitor,
+            gst::ClockTime::from_seconds(1),
+        );
+        appsrc.set_state(gst::State::Null).unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(result.unwrap_err().contains("synthetic driver error"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn monitored_timelapse_panic_cleans_before_finishing() {
+        gst::init().unwrap();
+        let monitor = RecordingMonitor::new("software".into());
+        let status = monitor.subscribe();
+        let worker_monitor = monitor.clone();
+        let pipeline = gst::Pipeline::new();
+        pipeline.set_state(gst::State::Ready).unwrap();
+        let worker_pipeline = pipeline.clone();
+        let result = run_timelapse_worker(monitor, move || async move {
+            let mut guard = TimelapsePipeline::new(worker_monitor);
+            guard.pipeline = Some(worker_pipeline);
+            panic!("synthetic worker panic");
+        })
+        .await;
+        assert_eq!(result.unwrap_err(), "Timelapse encoder worker panicked");
+        assert_eq!(pipeline.current_state(), gst::State::Null);
+        assert_eq!(status.borrow().phase, RecordingPhase::Finished);
+        assert_eq!(
+            status.borrow().error.as_deref(),
+            Some("Timelapse encoder worker panicked")
+        );
+    }
 
     #[test]
     fn v4l2_timelapse_chain_remains_linked_after_elements_enter_pipeline() {

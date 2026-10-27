@@ -47,6 +47,7 @@ mod motor_picker;
 mod overlay_style;
 mod preview_geometry;
 pub mod qr_overlay;
+mod recording_error;
 pub mod settings;
 mod state;
 mod toggle_feedback;
@@ -68,6 +69,7 @@ use cosmic::iced::Subscription;
 use cosmic::widget::{self, about::About};
 use cosmic::{ApplicationExt, Element, Task};
 use iced_futures::subscription;
+pub use recording_error::EncoderOperation;
 pub use state::{
     AppFlags, AppModel, BurstModeStage, BurstModeState, CameraMode, ContextPage, FileSource,
     FilterType, Message, PhotoAspectRatio, PhotoTimerSetting, PrewarmResults, RecordingState,
@@ -508,6 +510,8 @@ impl cosmic::Application for AppModel {
             last_published_photo_id: 0,
             shutdown_waiting_for_recorder: false,
             recording_jobs: std::collections::BTreeSet::new(),
+            encoder_operations: std::collections::BTreeMap::new(),
+            recording_failure: None,
             is_capturing: false,
             motion_photo_recorder: None,
             motion_photo_retiring: None,
@@ -974,7 +978,11 @@ impl cosmic::Application for AppModel {
 
     /// Describes the interface based on the current state of the application model.
     fn view(&self) -> Element<'_, Self::Message> {
-        self.view()
+        self.with_recording_failure_dialog(AppModel::view(self))
+    }
+
+    fn dialog(&self) -> Option<Element<'_, Self::Message>> {
+        self.recording_failure_dialog()
     }
 
     /// Register subscriptions for this application.
@@ -1735,6 +1743,7 @@ impl cosmic::Application for AppModel {
             Subscription::none()
         };
         Subscription::batch([
+            self.encoder_failure_subscriptions(),
             window_controls::subscription(),
             motion_photo_lifecycle,
             config_sub,
