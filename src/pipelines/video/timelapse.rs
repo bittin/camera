@@ -612,7 +612,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn monitored_timelapse_software_resolves_encoder_and_writes_video() {
         gst::init().unwrap();
-        let scratch = PathBuf::from(std::env::var_os("TMPDIR").expect("scratch TMPDIR"));
+        let scratch = std::env::temp_dir();
         let output = scratch.join(format!("timelapse-monitor-{}.mp4", uuid::Uuid::new_v4()));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let frame = Arc::new(CameraFrame {
@@ -663,8 +663,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn monitored_timelapse_bus_error_is_visible_while_input_remains_open() {
         gst::init().unwrap();
-        let output = PathBuf::from(std::env::var_os("TMPDIR").expect("scratch TMPDIR"))
-            .join(format!("timelapse-error-{}.mp4", uuid::Uuid::new_v4()));
+        let output =
+            std::env::temp_dir().join(format!("timelapse-error-{}.mp4", uuid::Uuid::new_v4()));
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         tx.send(Arc::new(CameraFrame {
             width: 33,
