@@ -271,6 +271,9 @@ impl MemoryEncoder {
                     .field("stream-format", "obu-stream")
                     .field("alignment", "tu")
                     .build(),
+                crate::media::encoders::video::VideoCodec::VP8 => {
+                    return Err("Motion Photo does not support VP8".into());
+                }
             };
             sink.set_caps(Some(&encoded_caps));
             let chain = [

@@ -7,7 +7,10 @@ use gstreamer as gst;
 use std::path::Path;
 
 pub(crate) fn validate_encoder(info: &EncoderInfo) -> Result<(), String> {
-    if info.element_name.contains("vp8") || info.element_name.contains("vp9") {
+    if info.codec == crate::media::encoders::video::VideoCodec::VP8
+        || info.element_name.contains("vp8")
+        || info.element_name.contains("vp9")
+    {
         return Err(
             "Motion Photo requires AVC, HEVC or AV1 in MP4; select a compatible video encoder"
                 .into(),
@@ -100,6 +103,18 @@ mod tests {
             add_synthetic_audio, push_frame, software_encoder, wait_for_audio, write_clip,
         },
     };
+
+    #[test]
+    fn vp8_is_rejected_for_motion_photos_by_codec() {
+        let info = EncoderInfo {
+            element_name: "custom-hardware-encoder".into(),
+            display_name: "VP8".into(),
+            codec: VideoCodec::VP8,
+            is_hardware: true,
+            priority: 46,
+        };
+        assert!(validate_encoder(&info).is_err());
+    }
 
     /// Recover the appended MP4 using the published directory, not the input size.
     fn check_packaged_clip_decodes_in_both_still_formats(clip: &Path) {

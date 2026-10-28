@@ -26,13 +26,15 @@ pub enum VideoCodec {
     HEVC,
     /// H.264 codec (best compatibility)
     H264,
+    /// VP8 codec (WebM, explicit hardware selection)
+    VP8,
 }
 
 impl VideoCodec {
     /// Get the container format for this codec
     pub fn container_format(&self) -> ContainerFormat {
         match self {
-            VideoCodec::AV1 => ContainerFormat::WebM,
+            VideoCodec::AV1 | VideoCodec::VP8 => ContainerFormat::WebM,
             VideoCodec::HEVC => ContainerFormat::MP4,
             VideoCodec::H264 => ContainerFormat::MP4,
         }
@@ -49,6 +51,8 @@ impl VideoCodec {
             VideoCodec::AV1 => Some("av1parse"),
             VideoCodec::HEVC => Some("h265parse"),
             VideoCodec::H264 => Some("h264parse"),
+            // V4L2 emits complete VP8 frames that webmmux accepts directly.
+            VideoCodec::VP8 => None,
         }
     }
 }
@@ -385,6 +389,14 @@ const ENCODER_SPECS: &[EncoderSpec] = &[
         ui_priority: 32,
         auto_rank: Some(10),
     },
+    EncoderSpec {
+        name: "v4l2vp8enc",
+        display_name: "V4L2 VP8 (HW)",
+        codec: VideoCodec::VP8,
+        hardware: true,
+        ui_priority: 46,
+        auto_rank: None,
+    },
 ];
 
 fn automatic_encoder_specs() -> Vec<&'static EncoderSpec> {
@@ -594,7 +606,7 @@ pub fn configure_video_encoder(
         }
 
         // V4L2 hardware encoders
-        "v4l2h264enc" | "v4l2h265enc" => {
+        "v4l2h264enc" | "v4l2h265enc" | "v4l2vp8enc" => {
             // V4L2 encoders typically have limited configuration
             debug!("Using V4L2 encoder with default configuration");
         }
@@ -673,6 +685,94 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
+    fn vp8_hardware_encoder_is_explicit_and_appended_to_ui() {
+        let spec = ENCODER_SPECS
+            .iter()
+            .find(|spec| spec.name == "v4l2vp8enc")
+            .expect("V4L2 VP8 must be discoverable");
+        assert!(spec.hardware);
+        assert_eq!(spec.codec, VideoCodec::VP8);
+        assert_eq!(spec.display_name, "V4L2 VP8 (HW)");
+        assert_eq!(spec.auto_rank, None);
+        assert!(
+            ENCODER_SPECS
+                .iter()
+                .filter(|other| other.name != spec.name)
+                .all(|other| other.ui_priority < spec.ui_priority)
+        );
+    }
+
+    #[test]
+    fn vp8_assembles_parserless_webm_and_muxes_frames() {
+        gst::init().unwrap();
+        // Software fixture: exercise VP8 caps/muxing without hardware or a camera.
+        let info = EncoderInfo {
+            element_name: "vp8enc".into(),
+            display_name: "VP8 fixture".into(),
+            codec: VideoCodec::VP8,
+            is_hardware: false,
+            priority: 0,
+        };
+        let selected =
+            create_encoder_from_info_with_bitrate(&info, VideoQuality::Low, 64, 48, None).unwrap();
+        assert_eq!(selected.codec, VideoCodec::VP8);
+        assert_eq!(selected.container, ContainerFormat::WebM);
+        assert_eq!(selected.extension, "webm");
+        assert!(selected.parser.is_none());
+        assert_eq!(selected.muxer.factory().unwrap().name(), "webmmux");
+
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("videotestsrc")
+            .property("num-buffers", 3i32)
+            .build()
+            .unwrap();
+        let caps = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::from_str("video/x-raw,format=I420,width=64,height=48,framerate=10/1")
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("appsink")
+            .build()
+            .unwrap()
+            .downcast::<gstreamer_app::AppSink>()
+            .unwrap();
+        let chain = [
+            &source,
+            &caps,
+            &selected.encoder,
+            &selected.muxer,
+            sink.upcast_ref(),
+        ];
+        pipeline.add_many(chain).unwrap();
+        gst::Element::link_many(chain).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut bytes = Vec::new();
+        while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_seconds(5)) {
+            bytes.extend_from_slice(sample.buffer().unwrap().map_readable().unwrap().as_slice());
+        }
+        let message = pipeline.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(5),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        assert!(
+            matches!(
+                message.as_ref().map(|m| m.view()),
+                Some(gst::MessageView::Eos(_))
+            ),
+            "{message:?}"
+        );
+        assert!(
+            bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3]),
+            "missing EBML header"
+        );
+        assert!(bytes.windows(5).any(|w| w == b"V_VP8"), "missing VP8 track");
+    }
+
+    #[test]
     fn registry_keeps_distinct_automatic_and_ui_orders() {
         let automatic: Vec<_> = automatic_encoder_specs().iter().map(|s| s.name).collect();
         assert_eq!(
@@ -716,6 +816,7 @@ mod tests {
                 "qsvh264enc",
                 "amfh264enc",
                 "v4l2h264enc",
+                "v4l2vp8enc",
             ]
         );
         let names: std::collections::HashSet<_> = ENCODER_SPECS.iter().map(|s| s.name).collect();
@@ -728,6 +829,8 @@ mod tests {
                 VideoCodec::AV1
             } else if spec.name.contains("265") {
                 VideoCodec::HEVC
+            } else if spec.name.contains("vp8") {
+                VideoCodec::VP8
             } else {
                 VideoCodec::H264
             };
